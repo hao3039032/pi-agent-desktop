@@ -214,6 +214,13 @@ async function bundleNodeRuntime() {
       join(rootDir, "desktop", "server-helper-Info.plist"),
       join(contentsDir, "Info.plist"),
     );
+    // Fork: ship npm on macOS as well, so pi can install/update packages
+    // without a system Node.js (lib/distro/runtime-env.ts puts it on PATH).
+    await cp(
+      await findNpmSource(),
+      join(nodeResourcesDir, "node_modules", "npm"),
+      { recursive: true },
+    );
   } else {
     const executableName = process.platform === "win32" ? "node.exe" : "node";
     binaryPath = join(nodeResourcesDir, executableName);

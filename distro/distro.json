@@ -1,0 +1,169 @@
+{
+  "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
+  "id": "lw",
+  "revision": 1,
+  "app": {
+    "productName": "Pi Agent LW",
+    "identifier": "com.hao3039032.pi-agent-lw",
+    "repository": "hao3039032/pi-agent-desktop"
+  },
+  "defaultBaseUrl": "https://ai-new-api.91prize.com",
+  "provider": {
+    "id": "lw",
+    "name": "LW",
+    "api": "anthropic-messages",
+    "defaultModel": "glm-5.3",
+    "models": [
+      {
+        "id": "glm-5.3",
+        "name": "glm-5.3",
+        "reasoning": true,
+        "input": [
+          "text"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 131072,
+        "thinkingLevelMap": {
+          "xhigh": null,
+          "max": "max",
+          "high": "high",
+          "low": "low"
+        }
+      },
+      {
+        "id": "glm-5.3-flash",
+        "name": "glm-5.3-flash",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 128000,
+        "thinkingLevelMap": {
+          "max": "max",
+          "high": "high",
+          "low": "low"
+        }
+      },
+      {
+        "id": "minimax-m3",
+        "name": "minimax-m3",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 131072
+      },
+      {
+        "id": "claude-opus-5-5",
+        "name": "Claude Opus 5.5",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1000000,
+        "maxTokens": 128000
+      }
+    ]
+  },
+  "packages": [
+    "npm:pi-mcp-adapter",
+    "npm:pi-subagents",
+    "git:github.com/hao3039032/pi-plan-mode",
+    "npm:pi-web-access",
+    "git:github.com/hao3039032/pi-model-images"
+  ],
+  "settingsDefaults": {
+    "defaultThinkingLevel": "high"
+  },
+  "webSearch": {
+    "baseUrlKey": "geminiBaseUrl",
+    "apiKeyKey": "geminiApiKey",
+    "defaults": {
+      "allowBrowserCookies": true,
+      "provider": "gemini",
+      "searchModel": "gemini-3.8-flash",
+      "summaryModel": "gemini-3.5-flash-lite",
+      "youtube": {
+        "enabled": true,
+        "preferredModel": "gemini-3.5-flash-lite"
+      },
+      "video": {
+        "enabled": true,
+        "preferredModel": "gemini-3.5-flash-lite"
+      },
+      "workflow": "auto-summary",
+      "autoOpenBrowser": false
+    }
+  },
+  "agentFiles": {
+    "pi-plan-mode.json": {
+      "defaultPlanTools": [
+        "read",
+        "bash",
+        "grep",
+        "find",
+        "ls",
+        "web_enable",
+        "web_search",
+        "source_check",
+        "fetch_content",
+        "get_search_content"
+      ],
+      "safeSubcommands": {
+        "grep": [
+          "-i",
+          "-n",
+          "-c",
+          "-l",
+          "-v",
+          "-w",
+          "-E",
+          "-F",
+          "-e",
+          "-r",
+          "-in",
+          "-ni",
+          "-rn",
+          "-nr",
+          "-ri",
+          "-ir",
+          "-rin",
+          "-irn",
+          "-rni",
+          "-nri",
+          "-inr",
+          "-nir",
+          "-A",
+          "-B",
+          "-C"
+        ],
+        "rg": [
+          "-i",
+          "-n",
+          "-c",
+          "-l",
+          "-w",
+          "-F",
+          "-v",
+          "-e",
+          "-g",
+          "-t",
+          "-A",
+          "-B",
+          "-C",
+          "-in",
+          "-ni",
+          "-S",
+          "-uu",
+          "--files",
+          "--no-ignore"
+        ]
+      }
+    }
+  }
+}
