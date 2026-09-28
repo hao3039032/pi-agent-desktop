@@ -58,6 +58,15 @@ function main() {
   const version = distroVersion(upstreamVersion, distro.revision);
   writeFileSync(packagePath, `${JSON.stringify({ ...pkg, version, upstreamVersion }, null, 2)}\n`);
 
+  // src-tauri/Cargo.toml carries the same version; release-components.mjs
+  // requires the two to agree.
+  const cargoPath = join(tauriDir, "Cargo.toml");
+  const cargo = readFileSync(cargoPath, "utf8").replace(
+    /^(version\s*=\s*)"\d+\.\d+\.\d+"/m,
+    `$1"${version}"`,
+  );
+  writeFileSync(cargoPath, cargo);
+
   const base = readJson(join(tauriDir, "tauri.conf.json"));
   const platformFile = { macos: null, windows: "tauri.windows.conf.json", linux: "tauri.linux.conf.json" }[platform];
   const upstreamResources = (platformFile ? readJson(join(tauriDir, platformFile)).bundle?.resources : null)
