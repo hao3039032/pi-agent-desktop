@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { DISTRO } from "./config";
+import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
 import { isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
 
@@ -10,6 +11,7 @@ export interface DistroServiceStatus {
   configured: boolean;
   baseUrl: string;
   hasApiKey: boolean;
+  npmMirror: boolean;
 }
 
 export class DistroConfigError extends Error {}
@@ -36,6 +38,7 @@ export function readDistroServiceStatus(): DistroServiceStatus {
     configured: baseUrl !== "" && hasApiKey,
     baseUrl: baseUrl || DISTRO.defaultBaseUrl,
     hasApiKey,
+    npmMirror: readNpmMirrorEnabled(),
   };
 }
 
@@ -60,7 +63,7 @@ export function normalizeBaseUrl(value: unknown): string {
  * An omitted/empty apiKey keeps the stored one, so changing only the URL
  * does not require re-entering the key.
  */
-export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKey?: unknown }): Promise<DistroServiceStatus> {
+export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKey?: unknown; useNpmMirror?: unknown }): Promise<DistroServiceStatus> {
   const baseUrl = normalizeBaseUrl(input.baseUrl);
   const incomingKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
   if (/\s/.test(incomingKey)) throw new DistroConfigError("apiKey must not contain whitespace");
@@ -101,10 +104,15 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
   }
 
   const settingsManager = SettingsManager.create(agentDir, agentDir);
+  let settingsDirty = false;
   if (!settingsManager.getDefaultProvider()) {
     settingsManager.setDefaultModelAndProvider(DISTRO.provider.id, DISTRO.provider.defaultModel);
-    await settingsManager.flush();
+    settingsDirty = true;
   }
+  if (typeof input.useNpmMirror === "boolean") {
+    await setNpmMirrorEnabled(input.useNpmMirror, agentDir);
+  }
+  if (settingsDirty) await settingsManager.flush();
 
   return readDistroServiceStatus();
 }

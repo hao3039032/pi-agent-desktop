@@ -1,5 +1,6 @@
 import { configureDistroPath, findDistroResourcesDir, runPortableGitPostInstall } from "./runtime-env";
 import { seedAgentDir } from "./seed";
+import { applyNpmMirrorEnvFromSettings } from "./npm-mirror";
 
 /**
  * Server-start hook for the distribution overlay (called from
@@ -16,5 +17,10 @@ export async function initDistro(): Promise<void> {
     await seedAgentDir(resourcesDir);
   } catch (error) {
     console.error("[distro] initialization failed:", error);
+  }
+  try {
+    applyNpmMirrorEnvFromSettings();
+  } catch (error) {
+    console.warn("[distro] npm mirror could not be applied:", error);
   }
 }
