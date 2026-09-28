@@ -11,6 +11,7 @@ export interface DistroServiceStatus {
   configured: boolean;
   baseUrl: string;
   hasApiKey: boolean;
+  npmMirror: boolean;
 }
 
 const inputStyle: CSSProperties = {
@@ -45,10 +46,12 @@ export function DistroServiceForm({
   const s = distroStrings(locale);
   const [baseUrl, setBaseUrl] = useState(status.baseUrl);
   const [apiKey, setApiKey] = useState("");
+  const [useNpmMirror, setUseNpmMirror] = useState(status.npmMirror);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ error: boolean; text: string } | null>(null);
 
   useEffect(() => setBaseUrl(status.baseUrl), [status.baseUrl]);
+  useEffect(() => setUseNpmMirror(status.npmMirror), [status.npmMirror]);
 
   const canSave = !busy && baseUrl.trim() !== "" && (apiKey.trim() !== "" || status.hasApiKey);
 
@@ -59,7 +62,7 @@ export function DistroServiceForm({
       const response = await fetch("/api/distro", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseUrl, apiKey }),
+        body: JSON.stringify({ baseUrl, apiKey, useNpmMirror }),
       });
       const data = (await response.json()) as DistroServiceStatus & { error?: string };
       if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
@@ -102,6 +105,24 @@ export function DistroServiceForm({
           autoComplete="off"
         />
       </ConfigField>
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 7,
+          fontSize: 12,
+          color: "var(--text-muted)",
+          cursor: "pointer",
+          userSelect: "none",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={useNpmMirror}
+          onChange={(event) => setUseNpmMirror(event.target.checked)}
+        />
+        {s.npmMirrorLabel}
+      </label>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span
           style={{ flex: 1, fontSize: 12, color: message?.error ? "var(--color-danger, #e5484d)" : "var(--text-muted)" }}

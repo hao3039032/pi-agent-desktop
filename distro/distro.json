@@ -1,13 +1,14 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
   "id": "lw",
-  "revision": 1,
+  "revision": 2,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
     "repository": "hao3039032/pi-agent-desktop"
   },
   "defaultBaseUrl": "https://ai-new-api.91prize.com",
+  "npmMirrorUrl": "https://registry.npmmirror.com",
   "provider": {
     "id": "lw",
     "name": "LW",

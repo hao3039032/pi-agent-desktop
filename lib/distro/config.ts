@@ -15,6 +15,8 @@ export interface DistroConfig {
   id: string;
   revision: number;
   defaultBaseUrl: string;
+  /** Registry the "China npm mirror" checkbox writes into settings/env. */
+  npmMirrorUrl: string;
   provider: {
     id: string;
     name: string;
