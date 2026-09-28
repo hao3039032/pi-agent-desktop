@@ -5,7 +5,7 @@
 ## 用户得到什么
 
 - 5 个扩展包（pi-mcp-adapter、pi-subagents、pi-plan-mode fork 版、pi-web-access、pi-model-images）已预装，首次启动自动接入；
-- 首次启动弹窗填写服务地址（Base URL）和 API Key，之后在 设置 → 通用 → 服务配置 修改。地址变更只改一处，`models.json` 和 `web-search.json` 同步更新；
+- 首次启动弹窗填写服务地址（Base URL）和 API Key，之后在 设置 → 通用 → 服务配置 修改。地址变更只改一处，`models.json` 和 `web-search.json` 同步更新；弹窗里的「使用国内 npm 镜像」勾选把 `registry.npmmirror.com` 写进 `settings.json` 的 `npmCommand`（插件安装走它），并镜像到进程环境 `npm_config_registry`（`npx skills add` 继承），服务启动时从 settings 恢复，用户自己设过的环境变量优先；
 - Windows 自带 Git Bash（pi 的 bash 工具和 `git:` 扩展包需要）；
 - 应用内安装/升级插件不再需要系统 npm。
 
