@@ -1048,6 +1048,26 @@ fn wait_for_server(
     ))
 }
 
+/// pi-subagents background (async) children detach into their own Pi host
+/// process. The extension attributes the host npm package by walking up from
+/// `process.argv[1]` (our `desktop-server.cjs` lives in a different package
+/// tree) and then from the extension's own node_modules copy — both probes
+/// fail in the packaged layout, so start_packaged_server sets this override
+/// to the bundled SDK tree. Only this var: `PI_PACKAGE_DIR` is injected into
+/// the detached runner by the extension itself once the root resolves, and
+/// the bundled node.exe already satisfies the executable probe.
+#[cfg(feature = "custom-protocol")]
+const PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT_ENV: &str =
+    "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
+
+#[cfg(feature = "custom-protocol")]
+fn pi_subagents_package_root(server_dir: &Path) -> PathBuf {
+    server_dir
+        .join("node_modules")
+        .join("@earendil-works")
+        .join("pi-coding-agent")
+}
+
 #[cfg(feature = "custom-protocol")]
 fn start_packaged_server(
     app: &tauri::AppHandle,
@@ -1099,6 +1119,10 @@ fn start_packaged_server(
         .env("NODE_ENV", "production")
         .env("NEXT_TELEMETRY_DISABLED", "1")
         .env("PI_WEB_PARENT_PID", std::process::id().to_string())
+        .env(
+            PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT_ENV,
+            pi_subagents_package_root(&server_dir),
+        )
         .env(DESKTOP_API_TOKEN_ENV, desktop_api_token)
         .env(DESKTOP_INSTANCE_ID_ENV, desktop_instance_id)
         .stdin(Stdio::null())
@@ -1154,6 +1178,28 @@ mod tests {
     fn leaves_non_windows_path_unchanged() {
         let path = Path::new("/Applications/Pi Agent.app/Contents/Resources/server");
         assert_eq!(child_process_compatible_path(path), PathBuf::from(path));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pi_subagents_override_targets_the_bundled_sdk_tree() {
+        assert_eq!(
+            super::pi_subagents_package_root(Path::new(r"C:\Apps\Pi Agent LW\resources\server",)),
+            PathBuf::from(
+                r"C:\Apps\Pi Agent LW\resources\server\node_modules\@earendil-works\pi-coding-agent",
+            )
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pi_subagents_override_targets_the_bundled_sdk_tree() {
+        assert_eq!(
+            super::pi_subagents_package_root(Path::new("/opt/pi-agent-lw/resources/server",)),
+            PathBuf::from(
+                "/opt/pi-agent-lw/resources/server/node_modules/@earendil-works/pi-coding-agent",
+            )
+        );
     }
 
     #[cfg(target_os = "linux")]
