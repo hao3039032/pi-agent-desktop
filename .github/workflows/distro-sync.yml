@@ -1,0 +1,98 @@
+# Fork: follow upstream releases (docs/distro.md).
+#
+# Daily: if abcwyc/pi-agent-desktop published a release this fork has not
+# merged yet, merge that release tag into main, verify, push, and start
+# distro-release.yml. A merge conflict or a failing check stops the run
+# before anything is pushed; resolve it locally (`git merge <tag>`).
+#
+# Requires the DISTRO_SYNC_TOKEN secret: a fine-grained token for this
+# repository with Contents and Workflows read/write. GITHUB_TOKEN cannot push
+# upstream commits that touch .github/workflows, which every upstream
+# release does.
+name: Sync upstream release
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Start a distro release even if upstream has nothing new
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: distro-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.DISTRO_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::DISTRO_SYNC_TOKEN is not set (see the header of distro-sync.yml)"
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.DISTRO_SYNC_TOKEN }}
+
+      - name: Find the latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh release view --repo abcwyc/pi-agent-desktop --json tagName --jq .tagName)"
+          git remote add upstream https://github.com/abcwyc/pi-agent-desktop.git
+          git fetch --no-tags upstream "refs/tags/$tag:refs/tags/upstream/$tag"
+          if git merge-base --is-ancestor "upstream/$tag" HEAD; then
+            echo "Already on upstream $tag"
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "merge=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream release
+        if: steps.upstream.outputs.merge == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit -m "Merge upstream ${{ steps.upstream.outputs.tag }}" "upstream/${{ steps.upstream.outputs.tag }}"
+
+      - name: Set up Node.js
+        if: steps.upstream.outputs.merge == 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify
+        if: steps.upstream.outputs.merge == 'true'
+        run: |
+          npm ci
+          npm run lint
+          npx tsc --noEmit
+          npm test
+
+      - name: Push
+        if: steps.upstream.outputs.merge == 'true'
+        run: git push origin HEAD:main
+
+      - name: Start distro release
+        if: steps.upstream.outputs.merge == 'true' || inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run distro-release.yml --ref main

@@ -1,0 +1,163 @@
+# Fork: build and publish the distribution (docs/distro.md).
+#
+# Differences from upstream's release.yml (left untouched so upstream merges
+# never conflict): the version is derived from upstream's + distro revision,
+# the app is renamed and its updater points at this repository
+# (scripts/distro-build-config.mjs), and each platform bundles the
+# pre-installed pi packages (distro-seed) — Windows also PortableGit.
+name: Publish distro release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: distro-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      # tauri-action merges each platform into one latest.json on the release;
+      # parallel jobs would overwrite each other's entries.
+      max-parallel: 1
+      matrix:
+        include:
+          - runner: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc --bundles nsis
+            apple_signing_identity: ""
+          - runner: macos-15
+            platform: macos
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+            apple_signing_identity: "-"
+          - runner: ubuntu-24.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            args: --target x86_64-unknown-linux-gnu --bundles deb
+            apple_signing_identity: ""
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Require updater signing secrets
+        shell: bash
+        env:
+          UPDATER_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          test -n "$UPDATER_PRIVATE_KEY"
+          test -n "$UPDATER_PUBLIC_KEY"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Configure updater public key
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/configure-updater-public-key.mjs
+
+      - name: Configure distro build (version, name, updater endpoint, resources)
+        shell: bash
+        run: node scripts/distro-build-config.mjs ${{ matrix.platform }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Write component manifest
+        run: npm run release:manifest
+
+      - name: Prepare packaged Next.js server
+        run: npm run desktop:prepare
+
+      - name: Pre-install distro pi packages
+        run: npm run distro:seed
+
+      - name: Stage PortableGit (Git Bash)
+        if: runner.os == 'Windows'
+        run: npm run distro:git
+
+      - name: Test desktop shell
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
+
+      - name: Build, sign, and upload
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.apple_signing_identity }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Pi Agent LW v__VERSION__
+          releaseBody: |
+            Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
+
+            - Windows: download `*_x64-setup.exe` and run it.
+            - macOS (Apple Silicon): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
+            - Linux: install the `.deb`.
+
+            On first launch, enter the service address and API key. Later changes: Settings → General → Service.
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          args: ${{ matrix.args }} --config src-tauri/tauri.distro.conf.json
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node scripts/distro-build-config.mjs linux)"
+          gh release edit "v$version" --draft=false --latest
+
+  notify:
+    needs: [build, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the failed release
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "## Distro release build failed"
+            echo
+            echo "[Run log]($RUN_URL)"
+            echo
+            echo "The release stays a **draft**. Do not publish it by hand: a release missing a"
+            echo "platform's installer or updater entry will not serve updates to that platform."
+          } >> "$GITHUB_STEP_SUMMARY"

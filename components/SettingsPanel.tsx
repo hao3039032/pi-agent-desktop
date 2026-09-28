@@ -34,6 +34,7 @@ import { AgentsConfig } from "./AgentsConfig";
 import { PluginsConfig } from "./PluginsConfig";
 import { AppUpdatesSection } from "./AppUpdatesSection";
 import { DesktopAppSection } from "./desktop";
+import { DistroSettingsSection } from "./distro";
 import { ConfigButton, ConfigSwitch } from "./SettingsUi";
 import { isImeComposing } from "@/lib/ime";
 
@@ -203,6 +204,8 @@ function GeneralSettings({
       </div>
 
       <AppUpdatesSection onBusyChange={onBusyChange} />
+
+      <DistroSettingsSection />
 
       <div className="settings-general-columns">
         <div className="settings-general-col">
