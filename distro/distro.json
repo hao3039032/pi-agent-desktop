@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
   "id": "lw",
-  "revision": 3,
+  "revision": 4,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -67,6 +67,17 @@
           "image"
         ],
         "contextWindow": 1000000,
+        "maxTokens": 128000
+      },
+      {
+        "id": "gpt-6-astra",
+        "name": "GPT-6 Astra",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 272000,
         "maxTokens": 128000
       }
     ]
