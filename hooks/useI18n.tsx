@@ -6,7 +6,9 @@ import { getLocalePlugin, getSupportedLocales } from "@/lib/i18n/registry";
 import { translateMessage } from "@/lib/i18n/format";
 import type { Locale, LocalePlugin, TranslationParams } from "@/lib/i18n/types";
 
-const defaultLocale: Locale = "en";
+// Fork distro default: first launch is Simplified Chinese (the distro's
+// audience is Chinese-speaking); a stored preference always wins.
+const defaultLocale: Locale = "zh-CN";
 
 interface I18nContextValue {
   locale: Locale;
@@ -27,8 +29,8 @@ function getMessages(): Record<string, Record<string, string>> {
 function readInitialLocale(): Locale {
   const stored = getPref(APP_PREF_KEYS.locale);
   if (stored === "en" || stored === "zh-CN" || stored === "zh-TW") return stored;
-  // UI defaults to English; browser language is intentionally not consulted
-  // (the topbar language switcher was removed).
+  // First launch defaults to Simplified Chinese; browser language is
+  // intentionally not consulted (the topbar language switcher was removed).
   return defaultLocale;
 }
 
