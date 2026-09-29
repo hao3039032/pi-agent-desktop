@@ -55,7 +55,8 @@ async function assembleServer() {
   // Next's file tracer follows normal imports but intentionally omits files
   // reached through dynamic provider/export/plugin paths. These packages are
   // serverExternalPackages, so preserve their complete runtime `dist/` trees.
-  for (const packageName of await piPackageDirNames()) {
+  const directPiPackages = await piPackageDirNames();
+  for (const packageName of directPiPackages) {
     const source = join(rootDir, "node_modules", "@earendil-works", packageName, "dist");
     const destination = join(
       serverResourcesDir,
@@ -65,6 +66,49 @@ async function assembleServer() {
       "dist",
     );
     await cp(source, destination, { recursive: true, force: true });
+  }
+
+  // pi-subagents' detached runner resolves its host peer aliases from the
+  // bundled SDK tree (PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT in
+  // src-tauri/src/lib.rs): every export subpath of the scope's packages,
+  // including ones no app code imports (`pi-agent-core/node`) and transitive
+  // scope packages (`chord`, `pi-telemetry`). Next's tracer ships only
+  // fragments of those — a nested chord holding nothing but `dist/context/`
+  // — which fails the runner's completeness probe with "does not provide
+  // @earendil-works/pi-agent-core/node, @earendil-works/chord". Mirror the
+  // complete `dist/` of the remaining top-level scope packages and of the
+  // copies npm nested under every scope package, so every subpath resolves.
+  const scopeSource = join(rootDir, "node_modules", "@earendil-works");
+  const scopeDestination = join(serverResourcesDir, "node_modules", "@earendil-works");
+  for (const entry of await readdir(scopeSource, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const packageSource = join(scopeSource, entry.name);
+    const packageDestination = join(scopeDestination, entry.name);
+
+    if (!directPiPackages.includes(entry.name)) {
+      await cp(join(packageSource, "dist"), join(packageDestination, "dist"), { recursive: true, force: true });
+      // The tracer may not have staged this package at all; without the
+      // manifest its `exports` map cannot resolve the alias targets.
+      await copyFile(join(packageSource, "package.json"), join(packageDestination, "package.json"));
+    }
+
+    const nestedSource = join(packageSource, "node_modules", "@earendil-works");
+    const nestedEntries = await readdir(nestedSource, { withFileTypes: true }).catch(() => []);
+    for (const nested of nestedEntries) {
+      if (!nested.isDirectory()) continue;
+      const nestedSourcePackage = join(nestedSource, nested.name);
+      const nestedDestinationPackage = join(
+        packageDestination,
+        "node_modules",
+        "@earendil-works",
+        nested.name,
+      );
+      await cp(join(nestedSourcePackage, "dist"), join(nestedDestinationPackage, "dist"), { recursive: true, force: true });
+      await copyFile(
+        join(nestedSourcePackage, "package.json"),
+        join(nestedDestinationPackage, "package.json"),
+      );
+    }
   }
 
   // node-pty loads its native binding through a runtime-computed path

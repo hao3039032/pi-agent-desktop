@@ -1,0 +1,90 @@
+name: Test the macOS desktop build
+
+# Manual only, and deliberately not part of any release path: it builds the
+# macOS (Apple Silicon) app exactly like the release workflow does — same
+# distro config, same seed, same signing inputs — but uploads the bundles as
+# workflow artifacts instead of creating a release. Use it to iterate on the
+# packaged app (server staging, bundled packages, updater behavior) without
+# touching the published latest.json; a mac-only release would strand the
+# other platforms' updater entries.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-test-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Check out pi-agent-desktop
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Configure updater public key
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: node scripts/configure-updater-public-key.mjs
+
+      - name: Configure distro build (version, name, updater endpoint, resources)
+        run: node scripts/distro-build-config.mjs macos
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Write component manifest
+        run: npm run release:manifest
+
+      - name: Prepare packaged Next.js server
+        run: npm run desktop:prepare
+
+      - name: Pre-install distro pi packages
+        run: npm run distro:seed
+
+      # Not tauri-action: no release, no draft, no latest.json — the bundles
+      # land in target/release/bundle and are uploaded as artifacts below.
+      - name: Build the app (ad-hoc signed)
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: >
+          npx tauri build
+          --target aarch64-apple-darwin
+          --config src-tauri/tauri.distro.conf.json
+
+      - name: Verify the subagent host tree staged completely
+        shell: bash
+        run: |
+          server_scope="src-tauri/resources/server/node_modules/@earendil-works"
+          for pkg in pi-coding-agent pi-agent-core chord; do
+            test -d "$server_scope/$pkg" || { echo "missing $pkg"; exit 1; }
+          done
+          test -f "$server_scope/pi-agent-core/dist/node.js"
+          test -f "$server_scope/chord/dist/index.js"
+
+      - name: Upload the bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-agent-lw-macos-aarch64
+          path: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: error
+          compression-level: 0
