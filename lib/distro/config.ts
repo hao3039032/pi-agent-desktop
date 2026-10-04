@@ -31,7 +31,34 @@ export interface DistroConfig {
     apiKeyKey: string;
     defaults: Record<string, unknown>;
   };
+  /** JSON files written into the agent dir on first run (missing files only). */
   agentFiles: Record<string, unknown>;
+  /** Raw text files written into the agent dir on first run (e.g. WATCHDOG.yml). */
+  agentTextFiles?: Record<string, string>;
+  /** File → legacy file names whose presence must suppress seeding (the
+   * owning extension reads and migrates them itself, e.g. pi-plan-vanguard). */
+  legacyAgentFiles?: Record<string, string[]>;
 }
 
 export const DISTRO: DistroConfig = distroJson as unknown as DistroConfig;
+
+/**
+ * Rebase per-model absolute baseUrls that point at the distro's default
+ * service onto `baseUrl` (the one the user configured), keeping any suffix
+ * (`https://…/v1beta` → `https://custom/v1beta`). Model entries without a
+ * baseUrl, or pointing elsewhere, pass through untouched. Without this a
+ * user who changed the service address would still send one model's traffic
+ * to the default one.
+ */
+export function rebaseDistroModelUrls(
+  models: DistroModel[],
+  baseUrl: string,
+  defaultBase = DISTRO.defaultBaseUrl,
+): DistroModel[] {
+  if (!baseUrl || baseUrl === defaultBase) return models;
+  return models.map((model) =>
+    typeof model.baseUrl === "string" && model.baseUrl.startsWith(defaultBase)
+      ? { ...model, baseUrl: baseUrl.replace(/\/+$/, "") + model.baseUrl.slice(defaultBase.length) }
+      : model,
+  );
+}

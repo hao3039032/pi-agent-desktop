@@ -61,7 +61,6 @@ export interface ReconcileResult {
   managed: ManagedState;
   changed: boolean;
 }
-
 /**
  * For each seed package:
  * - an existing entry for the same package (npm/git source, an older bundle
@@ -69,6 +68,12 @@ export interface ReconcileResult {
  *   user's per-package filters; duplicates are dropped;
  * - a package the user removed after we added it stays removed;
  * - otherwise the bundled path is appended.
+ *
+ * Entries we manage for packages that left the seed (dropped from the bundle)
+ * are removed — after an app update the bundled copy no longer exists, and pi
+ * would fail to load the dangling path. Their state entries are dropped too,
+ * so re-bundling the package later re-adds it instead of remembering a removal
+ * the user never made.
  */
 export function reconcilePackages({ entries, seed, previous }: ReconcileInput): ReconcileResult {
   let result = [...entries];
@@ -104,6 +109,14 @@ export function reconcilePackages({ entries, seed, previous }: ReconcileInput): 
     if (!(source in managed.packages) && seed.some((pkg) => pkg.source === source)) {
       managed.packages[source] = path;
     }
+  }
+
+  // Prune packages that left the seed: drop entries pointing at the bundled
+  // copy of a source the current bundle no longer ships.
+  for (const [source, path] of Object.entries(previous?.packages ?? {})) {
+    if (seed.some((pkg) => pkg.source === source)) continue;
+    const seedCopy = (entry: PackageEntry) => normalizePath(entrySource(entry)) === normalizePath(path);
+    if (result.some(seedCopy)) result = result.filter((entry) => !seedCopy(entry));
   }
 
   const changed = JSON.stringify(result) !== JSON.stringify(entries);
