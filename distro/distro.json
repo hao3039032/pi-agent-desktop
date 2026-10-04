@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
   "id": "lw",
-  "revision": 5,
+  "revision": 6,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -79,15 +79,36 @@
         ],
         "contextWindow": 272000,
         "maxTokens": 128000
+      },
+      {
+        "id": "gemini-3.8-flash",
+        "name": "Gemini 3.8 Flash",
+        "api": "google-generative-ai",
+        "baseUrl": "https://ai-new-api.91prize.com/v1beta",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 65536,
+        "thinkingLevelMap": {
+          "xhigh": "high",
+          "max": "high",
+          "high": "high",
+          "medium": "medium",
+          "low": "low",
+          "minimal": "minimal"
+        }
       }
     ]
   },
   "packages": [
-    "npm:pi-mcp-adapter",
     "npm:pi-subagents",
-    "git:github.com/hao3039032/pi-plan-mode",
     "npm:pi-web-access",
-    "git:github.com/hao3039032/pi-model-images"
+    "git:github.com/hao3039032/pi-model-images",
+    "npm:pi-omp-advisor",
+    "git:github.com/hao3039032/pi-plan-vanguard"
   ],
   "settingsDefaults": {
     "defaultThinkingLevel": "high"
@@ -113,7 +134,7 @@
     }
   },
   "agentFiles": {
-    "pi-plan-mode.json": {
+    "pi-plan-vanguard.json": {
       "defaultPlanTools": [
         "read",
         "bash",
@@ -125,57 +146,16 @@
         "source_check",
         "fetch_content",
         "get_search_content"
-      ],
-      "safeSubcommands": {
-        "grep": [
-          "-i",
-          "-n",
-          "-c",
-          "-l",
-          "-v",
-          "-w",
-          "-E",
-          "-F",
-          "-e",
-          "-r",
-          "-in",
-          "-ni",
-          "-rn",
-          "-nr",
-          "-ri",
-          "-ir",
-          "-rin",
-          "-irn",
-          "-rni",
-          "-nri",
-          "-inr",
-          "-nir",
-          "-A",
-          "-B",
-          "-C"
-        ],
-        "rg": [
-          "-i",
-          "-n",
-          "-c",
-          "-l",
-          "-w",
-          "-F",
-          "-v",
-          "-e",
-          "-g",
-          "-t",
-          "-A",
-          "-B",
-          "-C",
-          "-in",
-          "-ni",
-          "-S",
-          "-uu",
-          "--files",
-          "--no-ignore"
-        ]
-      }
+      ]
     }
+  },
+  "legacyAgentFiles": {
+    "pi-plan-vanguard.json": [
+      "pi-plan-mode.json",
+      "plan-mode.json"
+    ]
+  },
+  "agentTextFiles": {
+    "WATCHDOG.yml": "# pi-omp-advisor 全局配置(用户级,所有项目生效)\n# main: false —— 常规 pi 会话默认不启动 advisor(按需用 /advisor on 临时开启)\nmain: false\nsubagents: false\n\nadvisors:\n  - name: advisor\n    model: lw/gemini-3.8-flash\n    tools: [read, grep, glob]\n    contextTokens: 48000\n"
   }
 }
