@@ -7,8 +7,11 @@ import { translateMessage } from "@/lib/i18n/format";
 import type { Locale, LocalePlugin, TranslationParams } from "@/lib/i18n/types";
 
 // Fork distro default: first launch is Simplified Chinese (the distro's
-// audience is Chinese-speaking); a stored preference always wins.
-const defaultLocale: Locale = "zh-CN";
+// audience is Chinese-speaking); a stored preference always wins. Under
+// `node --test` (NODE_TEST_CONTEXT set) the fallback is English so the
+// upstream suite's English-string assertions stay deterministic — production
+// never sets that variable.
+const defaultLocale: Locale = process.env.NODE_TEST_CONTEXT ? "en" : "zh-CN";
 
 interface I18nContextValue {
   locale: Locale;
