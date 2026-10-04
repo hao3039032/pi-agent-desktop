@@ -1,9 +1,11 @@
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO } from "./config";
+import { DISTRO, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
+import { runMcpAdapterMigration } from "./mcp-migration";
 
 export interface SeedManifest {
   distro: string;
@@ -17,6 +19,8 @@ interface DistroState extends ManagedState {
   distro: string;
   seedVersion?: string;
   defaultsApplied?: boolean;
+  /** One-time migrations that already ran (name → true). */
+  migrations?: Record<string, boolean>;
 }
 
 export function distroStatePath(agentDir = getAgentDir()): string {
@@ -46,6 +50,7 @@ function refreshProviderModels(): void {
     const providers = isRecord(config.providers) ? config.providers : {};
     const existing = providers[DISTRO.provider.id];
     if (!isRecord(existing)) return;
+    const storedBaseUrl = typeof existing.baseUrl === "string" ? existing.baseUrl : DISTRO.defaultBaseUrl;
     writeModelsConfig({
       ...config,
       providers: {
@@ -54,7 +59,7 @@ function refreshProviderModels(): void {
           ...existing,
           name: DISTRO.provider.name,
           api: DISTRO.provider.api,
-          models: DISTRO.provider.models,
+          models: rebaseDistroModelUrls(DISTRO.provider.models, storedBaseUrl),
         },
       },
     });
@@ -91,11 +96,45 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
       settingsManager.setDefaultThinkingLevel(level as never);
     }
   }
+
+  // One-time switch from the bundled pi-mcp-adapter extension to pi's
+  // built-in MCP (distro revision 6): remove the package entry and the
+  // adapter's "-builtin:mcp" guard, and carry adapter-only server configs
+  // over to <agentDir>/mcp.json. Recorded so it never runs twice.
+  const migrations = { ...(previous?.migrations ?? {}) };
+  if (!migrations.mcpAdapter) {
+    const report = runMcpAdapterMigration(agentDir, settingsManager);
+    migrations.mcpAdapter = true;
+    if (
+      report.removedPackageEntries > 0 ||
+      report.restoredBuiltinMcp ||
+      report.migratedServers.length > 0 ||
+      report.skippedServers.length > 0 ||
+      report.warnings.length > 0
+    ) {
+      console.log(
+        `[distro] pi-mcp-adapter -> built-in MCP: ${report.removedPackageEntries} package entry(ies) removed,` +
+          ` builtin mcp ${report.restoredBuiltinMcp ? "restored" : "already on"},` +
+          ` servers migrated: ${report.migratedServers.length ? report.migratedServers.join(", ") : "none"}` +
+          (report.skippedServers.length ? `; skipped: ${report.skippedServers.join(", ")}` : "") +
+          (report.warnings.length ? `; ${report.warnings.join("; ")}` : ""),
+      );
+    }
+  }
+
   await settingsManager.flush();
 
   for (const [name, contents] of Object.entries(DISTRO.agentFiles)) {
     const path = join(agentDir, name);
+    // A legacy file the owning extension reads (and migrates itself on next
+    // save) must not be shadowed by a freshly seeded canonical file.
+    if ((DISTRO.legacyAgentFiles?.[name] ?? []).some((legacy) => fileExists(join(agentDir, legacy)))) continue;
     if (!fileExists(path) && isRecord(contents)) writeJsonObject(path, contents);
+  }
+
+  for (const [name, contents] of Object.entries(DISTRO.agentTextFiles ?? {})) {
+    const path = join(agentDir, name);
+    if (!fileExists(path) && typeof contents === "string") writeFileSync(path, contents, { mode: 0o644 });
   }
 
   if (versionChanged) refreshProviderModels();
@@ -105,5 +144,6 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
     seedVersion: manifest.seedVersion,
     defaultsApplied: true,
     packages: reconciled.managed.packages,
+    migrations,
   });
 }
