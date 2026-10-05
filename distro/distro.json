@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
   "id": "lw",
-  "revision": 6,
+  "revision": 7,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -132,6 +132,10 @@
       "workflow": "auto-summary",
       "autoOpenBrowser": false
     }
+  },
+  "imageGen": {
+    "configFile": "pi-model-images.json",
+    "baseUrlSuffix": "/v1"
   },
   "agentFiles": {
     "pi-plan-vanguard.json": {

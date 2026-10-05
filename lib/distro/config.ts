@@ -31,6 +31,13 @@ export interface DistroConfig {
     apiKeyKey: string;
     defaults: Record<string, unknown>;
   };
+  /** pi-model-images 0.2+ ships the imagegen CLI as a skill; its config file
+   * gets the same service address in OpenAI form (`…` + suffix) and key so
+   * image generation works without extra setup. */
+  imageGen?: {
+    configFile: string;
+    baseUrlSuffix: string;
+  };
   /** JSON files written into the agent dir on first run (missing files only). */
   agentFiles: Record<string, unknown>;
   /** Raw text files written into the agent dir on first run (e.g. WATCHDOG.yml). */
@@ -61,4 +68,18 @@ export function rebaseDistroModelUrls(
       ? { ...model, baseUrl: baseUrl.replace(/\/+$/, "") + model.baseUrl.slice(defaultBase.length) }
       : model,
   );
+}
+
+/**
+ * The OpenAI-style base the imagegen CLI needs (`{base}/images/generations`):
+ * the service address with the distro's suffix appended unless it already
+ * ends with it (`https://gw.example` → `https://gw.example/v1`,
+ * `https://gw.example/v1/` → `https://gw.example/v1`).
+ */
+export function imageGenBaseUrl(
+  baseUrl: string,
+  suffix = DISTRO.imageGen?.baseUrlSuffix ?? "/v1",
+): string {
+  const base = baseUrl.trim().replace(/\/+$/, "");
+  return base.endsWith(suffix) ? base : base + suffix;
 }
