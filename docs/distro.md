@@ -4,7 +4,7 @@
 
 ## 用户得到什么
 
-- 5 个扩展包（pi-subagents、pi-web-access、pi-model-images、pi-omp-advisor、pi-plan-vanguard）已预装，首次启动自动接入；MCP 不再走 pi-mcp-adapter，改用 pi 官方内置 MCP（设置 → MCP 管理 `~/.pi/agent/mcp.json`），老安装升级时自动迁移（见下）；
+- 5 个扩展包（pi-subagents、pi-web-access、pi-model-images、pi-omp-advisor、pi-plan-vanguard）已预装，首次启动自动接入；子代理默认运行时限 60 分钟（pi-subagents 内置 30 分钟，通过 `extensions/subagent/config.json` 的 `timeoutMs: 3600000` 覆盖，并在截止前 5 分钟启用收尾检查点）；MCP 不再走 pi-mcp-adapter，改用 pi 官方内置 MCP（设置 → MCP 管理 `~/.pi/agent/mcp.json`），老安装升级时自动迁移（见下）；
 - pi-omp-advisor 的模型与设置沿用开发机：WATCHDOG.yml（首次种入，`main: false`，按需 `/advisor on`），advisor 模型 `lw/gemini-3.8-flash`（已加入 provider 模型表）；
 - 首次启动弹窗填写服务地址（Base URL）和 API Key，之后在 设置 → 通用 → 服务配置 修改。地址变更只改一处，`models.json` 和 `web-search.json` 同步更新；弹窗里的「使用国内 npm 镜像」勾选把 `registry.npmmirror.com` 写进 `settings.json` 的 `npmCommand`（插件安装走它），并镜像到进程环境 `npm_config_registry`（`npx skills add` 继承），服务启动时从 settings 恢复，用户自己设过的环境变量优先；
 - Windows 自带 Git Bash（pi 的 bash 工具和 `git:` 扩展包需要）；
