@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, rebaseDistroModelUrls } from "./config";
+import { DISTRO, imageGenBaseUrl, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -69,6 +69,34 @@ function refreshProviderModels(): void {
 }
 
 /**
+ * pi-model-images 0.2 replaced the registered imagegen tool with a CLI
+ * reading its own config file. Create it from the configured service so
+ * image generation works right after the upgrade, for users who never
+ * reopen the service form. Missing file only — a hand-created or hand-edited
+ * config is never overwritten (the service form keeps one that exists in
+ * step with later address changes). Same write-when-missing semantics as
+ * agentFiles above.
+ */
+function ensureImageGenConfig(agentDir: string): void {
+  const configFile = DISTRO.imageGen?.configFile;
+  if (!configFile) return;
+  const path = join(agentDir, configFile);
+  if (fileExists(path)) return;
+  try {
+    const config = readModelsConfig();
+    const providers = isRecord(config.providers) ? config.providers : {};
+    const provider = providers[DISTRO.provider.id];
+    if (!isRecord(provider)) return;
+    const baseUrl = typeof provider.baseUrl === "string" ? provider.baseUrl : "";
+    const apiKey = typeof provider.apiKey === "string" ? provider.apiKey : "";
+    if (!baseUrl || !apiKey) return;
+    writeJsonObject(path, { baseUrl: imageGenBaseUrl(baseUrl), apiKey });
+  } catch (error) {
+    console.warn("[distro] could not seed the imagegen config:", error);
+  }
+}
+
+/**
  * Point the user's pi configuration at the packages pre-installed in the app
  * bundle, and apply first-run defaults. Idempotent; cheap when nothing changed.
  */
@@ -131,6 +159,8 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
     if ((DISTRO.legacyAgentFiles?.[name] ?? []).some((legacy) => fileExists(join(agentDir, legacy)))) continue;
     if (!fileExists(path) && isRecord(contents)) writeJsonObject(path, contents);
   }
+
+  ensureImageGenConfig(agentDir);
 
   for (const [name, contents] of Object.entries(DISTRO.agentTextFiles ?? {})) {
     const path = join(agentDir, name);

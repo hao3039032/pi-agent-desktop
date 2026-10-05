@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, rebaseDistroModelUrls } from "./config";
+import { DISTRO, imageGenBaseUrl, rebaseDistroModelUrls } from "./config";
 import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
 import { isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -18,6 +18,10 @@ export class DistroConfigError extends Error {}
 
 function webSearchPath(agentDir: string): string {
   return join(agentDir, "web-search.json");
+}
+
+function imageGenPath(agentDir: string): string | null {
+  return DISTRO.imageGen ? join(agentDir, DISTRO.imageGen.configFile) : null;
 }
 
 export function readDistroServiceStatus(): DistroServiceStatus {
@@ -59,7 +63,9 @@ export function normalizeBaseUrl(value: unknown): string {
 
 /**
  * Write the service address and key everywhere the distro uses them:
- * models.json (the chat provider) and web-search.json (pi-web-access).
+ * models.json (the chat provider), web-search.json (pi-web-access) and
+ * pi-model-images.json (the imagegen CLI shipped as a skill since
+ * pi-model-images 0.2, which talks to the OpenAI Images API directly).
  * An omitted/empty apiKey keeps the stored one, so changing only the URL
  * does not require re-entering the key.
  */
@@ -101,6 +107,22 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
     });
   } else {
     console.warn("[distro] web-search.json is not valid JSON; left untouched");
+  }
+
+  // Same service, OpenAI form: the imagegen CLI posts to
+  // `{baseUrl}/images/generations` and must not share the anthropic base.
+  const imageGen = imageGenPath(agentDir);
+  if (imageGen) {
+    const imageGenConfig = readJsonObject(imageGen);
+    if (imageGenConfig) {
+      writeJsonObject(imageGen, {
+        ...imageGenConfig,
+        baseUrl: imageGenBaseUrl(baseUrl),
+        apiKey,
+      });
+    } else {
+      console.warn(`[distro] ${DISTRO.imageGen?.configFile} is not valid JSON; left untouched`);
+    }
   }
 
   const settingsManager = SettingsManager.create(agentDir, agentDir);

@@ -28,7 +28,7 @@
 
 ## 运行时行为细节
 
-- **种子**：服务启动时（`instrumentation-node.ts` → `initDistro()`）检测 `resources/pi-seed/manifest.json`，把用户 `settings.json` 的 packages 指向包内副本。匹配规则见 `lib/distro/packages.ts`：npm/git 源忽略版本号，本地路径按 `/pi-seed/<相对路径>` 识别（换安装目录也能跟上）；用户手动删掉的包不会自动加回来（记录在 `~/.pi/agent/desktop-distro.json`）；**从发行包里移除的包**会把指向包内副本的条目剪掉（不留悬空路径），且不当作「用户删过」记仇，将来重新捆绑时会重新种入。`agentFiles` 只在目标文件不存在时写入；`legacyAgentFiles` 列出的旧文件（如 `pi-plan-mode.json`）已存在时跳过种入，由 pi-plan-vanguard 自己读取并在下次保存时迁移，避免遮蔽用户配置。
+- **种子**：服务启动时（`instrumentation-node.ts` → `initDistro()`）检测 `resources/pi-seed/manifest.json`，把用户 `settings.json` 的 packages 指向包内副本。匹配规则见 `lib/distro/packages.ts`：npm/git 源忽略版本号，本地路径按 `/pi-seed/<相对路径>` 识别（换安装目录也能跟上）；用户手动删掉的包不会自动加回来（记录在 `~/.pi/agent/desktop-distro.json`）；**从发行包里移除的包**会把指向包内副本的条目剪掉（不留悬空路径），且不当作「用户删过」记仇，将来重新捆绑时会重新种入。`agentFiles` 只在目标文件不存在时写入；`legacyAgentFiles` 列出的旧文件（如 `pi-plan-mode.json`）已存在时跳过种入，由 pi-plan-vanguard 自己读取并在下次保存时迁移，避免遮蔽用户配置。imagegen 的配置 `pi-model-images.json` 同样只在缺失时从已配置的服务地址（`+ /v1`）和 key 种入，已存在的不动，后续地址变更由服务表单同步。
 - **升级**：`seedVersion` 变化时会用 distro.json 里的模型表刷新 LW provider 的模型列表（不动用户的 baseUrl/apiKey；模型条目里指向默认服务地址的绝对 baseUrl 会改写成用户配置的地址，如 `…/v1beta`），并重写包路径。
 - **一次性迁移（pi-mcp-adapter → 官方 MCP）**：`lib/distro/mcp-migration.ts`，每个 agent 目录至多跑一次（记录在 `desktop-distro.json` 的 `migrations.mcpAdapter`）：
   1. 删除 `packages` 里手写形式的 pi-mcp-adapter 条目（`npm:pi-mcp-adapter` / 带版本号；包内路径形式由种子剪除逻辑处理）；
