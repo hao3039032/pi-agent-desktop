@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
   "id": "lw",
-  "revision": 7,
+  "revision": 8,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -138,6 +138,10 @@
     "baseUrlSuffix": "/v1"
   },
   "agentFiles": {
+    "extensions/subagent/config.json": {
+      "timeoutMs": 3600000,
+      "checkpointBeforeDeadlineMs": 300000
+    },
     "pi-plan-vanguard.json": {
       "defaultPlanTools": [
         "read",
