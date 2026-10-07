@@ -18,6 +18,7 @@
 | `scripts/distro-seed.mjs` | 构建时把扩展包装进 `src-tauri/resources/pi-seed/`，并写 `manifest.json`（含 `seedVersion`）和 `bin/npm` shim。git 包去掉 peer 依赖和 `.map`/`.d.ts` 以减小体积 |
 | `scripts/distro-portable-git.mjs` | Windows 构建时下载 PortableGit（版本和 sha256 写死在脚本里），解压、裁剪文档/翻译后放进 `resources/git/`。`post-install.bat` 保留，由运行时执行 |
 | `scripts/distro-build-config.mjs` | 发版时生成 `tauri.distro.conf.json`（改名、identifier、updater 指向本仓库、附加 resources），并把版本号写成 上游X.Y.Z×100+revision |
+| `scripts/distro-reset-revision.mjs` | 合并上游后若版本变化，把 `distro.json` 的 `revision` 重置为 1（revision 按上游版本分别计数，`distro-sync.yml` 自动执行，也并入 merge commit） |
 | `lib/distro/` | 运行时：PATH 注入（npm shim、Git Bash）、首次启动种子（packages 重写、默认值、`pi-plan-vanguard.json`、`WATCHDOG.yml`）、服务配置读写、pi-mcp-adapter → 官方 MCP 的一次性迁移（`mcp-migration.ts`） |
 | `components/distro/` | 首次启动弹窗 + 设置里的服务配置表单 |
 | `app/api/distro/` | `GET/PUT /api/distro`：服务配置状态与保存（不回传 key） |
@@ -41,7 +42,7 @@
 
 ## 发版流程
 
-1. 改动 distro 层（模型表、扩展包列表、PortableGit 版本等）后：把 `distro/distro.json` 的 `revision` +1；
+1. 改动 distro 层（模型表、扩展包列表、PortableGit 版本等）后：把 `distro/distro.json` 的 `revision` +1。`revision` 按上游版本分别计数：合并上游后版本变了就重置为 1（`distro-sync.yml` 自动执行 `scripts/distro-reset-revision.mjs` 并并入 merge commit），所以 0.4.805 之后同步到 0.5.2，下一个版本是 0.5.201 而不是 0.5.206；上游版本不变时才需要手动 +1。手动 `git merge <上游tag>` 解冲突后自己跑一次 `node scripts/distro-reset-revision.mjs`（默认以 HEAD^1 为合并前基线）并把改动并入 merge commit。上游 `X.Y.0` 版本用 prerelease 后缀编码：`X.Y.0-rev.R`（如 0.6.0 → 0.6.0-rev.1），因为 `X.Y.(0×100+R)` 会撞上上游自己的 patch 号；后缀按 semver 排序，升级链依然单调（0.5.209 < 0.6.0-rev.1 < … < 0.6.0-rev.99 < 0.6.101），Tauri 更新器默认就是纯 semver 比较；
 2. 手动触发 `distro-release.yml`，或等 `distro-sync.yml` 在上游发新 release 后自动触发；
 3. 三平台构建全部成功后 draft 自动转正；部分失败保持 draft，会在 job summary 里报警，不要手工发布。
 

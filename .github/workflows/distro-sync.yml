@@ -1,7 +1,8 @@
 # Fork: follow upstream releases (docs/distro.md).
 #
 # Daily: if abcwyc/pi-agent-desktop published a release this fork has not
-# merged yet, merge that release tag into main, verify, push, and start
+# merged yet, merge that release tag into main (resetting the distro
+# revision when the upstream version changed), verify, push, and start
 # distro-release.yml. A merge conflict or a failing check stops the run
 # before anything is pushed; resolve it locally (`git merge <tag>`).
 #
@@ -65,19 +66,25 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Merge upstream release
-        if: steps.upstream.outputs.merge == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git merge --no-edit -m "Merge upstream ${{ steps.upstream.outputs.tag }}" "upstream/${{ steps.upstream.outputs.tag }}"
-
       - name: Set up Node.js
         if: steps.upstream.outputs.merge == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
+
+      - name: Merge upstream release
+        if: steps.upstream.outputs.merge == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit -m "Merge upstream ${{ steps.upstream.outputs.tag }}" "upstream/${{ steps.upstream.outputs.tag }}"
+          # The distro revision counts per upstream version (docs/distro.md):
+          # when the merge changed the version, fold the reset into the merge.
+          if [ "$(node scripts/distro-reset-revision.mjs)" = "reset" ]; then
+            git add distro/distro.json
+            git commit --amend --no-edit
+          fi
 
       - name: Verify
         if: steps.upstream.outputs.merge == 'true'
