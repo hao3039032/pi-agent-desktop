@@ -4,7 +4,7 @@
 
 ## 用户得到什么
 
-- 5 个扩展包（pi-subagents、pi-web-access、pi-model-images、pi-omp-advisor、pi-plan-vanguard）已预装，首次启动自动接入；子代理默认运行时限 60 分钟（pi-subagents 内置 30 分钟，通过 `extensions/subagent/config.json` 的 `timeoutMs: 3600000` 覆盖，并在截止前 5 分钟启用收尾检查点）；MCP 不再走 pi-mcp-adapter，改用 pi 官方内置 MCP（设置 → MCP 管理 `~/.pi/agent/mcp.json`），老安装升级时自动迁移（见下）；
+- 5 个扩展包（pi-subagents、pi-web-access、pi-model-images、pi-omp-advisor、pi-plan-vanguard）已预装，首次启动自动接入；子代理默认运行时限 60 分钟（pi-subagents 内置 30 分钟，通过 `extensions/subagent/config.json` 的 `timeoutMs: 3600000` 覆盖，并在截止前 5 分钟启用收尾检查点）；Code mode 默认常开（一次性种入 `+codemode` 到全局 `defaultTools`，仅当用户没有自己的选择；分类器/图像模型只能从 codemode 脚本调到）；MCP 不再走 pi-mcp-adapter，改用 pi 官方内置 MCP（设置 → MCP 管理 `~/.pi/agent/mcp.json`），老安装升级时自动迁移（见下）；
 - pi-omp-advisor 的模型与设置沿用开发机：WATCHDOG.yml（首次种入，`main: false`，按需 `/advisor on`），advisor 模型 `lw/gemini-3.8-flash`（已加入 provider 模型表）；
 - 首次启动弹窗填写服务地址（Base URL）和 API Key，之后在 设置 → 通用 → 服务配置 修改。地址变更只改一处，`models.json` 和 `web-search.json` 同步更新；弹窗里的「使用国内 npm 镜像」勾选把 `registry.npmmirror.com` 写进 `settings.json` 的 `npmCommand`（插件安装走它），并镜像到进程环境 `npm_config_registry`（`npx skills add` 继承），服务启动时从 settings 恢复，用户自己设过的环境变量优先；
 - Windows 自带 Git Bash（pi 的 bash 工具和 `git:` 扩展包需要）；
@@ -29,6 +29,7 @@
 ## 运行时行为细节
 
 - **种子**：服务启动时（`instrumentation-node.ts` → `initDistro()`）检测 `resources/pi-seed/manifest.json`，把用户 `settings.json` 的 packages 指向包内副本。匹配规则见 `lib/distro/packages.ts`：npm/git 源忽略版本号，本地路径按 `/pi-seed/<相对路径>` 识别（换安装目录也能跟上）；用户手动删掉的包不会自动加回来（记录在 `~/.pi/agent/desktop-distro.json`）；**从发行包里移除的包**会把指向包内副本的条目剪掉（不留悬空路径），且不当作「用户删过」记仇，将来重新捆绑时会重新种入。`agentFiles` 只在目标文件不存在时写入；`legacyAgentFiles` 列出的旧文件（如 `pi-plan-mode.json`）已存在时跳过种入，由 pi-plan-vanguard 自己读取并在下次保存时迁移，避免遮蔽用户配置。imagegen 的配置 `pi-model-images.json` 同样只在缺失时从已配置的服务地址（`+ /v1`）和 key 种入，已存在的不动，后续地址变更由服务表单同步。
+- **一次性迁移（Code mode 常开，revision 9）**：`settings.json` 没有 `defaultTools` 键时种入 `["+codemode"]`（`lib/distro/seed.ts`，记录在 `migrations.defaultTools`，在 SettingsManager flush 之后写入，避免内存快照覆盖）。用户自己选过工具列表（键存在）则完全不动；之后在 GUI 里切回「automatic」会删键，迁移不重跑，不会覆盖用户选择。
 - **升级**：`seedVersion` 变化时会用 distro.json 里的模型表刷新 LW provider 的模型列表（不动用户的 baseUrl/apiKey；模型条目里指向默认服务地址的绝对 baseUrl 会改写成用户配置的地址，如 `…/v1beta`），并重写包路径。
 - **一次性迁移（pi-mcp-adapter → 官方 MCP）**：`lib/distro/mcp-migration.ts`，每个 agent 目录至多跑一次（记录在 `desktop-distro.json` 的 `migrations.mcpAdapter`）：
   1. 删除 `packages` 里手写形式的 pi-mcp-adapter 条目（`npm:pi-mcp-adapter` / 带版本号；包内路径形式由种子剪除逻辑处理）；
