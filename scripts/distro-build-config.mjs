@@ -5,8 +5,12 @@
  *   node scripts/distro-build-config.mjs <macos|windows|linux>
  *
  * 1. Version: the distro version is derived from the upstream version so it
- *    always sorts after the upstream release it is built on and before the
- *    next one: upstream X.Y.Z + distro revision R → X.Y.(Z*100+R). Written into
+ *    never collides with an upstream release tag and always decodes back to
+ *    the base: upstream X.Y.Z + distro revision R → X.Y.(Z*100+R), or
+ *    X.Y.0-rev.R for a .0 base (X.Y.(0*100+R) would collide with upstream's
+ *    own patch space). R counts per upstream version —
+ *    scripts/distro-reset-revision.mjs resets it to 1 whenever a sync changes
+ *    the upstream version. Written into
  *    src-tauri/pi-agent-desktop-package.json (read by Tauri and lib/branding.ts)
  *    in the CI checkout only — the committed file stays upstream's, so merges
  *    never conflict on it.
@@ -31,6 +35,15 @@ export function distroVersion(upstreamVersion, revision) {
   if (!match) throw new Error(`Unexpected upstream version: ${upstreamVersion}`);
   if (!Number.isInteger(revision) || revision < 0 || revision > 99) {
     throw new Error(`distro revision must be an integer 0..99, got ${revision}`);
+  }
+  // A .0 base has no patch room: X.Y.(0*100+R) is X.Y.R itself, i.e.
+  // upstream's own patch space, and any higher patch would collide with the
+  // next base's X.Y.(1*100+R). A semver prerelease suffix keeps the base
+  // readable, never collides with an upstream tag, and still sorts correctly:
+  // 0.6.0-rev.1 > 0.5.209, 0.6.0-rev.10 > 0.6.0-rev.9, and the first distro
+  // release on upstream 0.6.1 (0.6.101) tops any 0.6.0-rev.R.
+  if (Number(match[3]) === 0) {
+    return `${upstreamVersion}-rev.${revision}`;
   }
   return `${match[1]}.${match[2]}.${Number(match[3]) * 100 + revision}`;
 }
@@ -59,13 +72,15 @@ function main() {
   writeFileSync(packagePath, `${JSON.stringify({ ...pkg, version, upstreamVersion }, null, 2)}\n`);
 
   // src-tauri/Cargo.toml carries the same version; release-components.mjs
-  // requires the two to agree.
+  // requires the two to agree. The pattern must accept prerelease suffixes
+  // (.0 bases produce X.Y.0-rev.R) and must never silently fail to match.
   const cargoPath = join(tauriDir, "Cargo.toml");
-  const cargo = readFileSync(cargoPath, "utf8").replace(
-    /^(version\s*=\s*)"\d+\.\d+\.\d+"/m,
-    `$1"${version}"`,
-  );
-  writeFileSync(cargoPath, cargo);
+  const cargoVersionLine = /^(version\s*=\s*")[^"]+(")/m;
+  const cargo = readFileSync(cargoPath, "utf8");
+  if (!cargoVersionLine.test(cargo)) {
+    throw new Error(`Could not find the version line in ${cargoPath}.`);
+  }
+  writeFileSync(cargoPath, cargo.replace(cargoVersionLine, `$1${version}$2`));
 
   const base = readJson(join(tauriDir, "tauri.conf.json"));
   const platformFile = { macos: null, windows: "tauri.windows.conf.json", linux: "tauri.linux.conf.json" }[platform];
