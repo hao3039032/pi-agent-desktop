@@ -25,7 +25,13 @@ export interface DistroConfig {
     models: DistroModel[];
   };
   packages: string[];
-  settingsDefaults: { defaultThinkingLevel?: string };
+  settingsDefaults: {
+    defaultThinkingLevel?: string;
+    /** Seeded once, only when the user's settings.json carries no `defaultTools`
+     * of their own; `+codemode` starts every session with Code mode active
+     * (classifier/image models need it, see lib/codemode-settings.ts). */
+    defaultTools?: string[];
+  };
   webSearch: {
     baseUrlKey: string;
     apiKeyKey: string;
