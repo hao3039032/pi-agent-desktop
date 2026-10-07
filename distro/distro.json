@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change.",
   "id": "lw",
-  "revision": 8,
+  "revision": 9,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -111,7 +111,10 @@
     "git:github.com/hao3039032/pi-plan-vanguard"
   ],
   "settingsDefaults": {
-    "defaultThinkingLevel": "high"
+    "defaultThinkingLevel": "high",
+    "defaultTools": [
+      "+codemode"
+    ]
   },
   "webSearch": {
     "baseUrlKey": "geminiBaseUrl",
