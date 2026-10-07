@@ -5,6 +5,7 @@ import { DISTRO, imageGenBaseUrl, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
+import { defaultToolEntries, getGlobalSettingsPath, updateGlobalSettings } from "../global-settings-file";
 import { runMcpAdapterMigration } from "./mcp-migration";
 
 export interface SeedManifest {
@@ -151,6 +152,28 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
   }
 
   await settingsManager.flush();
+
+  // One-time Code mode default (distro revision 9): `+codemode` in the global
+  // defaultTools starts every session with Code mode active — the classifier
+  // and image models the distro ships are reachable only from codemode
+  // scripts. Runs after the flush: SettingsManager holds its own in-memory
+  // snapshot of settings.json from before this write, and flushing it later
+  // would erase the key. Applied only when the user's settings.json has no
+  // `defaultTools` of their own; recorded so the GUI's "automatic" choice
+  // (which deletes the key) is never re-applied against them.
+  if (!migrations.defaultTools && DISTRO.settingsDefaults.defaultTools) {
+    migrations.defaultTools = true;
+    try {
+      const applied = await updateGlobalSettings(getGlobalSettingsPath(agentDir), (settings) => {
+        if (defaultToolEntries(settings) !== undefined) return false;
+        settings.defaultTools = [...DISTRO.settingsDefaults.defaultTools!];
+        return true;
+      });
+      if (applied) console.log("[distro] Code mode enabled by default (+codemode)");
+    } catch (error) {
+      console.warn("[distro] could not seed the default Code mode switch:", error);
+    }
+  }
 
   for (const [name, contents] of Object.entries(DISTRO.agentFiles)) {
     const path = join(agentDir, name);
