@@ -17,6 +17,22 @@ export function findDistroResourcesDir(): string | null {
   return null;
 }
 
+/**
+ * The packaged distribution updates as one application through its own
+ * updater (Settings → General → Version & Updates, backed by this
+ * repository's releases), so upstream's @agegr/pi-web npm version check has
+ * no meaning here: between our merges it can only tell the user about an
+ * agegr release they cannot install piecemeal. The new-session row's update
+ * link is fed by /api/app-update, which honours this flag; dev builds and
+ * upstream-style bundles without the seed keep upstream's behaviour. An
+ * explicit value set by the operator wins.
+ */
+export function applyUpstreamWebUpdateSkip(): void {
+  if (process.env.PI_WEB_SKIP_VERSION_CHECK === undefined) {
+    process.env.PI_WEB_SKIP_VERSION_CHECK = "1";
+  }
+}
+
 function pathEntries(): string[] {
   return (process.env.PATH ?? "").split(delimiter).filter(Boolean);
 }

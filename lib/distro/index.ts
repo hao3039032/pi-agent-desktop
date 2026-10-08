@@ -1,4 +1,9 @@
-import { configureDistroPath, findDistroResourcesDir, runPortableGitPostInstall } from "./runtime-env";
+import {
+  applyUpstreamWebUpdateSkip,
+  configureDistroPath,
+  findDistroResourcesDir,
+  runPortableGitPostInstall,
+} from "./runtime-env";
 import { seedAgentDir } from "./seed";
 import { applyNpmMirrorEnvFromSettings } from "./npm-mirror";
 
@@ -13,6 +18,10 @@ export async function initDistro(): Promise<void> {
   if (!resourcesDir) return;
   try {
     configureDistroPath(resourcesDir);
+    // Read at module scope by /api/app-update, which loads after this
+    // instrumentation runs: the packaged app must not advertise upstream
+    // pi-web releases it updates past as a whole.
+    applyUpstreamWebUpdateSkip();
     runPortableGitPostInstall(resourcesDir);
     await seedAgentDir(resourcesDir);
   } catch (error) {
