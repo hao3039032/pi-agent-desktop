@@ -166,13 +166,12 @@ export async function getLatestAppRelease(
   try {
     return await fetchLatestFromApi(project, fetcher, timeoutMs);
   } catch (apiError) {
-    // A 404 from the API is definitive: the repository has no stable release
-    // yet, and the redirect below would say the same thing.
-    if (apiError instanceof Error && /HTTP 404/.test(apiError.message)) throw apiError;
-    // Otherwise the API endpoint may simply be unreachable — api.github.com
-    // is blocked or throttled on some networks while github.com itself
-    // resolves. Ask the website where its "latest" release landed: the
-    // redirect target names the tag without needing the API at all.
+    // The API endpoint may simply be unreachable — api.github.com is blocked
+    // or throttled on some networks while github.com itself resolves. Ask the
+    // website where its "latest" release landed: the redirect target names
+    // the tag without needing the API at all. (A definitive 404 never gets
+    // here: fetchLatestFromApi answers it with an unpublished release
+    // itself, so any error reaching this handler means the API call failed.)
     try {
       return await fetchLatestFromRedirect(project, fetcher, Math.min(timeoutMs, 10_000));
     } catch {
@@ -207,7 +206,9 @@ async function fetchLatestFromApi(
  * Fallback for networks where api.github.com is unreachable but github.com
  * works: `GET /<repo>/releases/latest` answers 302 to the newest stable
  * release's tag page (drafts and prereleases are skipped, same as the API),
- * or to the plain releases list when there is no stable release yet.
+ * or to the plain releases list when there is no stable release yet. The
+ * redirect has to stay inside this repository's tag pages; any other target
+ * is a failed probe, not an answer.
  */
 async function fetchLatestFromRedirect(
   project: AppUpdateProject,
@@ -229,10 +230,20 @@ async function fetchLatestFromRedirect(
     throw new Error("GitHub redirected the latest-release URL to an unexpected target.");
   }
 
-  const tagMatch = /\/releases\/tag\/([^/?#]+)\/?$/.exec(target.pathname);
-  if (!tagMatch) return unpublishedRelease(project);
+  // The redirect must land inside this repository: only its own tag page
+  // names the release that was asked about. The plain releases list still
+  // means there is no stable release yet; any other target — another
+  // repository, a non-release page — is a failed probe, so the caller keeps
+  // the original API error instead of an "unpublished" answer.
+  const pathname = target.pathname.replace(/\/+$/, "");
+  const releasesPath = `/${project.repository}/releases`;
+  const tagPath = `${releasesPath}/tag/`;
+  if (pathname === releasesPath) return unpublishedRelease(project);
+  if (!pathname.startsWith(tagPath)) {
+    throw new Error("GitHub redirected the latest-release URL outside this repository.");
+  }
 
-  const tag = decodeURIComponent(tagMatch[1]);
+  const tag = decodeURIComponent(pathname.slice(tagPath.length));
   const latest = parseVersion(tag);
   const current = parseVersion(project.currentVersion);
   if (!latest || !current) throw new Error(`GitHub redirected to an invalid release tag: ${tag}`);
