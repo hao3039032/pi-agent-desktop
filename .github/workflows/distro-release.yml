@@ -147,10 +147,17 @@ jobs:
       # release-asset API endpoint (api.github.com/repos/<repo>/releases/
       # assets/<id>), with no input to change it. Networks that block
       # api.github.com while github.com stays reachable then see the update
-      # check succeed and the download fail. Rewriting the URLs to the assets'
-      # browser_download_url keeps the whole update on github.com; the minisign
+      # check succeed and the download fail. Rewriting the URLs to github.com
+      # download URLs keeps the whole update on github.com; the minisign
       # signatures cover the artifacts, not latest.json, so rewriting the feed
-      # cannot forge an update. Must run before the draft is published.
+      # cannot forge an update.
+      #
+      # The rewrite must run before the draft is published, but a draft's
+      # assets are served from .../releases/download/untagged-<hash>/... and
+      # that path segment only becomes the tag on publish — every untagged-
+      # URL 404s afterwards (that is how v0.6.0-rev.1 shipped a broken feed).
+      # The script therefore rebuilds each URL with the tag instead of copying
+      # the draft's browser_download_url verbatim.
       - name: Rewrite updater JSON download URLs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -164,7 +171,7 @@ jobs:
           fi
           gh api "repos/${{ github.repository }}/releases/$release_id/assets" > assets.json
           gh release download "$tag" --pattern latest.json --dir updater-dist
-          node scripts/rewrite-updater-json.mjs --latest-json updater-dist/latest.json --assets assets.json --repository "${{ github.repository }}"
+          node scripts/rewrite-updater-json.mjs --latest-json updater-dist/latest.json --assets assets.json --repository "${{ github.repository }}" --tag "$tag"
           cd updater-dist
           gh release upload "$tag" latest.json --clobber
 
