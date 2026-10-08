@@ -3,7 +3,7 @@
  * Fork: rewrite the updater feed's api.github.com download URLs.
  *
  *   node scripts/rewrite-updater-json.mjs \
- *     --latest-json <file> --assets <file> --repository <owner>/<repo>
+ *     --latest-json <file> --assets <file> --repository <owner>/<repo> --tag <tag>
  *
  * tauri-apps/tauri-action writes latest.json with every platforms.*.url
  * pointing at the release-asset *API* endpoint
@@ -12,9 +12,17 @@
  * only needs the JSON, but the download itself then goes through
  * api.github.com, which some networks block while github.com stays reachable:
  * the in-app check succeeds and the download fails. The release workflow
- * therefore rewrites those URLs to the assets' browser_download_url
- * (https://github.com/<repo>/releases/download/...) before publishing the
- * draft release.
+ * therefore rewrites those URLs to github.com download URLs before publishing
+ * the draft release.
+ *
+ * The rewrite runs while the release is still a draft, and GitHub serves a
+ * draft's assets from https://github.com/<repo>/releases/download/
+ * untagged-<hash>/<file>: that path segment only becomes the tag once the
+ * draft is published, at which point every untagged- URL 404s. Copying the
+ * draft's browser_download_url verbatim therefore ships a broken feed (that
+ * is exactly how v0.6.0-rev.1 broke) — the script rebuilds each URL with the
+ * tag the release *will* be published under (the same `v$version` the
+ * publish step uses), keeping the file-name segment untouched.
  *
  * The minisign signatures cover the artifacts, not latest.json, so moving the
  * pointer cannot forge an update. Safe to re-run: URLs that do not match the
@@ -26,29 +34,60 @@ import { fileURLToPath } from "node:url";
 // tauri-action's asset-API form, with the owner/repo it belongs to.
 const ASSET_API_URL = /^https:\/\/api\.github\.com\/repos\/([^/]+)\/([^/]+)\/releases\/assets\/(\d+)$/;
 
+// GitHub's browser download form. The path segment between "download" and
+// the file name is the tag for a published release, or "untagged-<hash>"
+// for a draft.
+const BROWSER_DOWNLOAD_URL = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/releases\/download\/([^/]+)\/(.+)$/;
+
 /**
  * Rewrite `platforms.*.url` from the asset-API URL tauri-action writes to the
- * asset's browser_download_url.
+ * asset's github.com download URL under `tag` — a draft's untagged-<hash>
+ * browser_download_url would 404 once the release is published.
  *
  * `latestJson` is the parsed latest.json, `assets` the parsed GitHub
  * release-assets array ({id, name, browser_download_url}), `repository` the
- * "<owner>/<repo>" slug the feed must belong to. Returns the rewritten
- * object (the input is not mutated), whether anything changed, and the
- * platform keys that were rewritten. Throws when a URL names an asset that is
- * not in `assets`, or when an asset's browser_download_url is not on
- * github.com.
+ * "<owner>/<repo>" slug the feed must belong to, `tag` the git tag the
+ * release will be published under. Returns the rewritten object (the input
+ * is not mutated), whether anything changed, and the platform keys that were
+ * rewritten. Throws when a URL names an asset that is not in `assets`, when
+ * an asset's browser_download_url is not a github.com download URL of
+ * `repository`, or when `tag` is missing.
  */
-export function rewriteUpdaterJson(latestJson, assets, repository) {
+export function rewriteUpdaterJson(latestJson, assets, repository, tag) {
+  if (typeof tag !== "string" || tag.trim() === "") {
+    throw new Error(
+      `the tag the release will be published under is required, got ${JSON.stringify(tag)}`,
+    );
+  }
   const byId = new Map();
   for (const asset of assets ?? []) {
     const url = asset?.browser_download_url;
-    if (typeof url !== "string" || !url.startsWith("https://github.com/")) {
+    const match = typeof url === "string" ? BROWSER_DOWNLOAD_URL.exec(url) : null;
+    if (!match) {
       throw new Error(
         `release asset ${JSON.stringify(asset?.name ?? asset?.id)} has an unexpected ` +
-          `browser_download_url (${JSON.stringify(url)}); expected an https://github.com/ URL`,
+          `browser_download_url (${JSON.stringify(url)}); expected an ` +
+          `https://github.com/<owner>/<repo>/releases/download/... URL`,
       );
     }
-    if (asset.id != null) byId.set(String(asset.id), url);
+    if (`${match[1]}/${match[2]}` !== repository) {
+      throw new Error(
+        `release asset ${JSON.stringify(asset?.name ?? asset?.id)} is served from ` +
+          `${match[1]}/${match[2]}, not from ${repository}`,
+      );
+    }
+    if (asset.id != null) {
+      // A draft serves the file under untagged-<hash>; substitute the tag the
+      // release will be published under (a no-op for a published URL whose
+      // segment already equals the tag). The file-name segment is preserved
+      // exactly as GitHub encodes it.
+      byId.set(
+        String(asset.id),
+        match[3] === tag
+          ? url
+          : `https://github.com/${match[1]}/${match[2]}/releases/download/${encodeURIComponent(tag)}/${match[4]}`,
+      );
+    }
   }
 
   const platforms = latestJson?.platforms;
@@ -90,7 +129,7 @@ function readFlag(argv, name) {
   const index = argv.indexOf(`--${name}`);
   if (index === -1 || index + 1 >= argv.length) {
     throw new Error(
-      `usage: rewrite-updater-json.mjs --latest-json <file> --assets <file> --repository <owner>/<repo> ` +
+      `usage: rewrite-updater-json.mjs --latest-json <file> --assets <file> --repository <owner>/<repo> --tag <tag> ` +
         `(missing --${name})`,
     );
   }
@@ -102,8 +141,12 @@ function main() {
   const latestJsonPath = readFlag(argv, "latest-json");
   const assetsPath = readFlag(argv, "assets");
   const repository = readFlag(argv, "repository");
+  const tag = readFlag(argv, "tag");
   if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) {
     throw new Error(`--repository must be an "<owner>/<repo>" slug, got ${JSON.stringify(repository)}`);
+  }
+  if (!tag.trim()) {
+    throw new Error(`--tag (the tag the release will be published under) must not be empty`);
   }
 
   const latestJson = JSON.parse(readFileSync(latestJsonPath, "utf8"));
@@ -113,11 +156,11 @@ function main() {
   }
 
   const { latestJson: rewritten, changed, rewrittenPlatforms } =
-    rewriteUpdaterJson(latestJson, assets, repository);
+    rewriteUpdaterJson(latestJson, assets, repository, tag);
   writeFileSync(latestJsonPath, `${JSON.stringify(rewritten, null, 2)}\n`);
   console.log(
     changed
-      ? `${latestJsonPath}: rewrote ${rewrittenPlatforms.length} platform URL(s) to browser_download_url (${rewrittenPlatforms.join(", ")})`
+      ? `${latestJsonPath}: rewrote ${rewrittenPlatforms.length} platform URL(s) to github.com download URLs under tag ${tag} (${rewrittenPlatforms.join(", ")})`
       : `${latestJsonPath}: no ${repository} asset-API URLs found; left unchanged`,
   );
 }
