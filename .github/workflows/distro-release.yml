@@ -94,6 +94,12 @@ jobs:
       - name: Prepare packaged Next.js server
         run: npm run desktop:prepare
 
+      - name: Verify packaged server
+        # The verify script is exercised on mac/linux; its Windows path
+        # handling is not yet proven (follow-up candidate).
+        if: runner.os != 'Windows'
+        run: npm run desktop:verify
+
       - name: Pre-install distro pi packages
         run: npm run distro:seed
 
@@ -137,6 +143,31 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      # tauri-action hardcodes every platforms.*.url in latest.json as the
+      # release-asset API endpoint (api.github.com/repos/<repo>/releases/
+      # assets/<id>), with no input to change it. Networks that block
+      # api.github.com while github.com stays reachable then see the update
+      # check succeed and the download fail. Rewriting the URLs to the assets'
+      # browser_download_url keeps the whole update on github.com; the minisign
+      # signatures cover the artifacts, not latest.json, so rewriting the feed
+      # cannot forge an update. Must run before the draft is published.
+      - name: Rewrite updater JSON download URLs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node scripts/distro-build-config.mjs linux)"
+          tag="v$version"
+          release_id="$(gh api "repos/${{ github.repository }}/releases" --jq ".[] | select(.draft) | select(.tag_name == \"$tag\") | .id")"
+          if [ -z "$release_id" ]; then
+            echo "::error::no draft release tagged \"$tag\" found; cannot rewrite the updater feed"
+            exit 1
+          fi
+          gh api "repos/${{ github.repository }}/releases/$release_id/assets" > assets.json
+          gh release download "$tag" --pattern latest.json --dir updater-dist
+          node scripts/rewrite-updater-json.mjs --latest-json updater-dist/latest.json --assets assets.json --repository "${{ github.repository }}"
+          cd updater-dist
+          gh release upload "$tag" latest.json --clobber
+
       - name: Publish the draft release
         env:
           GH_TOKEN: ${{ github.token }}
