@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -232,6 +232,35 @@ test("desktop staging ships node-pty native prebuilds with executable helpers", 
   assert.match(prepareSource, /node_modules", "node-pty"\)/);
   assert.match(prepareSource, /\["darwin-arm64", "darwin-x64"\]/);
   assert.match(prepareSource, /chmod\(join\(ptyDestination, "prebuilds", variant, "spawn-helper"\), 0o755\)/);
+});
+
+test("every workflow step that compiles the app embeds the updater public key", async () => {
+  // lib.rs registers tauri-plugin-updater only when option_env! sees
+  // PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY while the Rust code compiles; the
+  // pubkey a workflow step writes into tauri.conf.json is NOT read on that
+  // path. A `tauri build` step (directly or through tauri-action) without the
+  // env var therefore ships an app whose updater plugin is missing entirely:
+  // check() invokes plugin:updater|check, the command does not exist, and the
+  // app can never detect updates. mac-build-test.yml did exactly that while
+  // its own header claimed it was for iterating on "updater behavior".
+  const offenders = [];
+  for (const file of await readdir(join(root, ".github", "workflows"))) {
+    if (!file.endsWith(".yml")) continue;
+    const text = await readFile(join(root, ".github", "workflows", file), "utf8");
+    // Steps start at `      - name:` (six-space job indent); everything up to
+    // the next one belongs to the same step, env block included.
+    for (const chunk of text.split(/\n(?=      - name:)/)) {
+      if (!/tauri build|uses: tauri-apps\/tauri-action/.test(chunk)) continue;
+      if (!chunk.includes("PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY")) {
+        offenders.push(`${file}: ${/^      - name: (.*)$/m.exec(chunk)?.[1] ?? "(unnamed step)"}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "these steps compile the app without PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY, so the updater plugin is never registered (see lib.rs option_env! gate)",
+  );
 });
 
 test("the Tauri crates stay on the npm packages' major/minor", async () => {
