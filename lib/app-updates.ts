@@ -162,6 +162,30 @@ export async function getLatestAppRelease(
   options: { fetcher?: Fetcher; timeoutMs?: number } = {},
 ): Promise<AppComponentReleaseInfo> {
   const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  try {
+    return await fetchLatestFromApi(project, fetcher, timeoutMs);
+  } catch (apiError) {
+    // A 404 from the API is definitive: the repository has no stable release
+    // yet, and the redirect below would say the same thing.
+    if (apiError instanceof Error && /HTTP 404/.test(apiError.message)) throw apiError;
+    // Otherwise the API endpoint may simply be unreachable — api.github.com
+    // is blocked or throttled on some networks while github.com itself
+    // resolves. Ask the website where its "latest" release landed: the
+    // redirect target names the tag without needing the API at all.
+    try {
+      return await fetchLatestFromRedirect(project, fetcher, Math.min(timeoutMs, 10_000));
+    } catch {
+      throw apiError;
+    }
+  }
+}
+
+async function fetchLatestFromApi(
+  project: AppUpdateProject,
+  fetcher: Fetcher,
+  timeoutMs: number,
+): Promise<AppComponentReleaseInfo> {
   const response = await fetcher(
     `https://api.github.com/repos/${project.repository}/releases/latest`,
     {
@@ -171,12 +195,60 @@ export async function getLatestAppRelease(
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": `pi-agent-desktop/${APP_VERSION}`,
       },
-      signal: AbortSignal.timeout(options.timeoutMs ?? 15_000),
+      signal: AbortSignal.timeout(timeoutMs),
     },
   );
   if (response.status === 404) return unpublishedRelease(project);
   if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}.`);
   return parseRelease(project, await response.json() as GitHubRelease);
+}
+
+/**
+ * Fallback for networks where api.github.com is unreachable but github.com
+ * works: `GET /<repo>/releases/latest` answers 302 to the newest stable
+ * release's tag page (drafts and prereleases are skipped, same as the API),
+ * or to the plain releases list when there is no stable release yet.
+ */
+async function fetchLatestFromRedirect(
+  project: AppUpdateProject,
+  fetcher: Fetcher,
+  timeoutMs: number,
+): Promise<AppComponentReleaseInfo> {
+  const response = await fetcher(`https://github.com/${project.repository}/releases/latest`, {
+    redirect: "manual",
+    cache: "no-store",
+    headers: { "User-Agent": `pi-agent-desktop/${APP_VERSION}` },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  const location = response.headers.get("location");
+  if (!location) throw new Error("GitHub did not redirect the latest-release URL.");
+
+  const target = new URL(location, "https://github.com/");
+  if (target.protocol !== "https:" || target.hostname !== "github.com") {
+    throw new Error("GitHub redirected the latest-release URL to an unexpected target.");
+  }
+
+  const tagMatch = /\/releases\/tag\/([^/?#]+)\/?$/.exec(target.pathname);
+  if (!tagMatch) return unpublishedRelease(project);
+
+  const tag = decodeURIComponent(tagMatch[1]);
+  const latest = parseVersion(tag);
+  const current = parseVersion(project.currentVersion);
+  if (!latest || !current) throw new Error(`GitHub redirected to an invalid release tag: ${tag}`);
+
+  const releaseUrl = `https://github.com/${project.repository}/releases/tag/${encodeURIComponent(tag)}`;
+  return {
+    project: project.id,
+    name: project.name,
+    repository: project.repository,
+    repositoryUrl: repositoryUrl(project),
+    currentVersion: current.display,
+    latestVersion: latest.display,
+    releaseUrl,
+    updateAvailable: compareAppVersions(latest.display, current.display) > 0,
+    releaseStatus: "available",
+  };
 }
 
 export async function checkAppUpdate(

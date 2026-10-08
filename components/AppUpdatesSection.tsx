@@ -156,13 +156,15 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
       ? t("appSettings.checkFailed")
       : !appRelease || appRelease.releaseStatus === "unknown"
         ? t("appSettings.releaseUnavailable")
-        : appRelease.releaseStatus === "unpublished" || !appRelease.latestVersion
-          ? t("appSettings.noReleases")
-          : `v${appRelease.latestVersion}`;
+        : appRelease.releaseStatus === "error"
+          ? t("appSettings.checkFailed")
+          : appRelease.releaseStatus === "unpublished" || !appRelease.latestVersion
+            ? t("appSettings.noReleases")
+            : `v${appRelease.latestVersion}`;
 
   const statusText = loading
     ? t("appSettings.checkingReleases")
-    : loadError
+    : loadError || appRelease?.releaseStatus === "error"
       ? t("appSettings.checkFailed")
       : updateAvailable
         ? t("appSettings.updateAvailable")
