@@ -59,9 +59,15 @@ jobs:
 
       # Not tauri-action: no release, no draft, no latest.json — the bundles
       # land in target/release/bundle and are uploaded as artifacts below.
+      # PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY must be present while the Rust code
+      # compiles: lib.rs registers the updater plugin only when option_env!
+      # finds it, and the tauri.conf.json pubkey the earlier step wrote is not
+      # read there — without this env var the built app has no updater at all
+      # and can never check for updates.
       - name: Build the app (ad-hoc signed)
         env:
           APPLE_SIGNING_IDENTITY: "-"
+          PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: >
