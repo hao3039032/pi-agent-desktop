@@ -49,7 +49,7 @@ export function isCommandOnPath(name: string, entries = pathEntries()): boolean 
   return entries.some((dir) => names.some((candidate) => existsSync(join(dir, candidate))));
 }
 
-function hasSystemGitBash(): boolean {
+export function hasSystemGitBash(): boolean {
   const roots = [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]].filter(Boolean) as string[];
   return roots.some((root) => existsSync(join(root, "Git", "bin", "bash.exe")));
 }
