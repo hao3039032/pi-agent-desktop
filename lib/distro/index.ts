@@ -5,6 +5,7 @@ import {
   runPortableGitPostInstall,
 } from "./runtime-env";
 import { seedAgentDir } from "./seed";
+import { ensureBundledBashShellPath } from "./shell-path";
 import { applyNpmMirrorEnvFromSettings } from "./npm-mirror";
 
 /**
@@ -26,6 +27,14 @@ export async function initDistro(): Promise<void> {
     await seedAgentDir(resourcesDir);
   } catch (error) {
     console.error("[distro] initialization failed:", error);
+  }
+  // After seedAgentDir: it flushes its own SettingsManager snapshot, and the
+  // pin is a locked field-level write of its own (see shell-path.ts for why
+  // the PATH prepend alone is not enough on real machines).
+  try {
+    await ensureBundledBashShellPath(resourcesDir);
+  } catch (error) {
+    console.warn("[distro] bundled Git Bash could not be pinned:", error);
   }
   try {
     applyNpmMirrorEnvFromSettings();

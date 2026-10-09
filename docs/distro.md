@@ -37,6 +37,7 @@
   2. 移除 `extensions` 里的 `-builtin:mcp`（adapter 首次启动写入的内置 MCP 关闭标记），恢复官方 MCP；
   3. 把只有 adapter 会读的服务器定义合并进 `~/.pi/agent/mcp.json`（已有同名条目优先，不删任何东西）：`~/.pi/agent/mcp-adapter.json`、`~/.config/mcp/mcp.json`、`~/.agents/mcp.json`、`~/.agents/mcp/mcp.json`。字段转换：`disabled` → `enabled:false`、`requestTimeoutMs`（毫秒）→ `timeout`（秒）、`directTools:true`/`"search"`/名单 → `exposure:"direct"`/`"deferred"`/`toolExposure`、`excludeTools` → `toolExposure{hidden}`、`oauth.redirectUri` → `oauth.callbackUrl`；`type:"sse"` 条目跳过；adapter 专属调优（lifecycle、approveTools、scriptMode 等）无对应项丢弃。OAuth 登录态存在系统钥匙串里迁不走，涉及的服务器需要重新 `/mcp login <server>` 一次。
 - **PATH**：npm shim（`pi-seed/bin`）只有在系统没有 npm 时才追加；Git Bash（`resources/git/bin`）在 Windows 上且系统没有 Git for Windows 时前置。
+- **shellPath 钉入**：pi 解析 bash 走 `where.exe` 扫 PATH，而 `where` 不会在首个命中处短路——公司机器 PATH 里一条失效的网络映射盘就能烧穿它 5 秒的超时，误报 No bash shell found。因此在 Windows 上且系统没有 Git for Windows 时，还会把 `settings.json` 的 `shellPath` 直接钉到捆绑 bash（`lib/distro/shell-path.ts`，pi 的最高优先级解析，纯 existsSync，不经过 PATH）。归属记录在 `desktop-distro.json` 的 `managedShellPath`：应用换目录安装时自动改指、捆绑 git 不存在时自动摘除，用户自己设的路径永不覆盖。
 - **PortableGit**：`post-install.bat` 在用户机器上首次启动时静默执行一次（脚本自删）。
 - **安全**：`models.json`、`web-search.json`、`desktop-distro.json` 以 `0600` 权限原子写入；`/api/distro` 的 GET 不返回 key。
 

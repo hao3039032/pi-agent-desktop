@@ -22,6 +22,8 @@ interface DistroState extends ManagedState {
   defaultsApplied?: boolean;
   /** One-time migrations that already ran (name → true). */
   migrations?: Record<string, boolean>;
+  /** The shellPath this app pinned to the bundled Git Bash (shell-path.ts). */
+  managedShellPath?: string;
 }
 
 export function distroStatePath(agentDir = getAgentDir()): string {
@@ -198,5 +200,8 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
     defaultsApplied: true,
     packages: reconciled.managed.packages,
     migrations,
+    // Preserved for ensureBundledBashShellPath, which merges into the same
+    // file after this write; dropping it here would orphan the pin marker.
+    ...(previous?.managedShellPath ? { managedShellPath: previous.managedShellPath } : {}),
   });
 }
