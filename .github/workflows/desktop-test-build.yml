@@ -78,12 +78,18 @@ jobs:
         if: runner.os == 'Windows' || runner.os == 'Linux'
         run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
 
-      # No updater key here: artifacts for the updater are switched off, and the
-      # public key is not embedded, so the build cannot accept an update.
+      # Fork: PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY must be present while the
+      # Rust code compiles — lib.rs registers the updater plugin only when
+      # option_env! finds it (see scripts/release-workflows.test.mjs). Upstream
+      # built without the key on the theory that an unembedded key cannot
+      # accept an update, but without the key the plugin is missing entirely:
+      # check() invokes a command that does not exist. createUpdaterArtifacts
+      # stays false — nothing here publishes an update.
       - name: Build installer
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+          PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
         run: |
           npx tauri build ${{ matrix.args }} \
             --config "{\"version\":\"${{ steps.version.outputs.value }}\",\"bundle\":{\"createUpdaterArtifacts\":false}}"
