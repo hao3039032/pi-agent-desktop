@@ -103,39 +103,43 @@ jobs:
           tagName: v__VERSION__
           releaseName: pi-agent-desktop v__VERSION__
           releaseBody: |
-            ## Pi Agent Desktop 0.6.4
+            ## Pi Agent Desktop 0.6.5
 
-            Native menus are back, and opening Settings no longer freezes the app.
+            A cleaner, more Mac-like look, and a Homebrew install option.
+
+            ### Changed
+
+            - The sidebar, fonts and focus rings follow macOS conventions more closely.
+            - **Appearance** now offers **Light**, **Dark** and **System**. The Mist, Rose and Pine themes are removed; a saved choice of one of them falls back to System.
 
             ### Fixed
 
-            - Opening **Settings** could freeze the whole app on some systems. Popup menus are now built and shown by the desktop shell itself, so nothing on the page can deadlock with an open menu.
-            - The Settings button, top bar **More**, session and project menus, and the project switcher use native menus again, and clicking their items works.
-            - Right-clicking a file Pi wrote, a link to a local file, or a file name in inline code shows the native **Open**, **Open With** (macOS), **Reveal in Finder / Explorer** and **Copy Path** menu again.
+            - In dark mode, the steering / follow-up delivery buttons and the sub-agent steer button had near-white text on a near-white background. They now use the proper contrast color.
 
             ### Good to know
 
-            - If a native menu cannot be shown, the in-app menu opens instead.
-            - The app log folder now has a `desktop.log` that records when popup menus open and close, to help diagnose a hang.
+            - On Apple Silicon Macs you can now install with Homebrew. See the README for the command.
 
             Bundled components: pi 1.1.0, pi-web 0.10.0.
 
             ---
 
-            ## Pi Agent Desktop 0.6.4
+            ## Pi Agent Desktop 0.6.5
 
-            原生菜单回来了，打开设置不再卡死。
+            界面更干净、更接近 Mac 原生风格，并新增 Homebrew 安装方式。
+
+            ### 变更
+
+            - 侧边栏、字体和焦点样式更贴近 macOS 习惯。
+            - **外观**现在只有**浅色**、**深色**和**跟随系统**。移除了 Mist、Rose 和 Pine 主题；之前选了这些主题的会自动回到跟随系统。
 
             ### 修复
 
-            - 在部分系统上，打开**设置**可能导致整个应用卡死。现在弹出菜单由桌面外壳自己构建和显示，页面上的任何操作都不会再与打开的菜单互相等待。
-            - 设置按钮、顶栏**更多**、会话和项目菜单、项目切换重新使用原生菜单，点击菜单项能正常生效。
-            - 在 Pi 写出的文件、指向本地文件的链接，或行内代码里的文件名上点右键，重新显示原生的**打开**、**用其他应用打开**（macOS）、**在 Finder / 资源管理器中显示**和**复制路径**菜单。
+            - 深色模式下，引导 / 追加消息的投递按钮和子代理的引导按钮是近白色文字叠在近白色背景上，现在改用正确的对比色。
 
             ### 需要了解
 
-            - 如果原生菜单无法显示，会改为打开应用内菜单。
-            - 应用日志目录新增 `desktop.log`，记录弹出菜单的打开和关闭，便于排查卡死问题。
+            - Apple Silicon Mac 上现在可以用 Homebrew 安装，命令见 README。
 
             内置组件版本：pi 1.1.0、pi-web 0.10.0。
           releaseDraft: true
@@ -222,3 +226,40 @@ jobs:
 
           This issue is reused for subsequent failures; close it once a release is green."
           fi
+
+  # Keeps Casks/pi-agent.rb (the Homebrew tap: `brew tap abcwyc/pi-agent-desktop
+  # https://github.com/abcwyc/pi-agent-desktop`) on the release that was just
+  # published. Runs only after `manifest` has published it, so a draft or partly
+  # failed release never reaches Homebrew users. Placed after `notify` because
+  # release-workflows.test.mjs slices the manifest job up to `notify:`.
+  homebrew:
+    needs: manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pi-agent-desktop
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Point the cask at the published DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./src-tauri/pi-agent-desktop-package.json').version")"
+          digest="$(gh release view "v$version" --json assets \
+            --jq '.assets[] | select(.name | endswith("_aarch64.dmg")) | .digest')"
+          if [ -z "$digest" ]; then
+            echo "No aarch64 DMG digest on release v$version" >&2
+            exit 1
+          fi
+          node scripts/update-homebrew-cask.mjs "$version" "$digest"
+          if git diff --quiet -- Casks; then
+            echo "Cask already at $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/pi-agent.rb
+          git commit -m "chore(homebrew): update cask to $version"
+          git push origin HEAD:main

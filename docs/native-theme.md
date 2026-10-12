@@ -65,7 +65,11 @@ the intent described here.
 **Palette.** The canvas is warm off-white (`--bg: #f7f7f5`), and pure white is reserved for
 controls and elevated surfaces (`--surface`). The accent is near-black (`#1d1d1f`, near-white
 in dark mode) rather than a brand colour. Emphasis comes from contrast, not hue. `--text-dim`
-stays at a value that clears 3:1 contrast because it carries real labels.
+stays at a value that clears 3:1 contrast because it carries real labels; inside the sidebar
+(light mode) it is darkened to clear 4.5:1, and `--text-meta` (10px message footnotes) does too.
+The two exceptions to the near-black accent are text selection and keyboard focus rings: they
+use the system `AccentColor` (`--selection`, `--focus-ring`, behind an `@supports` query that
+also requires `color-mix`) so they read as native. Browsers without it keep the neutral values.
 
 **Shape and motion.** Radii come from `--radius-sm/md/lg/xl` (6/8/12/16px). Controls are
 `--control-height-sm` 28px or `--control-height` 32px. Elevation uses the four
@@ -81,7 +85,12 @@ right-panel header row and the file-panel expand button.
 - Header rows (New chat / folder / branch) are flat and full-width, Claude-Desktop style.
 - Refresh stays hidden until you hover the folder row.
 - Projects render as a Codex-style tree. Session rows are 28px, matching the view-switcher
-  tabs.
+  tabs. Project and session rows share one inset pill (10px margin, 8px radius); a project row
+  is 30px (34px on touch) and has no disclosure chevron, because its folder glyph already shows
+  open / closed. Session titles share the project name's left edge, and a plain row keeps its
+  hidden chat glyph in layout so running / unread indicators land in the same slot.
+- The section label ("Projects") is sentence case, 12px semibold, not tracked capitals; row
+  titles are Regular (400) even when selected.
 - A selected row has no accent ring: its border blends into the selected background.
 - A row's "…" menu is always visible on touch devices.
 

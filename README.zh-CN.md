@@ -17,9 +17,9 @@
 - 每周检查三个组成项目的稳定 GitHub Release，并在发现更新时提醒用户。
 - 通过一个升级按钮安装完整、签名的 Pi Agent 新版本并自动重启。
 
-![Pi Agent 浅色模式界面](./docs/screenshots/pi-agent-light@2x.png)
+![Pi Agent 浅色模式界面](./docs/screenshots/pi-agent-light.webp)
 
-![Pi Agent 深色模式界面](./docs/screenshots/pi-agent-dark@2x.png)
+![Pi Agent 深色模式界面](./docs/screenshots/pi-agent-dark.webp)
 
 **[⬇️ 下载 Pi Agent（macOS / Windows）](https://github.com/abcwyc/pi-agent-desktop/releases)**
 
@@ -32,6 +32,14 @@
 发布版本可从 [GitHub Releases](https://github.com/abcwyc/pi-agent-desktop/releases) 下载：
 
 - Apple Silicon Mac：下载 `aarch64.dmg`，打开后将 App 拖入 `Applications`。正式 Release 不构建 Intel Mac 版本。
+- 使用 [Homebrew](https://brew.sh) 的 Apple Silicon Mac：从本仓库的 tap 安装。tap 通过仓库地址添加，第一条命令只需执行一次：
+
+  ```bash
+  brew tap abcwyc/pi-agent-desktop https://github.com/abcwyc/pi-agent-desktop
+  brew install --cask pi-agent
+  ```
+
+  App 会在设置中自行升级，所以 `brew upgrade` 默认不会处理它，除非加上 `--greedy`。`brew uninstall --cask --zap pi-agent` 会删除 App 及其窗口状态，但不会删除与 pi CLI 共用的 `~/.pi`。
 - Linux x64：下载 `.deb` 包，用发行版自带的包管理器安装。社区还维护了一个 [flatpark.org](https://flatpark.org/apps/io.github.abcwyc.pi-agent-desktop/) 上的 Flatpak 版本——不是官方发布，但 Flatpak 兼容大多数发行版，也会帮你处理更新。
 - Windows x64：下载名称以 `x64-setup.exe` 结尾的安装程序并运行。安装器会在需要时安装 Microsoft WebView2。
 

@@ -6,8 +6,8 @@ import { chromium } from "playwright";
 
 const base = process.env.E2E_BASE_URL || "http://127.0.0.1:30141";
 const artifacts = fileURLToPath(new URL("../test-results/themes/", import.meta.url));
-const themes = ["light", "dark", "mist", "rose", "pine", "auto"];
-const labels = ["Light", "Dark", "Mist", "Rose", "Pine", "System"];
+const themes = ["light", "dark", "auto"];
+const labels = ["Light", "Dark", "System"];
 await mkdir(artifacts, { recursive: true });
 const browser = await chromium.launch();
 
@@ -78,8 +78,8 @@ try {
     };
     const expectTheme = async (theme) => {
       await page.waitForFunction((value) => document.documentElement.dataset.theme === value, theme);
-      assert.equal(await page.locator("html").evaluate((root) => root.classList.contains("dark")), theme === "dark" || theme === "pine");
-      assert.equal(await page.locator("html").evaluate((root) => getComputedStyle(root).colorScheme), theme === "dark" || theme === "pine" ? "dark" : "light");
+      assert.equal(await page.locator("html").evaluate((root) => root.classList.contains("dark")), theme === "dark");
+      assert.equal(await page.locator("html").evaluate((root) => getComputedStyle(root).colorScheme), theme === "dark" ? "dark" : "light");
     };
     await openSettings();
     for (const [index, theme] of themes.entries()) {
@@ -117,9 +117,13 @@ try {
     }
     await page.emulateMedia({ colorScheme: "dark" });
     await expectTheme("dark");
-    await page.getByRole("radio", { name: "Pine", exact: true }).locator("..").click();
+    // An explicit choice holds while the system scheme moves underneath it.
+    await page.getByRole("radio", { name: "Light", exact: true }).locator("..").click();
+    await expectTheme("light");
+    await page.emulateMedia({ colorScheme: "dark" });
+    await expectTheme("light");
     await page.emulateMedia({ colorScheme: "light" });
-    await expectTheme("pine");
+    await expectTheme("light");
     const light = page.getByRole("radio", { name: "Light", exact: true });
     await light.focus();
     await light.press("ArrowRight");
@@ -128,6 +132,12 @@ try {
     await page.keyboard.press("Escape");
     await page.reload();
     await expectTheme("dark");
+    // The tinted palettes were removed: a saved one falls back to the system scheme.
+    for (const removed of ["mist", "rose", "pine"]) {
+      await page.evaluate((value) => localStorage.setItem("pi-theme", value), removed);
+      await page.reload();
+      await expectTheme("light");
+    }
     // The fork has no topbar theme/language menus (declined upstream UI); the
     // Settings radios above are the only theme control.
     if (width === 1440) {

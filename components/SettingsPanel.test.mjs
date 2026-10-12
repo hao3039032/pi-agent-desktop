@@ -149,9 +149,13 @@ test("trusting from Settings › MCP reloads, in place, the other mounted sectio
   assert.match(panelSource, /sectionHost\("models", <ModelsConfig embedded cwd=\{cwd\} onClose=\{onClose\} onOpenMcp=\{\(\) => activateSection\("mcp"\)\} \/>\)/);
 });
 
-test("offers five palettes and system theme selection with native radios", () => {
-  for (const preference of ["light", "dark", "mist", "rose", "pine", "auto"]) {
+test("offers light, dark and system theme selection with native radios", () => {
+  for (const preference of ["light", "dark", "auto"]) {
     assert.match(themeOptionsSource, new RegExp(`id: "${preference}"`));
+  }
+  // The tinted palettes were removed; a stored one must fall back to system.
+  for (const removed of ["mist", "rose", "pine"]) {
+    assert.doesNotMatch(themeOptionsSource, new RegExp(`id: "${removed}"`));
   }
   assert.match(panelSource, /THEME_OPTIONS\.map/);
   assert.match(panelSource, /type="radio"/);

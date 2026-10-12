@@ -17,9 +17,9 @@
 - A weekly check of the latest stable `pi-agent-desktop` GitHub Release, with an in-app notice only when the installed app is older.
 - One upgrade button installs a complete, signed new build of Pi Agent and restarts automatically.
 
-![Pi Agent light mode](./docs/screenshots/pi-agent-light@2x.png)
+![Pi Agent light mode](./docs/screenshots/pi-agent-light.webp)
 
-![Pi Agent dark mode](./docs/screenshots/pi-agent-dark@2x.png)
+![Pi Agent dark mode](./docs/screenshots/pi-agent-dark.webp)
 
 **[⬇️ Download Pi Agent (macOS / Windows)](https://github.com/abcwyc/pi-agent-desktop/releases)**
 
@@ -32,6 +32,14 @@ Repository: [abcwyc/pi-agent-desktop](https://github.com/abcwyc/pi-agent-desktop
 Builds are available from [GitHub Releases](https://github.com/abcwyc/pi-agent-desktop/releases):
 
 - Apple Silicon Mac: download the `aarch64.dmg`, open it, and drag the app into `Applications`. Official releases do not build for Intel Macs.
+- Apple Silicon Mac with [Homebrew](https://brew.sh): install from this repository's tap. The tap is added from the repo URL, so the first command is needed once:
+
+  ```bash
+  brew tap abcwyc/pi-agent-desktop https://github.com/abcwyc/pi-agent-desktop
+  brew install --cask pi-agent
+  ```
+
+  The app upgrades itself from Settings, so `brew upgrade` leaves it alone unless you pass `--greedy`. `brew uninstall --cask --zap pi-agent` removes the app and its window state but never `~/.pi`, which the pi CLI shares.
 - Linux x64: download the `.deb` package and install it with your distribution's package manager. A community-maintained Flatpak is also available at [flatpark.org](https://flatpark.org/apps/io.github.abcwyc.pi-agent-desktop/) — not an official release, but Flatpak works across most distributions and handles updates for you.
 
 - Windows x64: download the installer whose name ends in `x64-setup.exe` and run it. The installer pulls in Microsoft WebView2 when it is missing.
