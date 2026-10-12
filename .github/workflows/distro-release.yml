@@ -47,7 +47,7 @@ jobs:
           - runner: ubuntu-24.04
             platform: linux
             target: x86_64-unknown-linux-gnu
-            args: --target x86_64-unknown-linux-gnu --bundles deb
+            args: --target x86_64-unknown-linux-gnu --bundles appimage
             apple_signing_identity: ""
     runs-on: ${{ matrix.runner }}
     steps:
@@ -158,7 +158,7 @@ jobs:
 
             - Windows: download `*_x64-setup.exe` and run it.
             - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
-            - Linux: install the `.deb`.
+            - Linux: download the `.AppImage`, make it executable (`chmod +x`) and run it. In-app self-update on Linux works from the AppImage build.
 
             On first launch, enter the service address and API key. Later changes: Settings → General → Service.
           releaseDraft: true

@@ -53,7 +53,7 @@ test("Linux and Windows packaging include the bundled Node runtime", async () =>
 
   assert.match(prepareSource, /process\.platform === "win32" \? "node\.exe" : "node"/);
   assert.match(prepareSource, /node_modules", "npm"/);
-  assert.deepEqual(linuxConfig.bundle.targets, ["deb"]);
+  assert.deepEqual(linuxConfig.bundle.targets, ["appimage"]);
   assert.ok(linuxConfig.bundle.resources.includes("resources/node"));
   assert.deepEqual(windowsConfig.bundle.targets, ["nsis"]);
   assert.ok(windowsConfig.bundle.icon.includes("icons/icon.ico"));

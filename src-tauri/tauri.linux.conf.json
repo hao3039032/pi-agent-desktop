@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "targets": ["deb"],
+    "targets": ["appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -11,15 +11,6 @@
       "resources/server",
       "resources/node",
       "resources/component-versions.json"
-    ],
-    "linux": {
-      "deb": {
-        "depends": [
-          "libwebkit2gtk-4.1-0",
-          "libgtk-3-0",
-          "libayatana-appindicator3-1 | libappindicator3-1"
-        ]
-      }
-    }
+    ]
   }
 }
