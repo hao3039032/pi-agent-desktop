@@ -33,6 +33,28 @@ export function applyUpstreamWebUpdateSkip(): void {
   }
 }
 
+/**
+ * The distro's security reviewer (`@erichll/pi-auto-review`) refuses to load
+ * when its package root sits inside the session workspace
+ * (`assertTrustedInstallation`: an agent-writable copy of the reviewer could
+ * have been rewritten by the very agent it judges). The distro installs the
+ * package under the app's `resources/pi-seed` directory, which on Windows
+ * lives under the user profile — so a workspace at the home directory or the
+ * drive root (both legitimate picks, and `~/pi-cwd-*` defaults sit under home)
+ * contains the install and would leave every ask unanswered by the reviewer.
+ *
+ * The containment check buys nothing here anyway: the distro's permission
+ * config has `path: "allow"`, so the agent's write tools are not confined to
+ * the workspace and the AppData copy was never out of reach. Opting out keeps
+ * the reviewer functional for those workspaces. An explicit operator value
+ * always wins (set `0` to keep the strict check).
+ */
+export function applyAutoReviewWorkspaceOptOut(): void {
+  if (process.env.PI_AUTO_REVIEW_ALLOW_UNTRUSTED_DEV === undefined) {
+    process.env.PI_AUTO_REVIEW_ALLOW_UNTRUSTED_DEV = "1";
+  }
+}
+
 function pathEntries(): string[] {
   return (process.env.PATH ?? "").split(delimiter).filter(Boolean);
 }

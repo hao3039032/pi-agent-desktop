@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 2,
+  "revision": 3,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -100,6 +100,26 @@
           "low": "low",
           "minimal": "minimal"
         }
+      },
+      {
+        "id": "gemini-3.5-flash-lite",
+        "name": "Gemini 3.5 Flash Lite",
+        "api": "google-generative-ai",
+        "baseUrl": "https://ai-new-api.91prize.com/v1beta",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 65536,
+        "thinkingLevelMap": {
+          "max": "high",
+          "high": "high",
+          "medium": "medium",
+          "low": "low",
+          "minimal": "minimal"
+        }
       }
     ]
   },
@@ -108,7 +128,9 @@
     "npm:pi-web-access",
     "git:github.com/hao3039032/pi-model-images",
     "npm:pi-omp-advisor",
-    "git:github.com/hao3039032/pi-plan-vanguard"
+    "git:github.com/hao3039032/pi-plan-vanguard",
+    "npm:@gotgenes/pi-permission-system",
+    "npm:@erichll/pi-auto-review"
   ],
   "settingsDefaults": {
     "defaultThinkingLevel": "high",
@@ -141,6 +163,94 @@
     "baseUrlSuffix": "/v1"
   },
   "agentFiles": {
+    "extensions/pi-auto-review/config.json": {
+      "model": "lw/gemini-3.5-flash-lite",
+      "reasoning": "low",
+      "timeoutMs": 90000,
+      "maxTokens": 1024,
+      "retries": 2,
+      "maxUserTranscriptTokens": 1200,
+      "maxToolTranscriptTokens": 1200,
+      "maxRelevantResultTokens": 800,
+      "maxReviewerInputTokens": 8192,
+      "breakGlassEnabled": true,
+      "failureMode": "deny",
+      "grantTtlMs": 60000,
+      "autoConfirmBoundedAllows": ["external_directory", "path"],
+      "policyAudit": {
+        "enabled": true,
+        "retentionDays": 180
+      }
+    },
+    "extensions/pi-permission-system/config.json": {
+      "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
+      "debugLog": false,
+      "permissionReviewLog": true,
+      "yoloMode": false,
+      "permissionDialogKeys": {
+        "approve": "1",
+        "approveSession": "2",
+        "approveSessionBoth": "3",
+        "deny": "4",
+        "denyWithReason": "5"
+      },
+      "promptNotifications": ["bell"],
+      "promptTimeoutMs": 120000,
+      "authorizerChain": ["pi-auto-review"],
+      "shellTools": {
+        "powershell": { "commandArgument": "command" }
+      },
+      "permission": {
+        "*": "ask",
+        "path": "allow",
+        "external_directory": "allow",
+        "bash": {
+          "*": "ask",
+          "rm -rf /": "deny",
+          "rm -fr /": "deny",
+          "rm -r /": "deny",
+          "rm -f /": "deny",
+          "rm -rf ~": "deny",
+          "rm -fr ~": "deny",
+          "rm -r ~": "deny",
+          "rm -f ~": "deny",
+          "rm * ~": "deny",
+          "rm -rf /?": "deny",
+          "rm -fr /?": "deny",
+          "rm -r /?": "deny",
+          "rm -rf /?/": "deny",
+          "rm -fr /?/": "deny",
+          "rm -r /?/": "deny",
+          "mkfs*": "deny",
+          "dd if=* of=/dev/*": "deny",
+          "dd * of=\\\\.\\*": "deny",
+          "rm * ?:\\": "deny",
+          "rm * ?:": "deny",
+          "Remove-Item * ?:\\": "deny",
+          "Remove-Item * ?:": "deny",
+          "remove-item * ?:\\": "deny",
+          "remove-item * ?:": "deny",
+          "REMOVE-ITEM * ?:\\": "deny",
+          "REMOVE-ITEM * ?:": "deny",
+          "format ?:*": "deny",
+          "Format ?:*": "deny",
+          "FORMAT ?:*": "deny",
+          "Format-Volume*": "deny",
+          "format-volume*": "deny",
+          "FORMAT-VOLUME*": "deny",
+          "Clear-Disk*": "deny",
+          "clear-disk*": "deny",
+          "CLEAR-DISK*": "deny",
+          "Remove-Partition*": "deny",
+          "remove-partition*": "deny",
+          "REMOVE-PARTITION*": "deny"
+        },
+        "read": "allow",
+        "grep": "allow",
+        "find": "allow",
+        "ls": "allow"
+      }
+    },
     "extensions/subagent/config.json": {
       "timeoutMs": 3600000,
       "checkpointBeforeDeadlineMs": 300000

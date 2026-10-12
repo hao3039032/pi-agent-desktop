@@ -33,6 +33,7 @@ import {
 import type { SessionEntry } from "./types";
 import { buildSubagentPromptPlan } from "./subagent-prompt";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
+import { findSecurityExtensionPaths } from "./permission-system-package";
 import { appendSubagentInputFiles, loadSubagentInputFiles } from "./subagent-input";
 import { projectTrustReloadOptions } from "./project-trust";
 import { resolveShellTools } from "./powershell-settings";
@@ -224,6 +225,18 @@ export function createSubagentController(
       const agentDir = getAgentDir();
       const parentModelRuntime = (parent.inner as unknown as { modelRuntime: ModelRuntime }).modelRuntime;
       const settingsManager = SettingsManager.create(childCwd, agentDir);
+      // Subagent sessions load no extensions by default, which would leave their
+      // bash ungated by the permission system (and the authorizer chain
+      // unresolvable when a model reviewer is configured). Inject the installed
+      // security package directories as additional extension paths: the resource
+      // loader loads those even under noExtensions, and only those, so the child
+      // keeps its isolation while catastrophic-operation denies still hold.
+      const securityExtensionPaths = profile.loadExtensions
+        ? []
+        : findSecurityExtensionPaths(
+          settingsManager.getGlobalSettings().packages as Array<string | { source: string }> | undefined,
+          agentDir,
+        );
       const inheritedParentContext = inheritContext
         ? `The following is the active conversation context from the parent session. Use it only as background for the delegated task:\n${parentContextText(parent)}`
         : undefined;
@@ -246,6 +259,9 @@ export function createSubagentController(
         settingsManager,
         resourceLoaderOptions: {
           noExtensions: !profile.loadExtensions,
+          ...(securityExtensionPaths.length > 0
+            ? { additionalExtensionPaths: securityExtensionPaths }
+            : {}),
           noSkills: !profile.loadSkills,
           noPromptTemplates: true,
           noThemes: true,
