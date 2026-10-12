@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { desktopTargetTriple } from "./desktop-platform.mjs";
+import { desktopTargetTriple, readMachOCpuTypes, requiredMachOCpuType } from "./desktop-platform.mjs";
 import { piPackageDirNames } from "./pi-packages.mjs";
 import { dedupeNestedPackages, findNestedPiScopePackages, stageCompletePackage } from "./stage-package.mjs";
 
@@ -14,6 +14,24 @@ const standaloneDir = join(desktopBuildDir, "standalone");
 const serverResourcesDir = join(rootDir, "src-tauri", "resources", "server");
 const serverHelperDir = join(rootDir, "src-tauri", "resources", "Pi Agent Server.app");
 const nodeResourcesDir = join(rootDir, "src-tauri", "resources", "node");
+
+// Cross-arch builds (x86_64 macOS from an Apple Silicon runner) must not bundle
+// the host's Node, so the workflow tells this script what it is building and
+// where the matching Node binary lives. Without the override the host's
+// process.execPath is copied — correct whenever host arch == target arch.
+const KNOWN_DESKTOP_TRIPLES = new Set([
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]);
+
+const targetTriple = process.env.PI_DESKTOP_TARGET_TRIPLE ?? desktopTargetTriple();
+if (!KNOWN_DESKTOP_TRIPLES.has(targetTriple)) {
+  throw new Error(
+    `Unknown PI_DESKTOP_TARGET_TRIPLE ${JSON.stringify(process.env.PI_DESKTOP_TARGET_TRIPLE)} — expected one of:\n  ${[...KNOWN_DESKTOP_TRIPLES].join("\n  ")}`,
+  );
+}
 
 async function runNextBuild() {
   const require = createRequire(import.meta.url);
@@ -239,7 +257,9 @@ async function findNpmSource() {
 }
 
 async function bundleNodeRuntime() {
-  const triple = desktopTargetTriple();
+  const triple = targetTriple;
+  const sourceNodePath = process.env.PI_DESKTOP_NODE_BINARY ?? process.execPath;
+  await access(sourceNodePath, constants.R_OK);
   await rm(serverHelperDir, { recursive: true, force: true });
   await rm(nodeResourcesDir, { recursive: true, force: true });
 
@@ -252,7 +272,7 @@ async function bundleNodeRuntime() {
     const contentsDir = join(serverHelperDir, "Contents");
     binaryPath = join(contentsDir, "MacOS", "node");
     await mkdir(dirname(binaryPath), { recursive: true });
-    await copyFile(process.execPath, binaryPath);
+    await copyFile(sourceNodePath, binaryPath);
     await chmod(binaryPath, 0o755);
     await copyFile(
       join(rootDir, "desktop", "server-helper-Info.plist"),
@@ -269,13 +289,34 @@ async function bundleNodeRuntime() {
     const executableName = process.platform === "win32" ? "node.exe" : "node";
     binaryPath = join(nodeResourcesDir, executableName);
     await mkdir(nodeResourcesDir, { recursive: true });
-    await copyFile(process.execPath, binaryPath);
+    await copyFile(sourceNodePath, binaryPath);
     await chmod(binaryPath, 0o755);
     await cp(
       await findNpmSource(),
       join(nodeResourcesDir, "node_modules", "npm"),
       { recursive: true },
     );
+  }
+
+  // Wrong-arch staging is silent at build time and fatal on the target
+  // machine ("Bad CPU type in executable" when the shell spawns the server),
+  // so gate it here: the bundled Mach-O must contain the target's cpu type.
+  if (triple.endsWith("-apple-darwin")) {
+    const cpuTypes = readMachOCpuTypes(binaryPath);
+    if (cpuTypes === null) {
+      throw new Error(
+        `Bundled Node at ${relative(rootDir, binaryPath)} is not a Mach-O binary; expected a darwin Node build for ${triple}.`,
+      );
+    }
+    const required = requiredMachOCpuType(triple);
+    if (!cpuTypes.includes(required)) {
+      throw new Error(
+        `Bundled Node at ${relative(rootDir, binaryPath)} carries no ${triple} code ` +
+          `(cpu types: ${cpuTypes.map((type) => `0x${type.toString(16).padStart(8, "0")}`).join(", ")}). ` +
+          "When cross-building, download a Node runtime for the target architecture and point " +
+          "PI_DESKTOP_NODE_BINARY at it (with PI_DESKTOP_TARGET_TRIPLE set to match).",
+      );
+    }
   }
 
   return { binaryPath, triple };

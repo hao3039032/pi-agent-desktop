@@ -36,6 +36,14 @@ jobs:
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
             apple_signing_identity: "-"
+          # Cross-compiled on the Apple Silicon runner (macOS 12 dropped the
+          # last Intel images): Rust targets x86_64-apple-darwin natively, and
+          # the bundled Node runtime is swapped below for a darwin-x64 build.
+          - runner: macos-15
+            platform: macos
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+            apple_signing_identity: "-"
           - runner: ubuntu-24.04
             platform: linux
             target: x86_64-unknown-linux-gnu
@@ -60,6 +68,29 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - name: Stage an x86_64 Node runtime for the Intel macOS build
+        # The Apple Silicon runner's own Node cannot serve an x86_64 bundle:
+        # prepare-desktop.mjs copies PI_DESKTOP_NODE_BINARY instead of the
+        # host's process.execPath and refuses a mismatched Mach-O arch.
+        # Rosetta (preinstalled, guarded anyway) lets desktop:verify run the
+        # x64 server on this runner.
+        if: matrix.target == 'x86_64-apple-darwin' && runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          if ! /usr/bin/pgrep -q oahd; then
+            softwareupdate --install-rosetta --agree-to-license
+          fi
+          version="$(node -p process.version)"
+          dir="$RUNNER_TEMP/node-$version-darwin-x64"
+          mkdir -p "$dir"
+          curl -fsSL "https://nodejs.org/dist/$version/node-$version-darwin-x64.tar.gz" \
+            | tar xz -C "$dir" --strip-components=1
+          test -x "$dir/bin/node"
+          {
+            echo "PI_DESKTOP_TARGET_TRIPLE=x86_64-apple-darwin"
+            echo "PI_DESKTOP_NODE_BINARY=$dir/bin/node"
+          } >> "$GITHUB_ENV"
 
       - name: Configure updater public key
         env:
@@ -126,7 +157,7 @@ jobs:
             Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
 
             - Windows: download `*_x64-setup.exe` and run it.
-            - macOS (Apple Silicon): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
+            - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
             - Linux: install the `.deb`.
 
             On first launch, enter the service address and API key. Later changes: Settings → General → Service.

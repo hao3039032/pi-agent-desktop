@@ -22,7 +22,7 @@
 | `lib/distro/` | 运行时：PATH 注入（npm shim、Git Bash）、首次启动种子（packages 重写、默认值、`pi-plan-vanguard.json`、`WATCHDOG.yml`）、服务配置读写、pi-mcp-adapter → 官方 MCP 的一次性迁移（`mcp-migration.ts`） |
 | `components/distro/` | 首次启动弹窗 + 设置里的服务配置表单 |
 | `app/api/distro/` | `GET/PUT /api/distro`：服务配置状态与保存（不回传 key） |
-| `.github/workflows/distro-release.yml` | 发版：三平台构建、签名、上传（fork 自有，上游的 release.yml 未动） |
+| `.github/workflows/distro-release.yml` | 发版：三平台四目标构建（macOS 双架构交叉编译）、签名、上传（fork 自有，上游的 release.yml 未动） |
 | `.github/workflows/distro-sync.yml` | 每日检查上游 release，合并→跑检查→推送→触发发版 |
 
 构建产物 `resources/pi-seed/`、`resources/git/`、`tauri.distro.conf.json` 均在 `.gitignore` 中，不进仓库。
@@ -45,7 +45,16 @@
 
 1. 改动 distro 层（模型表、扩展包列表、PortableGit 版本等）后：把 `distro/distro.json` 的 `revision` +1。`revision` 按上游版本分别计数：合并上游后版本变了就重置为 1（`distro-sync.yml` 自动执行 `scripts/distro-reset-revision.mjs` 并并入 merge commit），所以 0.4.805 之后同步到 0.5.2，下一个版本是 0.5.201 而不是 0.5.206；上游版本不变时才需要手动 +1。手动 `git merge <上游tag>` 解冲突后自己跑一次 `node scripts/distro-reset-revision.mjs`（默认以 HEAD^1 为合并前基线）并把改动并入 merge commit。上游 `X.Y.0` 版本用 prerelease 后缀编码：`X.Y.0-rev.R`（如 0.6.0 → 0.6.0-rev.1），因为 `X.Y.(0×100+R)` 会撞上上游自己的 patch 号；后缀按 semver 排序，升级链依然单调（0.5.209 < 0.6.0-rev.1 < … < 0.6.0-rev.99 < 0.6.101），Tauri 更新器默认就是纯 semver 比较；
 2. 手动触发 `distro-release.yml`，或等 `distro-sync.yml` 在上游发新 release 后自动触发；
-3. 三平台构建全部成功后 draft 自动转正；部分失败保持 draft，会在 job summary 里报警，不要手工发布。
+3. 全部目标构建成功后 draft 自动转正；部分失败保持 draft，会在 job summary 里报警，不要手工发布。
+
+## macOS 双架构（Intel 支持）
+
+Rust 直接在 Apple Silicon runner 上交叉编译 `x86_64-apple-darwin`；真正架构相关的只有随包分发的 Node 运行时：`scripts/prepare-desktop.mjs` 默认复制构建机正在运行的 `process.execPath`，交叉构建时由工作流从 nodejs.org 下载同版本 `darwin-x64` Node，并通过两个环境变量交给打包脚本：
+
+- `PI_DESKTOP_TARGET_TRIPLE`：本次构建的目标（如 `x86_64-apple-darwin`），不设则取构建机自身的平台/架构；
+- `PI_DESKTOP_NODE_BINARY`：要打包的 Node 二进制路径，替代 `process.execPath`。
+
+打包末尾有 Mach-O 架构校验：darwin 目标的随包 Node 若不含目标 cpu type（x86_64 / arm64），构建直接失败，不会把 ARM 包静默发给 Intel 机器（否则到目标机上启动 server 就报 `Bad CPU type in executable`）。node-pty 预编译两种架构本就随包携带，Code mode 沙箱是 WebAssembly，均与架构无关。`mac-build-test.yml` 的 `target` 输入可选架构，用于给 Intel 机器手出测试安装包；ARM runner 自带 Rosetta，`desktop:verify` 能在构建时验证 x64 包。
 
 ## 一次性设置
 

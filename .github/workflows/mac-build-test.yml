@@ -1,15 +1,24 @@
 name: Test the macOS desktop build
 
 # Manual only, and deliberately not part of any release path: it builds the
-# macOS (Apple Silicon) app exactly like the release workflow does — same
-# distro config, same seed, same signing inputs — but uploads the bundles as
-# workflow artifacts instead of creating a release. Use it to iterate on the
-# packaged app (server staging, bundled packages, updater behavior) without
-# touching the published latest.json; a mac-only release would strand the
-# other platforms' updater entries.
+# macOS app exactly like the release workflow does — same distro config, same
+# seed, same signing inputs — but uploads the bundles as workflow artifacts
+# instead of creating a release. Use it to iterate on the packaged app (server
+# staging, bundled packages, updater behavior) without touching the published
+# latest.json; a mac-only release would strand the other platforms' updater
+# entries. The target input picks Apple Silicon or Intel (cross-compiled with
+# a darwin-x64 Node runtime on the ARM runner).
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "macOS architecture to build"
+        type: choice
+        options:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+        default: aarch64-apple-darwin
 
 permissions:
   contents: read
@@ -32,6 +41,26 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Stage an x86_64 Node runtime for the Intel macOS build
+        # See distro-release.yml: the ARM runner's Node cannot serve an x86_64
+        # bundle, so prepare-desktop.mjs copies this one instead.
+        if: inputs.target == 'x86_64-apple-darwin' && runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          if ! /usr/bin/pgrep -q oahd; then
+            softwareupdate --install-rosetta --agree-to-license
+          fi
+          version="$(node -p process.version)"
+          dir="$RUNNER_TEMP/node-$version-darwin-x64"
+          mkdir -p "$dir"
+          curl -fsSL "https://nodejs.org/dist/$version/node-$version-darwin-x64.tar.gz" \
+            | tar xz -C "$dir" --strip-components=1
+          test -x "$dir/bin/node"
+          {
+            echo "PI_DESKTOP_TARGET_TRIPLE=x86_64-apple-darwin"
+            echo "PI_DESKTOP_NODE_BINARY=$dir/bin/node"
+          } >> "$GITHUB_ENV"
+
       - name: Configure updater public key
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
@@ -43,7 +72,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ inputs.target }}
 
       - name: Install dependencies
         run: npm ci
@@ -72,7 +101,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: >
           npx tauri build
-          --target aarch64-apple-darwin
+          --target ${{ inputs.target }}
           --config src-tauri/tauri.distro.conf.json
 
       - name: Verify the subagent host tree staged completely
@@ -88,9 +117,9 @@ jobs:
       - name: Upload the bundles
         uses: actions/upload-artifact@v4
         with:
-          name: pi-agent-lw-macos-aarch64
+          name: pi-agent-lw-${{ inputs.target }}
           path: |
-            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+            src-tauri/target/${{ inputs.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ inputs.target }}/release/bundle/macos/*.app
           if-no-files-found: error
           compression-level: 0
