@@ -115,6 +115,12 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             librsvg2-dev
+          # ubuntu-24.04 system libs carry .relr.dyn ELF sections that the
+          # strip linuxdeploy invokes does not understand (tauri#14796:
+          # "unknown type [0x13] section .relr.dyn" -> "failed to run
+          # linuxdeploy"). NO_STRIP skips that pass; the size cost is the
+          # unstripped system libraries inside the AppImage.
+          echo "NO_STRIP=true" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: npm ci
