@@ -44,11 +44,18 @@ jobs:
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
             apple_signing_identity: "-"
-          - runner: ubuntu-24.04
-            platform: linux
-            target: x86_64-unknown-linux-gnu
-            args: --target x86_64-unknown-linux-gnu --bundles appimage
-            apple_signing_identity: ""
+          # Linux is disabled since v0.6.504: the AppImage bundling step
+          # (`failed to run linuxdeploy`) fails on ubuntu-24.04 even with
+          # NO_STRIP=true (runs #17 and #19; tauri#14796 — linuxdeploy's strip
+          # rejects .relr.dyn sections in the runner's system libs, and the
+          # env var did not save it). The .deb bundle built fine (run #16), so
+          # re-enable with --bundles deb for an interim Linux artifact, or
+          # wait for tauri's rewritten AppImage bundler (tauri PR #12491).
+          # - runner: ubuntu-24.04
+          #   platform: linux
+          #   target: x86_64-unknown-linux-gnu
+          #   args: --target x86_64-unknown-linux-gnu --bundles appimage
+          #   apple_signing_identity: ""
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out
@@ -118,8 +125,10 @@ jobs:
           # ubuntu-24.04 system libs carry .relr.dyn ELF sections that the
           # strip linuxdeploy invokes does not understand (tauri#14796:
           # "unknown type [0x13] section .relr.dyn" -> "failed to run
-          # linuxdeploy"). NO_STRIP skips that pass; the size cost is the
-          # unstripped system libraries inside the AppImage.
+          # linuxdeploy"). NO_STRIP is the documented workaround, but it did
+          # NOT make the AppImage bundle pass (run #19 failed the same way) —
+          # which is why the Linux matrix entry is commented out above. Kept
+          # here for when Linux is re-enabled.
           echo "NO_STRIP=true" >> "$GITHUB_ENV"
 
       - name: Install dependencies
@@ -164,7 +173,7 @@ jobs:
 
             - Windows: download `*_x64-setup.exe` and run it.
             - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
-            - Linux: download the `.AppImage`, make it executable (`chmod +x`) and run it. In-app self-update on Linux works from the AppImage build.
+            - Linux: temporarily unavailable — the AppImage bundling step fails on our CI runner (tauri-apps/tauri#14796). The previous `.deb` release (v0.6.501) remains available; Linux will return once bundling is fixed.
 
             On first launch, enter the service address and API key. Later changes: Settings → General → Service.
           releaseDraft: true
