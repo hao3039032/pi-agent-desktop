@@ -105,14 +105,15 @@ jobs:
           --config src-tauri/tauri.distro.conf.json
 
       - name: Verify the subagent host tree staged completely
+        # SDK 1.2.0 dropped `chord` and pi-agent-core's `./node` subpath, so the
+        # scope checks the packages it still ships and the core package's entry.
         shell: bash
         run: |
           server_scope="src-tauri/resources/server/node_modules/@earendil-works"
-          for pkg in pi-coding-agent pi-agent-core chord; do
+          for pkg in pi-coding-agent pi-agent-core pi-mcp pi-telemetry; do
             test -d "$server_scope/$pkg" || { echo "missing $pkg"; exit 1; }
           done
-          test -f "$server_scope/pi-agent-core/dist/node.js"
-          test -f "$server_scope/chord/dist/index.js"
+          test -f "$server_scope/pi-agent-core/dist/index.js"
 
       - name: Upload the bundles
         uses: actions/upload-artifact@v4
