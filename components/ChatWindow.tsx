@@ -21,9 +21,10 @@ import { useIsMobile } from "@/hooks/useIsMobile";
 import { phaseLabel } from "@/lib/chat-phase-label";
 import { useAgentSession, type NoticeItem } from "@/hooks/useAgentSession";
 import { useDragDrop } from "@/hooks/useDragDrop";
+import { useDesktopDragDrop } from "@/hooks/useDesktopDragDrop";
 import { useScrollbarVisibility } from "@/hooks/useScrollbarVisibility";
 import type { SessionStatsInfo } from "@/lib/pi-types";
-import { importDroppedProjectFiles, partitionChatDroppedFiles } from "@/lib/chat-file-drop";
+import { formatDroppedPathsForComposer, importDroppedProjectFiles, partitionChatDroppedFiles } from "@/lib/chat-file-drop";
 import type { ToolEntry } from "@/lib/tool-presets";
 import type { SettingsSection } from "@/lib/settings-navigation";
 import { findChatScrollAnchor, type ChatScrollPosition } from "@/lib/chat-scroll-position";
@@ -36,6 +37,25 @@ import {
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
 import { sessionVisibleCounts } from "@/lib/scroll-memory";
+import { buildFileAtMentionsText } from "@/lib/file-fuzzy";
+import { encodeFilePathForApi, getFileName } from "@/lib/file-paths";
+import {
+  base64ToImageFile,
+  MAX_ATTACHED_IMAGES,
+  MAX_ATTACHED_IMAGE_BYTES,
+  MAX_ATTACHED_IMAGE_SELECTION_BYTES,
+} from "@/lib/image-attachments";
+import {
+  describeDroppedPaths,
+  importLocalFiles,
+  readDesktopImageAttachments,
+  type DesktopDropPathInfo,
+} from "@/lib/desktop-native";
+import {
+  PROJECT_UPLOAD_MAX_FILE_BYTES,
+  PROJECT_UPLOAD_MAX_TOTAL_BYTES,
+} from "@/lib/project-file-upload-client";
+import { isTauriDesktop } from "@/lib/desktop-updater";
 import { isImeComposing } from "@/lib/ime";
 
 interface Props {
@@ -787,9 +807,22 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   useEffect(() => () => { onContextUsageChange?.(null); }, [onContextUsageChange]);
 
   const cwd = session?.cwd ?? newSessionCwd;
-  const projectImportBusyRef = useRef(false);
+  const dropBusyRef = useRef(false);
+  const dropZoneRef = useRef<HTMLDivElement | null>(null);
 
-  const onDrop = useCallback((files: File[]) => {
+  const onDrop = useCallback((files: File[], directories: string[]) => {
+    // In the packaged shell Tauri's native drag/drop handler owns OS file
+    // drops (it is the only source of absolute paths); the HTML5 events are
+    // for browser builds only.
+    if (isTauriDesktop()) return;
+
+    if (directories.length > 0) {
+      addNotice({
+        type: "error",
+        message: t("chat.dropDirectoryBrowserUnsupported", { names: directories.slice(0, 3).join("; ") }),
+      });
+    }
+
     const { images, projectFiles } = partitionChatDroppedFiles(files);
 
     // Images stay on the multimodal attachment path (blocked while the agent is busy).
@@ -804,8 +837,8 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       addNotice({ type: "error", message: t("chat.dropNeedsProject") });
       return;
     }
-    if (projectImportBusyRef.current) return;
-    projectImportBusyRef.current = true;
+    if (dropBusyRef.current) return;
+    dropBusyRef.current = true;
 
     void (async () => {
       try {
@@ -839,12 +872,185 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
           message: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        projectImportBusyRef.current = false;
+        dropBusyRef.current = false;
       }
     })();
   }, [addNotice, chatInputRef, cwd, onProjectFilesImported, sessionBusy, t]);
 
+  // Desktop drop routing (absolute paths from Tauri's native handler):
+  // directories insert their absolute path into the composer, images go
+  // through the path-based attachment reader, and other files are copied
+  // into the session cwd and @mentioned — same outcomes as the browser
+  // paths, minus the blob upload. Items a downstream route would refuse
+  // (too large, over a cap) degrade per item into the partial-failure
+  // notice instead of aborting the whole drop.
+  const handleDesktopDropPaths = useCallback((paths: string[]) => {
+    if (dropBusyRef.current) return;
+    dropBusyRef.current = true;
+
+    void (async () => {
+      try {
+        const items = await describeDroppedPaths(paths);
+        const rejected: Array<{ name: string; reason: string }> = [];
+        const directoryPaths = items
+          .filter((item) => item.kind === "directory")
+          .map((item) => item.path);
+
+        // Images stay on the multimodal attachment path (blocked while the
+        // agent is busy). The reader 413s files over MAX_ATTACHED_IMAGE_BYTES
+        // and selections over the shared byte total, and the composer caps
+        // the attachment count, so all limits are pre-filtered here and
+        // reported per item.
+        const imagePaths: string[] = [];
+        let imageTotalBytes = 0;
+        for (const item of items) {
+          if (item.kind !== "file" || !item.imageMime) continue;
+          const name = getFileName(item.path) || item.path;
+          if ((item.size ?? 0) > MAX_ATTACHED_IMAGE_BYTES) {
+            rejected.push({ name, reason: `larger than ${MAX_ATTACHED_IMAGE_BYTES / (1024 * 1024)}MB` });
+            continue;
+          }
+          if (imagePaths.length >= MAX_ATTACHED_IMAGES) {
+            rejected.push({ name, reason: `at most ${MAX_ATTACHED_IMAGES} images can be attached` });
+            continue;
+          }
+          if (imageTotalBytes + (item.size ?? 0) > MAX_ATTACHED_IMAGE_SELECTION_BYTES) {
+            rejected.push({
+              name,
+              reason: `selected images must total ${MAX_ATTACHED_IMAGE_SELECTION_BYTES / (1024 * 1024)}MB or less`,
+            });
+            continue;
+          }
+          imagePaths.push(item.path);
+          imageTotalBytes += item.size ?? 0;
+        }
+
+        // Other files are copied into the cwd by path; the import route 413s
+        // over its per-file and batch byte caps, so they are checked here
+        // with a running total, like the browser path's rejected entries.
+        const acceptedImports: DesktopDropPathInfo[] = [];
+        let importTotalBytes = 0;
+        for (const item of items) {
+          if (item.kind !== "file" || item.imageMime) continue;
+          const name = getFileName(item.path) || item.path;
+          const size = item.size ?? 0;
+          if (size > PROJECT_UPLOAD_MAX_FILE_BYTES) {
+            rejected.push({ name, reason: `larger than ${PROJECT_UPLOAD_MAX_FILE_BYTES / (1024 * 1024)}MB` });
+            continue;
+          }
+          if (importTotalBytes + size > PROJECT_UPLOAD_MAX_TOTAL_BYTES) {
+            rejected.push({ name, reason: "upload total would exceed 100MB" });
+            continue;
+          }
+          acceptedImports.push(item);
+          importTotalBytes += size;
+        }
+        // Deduplicate by basename — keep the last occurrence, like the
+        // browser path: the import route computes conflicts before copying,
+        // so duplicate names would silently overwrite.
+        const importsByName = new Map<string, DesktopDropPathInfo>();
+        for (const item of acceptedImports) importsByName.set(getFileName(item.path) || item.path, item);
+        const importPaths = Array.from(importsByName.values()).map((item) => item.path);
+
+        const unsupported = items.filter((item) => item.kind === "missing" || item.kind === "other");
+
+        if (directoryPaths.length > 0) {
+          chatInputRef?.current?.insertText(formatDroppedPathsForComposer(directoryPaths));
+          chatInputRef?.current?.focus();
+          addNotice({
+            type: "success",
+            message: t("chat.dropPathInserted", { count: directoryPaths.length }),
+          });
+        }
+
+        if (imagePaths.length > 0 && !sessionBusy) {
+          // An image read failure must not take the import and unsupported
+          // steps down with it.
+          try {
+            const attachments = await readDesktopImageAttachments(imagePaths);
+            chatInputRef?.current?.addImages(
+              attachments.map((attachment) =>
+                base64ToImageFile(attachment.data, attachment.mimeType, attachment.name)),
+            );
+          } catch (error) {
+            addNotice({
+              type: "error",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+
+        let importMentionPaths: string[] = [];
+        let importErrors: Array<{ name: string; error: string }> = [];
+        if (importPaths.length > 0) {
+          if (!cwd) {
+            addNotice({ type: "error", message: t("chat.dropNeedsProject") });
+          } else {
+            const { status, data } = await importLocalFiles({
+              destDirectory: cwd,
+              sourcePaths: importPaths,
+              conflict: "skip",
+              encodeDestPath: encodeFilePathForApi,
+            });
+            if (status < 200 || status >= 300 && status !== 207) {
+              throw new Error(data.error ?? `Import failed (HTTP ${status})`);
+            }
+            const uploaded = data.uploaded ?? [];
+            const skipped = data.skipped ?? [];
+            importMentionPaths = [...uploaded, ...skipped];
+            if (importMentionPaths.length > 0) {
+              chatInputRef?.current?.insertText(buildFileAtMentionsText(importMentionPaths));
+              chatInputRef?.current?.focus();
+            }
+            if (uploaded.length > 0) onProjectFilesImported?.();
+            importErrors = data.errors ?? [];
+          }
+        }
+
+        const failureParts = [
+          ...rejected.map((item) => `${item.name}: ${item.reason}`),
+          ...importErrors.map((item) => `${item.name}: ${item.error}`),
+        ];
+        if (failureParts.length > 0) {
+          addNotice({
+            type: importMentionPaths.length ? "warning" : "error",
+            message: t("chat.dropProjectPartialFailure", { detail: failureParts.slice(0, 3).join("; ") }),
+          });
+        } else if (importMentionPaths.length > 0) {
+          addNotice({
+            type: "success",
+            message: t("chat.dropProjectSuccess", { count: importMentionPaths.length }),
+          });
+        }
+
+        if (unsupported.length > 0) {
+          addNotice({
+            type: "error",
+            message: t("chat.dropUnsupportedItems", {
+              names: unsupported
+                .slice(0, 3)
+                .map((item) => getFileName(item.path) || item.path)
+                .join("; "),
+            }),
+          });
+        }
+      } catch (error) {
+        addNotice({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        dropBusyRef.current = false;
+      }
+    })();
+  }, [addNotice, chatInputRef, cwd, onProjectFilesImported, sessionBusy, t]);
+
+  const { isDragOver: desktopDragOver } = useDesktopDragDrop({
+    dropZoneRef,
+    onDropPaths: handleDesktopDropPaths,
+  });
   const { isDragOver, handleDragEnter, handleDragOver, handleDragLeave, handleDrop } = useDragDrop(onDrop);
+  const dragOverlayVisible = isDragOver || desktopDragOver;
 
   // Stable Map identity: `messages` doesn't change during streaming updates
   // (the streaming message lives in streamState), so memoized MessageViews
@@ -1154,6 +1360,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
 
   return (
     <div
+      ref={dropZoneRef}
       className="chat-window chat-content relative flex h-full min-w-0 flex-col overflow-hidden"
       data-session-busy={sessionBusy ? "true" : undefined}
       style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
@@ -1171,7 +1378,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
         className="pointer-events-none absolute left-0 top-0 h-px w-24 overflow-y-scroll opacity-0"
       />
 
-      {isDragOver && (
+      {dragOverlayVisible && (
         <div className="pointer-events-none absolute inset-0 z-50 flex animate-[drop-zone-in_0.15s_ease_both] items-center justify-center bg-[var(--accent-soft)] backdrop-blur-[1px]">
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
             {[0, 0.8, 1.6].map((delay) => (
@@ -1207,7 +1414,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
               {t("chat.dropFilesHint")}
             </div>
             <div style={{ maxWidth: 360, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.4 }}>
-              {t("chat.dropFilesDetail")}
+              {isTauriDesktop() ? t("chat.dropFilesDetailDesktop") : t("chat.dropFilesDetail")}
             </div>
           </div>
         </div>

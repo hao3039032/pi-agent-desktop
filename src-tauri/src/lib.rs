@@ -1088,8 +1088,11 @@ fn build_window(app: &tauri::AppHandle, app_url: Url) -> tauri::Result<WebviewWi
         .inner_size(1440.0, 900.0)
         .min_inner_size(900.0, 600.0)
         .resizable(true)
-        // Pi Agent already handles browser drag/drop for image attachments.
-        .disable_drag_drop_handler()
+        // Keep Tauri's native drag/drop handler enabled: it is the only way to
+        // learn the absolute paths of dragged items (browsers never expose
+        // them), so folders can be referenced by path instead of failing the
+        // file-upload path. The web UI routes these events through
+        // `useDesktopDragDrop` in `hooks/useDesktopDragDrop.ts`.
         .on_navigation(move |url| {
             if same_origin(url, &navigation_origin) {
                 true

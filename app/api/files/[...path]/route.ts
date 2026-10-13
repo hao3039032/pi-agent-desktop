@@ -25,6 +25,7 @@ import { isFilePathReferencedBySession } from "@/lib/session-file-references";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import {
   inspectUploadTargets,
+  MAX_IMPORT_FILES,
   parseUploadConflictStrategy,
   validateUploadFileNames,
 } from "@/lib/file-upload";
@@ -53,7 +54,6 @@ const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
 const MAX_IMPORT_JSON_BYTES = 256 * 1024;
-const MAX_IMPORT_FILES = 100;
 const HTML_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
 // Local HTML previews are rendered in a same-origin iframe whose sandbox
 // attribute has no allow-scripts. This CSP is the defense-in-depth layer for
