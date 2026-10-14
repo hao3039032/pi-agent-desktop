@@ -193,6 +193,24 @@ async function assembleServer() {
     stagedNodeModulesDir,
   });
 
+  // sharp (pulled in by Next's production image optimizer) ships glibc and
+  // musl builds of its native libvips on Linux. The AppImage bundler's
+  // linuxdeploy walks every ELF under the resources and resolves its
+  // dependencies; the musl builds need `libc.musl-x86_64.so.1`, which no
+  // glibc system provides, so bundling dies with "Could not find dependency:
+  // libc.musl-x86_64.so.1" — the error tauri reports as an opaque "failed to
+  // run linuxdeploy". The packaged server always runs on the bundled glibc
+  // Node, so the musl variant is dead weight in every bundle; drop it here.
+  if (targetTriple.endsWith("-unknown-linux-gnu")) {
+    const imgDir = join(serverResourcesDir, "node_modules", "@img");
+    const imgEntries = await readdir(imgDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of imgEntries) {
+      if (entry.isDirectory() && entry.name.includes("linuxmusl")) {
+        await rm(join(imgDir, entry.name), { recursive: true, force: true });
+      }
+    }
+  }
+
   await copyFile(
     join(rootDir, "desktop", "server-launcher.cjs"),
     join(serverResourcesDir, "desktop-server.cjs"),

@@ -44,13 +44,20 @@ jobs:
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
             apple_signing_identity: "-"
-          # Linux is disabled since v0.6.504: the AppImage bundling step
-          # (`failed to run linuxdeploy`) fails on ubuntu-24.04 even with
-          # NO_STRIP=true (runs #17 and #19; tauri#14796 — linuxdeploy's strip
-          # rejects .relr.dyn sections in the runner's system libs, and the
-          # env var did not save it). The .deb bundle built fine (run #16), so
-          # re-enable with --bundles deb for an interim Linux artifact, or
-          # wait for tauri's rewritten AppImage bundler (tauri PR #12491).
+          # Linux stays disabled for now — but not for the old reason. The
+          # historical `failed to run linuxdeploy` was never the .relr.dyn /
+          # strip issue (tauri#14796): linuxdeploy resolves the dependencies
+          # of every ELF inside the resources, and sharp's musl libvips
+          # builds (bundled by npm on Linux) need libc.musl-x86_64.so.1,
+          # which no glibc system provides. That is fixed —
+          # prepare-desktop.mjs drops the musl packages at staging time and a
+          # full AppImage bundles cleanly again (verified end to end).
+          # What is NOT yet verified is the packaged app on real Linux
+          # desktops: on an NVIDIA + sway session GTK's Wayland backend dies
+          # with `Error 71 dispatching to Wayland display` (X11 works fine;
+          # the unpackaged binary crashes identically, so it is upstream
+          # webkit2gtk/GTK, not our bundling). Re-enable once the AppImage
+          # has passed smoke tests on a couple of standard distros.
           # - runner: ubuntu-24.04
           #   platform: linux
           #   target: x86_64-unknown-linux-gnu
@@ -122,14 +129,6 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             librsvg2-dev
-          # ubuntu-24.04 system libs carry .relr.dyn ELF sections that the
-          # strip linuxdeploy invokes does not understand (tauri#14796:
-          # "unknown type [0x13] section .relr.dyn" -> "failed to run
-          # linuxdeploy"). NO_STRIP is the documented workaround, but it did
-          # NOT make the AppImage bundle pass (run #19 failed the same way) —
-          # which is why the Linux matrix entry is commented out above. Kept
-          # here for when Linux is re-enabled.
-          echo "NO_STRIP=true" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: npm ci
@@ -173,7 +172,7 @@ jobs:
 
             - Windows: download `*_x64-setup.exe` and run it.
             - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
-            - Linux: temporarily unavailable — the AppImage bundling step fails on our CI runner (tauri-apps/tauri#14796). The previous `.deb` release (v0.6.501) remains available; Linux will return once bundling is fixed.
+            - Linux: temporarily unavailable — AppImage bundling is fixed (sharp's musl libvips was the real cause), but the packaged app needs smoke tests on real Linux desktops before shipping again.
 
             On first launch, enter the service address and API key. Later changes: Settings → General → Service.
           releaseDraft: true

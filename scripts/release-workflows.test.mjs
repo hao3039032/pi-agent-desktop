@@ -234,6 +234,19 @@ test("desktop staging ships node-pty native prebuilds with executable helpers", 
   assert.match(prepareSource, /chmod\(join\(ptyDestination, "prebuilds", variant, "spawn-helper"\), 0o755\)/);
 });
 
+test("desktop staging drops sharp's musl native builds for Linux bundles", async () => {
+  const prepareSource = await readFile(new URL("./prepare-desktop.mjs", import.meta.url), "utf8");
+  // npm installs sharp's glibc and musl libvips variants on Linux. The musl
+  // .so files need libc.musl-x86_64.so.1, which no glibc system provides, so
+  // linuxdeploy (the AppImage bundler's dependency walker) fails with
+  // "Could not find dependency: libc.musl-x86_64.so.1" — the opaque
+  // "failed to run linuxdeploy" that killed the Linux release from v0.6.504
+  // (misdiagnosed as the .relr.dyn/strip issue tauri#14796). Staging must
+  // delete the linuxmusl packages when targeting linux-gnu.
+  assert.match(prepareSource, /endsWith\("-unknown-linux-gnu"\)/);
+  assert.match(prepareSource, /entry\.name\.includes\("linuxmusl"\)/);
+});
+
 test("every workflow step that compiles the app embeds the updater public key", async () => {
   // lib.rs registers tauri-plugin-updater only when option_env! sees
   // PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY while the Rust code compiles; the
