@@ -45,10 +45,10 @@
       "disposition": "accepted"
     },
     "components/FileExplorer.tsx": {
-      "risk": "low",
-      "drift": 19,
+      "risk": "medium",
+      "drift": 62,
       "reason": "Took upstream FileExplorer wholesale in the v0.8.11 merge (its file-search implementation won); only the selectedFilePath prop remains fork-side. Kept deliberately.",
-      "structuralDrift": 19,
+      "structuralDrift": 35,
       "disposition": "accepted"
     },
     "components/TabBar.tsx": {
@@ -234,6 +234,7 @@
     "2026-09-26 \u2014 settings: the standalone AppSettings modal and its \"Desktop\" tab were folded into the General tab, which already rendered the same language and theme pickers. The product blurb and Version & Updates now sit at the top of General (components/AppUpdatesSection.tsx); the desktop-only window/tray switches live in components/desktop/DesktopAppSection.tsx (renders nothing in a browser), and the custom-stylesheet and diff-display controls joined General's appearance/chat sections. Seven appSettings.* locale keys went dead with the duplicate pickers and were dropped from all three locales. components/AppSettings.tsx deleted.",
     "2026-09-26 \u2014 components/ChatWindow.tsx: the empty-session branding header upstream renders above the composer (app icon + product name + version badge) is removed entirely rather than rebranded; the row now carries only NewSessionUpdateLink, which self-hides, so the row keeps no margin of its own. This is a deletion, not a move, so it needed a new sentinel direction: FORK_FEATURES entries gained `forbiddenMarkers` in components/fork-extractions.test.mjs, pinning apple-touch-icon and PRODUCT_NAME out of ChatWindow.tsx. A merge that re-adopts upstream's empty state now fails that test instead of silently restoring the branding.",
     "2026-09-26 \u2014 app/globals.css and app/settings.css restored to byte-identical with upstream 96966e5: ~470 + ~220 fork lines that had accumulated in them despite the rule moved to a 'fork base layer' at the top of app/native-theme.css (cascade verified unchanged by a computed-style comparison). scripts/upstream-css-baseline.test.mjs now pins both files to hashes in scripts/upstream-css-baseline.json; the sync workflow refreshes them after a merge with `node scripts/upstream-css-baseline.mjs update`, which refuses when either file differs from upstream. Design intent recorded in docs/native-theme.md.",
-    "2026-10-04 \u2014 baseline moved 96966e5 -> 6fcd7d4. Segment G (c5a70eb) was a single-parent commit, so git never recorded 6fcd7d4 as merged: merge-base stayed at 96966e5, `npm run drift` reported structural 18077 instead of 9959, and a merge of the upstream tag would have replayed the whole range (39 conflicts in a dry run). An `-s ours` merge now records the ancestry without touching the tree. Risk levels re-measured: lib/file-access.ts low->medium, lib/directory-browser.ts and components/FileExplorer.tsx medium->low; components/FileIcons.tsx no longer differs from upstream and its entry is removed."
+    "2026-10-04 \u2014 baseline moved 96966e5 -> 6fcd7d4. Segment G (c5a70eb) was a single-parent commit, so git never recorded 6fcd7d4 as merged: merge-base stayed at 96966e5, `npm run drift` reported structural 18077 instead of 9959, and a merge of the upstream tag would have replayed the whole range (39 conflicts in a dry run). An `-s ours` merge now records the ancestry without touching the tree. Risk levels re-measured: lib/file-access.ts low->medium, lib/directory-browser.ts and components/FileExplorer.tsx medium->low; components/FileIcons.tsx no longer differs from upstream and its entry is removed.",
+    "2026-10-16 \u2014 segment H (35c06c5, 2026-10-15) merged abcwyc v0.7.1 (9519ce4). No pi-web commit newer than 6fcd7d4 (v0.10.0) appears in 9519ce4's ancestry, so the pi-web baseline stays at 6fcd7d4. Risk re-measured against it: components/FileExplorer.tsx low->medium \u2014 the file-tree error retry and preview polish in the upstream 0.6.5->0.7.1 range raised its structural drift to 35."
   ]
 }
