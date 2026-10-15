@@ -879,9 +879,13 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
   // directories insert their absolute path into the composer, images go
   // through the path-based attachment reader, and other files are copied
   // into the session cwd and @mentioned — same outcomes as the browser
-  // paths, minus the blob upload. Items a downstream route would refuse
-  // (too large, over a cap) degrade per item into the partial-failure
-  // notice instead of aborting the whole drop.
+  // paths, minus the blob upload. Images are rejected per item against
+  // the three attachment caps (per-file bytes, count, selection total)
+  // into the partial-failure notice. Imported files get no byte
+  // pre-filter (the route copies local disk to local disk); a selection
+  // over the 100-file cap is one whole-batch 400 from the server, caught
+  // into the error notice, while per-file copy errors degrade into the
+  // partial-failure notice.
   const handleDesktopDropPaths = useCallback((paths: string[]) => {
     if (dropBusyRef.current) return;
     dropBusyRef.current = true;
