@@ -61,13 +61,10 @@ test("dropped directories insert their absolute paths into the composer", () => 
 });
 
 test("mixed desktop drops degrade per item instead of aborting", () => {
-  // Oversized images/files, the attachment-count overflow, the image
-  // selection total and the import batch total are rejected per item into
-  // the partial-failure notice rather than being sent to a route that
+  // Oversized images and the attachment-count overflow are rejected per item
+  // into the partial-failure notice rather than being sent to a route that
   // throws and losing the drop.
   assert.match(chatWindowSource, /MAX_ATTACHED_IMAGE_BYTES \/ \(1024 \* 1024\)/);
-  assert.match(chatWindowSource, /PROJECT_UPLOAD_MAX_FILE_BYTES \/ \(1024 \* 1024\)/);
-  assert.match(chatWindowSource, /importTotalBytes \+ size > PROJECT_UPLOAD_MAX_TOTAL_BYTES/);
   assert.match(chatWindowSource, /at most \$\{MAX_ATTACHED_IMAGES\} images can be attached/);
   // The reader 413s a whole selection over the shared total, so the drop
   // pre-filter mirrors it per item instead of losing every image to one
@@ -80,6 +77,11 @@ test("mixed desktop drops degrade per item instead of aborting", () => {
     chatWindowSource,
     /selected images must total \$\{MAX_ATTACHED_IMAGE_SELECTION_BYTES \/ \(1024 \* 1024\)\}MB or less/,
   );
+  // Imported files are copied by local path (desktop token, disk-to-disk),
+  // so the browser upload's 25MB/100MB caps must NOT be pre-filtered here —
+  // a merge must not bring them back to the desktop path.
+  assert.doesNotMatch(chatWindowSource, /PROJECT_UPLOAD_MAX/);
+  assert.doesNotMatch(chatWindowSource, /importTotalBytes/);
   // Duplicate basenames keep the last occurrence, like the browser path.
   assert.match(chatWindowSource, /importsByName\.set\(getFileName\(item\.path\) \|\| item\.path, item\)/);
   // An image read failure is contained so the import/unsupported steps run.

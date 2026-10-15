@@ -52,10 +52,6 @@ import {
   readDesktopImageAttachments,
   type DesktopDropPathInfo,
 } from "@/lib/desktop-native";
-import {
-  PROJECT_UPLOAD_MAX_FILE_BYTES,
-  PROJECT_UPLOAD_MAX_TOTAL_BYTES,
-} from "@/lib/project-file-upload-client";
 import { isTauriDesktop } from "@/lib/desktop-updater";
 import { isImeComposing } from "@/lib/ime";
 import { assignMessageKeys, createMessageKeyTracker } from "@/lib/message-keys";
@@ -927,25 +923,14 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
           imageTotalBytes += item.size ?? 0;
         }
 
-        // Other files are copied into the cwd by path; the import route 413s
-        // over its per-file and batch byte caps, so they are checked here
-        // with a running total, like the browser path's rejected entries.
+        // Other files are copied into the cwd by path. No byte caps here:
+        // the import route copies local disk to local disk (no HTTP body),
+        // so the 25MB/100MB limits of the browser's multipart upload do not
+        // apply — only the file-count cap and per-item copy errors remain.
         const acceptedImports: DesktopDropPathInfo[] = [];
-        let importTotalBytes = 0;
         for (const item of items) {
           if (item.kind !== "file" || item.imageMime) continue;
-          const name = getFileName(item.path) || item.path;
-          const size = item.size ?? 0;
-          if (size > PROJECT_UPLOAD_MAX_FILE_BYTES) {
-            rejected.push({ name, reason: `larger than ${PROJECT_UPLOAD_MAX_FILE_BYTES / (1024 * 1024)}MB` });
-            continue;
-          }
-          if (importTotalBytes + size > PROJECT_UPLOAD_MAX_TOTAL_BYTES) {
-            rejected.push({ name, reason: "upload total would exceed 100MB" });
-            continue;
-          }
           acceptedImports.push(item);
-          importTotalBytes += size;
         }
         // Deduplicate by basename — keep the last occurrence, like the
         // browser path: the import route computes conflicts before copying,
