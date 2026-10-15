@@ -1,6 +1,6 @@
 cask "pi-agent" do
-  version "0.6.4"
-  sha256 "9ade7d801c95faeae37547e1674731e5431fd1ea2391749594fdd3c7b0a1950e"
+  version "0.7.0"
+  sha256 "5f7e9c1031805dda495e0e8b7ed88b77701f2dd349bf74579e832362e18df233"
 
   url "https://github.com/abcwyc/pi-agent-desktop/releases/download/v#{version}/Pi.Agent_#{version}_aarch64.dmg"
   name "Pi Agent"
@@ -15,7 +15,9 @@ cask "pi-agent" do
   # The app upgrades itself from Settings with signed updater builds.
   auto_updates true
   depends_on arch: :arm64
-  depends_on macos: ">= :big_sur"
+  # The app builds against macOS 11 (Tauri `minimumSystemVersion`), which is also
+  # Homebrew's own floor, so a bare `depends_on :macos` is the whole requirement.
+  depends_on :macos
 
   app "Pi Agent.app"
 

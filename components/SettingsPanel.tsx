@@ -31,7 +31,6 @@ import {
   setThinkingExpandedByDefault,
 } from "@/lib/thinking-expansion-preference";
 import { ModelsConfig } from "./ModelsConfig";
-import { setupPushSubscription } from "@/lib/push-client";
 import { SkillsConfig } from "./SkillsConfig";
 import { AgentsConfig } from "./AgentsConfig";
 import { PluginsConfig } from "./PluginsConfig";
@@ -40,6 +39,7 @@ import { DesktopAppSection } from "./desktop";
 import { McpConfig } from "./McpConfig";
 import { DistroSettingsSection } from "./distro";
 import { ConfigButton, ConfigSwitch } from "./SettingsUi";
+import { ArtifactsSettingRow } from "./ArtifactsSettingRow";
 
 interface Props {
   cwd: string | null;
@@ -99,8 +99,6 @@ function GeneralSettings({
   const [shellSaving, setShellSaving] = useState(false);
   const [shellError, setShellError] = useState<string | null>(null);
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
-  const [pushRegistering, setPushRegistering] = useState(false);
-  const [pushStatus, setPushStatus] = useState<{ kind: "ok" | "error"; message: string } | null>(null);
   const [webAuthEnabled, setWebAuthEnabled] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState("");
@@ -166,28 +164,6 @@ function GeneralSettings({
     }
   };
 
-  const registerPush = async () => {
-    if (pushRegistering) return;
-    setPushRegistering(true);
-    setPushStatus(null);
-    try {
-      if (typeof window === "undefined" || !("Notification" in window)) {
-        throw new Error("unsupported or not permitted");
-      }
-      const permission = Notification.permission === "default"
-        ? await Notification.requestPermission()
-        : Notification.permission;
-      if (permission !== "granted") throw new Error("unsupported or not permitted");
-      const ok = await setupPushSubscription(locale);
-      if (!ok) throw new Error("unsupported or not permitted");
-      setPushStatus({ kind: "ok", message: t("settings.pushRegistered") });
-    } catch (cause) {
-      setPushStatus({ kind: "error", message: `${t("settings.pushRegisterFailed")} ${cause instanceof Error ? cause.message : String(cause)}` });
-    } finally {
-      setPushRegistering(false);
-    }
-  };
-
   const openCustomCss = async () => {
     setCustomCssBusy(true);
     setCustomCssError(null);
@@ -214,56 +190,35 @@ function GeneralSettings({
         <p className="settings-general-tagline">{t("appSettings.taglineDetails")}</p>
       </div>
 
-      <AppUpdatesSection onBusyChange={onBusyChange} />
-
       <DistroSettingsSection />
 
       <div className="settings-general-columns">
         <div className="settings-general-col">
+          <AppUpdatesSection onBusyChange={onBusyChange} />
+
           <section className="settings-general-section">
-            <h3 className="settings-general-heading">{t("settings.appearance")}</h3>
-            <div role="radiogroup" aria-label={t("settings.appearance")} className="settings-theme-options">
-              {THEME_OPTIONS.map((option) => {
-                const selected = preference === option.id;
+            <h3 className="settings-general-heading">{t("common.language")}</h3>
+            <div role="radiogroup" aria-label={t("common.language")} className="settings-language-options">
+              {supportedLocales.map((plugin) => {
+                const selected = locale === plugin.id;
                 return (
-                  <label
-                    key={option.id}
-                    className="settings-theme-option"
+                  <button
+                    key={plugin.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    onClick={() => setLocale(plugin.id as typeof locale)}
+                    className="settings-language-option"
                   >
-                    <input
-                      type="radio"
-                      name="theme"
-                      value={option.id}
-                      checked={selected}
-                      onChange={() => setThemePreference(option.id)}
-                      className="sr-only"
-                    />
-                    <ThemeIcon preference={option.id} />
-                    <span className="settings-theme-option-label">{t(option.label)}</span>
-                  </label>
+                    <span className="settings-language-radio">
+                      {selected && <span className="settings-language-radio-dot" />}
+                    </span>
+                    <span className="settings-language-label">{plugin.label}</span>
+                    <span className="settings-language-code">{plugin.id}</span>
+                  </button>
                 );
               })}
             </div>
-            <div className="settings-option-list">
-              <div className="settings-option">
-                <span className="settings-option-text">
-                  <span className="settings-option-title">{t("appSettings.customCss")}</span>
-                  <span className="settings-option-hint">{t("appSettings.customCssHint")}</span>
-                </span>
-                {desktop && (
-                  <ConfigButton
-                    variant="secondary"
-                    size="small"
-                    className="settings-option-action"
-                    disabled={customCssBusy}
-                    onClick={() => void openCustomCss()}
-                  >
-                    {customCssBusy ? t("appSettings.customCssOpening") : t("appSettings.customCssOpen")}
-                  </ConfigButton>
-                )}
-              </div>
-            </div>
-            {customCssError && <p role="alert" className="settings-general-error">{customCssError}</p>}
           </section>
 
           <section className="settings-general-section">
@@ -344,6 +299,7 @@ function GeneralSettings({
                   onChange={onQuoteSelectionChange}
                 />
               </div>
+              <ArtifactsSettingRow />
               <div className="settings-chat-option settings-chat-switch-option" role="radiogroup" aria-label={t("settings.enterSendMode")}>
                 <span>{t("settings.enterSendMode")}</span>
                 <div className="settings-send-mode-options">
@@ -396,6 +352,56 @@ function GeneralSettings({
               </div>
             </div>
           </section>
+        </div>
+
+        <div className="settings-general-col">
+          <section className="settings-general-section">
+            <h3 className="settings-general-heading">{t("settings.appearance")}</h3>
+            <div role="radiogroup" aria-label={t("settings.appearance")} className="settings-theme-options">
+              {THEME_OPTIONS.map((option) => {
+                const selected = preference === option.id;
+                return (
+                  <label
+                    key={option.id}
+                    className="settings-theme-option"
+                  >
+                    <input
+                      type="radio"
+                      name="theme"
+                      value={option.id}
+                      checked={selected}
+                      onChange={() => setThemePreference(option.id)}
+                      className="sr-only"
+                    />
+                    <ThemeIcon preference={option.id} />
+                    <span className="settings-theme-option-label">{t(option.label)}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <div className="settings-option-list">
+              <div className="settings-option">
+                <span className="settings-option-text">
+                  <span className="settings-option-title">{t("appSettings.customCss")}</span>
+                  <span className="settings-option-hint">{t("appSettings.customCssHint")}</span>
+                </span>
+                {desktop && (
+                  <ConfigButton
+                    variant="secondary"
+                    size="small"
+                    className="settings-option-action"
+                    disabled={customCssBusy}
+                    onClick={() => void openCustomCss()}
+                  >
+                    {customCssBusy ? t("appSettings.customCssOpening") : t("appSettings.customCssOpen")}
+                  </ConfigButton>
+                )}
+              </div>
+            </div>
+            {customCssError && <p role="alert" className="settings-general-error">{customCssError}</p>}
+          </section>
+
+          <DesktopAppSection />
 
           {shellSettings?.isWindows && (
             <section className="settings-general-section">
@@ -413,60 +419,6 @@ function GeneralSettings({
               {shellError && <p role="alert" className="settings-general-error">{shellError}</p>}
             </section>
           )}
-        </div>
-
-        <div className="settings-general-col">
-          <section className="settings-general-section">
-            <h3 className="settings-general-heading">{t("settings.pushPermission")}</h3>
-            <p className="settings-general-description">{t("settings.pushPermissionDescription")}</p>
-            <div className="settings-shell-option">
-              <span>{t("settings.pushPermission")}</span>
-              <button
-                type="button"
-                className="config-button config-button-small config-button-secondary"
-                disabled={pushRegistering}
-                onClick={() => void registerPush()}
-              >
-                {pushRegistering ? t("settings.pushRegisterLoading") : t("settings.pushRegister")}
-              </button>
-            </div>
-            {pushStatus && (
-              <p
-                role="status"
-                className="settings-general-error"
-                style={pushStatus.kind === "ok" ? { color: "var(--accent)" } : undefined}
-              >
-                {pushStatus.message}
-              </p>
-            )}
-          </section>
-
-          <section className="settings-general-section">
-            <h3 className="settings-general-heading">{t("common.language")}</h3>
-            <div role="radiogroup" aria-label={t("common.language")} className="settings-language-options">
-              {supportedLocales.map((plugin) => {
-                const selected = locale === plugin.id;
-                return (
-                  <button
-                    key={plugin.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
-                    onClick={() => setLocale(plugin.id as typeof locale)}
-                    className="settings-language-option"
-                  >
-                    <span className="settings-language-radio">
-                      {selected && <span className="settings-language-radio-dot" />}
-                    </span>
-                    <span className="settings-language-label">{plugin.label}</span>
-                    <span className="settings-language-code">{plugin.id}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-
-          <DesktopAppSection />
 
           {webAuthEnabled && (
             <section className="settings-general-section">

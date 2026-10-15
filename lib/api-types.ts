@@ -340,7 +340,10 @@ export interface McpTestResult {
   /** At most `MCP_TEST_MAX_TOOLS`, in the server's order; `toolCount` counts all of them. */
   tools: McpTestTool[];
   toolCount: number;
-  /** Present when a connected server declared the resources capability, as `pi mcp list --json` reports it. */
+  /**
+   * Present when the server offers resources. Not a count: pi lists them on
+   * demand since 1.2.0, because listing every resource can take long.
+   */
   resources?: true;
   serverInfo?: { name: string; version: string; title?: string };
   /** The folder a stdio server ran in. */

@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 5,
+  "revision": 1,
   "app": {
     "productName": "Pi Agent LW",
     "identifier": "com.hao3039032.pi-agent-lw",
@@ -176,7 +176,10 @@
       "breakGlassEnabled": true,
       "failureMode": "deny",
       "grantTtlMs": 60000,
-      "autoConfirmBoundedAllows": ["external_directory", "path"],
+      "autoConfirmBoundedAllows": [
+        "external_directory",
+        "path"
+      ],
       "policyAudit": {
         "enabled": true,
         "retentionDays": 180
@@ -194,11 +197,17 @@
         "deny": "4",
         "denyWithReason": "5"
       },
-      "promptNotifications": ["bell"],
+      "promptNotifications": [
+        "bell"
+      ],
       "promptTimeoutMs": 120000,
-      "authorizerChain": ["pi-auto-review"],
+      "authorizerChain": [
+        "pi-auto-review"
+      ],
       "shellTools": {
-        "powershell": { "commandArgument": "command" }
+        "powershell": {
+          "commandArgument": "command"
+        }
       },
       "permission": {
         "*": "ask",

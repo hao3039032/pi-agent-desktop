@@ -106,6 +106,13 @@ export interface McpTool {
   _meta?: Record<string, unknown>;
 }
 
+/** pi-mcp's `ContentAnnotations`. */
+export interface McpContentAnnotations {
+  audience?: ("user" | "assistant")[];
+  priority?: number;
+  lastModified?: string;
+}
+
 /** pi-mcp's `OAuthChallenge`, parsed from a server's `WWW-Authenticate` header. */
 export interface McpOAuthChallenge {
   resourceMetadataUrl?: URL;
@@ -152,7 +159,7 @@ export interface McpServerConnection {
   state: McpServerState;
   error: string | undefined;
   tools: McpTool[];
-  /** Whether the server declared the resources capability; SDK 1.2.0 no longer lists the resources themselves. */
+  /** Whether the server offers resources. Since pi 1.2.0 they are listed on demand, never at connect. */
   hasResources: boolean;
   /** Server instructions from `initialize`. */
   instructions: string | undefined;

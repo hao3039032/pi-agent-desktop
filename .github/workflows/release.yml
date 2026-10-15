@@ -103,45 +103,35 @@ jobs:
           tagName: v__VERSION__
           releaseName: pi-agent-desktop v__VERSION__
           releaseBody: |
-            ## Pi Agent Desktop 0.6.5
+            ## Pi Agent Desktop 0.7.1
 
-            A cleaner, more Mac-like look, and a Homebrew install option.
-
-            ### Changed
-
-            - The sidebar, fonts and focus rings follow macOS conventions more closely.
-            - **Appearance** now offers **Light**, **Dark** and **System**. The Mist, Rose and Pine themes are removed; a saved choice of one of them falls back to System.
+            Fixes on top of 0.7.0.
 
             ### Fixed
 
-            - In dark mode, the steering / follow-up delivery buttons and the sub-agent steer button had near-white text on a near-white background. They now use the proper contrast color.
+            - A message no longer flashes right after you send it, in a new chat or an existing one.
+            - Inline preview error messages follow the app language (English, 简体中文, 繁體中文).
+            - The preview download button reads **Download** like the other preview actions, with the file name in its tooltip.
+            - A renamed artifact updates its side-panel tab title.
+            - When the file tree fails to load it shows a themed error with **Retry** again.
 
-            ### Good to know
-
-            - On Apple Silicon Macs you can now install with Homebrew. See the README for the command.
-
-            Bundled components: pi 1.1.0, pi-web 0.10.0.
+            Bundled components: pi 1.2.0, pi-web 0.10.0.
 
             ---
 
-            ## Pi Agent Desktop 0.6.5
+            ## Pi Agent Desktop 0.7.1
 
-            界面更干净、更接近 Mac 原生风格，并新增 Homebrew 安装方式。
-
-            ### 变更
-
-            - 侧边栏、字体和焦点样式更贴近 macOS 习惯。
-            - **外观**现在只有**浅色**、**深色**和**跟随系统**。移除了 Mist、Rose 和 Pine 主题；之前选了这些主题的会自动回到跟随系统。
+            0.7.0 的问题修复版本。
 
             ### 修复
 
-            - 深色模式下，引导 / 追加消息的投递按钮和子代理的引导按钮是近白色文字叠在近白色背景上，现在改用正确的对比色。
+            - 发送消息后不再闪烁，新对话和已有对话均是如此。
+            - 内联预览的错误提示跟随应用语言（English、简体中文、繁體中文）。
+            - 预览的下载按钮改为与其他操作一致的**下载**文字按钮，悬停显示文件名。
+            - Artifact 重命名后，侧边面板标签标题同步更新。
+            - 文件树加载失败时重新显示带**重试**的主题化错误提示。
 
-            ### 需要了解
-
-            - Apple Silicon Mac 上现在可以用 Homebrew 安装，命令见 README。
-
-            内置组件版本：pi 1.1.0、pi-web 0.10.0。
+            内置组件版本：pi 1.2.0、pi-web 0.10.0。
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true

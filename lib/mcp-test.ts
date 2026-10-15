@@ -470,7 +470,9 @@ export async function observeTestConnection(
     toolCount: tools.length,
     durationMs,
     ...cwd,
-    ...(state === "connected" && connection.hasResources ? { resources: true } : {}),
+    ...(state === "connected" && connection.hasResources
+      ? { resources: true as const }
+      : {}),
     ...(client?.serverInfo ? { serverInfo: describeServerInfo(client.serverInfo, redact) } : {}),
   };
   if (state === "failed") {

@@ -26,6 +26,7 @@
   },
   "files": [
     "bin",
+    "lib/browser-open.js",
     ".next",
     "!.next/cache",
     "!.next/dev",
@@ -36,6 +37,7 @@
   ],
   "scripts": {
     "dev": "next dev -H 127.0.0.1 -p 30141",
+    "web": "node scripts/web-dev.mjs",
     "dev:lan": "node bin/network-exposure-warning.js 0.0.0.0 && next dev -H 0.0.0.0 -p 30141",
     "build": "next build --webpack",
     "start": "next start -H 127.0.0.1 -p 30141",
@@ -49,6 +51,7 @@
     "release:manifest": "node scripts/write-component-versions.mjs",
     "release:verify": "node scripts/verify-release-components.mjs",
     "drift": "node scripts/measure-fork-drift.mjs",
+    "preview-runtime": "node scripts/build-preview-runtime.mjs",
     "desktop:verify": "node scripts/verify-packaged-codemode.mjs",
     "test:release-tools": "node --test scripts/*.test.mjs",
     "test": "node --experimental-strip-types --test 'app/**/*.test.mjs' 'lib/**/*.test.mjs' 'scripts/**/*.test.mjs' 'components/**/*.test.mjs' 'hooks/**/*.test.mjs' 'public/**/*.test.mjs'",
@@ -60,11 +63,12 @@
     "test:e2e": "node e2e/run.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^1.1.0",
-    "@earendil-works/pi-ai": "^1.1.0",
+    "@earendil-works/pi-agent-core": "^1.2.0",
+    "@earendil-works/pi-ai": "^1.2.0",
     "@earendil-works/pi-coding-agent": "^1.2.0",
-    "@earendil-works/pi-tui": "^1.1.0",
+    "@earendil-works/pi-tui": "^1.2.0",
     "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/plugin-autostart": "^2.7.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.4.1",
     "@tauri-apps/plugin-dialog": "^2.8.1",
     "@tauri-apps/plugin-notification": "^2.5.1",
@@ -74,6 +78,7 @@
     "@xterm/xterm": "6.0.0",
     "croner": "^10.0.1",
     "js-yaml": "^5.4.2",
+    "mammoth": "^1.12.0",
     "next": "16.3.8",
     "node-pty": "1.2.0-beta.15",
     "proper-lockfile": "4.1.2",
@@ -84,6 +89,7 @@
     "web-push": "^3.6.7"
   },
   "devDependencies": {
+    "@tailwindcss/browser": "4.2.2",
     "@tailwindcss/postcss": "^4.2.2",
     "@tauri-apps/cli": "^2.12.1",
     "@types/js-yaml": "^4.0.9",
@@ -96,11 +102,11 @@
     "@types/semver": "7.8.0",
     "@types/web-push": "^3.6.4",
     "ansi_up": "^6.0.6",
+    "esbuild": "0.28.2",
     "eslint": "^9",
     "eslint-config-next": "16.3.8",
     "jiti": "^2.7.0",
-    "katex": "^0.16.47",
-    "mammoth": "^1.12.0",
+    "katex": "^0.19.0",
     "mermaid": "^11.16.1",
     "playwright": "^1.62.1",
     "postcss": "^8.5.26",
@@ -112,7 +118,11 @@
     "remark-frontmatter": "^5.0.0",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
+    "sucrase": "3.35.0",
     "tailwindcss": "^4.2.2",
     "typescript": "^5"
+  },
+  "overrides": {
+    "katex": "$katex"
   }
 }

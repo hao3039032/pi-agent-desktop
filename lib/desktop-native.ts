@@ -162,6 +162,13 @@ export async function openPathNative(path: string): Promise<void> {
   await invoke("open_path", { path });
 }
 
+/** Open the app log folder (desktop.log, server.log) in the file manager. */
+export async function openLogDirNative(): Promise<void> {
+  if (!isTauriDesktop()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_log_dir");
+}
+
 /** Reveal a local path in Finder / Explorer / file manager. */
 export async function revealItemInDirNative(path: string): Promise<void> {
   if (!isTauriDesktop()) {
@@ -397,10 +404,31 @@ export async function setCloseQuitsNative(quit: boolean): Promise<void> {
   await invoke("set_close_quits", { quit });
 }
 
+/** Whether the OS currently launches Pi Agent at login (false in a browser). */
+export async function isAutostartEnabledNative(): Promise<boolean> {
+  if (!isTauriDesktop()) return false;
+  const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+  return isEnabled();
+}
+
+/** Add or remove the OS launch-at-login entry; rejects if the OS refuses. */
+export async function setAutostartNative(enabled: boolean): Promise<void> {
+  if (!isTauriDesktop()) return;
+  const { enable, disable } = await import("@tauri-apps/plugin-autostart");
+  await (enabled ? enable() : disable());
+}
+
 export async function quitAppNative(): Promise<void> {
   if (!isTauriDesktop()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("quit_app");
+}
+
+/** Clear the webview's disk caches; resolves to the bytes freed (0 in a browser). */
+export async function clearAppCacheNative(): Promise<number> {
+  if (!isTauriDesktop()) return 0;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("clear_app_cache");
 }
 
 export async function showMainWindowNative(): Promise<void> {

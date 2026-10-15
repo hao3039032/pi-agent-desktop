@@ -1705,7 +1705,9 @@ function McpTestStatusLines({ status }: { status: McpServerStatus & { origin: "t
           {t("mcp.test.serverInfo", { name: revealHiddenCharacters(info.title ?? info.name), version: revealHiddenCharacters(info.version) })}
         </span>
       )}
-      {status.resources !== undefined && <span className="mcp-config-line is-dim">{t("mcp.test.resources")}</span>}
+      {status.resources && (
+        <span className="mcp-config-line is-dim">{t("mcp.test.resources")}</span>
+      )}
       {status.cwd !== undefined && <span className="mcp-config-line is-dim">{t("mcp.test.ranIn", { path: displayPath(status.cwd) })}</span>}
       {status.queuedMs !== undefined && status.queuedMs >= 500 && (
         <span className="mcp-config-line is-dim">{t("mcp.test.queued", { seconds: mcpSeconds(status.queuedMs) })}</span>

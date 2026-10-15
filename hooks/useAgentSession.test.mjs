@@ -184,7 +184,7 @@ test("only the session-mount load probes disk for external appends", () => {
   assert.match(loadSessionSource, /options\?: \{ force\?: boolean \}/);
   assert.match(loadSessionSource, /if \(options\?\.force\) params\.set\("force", "1"\)/);
   assert.match(loadSessionSource, /d\.wrapperRebuilt[\s\S]*?eventConnectionRef\.current\?\.close\(\)[\s\S]*?maintain\(sid\)/);
-  assert.match(mountSource, /loadSession\(session\.id, !cached, true, \{ force: true \}\)/);
+  assert.match(mountSource, /loadSession\(session\.id, !cached && !promoted, true, \{ force: true \}\)/);
   assert.match(source, /await loadSession\(sid\)/);
   assert.equal([...source.matchAll(/\{ force: true \}/g)].length, 1);
 });

@@ -1213,7 +1213,7 @@ test("a connected test shows what it listed, and the row reads connected", () =>
   const { value, text: shown } = connection(html);
   assert.match(value, /<span class="mcp-config-state is-on">Connected<\/span> 3 tool\(s\) listed in 0\.4 s, tested at [^.]+\./);
   assert.match(shown, /Server: docs-server 2\.1\.0/);
-  assert.match(shown, /Offers resources\./);
+  assert.match(shown, /Offers resources, listed when a session reads them\./);
   assert.doesNotMatch(shown, /Ran in/, "an HTTP server runs in no folder");
   // The Connection row right under it says what the test found; the Status row adds no sentence.
   assert.match(text(markup), /Status Connected when tested Connection Connected/);
