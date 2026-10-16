@@ -63,11 +63,15 @@ export interface ReconcileResult {
 }
 /**
  * For each seed package:
- * - an existing entry for the same package (npm/git source, an older bundle
- *   path, or a previous install location) is rewritten in place, keeping the
- *   user's per-package filters; duplicates are dropped;
+ * - an entry we previously wrote (this bundle's path, a prior install's
+ *   path recorded in our state, or any install's seed copy) is rewritten in
+ *   place to the current bundle path, keeping the user's per-package
+ *   filters; duplicates are dropped;
  * - a package the user removed after we added it stays removed;
- * - otherwise the bundled path is appended.
+ * - a package the user installed themselves in any other form (npm:/git:
+ *   source, versioned spec, or their own local path) is left untouched —
+ *   their install wins and no duplicate is appended;
+ * - otherwise the bundled path is appended (fresh machine, no entry at all).
  *
  * Entries we manage for packages that left the seed (dropped from the bundle)
  * are removed — after an app update the bundled copy no longer exists, and pi
@@ -82,24 +86,35 @@ export function reconcilePackages({ entries, seed, previous }: ReconcileInput): 
   for (const pkg of seed) {
     const key = packageKey(pkg.source);
     const previousPath = previous?.packages[pkg.source];
-    const matches = (entry: PackageEntry) => {
+    // Ownership: only entries the seeder itself wrote are managed. Canonical
+    // npm:/git: sources the user wrote are never adopted — silently pointing
+    // the user's config at bundle-local copies forks their install and breaks
+    // when the bundle moves or is deleted (e.g. dev trees cleaned mid-release).
+    const owned = (entry: PackageEntry) => {
       const source = entrySource(entry);
-      if (source === pkg.path || source === pkg.source) return true;
+      if (source === pkg.path) return true;
       if (previousPath && normalizePath(source) === normalizePath(previousPath)) return true;
-      if (isSeedCopy(source, pkg.relativePath)) return true;
-      return key !== null && packageKey(source) === key;
+      return isSeedCopy(source, pkg.relativePath);
+    };
+    // Presence in any form (versioned npm spec, git URL variant, or an
+    // unrelated local checkout) means the user already has this package, so
+    // seeding must not append a second copy next to theirs.
+    const present = (entry: PackageEntry) => {
+      const entryKey = key !== null ? packageKey(entrySource(entry)) : null;
+      return entryKey !== null && entryKey === key;
     };
 
-    const firstIndex = result.findIndex(matches);
+    const firstIndex = result.findIndex(owned);
     if (firstIndex === -1) {
       if (previousPath !== undefined) continue; // removed by the user — respect it
+      if (result.some(present)) continue;       // installed by the user — respect it
       result.push(pkg.path);
       managed.packages[pkg.source] = pkg.path;
       continue;
     }
 
-    result = result.filter((entry, index) => index === firstIndex || !matches(entry));
-    const index = result.findIndex(matches);
+    result = result.filter((entry, index) => index === firstIndex || !owned(entry));
+    const index = result.findIndex(owned);
     result[index] = withSource(result[index], pkg.path);
     managed.packages[pkg.source] = pkg.path;
   }
