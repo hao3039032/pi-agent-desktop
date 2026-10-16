@@ -33,7 +33,7 @@ tauri-plugin-window-state = "^2"
 # NSVisualEffectView behind the (transparent) webview: the sidebar material.
 window-vibrancy = "0.8"
 # Re-applies the traffic-light inset after AppKit's own title-bar layout
-# (`refresh_traffic_lights` in src/lib.rs). Same versions window-vibrancy
+# (`refresh_traffic_lights` in src/shell/window_appkit.rs). Same versions window-vibrancy
 # already pulls in.
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSString"] }

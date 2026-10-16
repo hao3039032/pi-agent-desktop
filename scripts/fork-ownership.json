@@ -45,10 +45,10 @@
       "disposition": "accepted"
     },
     "components/FileExplorer.tsx": {
-      "risk": "low",
-      "drift": 19,
+      "risk": "medium",
+      "drift": 62,
       "reason": "Took upstream FileExplorer wholesale in the v0.8.11 merge (its file-search implementation won); only the selectedFilePath prop remains fork-side. Kept deliberately.",
-      "structuralDrift": 19,
+      "structuralDrift": 35,
       "disposition": "accepted"
     },
     "components/TabBar.tsx": {
@@ -112,11 +112,74 @@
       "reason": "Adds ignores for the desktop build output directories.",
       "disposition": "accepted"
     },
+    "lib/subagent-extension.ts": {
+      "risk": "medium",
+      "drift": 68,
+      "structuralDrift": 68,
+      "disposition": "accepted",
+      "reason": "Fork precedence policy: preferPiSubagentsExtension detects loaded pi-subagents files and removes the built-in host plus resolved conflicts. Preserve package-first precedence and the detection flag when upstream changes extension registration; tool-name matching must not return."
+    },
+    "lib/subagent-runtime.ts": {
+      "risk": "medium",
+      "drift": 36,
+      "structuralDrift": 36,
+      "disposition": "accepted",
+      "reason": "Fork start/resume guard combines the process-wide detection flag with global package activation. Upstream lifecycle changes must retain this best-effort gate without blocking existing children from get/steer/notification paths."
+    },
+    "lib/subagent-settings.ts": {
+      "risk": "medium",
+      "drift": 43,
+      "structuralDrift": 43,
+      "disposition": "accepted",
+      "reason": "Fork package-activation reader and shared package identity support both the runtime guard and Agents panel. Preserve npm/versioned/local-path recognition and extensions: [] disable semantics when upstream changes settings persistence."
+    },
+    "components/AgentsConfig.tsx": {
+      "risk": "medium",
+      "drift": 55,
+      "structuralDrift": 51,
+      "disposition": "accepted",
+      "reason": "Fork pi-subagents notice disables the built-in switch and hides builtin profiles from both the sidebar and detail selection. Upstream form or selection changes can silently restore an orphaned builtin pane; retain visibleProfiles and settings-response wiring."
+    },
+    "app/api/subagents/settings/route.ts": {
+      "risk": "low",
+      "drift": 13,
+      "structuralDrift": 13,
+      "disposition": "accepted",
+      "reason": "Fork GET and PUT responses add legacyPackage from global package settings. Preserve both response paths when upstream changes the built-in settings API; the read does not activate extensions."
+    },
+    "lib/api-types.ts": {
+      "risk": "low",
+      "drift": 16,
+      "structuralDrift": 16,
+      "disposition": "accepted",
+      "reason": "Shared API types have drifted again since the earlier update-type extraction, including SubagentSettingsResponse.legacyPackage. Keep the field consistent with both settings route responses and AgentsConfig."
+    },
+    "lib/i18n/messages/en.ts": {
+      "risk": "high",
+      "drift": 488,
+      "structuralDrift": 488,
+      "disposition": "accepted",
+      "reason": "Accumulated fork UI translations, including the pi-subagents priority notice and reversed builtInDescription. Counts cover all current drift, not just this feature; upstream locale edits require review to retain fork keys and cross-locale parity."
+    },
+    "lib/i18n/messages/zh-CN.ts": {
+      "risk": "high",
+      "drift": 492,
+      "structuralDrift": 492,
+      "disposition": "accepted",
+      "reason": "Accumulated fork UI translations, including the pi-subagents priority notice and reversed builtInDescription. Counts cover all current drift, not just this feature; upstream locale edits require review to retain fork keys and cross-locale parity."
+    },
+    "lib/i18n/messages/zh-TW.ts": {
+      "risk": "high",
+      "drift": 480,
+      "structuralDrift": 480,
+      "disposition": "accepted",
+      "reason": "Accumulated fork UI translations, including the pi-subagents priority notice and reversed builtInDescription. Counts cover all current drift, not just this feature; upstream locale edits require review to retain fork keys and cross-locale parity."
+    },
     "lib/rpc-manager.ts": {
       "risk": "high",
-      "drift": 109,
-      "reason": "Small fork edit in a file upstream changes often; watch it despite the low drift count.",
-      "structuralDrift": 595,
+      "drift": 452,
+      "reason": "Upstream frequently changes session startup. Preserve the fork extension override composition and both subagent guard dependencies alongside the existing fork lifecycle wiring.",
+      "structuralDrift": 452,
       "disposition": "accepted"
     },
     "components/BranchNavigator.tsx": {
@@ -221,6 +284,7 @@
     "reduce": "Drift that can be removed without losing anything \u2014 desktop-only code that belongs in components/desktop/, or fork additions sitting in an upstream file that can move to a fork-owned one. Act on these."
   },
   "decisionLog": [
+    "2026-10-16 — Registered the pi-subagents precedence boundary from b6352fc: extension detection, runtime guard, settings reader, AgentsConfig selection, settings API/type, and all three locale files. Refreshed rpc-manager counts. Measurements use the unchanged pi-web baseline 6fcd7d4 and include accumulated drift, not merely this commit. These are accepted product-policy differences; medium/high incoming overlaps must request review even when git merges cleanly. No upstream implementation was moved across files; existing behavior tests plus per-file classifier regressions guard this boundary.",
     "2026-07-26 \u2014 lib/api-types.ts: fork update types moved to lib/app-update-types.ts; file now matches upstream and left the manifest.",
     "2026-07-26 \u2014 components/AppShell.tsx: desktop window chrome moved to components/desktop/ (-53 structural). The remaining 376 lines are the top-bar redesign; accepted.",
     "2026-07-26 \u2014 TabBar, FileExplorer, useTheme, FileViewer: assessed as generic improvements with zero desktop coupling. Upstreaming was declined, so accepted rather than reverted \u2014 reverting would delete working features to save CI review time.",
@@ -234,6 +298,7 @@
     "2026-09-26 \u2014 settings: the standalone AppSettings modal and its \"Desktop\" tab were folded into the General tab, which already rendered the same language and theme pickers. The product blurb and Version & Updates now sit at the top of General (components/AppUpdatesSection.tsx); the desktop-only window/tray switches live in components/desktop/DesktopAppSection.tsx (renders nothing in a browser), and the custom-stylesheet and diff-display controls joined General's appearance/chat sections. Seven appSettings.* locale keys went dead with the duplicate pickers and were dropped from all three locales. components/AppSettings.tsx deleted.",
     "2026-09-26 \u2014 components/ChatWindow.tsx: the empty-session branding header upstream renders above the composer (app icon + product name + version badge) is removed entirely rather than rebranded; the row now carries only NewSessionUpdateLink, which self-hides, so the row keeps no margin of its own. This is a deletion, not a move, so it needed a new sentinel direction: FORK_FEATURES entries gained `forbiddenMarkers` in components/fork-extractions.test.mjs, pinning apple-touch-icon and PRODUCT_NAME out of ChatWindow.tsx. A merge that re-adopts upstream's empty state now fails that test instead of silently restoring the branding.",
     "2026-09-26 \u2014 app/globals.css and app/settings.css restored to byte-identical with upstream 96966e5: ~470 + ~220 fork lines that had accumulated in them despite the rule moved to a 'fork base layer' at the top of app/native-theme.css (cascade verified unchanged by a computed-style comparison). scripts/upstream-css-baseline.test.mjs now pins both files to hashes in scripts/upstream-css-baseline.json; the sync workflow refreshes them after a merge with `node scripts/upstream-css-baseline.mjs update`, which refuses when either file differs from upstream. Design intent recorded in docs/native-theme.md.",
-    "2026-10-04 \u2014 baseline moved 96966e5 -> 6fcd7d4. Segment G (c5a70eb) was a single-parent commit, so git never recorded 6fcd7d4 as merged: merge-base stayed at 96966e5, `npm run drift` reported structural 18077 instead of 9959, and a merge of the upstream tag would have replayed the whole range (39 conflicts in a dry run). An `-s ours` merge now records the ancestry without touching the tree. Risk levels re-measured: lib/file-access.ts low->medium, lib/directory-browser.ts and components/FileExplorer.tsx medium->low; components/FileIcons.tsx no longer differs from upstream and its entry is removed."
+    "2026-10-04 \u2014 baseline moved 96966e5 -> 6fcd7d4. Segment G (c5a70eb) was a single-parent commit, so git never recorded 6fcd7d4 as merged: merge-base stayed at 96966e5, `npm run drift` reported structural 18077 instead of 9959, and a merge of the upstream tag would have replayed the whole range (39 conflicts in a dry run). An `-s ours` merge now records the ancestry without touching the tree. Risk levels re-measured: lib/file-access.ts low->medium, lib/directory-browser.ts and components/FileExplorer.tsx medium->low; components/FileIcons.tsx no longer differs from upstream and its entry is removed.",
+    "2026-10-16 \u2014 segment H (35c06c5, 2026-10-15) merged abcwyc v0.7.1 (9519ce4). No pi-web commit newer than 6fcd7d4 (v0.10.0) appears in 9519ce4's ancestry, so the pi-web baseline stays at 6fcd7d4. Risk re-measured against it: components/FileExplorer.tsx low->medium \u2014 the file-tree error retry and preview polish in the upstream 0.6.5->0.7.1 range raised its structural drift to 35."
   ]
 }

@@ -5,14 +5,15 @@ import test from "node:test";
 const chatWindowSource = await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8");
 const useDragDropSource = await readFile(new URL("../hooks/useDragDrop.ts", import.meta.url), "utf8");
 const useDesktopDragDropSource = await readFile(new URL("../hooks/useDesktopDragDrop.ts", import.meta.url), "utf8");
-const libRsSource = await readFile(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+const windowSource = await readFile(new URL("../src-tauri/src/shell/window.rs", import.meta.url), "utf8");
 
 test("the desktop shell keeps Tauri's native drag/drop handler enabled", () => {
   // Disabling it hides absolute paths from the webview, which is what routed
   // dropped folders into the (failing) blob-upload path (#79-style network
   // errors). A merge must not bring `disable_drag_drop_handler` back.
-  assert.ok(!libRsSource.includes("disable_drag_drop_handler"));
-  assert.match(libRsSource, /native drag\/drop handler enabled/);
+  assert.match(windowSource, /pub fn build_window\(/);
+  assert.ok(!windowSource.includes("disable_drag_drop_handler"));
+  assert.match(windowSource, /native drag\/drop handler enabled/);
 });
 
 test("ChatWindow routes desktop drops through useDesktopDragDrop", () => {
