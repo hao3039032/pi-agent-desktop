@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import {
+  readPiSubagentsPackageActive,
   readSubagentSettings,
   MAX_SUBAGENT_MAX_CONCURRENT,
   writeBuiltInSubagentsEnabled,
@@ -12,7 +13,11 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   try {
     const settings = readSubagentSettings();
-    return NextResponse.json({ enabled: settings.builtInEnabled, maxConcurrent: settings.maxConcurrent });
+    return NextResponse.json({
+      enabled: settings.builtInEnabled,
+      maxConcurrent: settings.maxConcurrent,
+      legacyPackage: readPiSubagentsPackageActive(),
+    });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },
@@ -48,7 +53,11 @@ export async function PUT(req: Request) {
     let settings = readSubagentSettings();
     if (body.enabled !== undefined) settings = writeBuiltInSubagentsEnabled(body.enabled);
     if (body.maxConcurrent !== undefined) settings = writeSubagentMaxConcurrent(body.maxConcurrent);
-    return NextResponse.json({ enabled: settings.builtInEnabled, maxConcurrent: settings.maxConcurrent });
+    return NextResponse.json({
+      enabled: settings.builtInEnabled,
+      maxConcurrent: settings.maxConcurrent,
+      legacyPackage: readPiSubagentsPackageActive(),
+    });
   } catch (error) {
     return NextResponse.json(
       { error: error instanceof Error ? error.message : String(error) },

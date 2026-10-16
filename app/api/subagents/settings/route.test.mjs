@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -33,18 +33,18 @@ function request(body, contentType = "application/json") {
 test("settings route defaults off and persists both switch states", async () => {
   let response = await GET();
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 10 });
+  assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 10, legacyPackage: false });
 
   response = await PUT(request({ enabled: true }));
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { enabled: true, maxConcurrent: 10 });
+  assert.deepEqual(await response.json(), { enabled: true, maxConcurrent: 10, legacyPackage: false });
   assert.deepEqual(
     JSON.parse(await readFile(join(testAgentDir, "agents", "settings.json"), "utf8")),
     { version: 1, builtInEnabled: true },
   );
 
   response = await PUT(request({ enabled: false }));
-  assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 10 });
+  assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 10, legacyPackage: false });
 });
 
 test("settings route validates mutations", async () => {
@@ -60,8 +60,30 @@ test("settings route validates mutations", async () => {
 test("settings route validates and persists concurrency", async () => {
   let response = await PUT(request({ maxConcurrent: 2 }));
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 2 });
+  assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 2, legacyPackage: false });
   response = await PUT(request({ maxConcurrent: 0 }));
   assert.equal(response.status, 400);
   assert.match((await response.json()).error, /between 1 and 32/);
+});
+
+test("settings route reports the pi-subagents package as legacyPackage", async () => {
+  const globalSettings = join(testAgentDir, "settings.json");
+  await writeFile(globalSettings, JSON.stringify({ packages: ["npm:pi-subagents"] }));
+  try {
+    let response = await GET();
+    assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 2, legacyPackage: true });
+
+    // The switch state and the hint travel together on PUT responses too.
+    response = await PUT(request({ maxConcurrent: 5 }));
+    assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 5, legacyPackage: true });
+
+    // A Plugins-panel disable (empty extension filter) reads as inactive.
+    await writeFile(globalSettings, JSON.stringify({
+      packages: [{ source: "npm:pi-subagents", extensions: [], skills: [], prompts: [], themes: [] }],
+    }));
+    response = await GET();
+    assert.deepEqual(await response.json(), { enabled: false, maxConcurrent: 5, legacyPackage: false });
+  } finally {
+    await rm(globalSettings, { force: true });
+  }
 });
