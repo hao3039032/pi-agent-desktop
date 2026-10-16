@@ -33,7 +33,8 @@ import { getUsageCostBreakdown } from "./usage-breakdown";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 import {
   createSubagentExtension,
-  preferPiWebSubagentExtension,
+  isPiSubagentsPreferred,
+  preferPiSubagentsExtension,
 } from "./subagent-extension";
 import {
   listSubagentProfiles,
@@ -42,7 +43,7 @@ import {
   SUBAGENT_CONTROL_TOOL_NAMES,
 } from "./subagents";
 import { createSubagentController } from "./subagent-runtime";
-import { isBuiltInSubagentsEnabled } from "./subagent-settings";
+import { isBuiltInSubagentsEnabled, readPiSubagentsPackageActive } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
@@ -2249,6 +2250,8 @@ const SUBAGENT_CONTROLLER = createSubagentController({
   resolveSessionPath,
   invalidateSessionList: invalidateSessionListCache,
   isBuiltInSubagentsEnabled,
+  isPiSubagentsPreferred,
+  isPiSubagentsPackageActive: readPiSubagentsPackageActive,
 });
 
 export function getSubagentRun(sessionId: string) {
@@ -2729,7 +2732,7 @@ export async function startRpcSession(
                 isBuiltInSubagentsEnabled,
               ),
             ],
-            extensionsOverride: (base) => preferUserBashExtension(preferPiWebSubagentExtension(base)),
+            extensionsOverride: (base) => preferUserBashExtension(preferPiSubagentsExtension(base)),
           },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });

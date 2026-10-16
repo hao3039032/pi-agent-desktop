@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike } from "./pi-types";
 import {
+  isPiSubagentsPreferred,
   subagentNotificationText,
   subagentToolDetails,
   type ResumeSubagentRequest,
@@ -37,7 +38,7 @@ import { findSecurityExtensionPaths } from "./permission-system-package";
 import { appendSubagentInputFiles, loadSubagentInputFiles } from "./subagent-input";
 import { projectTrustReloadOptions } from "./project-trust";
 import { resolveShellTools } from "./powershell-settings";
-import { isBuiltInSubagentsEnabled, readSubagentSettings } from "./subagent-settings";
+import { isBuiltInSubagentsEnabled, readPiSubagentsPackageActive, readSubagentSettings } from "./subagent-settings";
 import { SubagentQueue } from "./subagent-queue";
 import { addWorktree, removeWorktree } from "./worktree";
 import { randomUUID } from "node:crypto";
@@ -61,6 +62,13 @@ export interface SubagentRuntimeDependencies {
   resolveSessionPath(sessionId: string): Promise<string | null>;
   invalidateSessionList(): void;
   isBuiltInSubagentsEnabled?(): boolean;
+  /**
+   * Best-effort second gate, armed only while both halves hold: the most recent
+   * extension load in the process detected pi-subagents AND the global settings
+   * activate the package. Fires rarely (stale `Agent` calls) and asks for a reload.
+   */
+  isPiSubagentsPreferred?(): boolean;
+  isPiSubagentsPackageActive?(): boolean;
 }
 
 export interface SubagentController {
@@ -195,6 +203,11 @@ export function createSubagentController(
   async function start(request: StartSubagentRequest): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
+    const preferred = dependencies.isPiSubagentsPreferred ?? isPiSubagentsPreferred;
+    const packageActive = dependencies.isPiSubagentsPackageActive ?? readPiSubagentsPackageActive;
+    if (preferred() && packageActive()) {
+      throw new Error("Pi Web built-in sub-agents are inactive: the pi-subagents extension takes precedence. Ask the user to reload the session to apply this change");
+    }
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
     const parent = dependencies.getSession(parentSessionId);
     if (!parent?.isAlive()) throw new Error("Parent session is no longer available");
@@ -495,6 +508,11 @@ export function createSubagentController(
   async function resume(request: ResumeSubagentRequest): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
+    const preferred = dependencies.isPiSubagentsPreferred ?? isPiSubagentsPreferred;
+    const packageActive = dependencies.isPiSubagentsPackageActive ?? readPiSubagentsPackageActive;
+    if (preferred() && packageActive()) {
+      throw new Error("Pi Web built-in sub-agents are inactive: the pi-subagents extension takes precedence. Ask the user to reload the session to apply this change");
+    }
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
     const existing = await get(request.sessionId);
     if (!existing) throw new Error(`Subagent not found: ${request.sessionId}`);
