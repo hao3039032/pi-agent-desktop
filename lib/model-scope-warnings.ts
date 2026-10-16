@@ -14,6 +14,7 @@
 export type ModelScopeWarningCode =
   | "no-match"
   | "invalid-thinking-level"
+  | "ambiguous"
   | "unauthenticated-provider";
 
 export interface ModelScopeWarning {

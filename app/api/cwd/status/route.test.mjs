@@ -8,7 +8,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { alias: { "@": process.cwd() }, interopDefault: true });
 const { GET } = await jiti.import("./route.ts");
-const { allowFileRoot } = await jiti.import("../../../../lib/file-access.ts");
+const { allowFileRoot, normalizeSlashes } = await jiti.import("../../../../lib/file-access.ts");
 
 // Real paths: the temp folder is a link on macOS, and allowed roots compare resolved paths.
 const root = realpathSync(await mkdtemp(path.join(os.tmpdir(), "pi-web-cwd-status-")));
@@ -22,6 +22,12 @@ await mkdir(project, { recursive: true });
 await mkdir(outside, { recursive: true });
 await writeFile(file, "not a folder");
 await symlink(outside, escape);
+// Pin the allowed-roots cache to exactly this test's folder. Without this the
+// roots come from the machine's real session cwds, and a developer whose
+// session history contains e.g. /tmp makes every tmpdir path allowed — the
+// "outside the roots" assertions then see 200s that are correct on that
+// machine but fail the test.
+globalThis.__piAllowedRootsCache = { roots: new Set([normalizeSlashes(allowed)]), expiresAt: Number.POSITIVE_INFINITY };
 allowFileRoot(allowed);
 after(() => rm(root, { recursive: true, force: true }));
 
