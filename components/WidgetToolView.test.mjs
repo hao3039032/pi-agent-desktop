@@ -9,7 +9,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { WidgetToolView } = await jiti.import("./WidgetToolView.tsx");
+const { WidgetToolView, WidgetPreview, WidgetResultCard } = await jiti.import("./WidgetToolView.tsx");
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
 const { WIDGET_TOOL_NAME, widgetBlockView } = await jiti.import("@/lib/widget-tool.ts");
 
@@ -154,4 +154,45 @@ test("ChatWindow's hoist predicate accepts only renderable widget calls", async 
     type: "toolCall", toolCallId: "a", toolName: "show_widget",
     input: { title: "t", widget_code: "<div/>" },
   }), true);
+});
+
+test("WidgetResultCard renders order, title, type badge and localized status", () => {
+  const entryComplete = {
+    toolCallId: "c1",
+    order: 2,
+    status: "complete",
+    block: toolCallBlock({ input: COMPLETE_INPUT }),
+    view: { code: "<div/>", title: "sales dashboard", width: 640, height: 480, isSVG: false },
+  };
+  const htmlComplete = render(React.createElement(WidgetResultCard, { entry: entryComplete, total: 3 }));
+  assert.match(htmlComplete, /2\/3/);
+  assert.match(htmlComplete, /sales dashboard/);
+  assert.match(htmlComplete, /HTML/);
+  assert.match(htmlComplete, /is-complete/);
+
+  const entryStreaming = {
+    toolCallId: "c2",
+    order: 1,
+    status: "streaming",
+    block: toolCallBlock({ rawInput: '{"title": "live_stream", "widget_code": "<div' }),
+    view: "streaming",
+  };
+  const htmlStreaming = render(React.createElement(WidgetResultCard, { entry: entryStreaming, total: 1 }));
+  assert.match(htmlStreaming, /1\/1/);
+  assert.match(htmlStreaming, /live stream/);
+  assert.match(htmlStreaming, /is-streaming/);
+});
+
+test("WidgetPreview renders directly with preview buttons and handles streaming", () => {
+  const block = toolCallBlock({ input: COMPLETE_INPUT });
+  const view = widgetBlockView({ toolName: block.toolName, parsedInput: block.input });
+
+  const html = render(React.createElement(WidgetPreview, {
+    block,
+    view,
+    isStreaming: false,
+  }));
+  assert.ok(html.includes("<iframe"));
+  assert.match(html, /sales dashboard/);
+  assert.match(html, /Open in window/);
 });

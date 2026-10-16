@@ -3,15 +3,15 @@ import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { UnavailableWorkspace } from "@/lib/workspace-availability";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, ExtensionUiRequest, LeafChangeOptions, SessionInfo, SessionTreeNode, ToolCallContent, ToolResultMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, ExtensionUiRequest, LeafChangeOptions, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
 import { normalizeCustomPanelLines } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
 import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, hasAssistantAnswer, isAssistantTruncated, isMessageGroupAnchor, splitFinalAssistantBlocks } from "@/lib/message-display";
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
-import { WidgetToolView } from "./WidgetToolView";
-import { widgetBlockView } from "@/lib/widget-tool";
+import { TurnWidgetResults } from "./TurnWidgetResults";
+import { collectTurnWidgets, isTurnWidgetBlock } from "@/lib/widget-tool";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ConversationNavigator, type ConversationTurnLocation } from "./ConversationNavigator";
@@ -173,14 +173,12 @@ interface FinalSplitEntry {
 }
 
 /**
- * A show_widget call that renders as a card. Widget cards are hoisted out of
- * ProcessDetailsGroup and stay above the turn's answer: collapsing the process
- * details must never hide a rendered widget (its whole point is being seen).
+ * A show_widget call that renders in the turn results area. Widget calls are
+ * excluded from ProcessDetailsGroup and stay at the end of the turn, after
+ * the final answer.
  */
 export function isHoistableWidgetBlock(block: AssistantContentBlock): boolean {
-  if (block.type !== "toolCall") return false;
-  const view = widgetBlockView({ toolName: block.toolName, parsedInput: block.input });
-  return view !== null && view !== "streaming";
+  return isTurnWidgetBlock(block);
 }
 
 // Message objects are immutable (any change produces a new object), so the
@@ -1553,6 +1551,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   <MessageView
                     key={`${keyPrefix}-view-${messageKey}`}
                     message={msg}
+                    suppressWidgets
                     toolResults={toolResultsMap}
                     modelNames={modelNames}
                     cwd={messageCwd}
@@ -1587,9 +1586,9 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
               };
 
               const rendered: ReactNode[] = [];
-              for (let idx = 0; idx < messages.length;) {
+              for (let idx = 0; idx < messages.length || (idx === 0 && streamState.isStreaming);) {
                 const msg = messages[idx];
-                const hasAnchor = isMessageGroupAnchor(msg);
+                const hasAnchor = Boolean(msg && isMessageGroupAnchor(msg));
                 if (!hasAnchor && idx !== 0) {
                   rendered.push(renderMessage(idx));
                   idx += 1;
@@ -1601,37 +1600,32 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 // leading segment anyway instead of flattening the whole turn.
                 const userIdx = hasAnchor ? idx : -1;
                 const groupStartIdx = hasAnchor ? idx : 0;
-                let endIdx = idx + 1;
+                const turnKey = hasAnchor ? messageKeys[groupStartIdx] ?? groupStartIdx : "leading";
+                let endIdx = Math.min(idx + 1, messages.length);
                 while (endIdx < messages.length && !isMessageGroupAnchor(messages[endIdx])) endIdx += 1;
 
+                const isLiveTail = (agentRunning || streamState.isStreaming) && endIdx === messages.length && userIdx === lastAnchorIdx;
+                const streamingMessage = isLiveTail && streamState.isStreaming ? streamState.streamingMessage : null;
                 const finalAssistantIdx = findFinalAssistantIndex(messages, userIdx, endIdx);
-
-                if (finalAssistantIdx === -1) {
-                  for (let renderIdx = groupStartIdx; renderIdx < endIdx; renderIdx++) {
-                    rendered.push(renderMessage(renderIdx));
-                  }
-                  idx = endIdx;
-                  continue;
-                }
-
-                const isLiveTail = (sessionBusy || streamState.isStreaming) && endIdx === messages.length && userIdx === lastAnchorIdx;
-                if (isLiveTail) {
-                  for (let renderIdx = groupStartIdx; renderIdx < endIdx; renderIdx++) {
-                    rendered.push(renderMessage(renderIdx));
-                  }
-                  idx = endIdx;
-                  continue;
-                }
 
                 if (hasAnchor) rendered.push(renderMessage(userIdx));
 
-                const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
-                const { answerMessage: finalAnswerMessage, processMessage: finalProcessMessage } = getFinalSplit(finalAssistant);
+                const finalAssistant = finalAssistantIdx >= 0 ? messages[finalAssistantIdx] as AssistantMessage : null;
+                const { answerMessage: finalAnswerMessage, processMessage: finalProcessMessage } = finalAssistant
+                  ? getFinalSplit(finalAssistant)
+                  : { answerMessage: null, processMessage: null };
+
+                const turnWidgets = collectTurnWidgets(
+                  messages.slice(userIdx + 1, endIdx),
+                  toolResultsMap,
+                  {
+                    isStreaming: isLiveTail,
+                    entryIds: entryIds.slice(userIdx + 1, endIdx),
+                    streamingMessage,
+                  },
+                );
 
                 const processViews: ReactNode[] = [];
-                // Widget cards hoisted out of the process group, rendered above
-                // the answer so collapsing the group never hides them.
-                const hoistedWidgets: ReactNode[] = [];
                 let processToolCount = 0;
                 let processRefIdx: number | undefined;
                 let revealProcess = false;
@@ -1645,26 +1639,13 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   }
                   if (processMessage.role !== "assistant") continue;
                   const message = processIdx === finalAssistantIdx ? finalProcessMessage : processMessage;
+                  if (!message) continue;
                   const blocks = getDisplayableAssistantBlocks(message);
                   if (blocks.length === 0) continue;
                   processRefIdx ??= visibleRefIndexByMessage.get(processIdx);
-                  // Widget toolCall blocks leave the group and render above the
-                  // answer; everything else stays collapsible process content.
-                  let hoistedFromMessage = 0;
-                  for (const block of blocks) {
-                    if (!isHoistableWidgetBlock(block)) continue;
-                    hoistedFromMessage += 1;
-                    const toolCall = block as ToolCallContent;
-                    hoistedWidgets.push(
-                      <WidgetToolView
-                        key={`hoisted-widget-${toolCall.toolCallId}`}
-                        block={toolCall}
-                        view={widgetBlockView({ toolName: toolCall.toolName, parsedInput: toolCall.input })!}
-                        result={toolResultsMap.get(toolCall.toolCallId)}
-                      />,
-                    );
-                  }
-                  const rest = hoistedFromMessage > 0 ? blocks.filter((block) => !isHoistableWidgetBlock(block)) : blocks;
+                  // Widget toolCall blocks leave the group and render in TurnWidgetResults
+                  // after the answer; everything else stays collapsible process content.
+                  const rest = blocks.filter((block) => !isHoistableWidgetBlock(block));
                   processToolCount += countToolCallBlocks(rest);
                   revealProcess ||= Boolean(pendingSearchScroll && entryIds[processIdx] === pendingSearchScroll.entryId && (!searchBlock || blocks.includes(searchBlock)));
                   if (rest.length === 0) continue;
@@ -1695,15 +1676,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   );
                 }
 
-                if (hoistedWidgets.length > 0) {
-                  rendered.push(
-                    <div key={`widget-cards-${messageKeys[groupStartIdx] ?? groupStartIdx}`} style={{ marginBottom: 14 }}>
-                      {hoistedWidgets}
-                    </div>,
-                  );
-                }
-
-                if (finalAnswerMessage) {
+                if (finalAnswerMessage && finalAssistant) {
                   // Each tool call is stored as its own assistant entry, so the
                   // final answer alone carries no record of what the turn wrote.
                   // Gather the turn's assistant blocks and derive the file list
@@ -1715,10 +1688,30 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                     recoverTruncation: endIdx === messages.length && !streamState.isStreaming && !hasAssistantAnswer(finalAnswerMessage),
                   }));
                 }
-                for (let renderIdx = finalAssistantIdx + 1; renderIdx < endIdx; renderIdx++) {
+
+                if (streamingMessage && hasStreamingContent) {
+                  rendered.push(
+                    <MessageView key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} suppressWidgets />,
+                  );
+                }
+
+                // One keyed sibling owns this turn's results throughout generation and settlement.
+                if (turnWidgets.length > 0) {
+                  rendered.push(
+                    <TurnWidgetResults
+                      key={`widget-results-${turnKey}`}
+                      entries={turnWidgets}
+                      streamingMessage={streamingMessage}
+                      revealToolCallId={pendingSearchScroll ? turnWidgets.find((entry) => entry.entryId === pendingSearchScroll.entryId && (!searchBlock || (searchBlock.type === "toolCall" && entry.toolCallId === searchBlock.toolCallId)))?.toolCallId : undefined}
+                    />,
+                  );
+                }
+
+                for (let renderIdx = Math.max(finalAssistantIdx + 1, userIdx + 1); renderIdx < endIdx; renderIdx++) {
                   rendered.push(renderMessage(renderIdx));
                 }
                 idx = endIdx;
+                if (endIdx === messages.length) break;
               }
               const { startIndex } = getVisibleRenderWindow(rendered.length, visibleCount);
               const hasMore = startIndex > 0 || hasEarlierMessages;
@@ -1733,9 +1726,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 </>
               );
             })()}
-            {streamState.isStreaming && hasStreamingContent && streamState.streamingMessage && (
-              <MessageView message={streamState.streamingMessage as AgentMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />
-            )}
 
             {agentRunning && !hasStreamingContent && (agentPhase || isCompacting) && (
               <div className="break-words py-2 text-[13px] text-text-muted">

@@ -222,9 +222,12 @@ export function createGenerativeUiExtension(): InlineExtension {
         name: "visualize_read_me",
         label: "Read Guidelines",
         description:
-          "Returns design guidelines for show_widget — CSS patterns, colors, typography, layout rules and examples "
-          + "for charts, diagrams, dashboards, mockups and interactive widgets. "
-          + "Call once before your first show_widget call. Do NOT mention this call to the user — it is an internal setup step.",
+          "Load design guidelines and examples before creating a show_widget. "
+          + "Use this tool to get visual design rules for layout, spacing, typography, colors, "
+          + "CSS patterns, responsive design, accessibility, and composition. "
+          + "It provides guidance for charts, diagrams, dashboards, mockups, interactive widgets, "
+          + "SVG illustrations, and HTML visualizations. "
+          + "Call it once before the first show_widget call. Do NOT mention this call to the user — it is an internal setup step.",
         promptSnippet: "Load design guidelines before creating widgets. Call silently before first show_widget use.",
         promptGuidelines: [
           "Call visualize_read_me once before your first show_widget call to load design guidelines.",
@@ -263,10 +266,12 @@ export function createGenerativeUiExtension(): InlineExtension {
         name: "show_widget",
         label: "Show Widget",
         description:
-          "Render a chart, graph, plot, diagram, dashboard, or interactive visualization for the user: "
-          + "bar charts, pie charts, flowcharts, SVG graphics and images, HTML widgets, games, calculators, mockups. "
-          + "Draws charts with Chart.js or hand-drawn SVG and renders them inline in the conversation with full CSS/JS/Canvas support. "
-          + "Use it whenever the user wants a picture, drawing, illustration or interactive app instead of text. "
+          "Create and render a visual artifact inline in the conversation. "
+          + "Use this tool when the user asks to make, generate, draw, render, plot, visualize, or illustrate "
+          + "charts, graphs, diagrams, dashboards, infographics, interactive demos, UI mockups, calculators, "
+          + "games, simulations, SVG illustrations, or HTML/CSS/JavaScript widgets. "
+          + "Use it for visual output instead of a text-only explanation. "
+          + "The result is an interactive HTML or SVG widget rendered inline in chat. "
           + "IMPORTANT: Call visualize_read_me once before your first show_widget call.",
         promptSnippet:
           "Render interactive HTML/SVG widgets inline in the conversation. Supports full CSS, JS, Canvas, Chart.js.",

@@ -1,3 +1,10 @@
+import type {
+  AgentMessage,
+  AssistantContentBlock,
+  ToolCallContent,
+  ToolResultMessage,
+} from "./types";
+
 /**
  * Pure helpers for rendering show_widget tool calls inline. The tool input is
  * persisted in the session file, so widget calls made by the old package
@@ -141,4 +148,155 @@ export function streamingWidgetTitle(rawInput: string | undefined): string | nul
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Turn Widget collection and state helpers
+// ---------------------------------------------------------------------------
+
+export type TurnWidgetStatus = "streaming" | "running" | "complete" | "error" | "cancelled";
+
+export interface TurnWidgetEntry {
+  toolCallId: string;
+  order: number;
+  view: Exclude<WidgetBlockView, null>;
+  status: TurnWidgetStatus;
+  block: ToolCallContent;
+  result?: ToolResultMessage;
+  entryId?: string;
+  messageIndex?: number;
+}
+
+export function classifyWidgetStatus(
+  view: WidgetBlockView,
+  result?: ToolResultMessage,
+  options: { isStreaming?: boolean } = {},
+): TurnWidgetStatus {
+  if (view === "streaming" && !result) return options.isStreaming ? "streaming" : "cancelled";
+  if (!result) {
+    return options.isStreaming ? "running" : "cancelled";
+  }
+  if ((result as { cancelled?: boolean }).cancelled) return "cancelled";
+  if (result.isError) {
+    if (result.content?.some((b) => b.type === "text" && /\b(cancelled|aborted)\b/i.test(b.text))) {
+      return "cancelled";
+    }
+    return "error";
+  }
+  return view === "streaming" ? "cancelled" : "complete";
+}
+
+/**
+ * Whether a content block is a valid show_widget tool call (streaming or complete).
+ */
+export function isTurnWidgetBlock(block: AssistantContentBlock): boolean {
+  if (block.type !== "toolCall") return false;
+  const view = widgetBlockView({
+    toolName: block.toolName,
+    rawInput: block.rawInput,
+    parsedInput: block.input,
+  });
+  return view !== null;
+}
+
+export interface CollectTurnWidgetsOptions {
+  isStreaming?: boolean;
+  entryIds?: string[];
+  streamingMessage?: AgentMessage | null;
+  toolResults?: Map<string, ToolResultMessage>;
+}
+
+/**
+ * Scans assistant messages or blocks in a turn and collects all renderable
+ * show_widget calls in their original sequence.
+ */
+export function collectTurnWidgets(
+  items: Array<AgentMessage | AssistantContentBlock>,
+  toolResultsOrOptions?: Map<string, ToolResultMessage> | CollectTurnWidgetsOptions,
+  maybeOptions?: CollectTurnWidgetsOptions,
+): TurnWidgetEntry[] {
+  let toolResults: Map<string, ToolResultMessage> | undefined;
+  let options: CollectTurnWidgetsOptions = {};
+
+  if (toolResultsOrOptions instanceof Map) {
+    toolResults = toolResultsOrOptions;
+    if (maybeOptions) options = maybeOptions;
+  } else if (toolResultsOrOptions && typeof toolResultsOrOptions === "object") {
+    options = toolResultsOrOptions;
+    toolResults = options.toolResults;
+  } else if (maybeOptions) {
+    options = maybeOptions;
+    toolResults = options.toolResults;
+  }
+
+  const entries: TurnWidgetEntry[] = [];
+  const entriesById = new Map<string, TurnWidgetEntry>();
+
+  const processBlock = (block: AssistantContentBlock, entryId?: string, msgIdx?: number) => {
+    if (block.type !== "toolCall") return;
+    const view = widgetBlockView({
+      toolName: block.toolName,
+      rawInput: block.rawInput,
+      parsedInput: block.input,
+    });
+    if (!view) return;
+
+    const result = toolResults?.get(block.toolCallId);
+    const status = classifyWidgetStatus(view, result, { isStreaming: options.isStreaming });
+
+    const existing = entriesById.get(block.toolCallId);
+    if (existing) {
+      existing.view = view;
+      existing.status = status;
+      existing.block = block;
+      existing.result = result;
+      if (entryId !== undefined) existing.entryId = entryId;
+      if (msgIdx !== undefined) existing.messageIndex = msgIdx;
+    } else {
+      const entry: TurnWidgetEntry = {
+        toolCallId: block.toolCallId,
+        order: entries.length + 1,
+        view,
+        status,
+        block,
+        result,
+        entryId,
+        messageIndex: msgIdx,
+      };
+      entries.push(entry);
+      entriesById.set(block.toolCallId, entry);
+    }
+  };
+
+  items.forEach((item, idx) => {
+    if (!item) return;
+    if ("role" in item) {
+      if (item.role === "assistant" && Array.isArray(item.content)) {
+        const entryId = options.entryIds?.[idx];
+        for (const block of item.content) {
+          processBlock(block, entryId, idx);
+        }
+      }
+    } else if ("type" in item) {
+      processBlock(item, undefined, idx);
+    }
+  });
+
+  const streamingMsg = options.streamingMessage;
+  if (streamingMsg && streamingMsg.role === "assistant" && Array.isArray(streamingMsg.content)) {
+    for (const block of streamingMsg.content) {
+      processBlock(block, undefined, undefined);
+    }
+  }
+
+  return entries;
+}
+
+/**
+ * Returns the toolCallId of the last widget entry in a turn, or null when empty.
+ * By rule, the turn results area always defaults to expanding this last entry.
+ */
+export function lastTurnWidgetId(entries: TurnWidgetEntry[]): string | null {
+  if (!entries || entries.length === 0) return null;
+  return entries[entries.length - 1].toolCallId;
 }

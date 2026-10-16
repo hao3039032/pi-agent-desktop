@@ -17,7 +17,14 @@ import { CodeBlock } from "./MermaidBlock";
 import { HtmlPreviewDialog } from "./HtmlPreviewBlock";
 import { HtmlPreviewErrorBar } from "./HtmlPreviewErrorBar";
 import type { ToolCallContent, ToolResultMessage } from "@/lib/types";
-import { streamingWidgetBytes, streamingWidgetTitle, widgetPreviewKind, type WidgetBlockView } from "@/lib/widget-tool";
+import {
+  streamingWidgetBytes,
+  streamingWidgetTitle,
+  widgetPreviewKind,
+  type TurnWidgetEntry,
+  type TurnWidgetStatus,
+  type WidgetBlockView,
+} from "@/lib/widget-tool";
 
 /** Inline frames cap a bit above the chat previews: the widget is the message. */
 const WIDGET_FRAME_MAX_HEIGHT = 720;
@@ -85,7 +92,7 @@ async function popOutWidget(view: Exclude<WidgetBlockView, "streaming">): Promis
   }
 }
 
-function WidgetIcon() {
+export function WidgetIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent, currentColor)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
       <rect x="3" y="4" width="18" height="14" rx="2" />
@@ -102,15 +109,65 @@ export interface WidgetToolViewProps {
   isStreaming?: boolean;
 }
 
+export interface WidgetResultCardProps {
+  entry: TurnWidgetEntry;
+  total: number;
+}
+
+export function widgetStatusKey(status: TurnWidgetStatus) {
+  return ({
+    streaming: "widget.status.generating",
+    running: "widget.status.running",
+    error: "widget.status.error",
+    cancelled: "widget.status.cancelled",
+    complete: "widget.status.completed",
+  } as const)[status];
+}
+
 /**
- * The inline card for a show_widget call — rendered for the whole tool-call
- * block, deliberately outside ToolCallBlock's collapse mechanism: the widget
- * stays visible after the tool finishes. While the input streams it shows a
- * placeholder (re-mounting an iframe per delta would re-run its scripts);
- * once complete it renders the sandboxed frame plus a pop-out button backed
- * by /api/widgets/open.
+ * Compact card for displaying one widget in the results tab bar.
  */
-export function WidgetToolView({ block, view, result, isStreaming }: WidgetToolViewProps) {
+export function WidgetResultCard({ entry, total }: WidgetResultCardProps) {
+  const { t } = useI18n();
+  const title = entry.view !== "streaming"
+    ? entry.view.title
+    : (streamingWidgetTitle(entry.block.rawInput) ?? t("widget.cardTitle"));
+  const isSVG = entry.view !== "streaming" && entry.view.isSVG;
+  const kind = isSVG ? "SVG" : "HTML";
+
+  const statusLabel = t(widgetStatusKey(entry.status));
+
+  const orderLabel = `${entry.order}/${total}`;
+
+  return (
+    <>
+      <span className="turn-widget-tab-order" aria-label={t("widget.tabOrder", { order: entry.order, total })}>{orderLabel}</span>
+      <WidgetIcon />
+      <span className="turn-widget-tab-title" title={title}>
+        {title}
+      </span>
+      <span className="turn-widget-tab-badge">{kind}</span>
+      <span className={`turn-widget-tab-status is-${entry.status}`}>
+        {statusLabel}
+      </span>
+    </>
+  );
+}
+
+export interface WidgetPreviewProps {
+  block: ToolCallContent;
+  view: WidgetBlockView;
+  result?: ToolResultMessage;
+  isStreaming?: boolean;
+  status?: TurnWidgetStatus;
+}
+
+/**
+ * Dedicated preview renderer for a single widget. Renders a streaming placeholder
+ * while the input is incomplete, or the full sandboxed frame with source, download,
+ * and pop-out controls once complete.
+ */
+export function WidgetPreview({ block, view, result, isStreaming, status }: WidgetPreviewProps) {
   const { t } = useI18n();
   const [popState, setPopState] = useState<"idle" | "opening" | "opened" | "failed">("idle");
   const [popError, setPopError] = useState<string | null>(null);
@@ -118,6 +175,16 @@ export function WidgetToolView({ block, view, result, isStreaming }: WidgetToolV
   useEffect(() => () => {
     if (popTimerRef.current) clearTimeout(popTimerRef.current);
   }, []);
+
+  if (status && status !== "complete") {
+    return (
+      <div className={`turn-widget-placeholder is-${status}`}>
+        <WidgetIcon />
+        <span>{t(widgetStatusKey(status))}</span>
+        {resultText(result) && <pre>{resultText(result)}</pre>}
+      </div>
+    );
+  }
 
   if (view === "streaming") {
     const bytes = streamingWidgetBytes(block.rawInput);
@@ -160,6 +227,14 @@ export function WidgetToolView({ block, view, result, isStreaming }: WidgetToolV
       }}
     />
   );
+}
+
+/**
+ * The inline card for a show_widget call — compatibility wrapper around
+ * WidgetPreview for isolated tool-call fallback rendering.
+ */
+export function WidgetToolView({ block, view, result, isStreaming }: WidgetToolViewProps) {
+  return <WidgetPreview block={block} view={view} result={result} isStreaming={isStreaming} />;
 }
 
 function WidgetCard({ view, result, isStreaming, popState, popError, onPopOut }: {

@@ -20,6 +20,18 @@ the application in a clean checkout and runs the same browser tests with
 `E2E_SERVER_MODE=start` against `next start`. Do not build in a checkout used
 for development.
 
+The Widget results lifecycle regression can also run without a Next server or build:
+
+```sh
+node --test e2e/turn-widget-results.mjs
+```
+
+It mounts the actual ChatWindow turn-rendering block and Widget components in
+Chromium, checking streaming settlement, iframe identity, selection/keyboard
+updates, source navigation, and historical script protection. Set
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to use an existing Chromium executable
+instead of Playwright's default installation.
+
 Coverage:
 
 - A 5,000-message session opens with exactly the last 50 entries, bounded
