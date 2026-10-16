@@ -38,6 +38,7 @@ import { PluginsConfig } from "./PluginsConfig";
 import { AppUpdatesSection } from "./AppUpdatesSection";
 import { DesktopAppSection } from "./desktop";
 import { McpConfig } from "./McpConfig";
+import { DistroSettingsSection } from "./distro";
 import { ConfigButton, ConfigSwitch } from "./SettingsUi";
 import { ArtifactsSettingRow } from "./ArtifactsSettingRow";
 
@@ -195,9 +196,12 @@ function GeneralSettings({
         <p className="settings-general-tagline">{t("appSettings.taglineDetails")}</p>
       </div>
 
+      <AppUpdatesSection onBusyChange={onBusyChange} />
+
+      <DistroSettingsSection />
+
       <div className="settings-general-columns">
         <div className="settings-general-col">
-          <AppUpdatesSection onBusyChange={onBusyChange} />
 
           <section className="settings-general-section">
             <h3 className="settings-general-heading">{t("common.language")}</h3>

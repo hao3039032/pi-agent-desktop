@@ -64,7 +64,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" translate="no" className={`${notoSansMono.variable} notranslate`} suppressHydrationWarning>
+    <html lang="zh-CN" translate="no" className={`${notoSansMono.variable} notranslate`} suppressHydrationWarning>
       <head>
         <meta name="google" content="notranslate" />
         {/* Optional user stylesheet: <agentDir>/desktop/custom.css served by
