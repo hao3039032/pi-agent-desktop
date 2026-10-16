@@ -179,7 +179,7 @@ export function HtmlPreviewBlock({ code, lang, kind, isStreaming, defaultPreview
   );
 }
 
-function HtmlPreviewDialog({ title, srcDoc, themed, onClose }: { title: string; srcDoc: string; themed: boolean; onClose: () => void }) {
+export function HtmlPreviewDialog({ title, srcDoc, themed, onClose }: { title: string; srcDoc: string; themed: boolean; onClose: () => void }) {
   const { t } = useI18n();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const frameRef = useRef<HTMLIFrameElement>(null);

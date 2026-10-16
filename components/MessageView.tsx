@@ -21,6 +21,8 @@ import { skillExpansionToCommand } from "@/lib/slash-display";
 import type { SubagentToolDetails } from "@/lib/subagent-extension";
 import { CODEMODE_TOOL_NAME, codemodeCalls, codemodeScript, codemodeScriptPreview, stripCodemodeHeader } from "@/lib/codemode-view";
 import { CodemodeCallList } from "./CodemodeToolView";
+import { WidgetToolView } from "./WidgetToolView";
+import { widgetBlockView } from "@/lib/widget-tool";
 import { imageSource, resultImageFileName } from "@/lib/result-image";
 import { mcpToolLabel, prettyMcpResultText } from "@/lib/mcp-tool-display";
 import type {
@@ -972,6 +974,13 @@ function BlockView({ block, searchTarget, toolResults, isStreaming, streamingDur
   if (block.type === "toolCall") {
     const tc = block as ToolCallContent;
     const result = toolResults?.get(tc.toolCallId);
+    // The widget card owns the whole block: it stays rendered (never folded
+    // into ToolCallBlock's expand/collapse) for as long as the conversation
+    // is open — the widget IS the reply.
+    const widget = widgetBlockView({ toolName: tc.toolName, rawInput: tc.rawInput, parsedInput: tc.input });
+    if (widget) {
+      return <WidgetToolView block={tc} view={widget} result={result} isStreaming={isStreaming} />;
+    }
     const duration = toolCallDurations?.get(tc.toolCallId);
     // A loaded (non-streaming) message whose toolCall has no paired result
     // means the run was interrupted before the tool finished — render that

@@ -3,13 +3,15 @@ import { registerAbortHandler } from "@/hooks/useKeyboardShortcuts";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { UnavailableWorkspace } from "@/lib/workspace-availability";
-import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, ExtensionUiRequest, LeafChangeOptions, SessionInfo, SessionTreeNode, ToolResultMessage } from "@/lib/types";
+import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, ExtensionUiRequest, LeafChangeOptions, SessionInfo, SessionTreeNode, ToolCallContent, ToolResultMessage } from "@/lib/types";
 import { normalizeCustomPanelLines } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
 import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, hasAssistantAnswer, isAssistantTruncated, isMessageGroupAnchor, splitFinalAssistantBlocks } from "@/lib/message-display";
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
+import { WidgetToolView } from "./WidgetToolView";
+import { widgetBlockView } from "@/lib/widget-tool";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ConversationNavigator, type ConversationTurnLocation } from "./ConversationNavigator";
@@ -168,6 +170,17 @@ interface FinalSplitEntry {
   processMessage: AssistantMessage;
   /** The final answer bubble; also kept for error/truncation notices without answer text. */
   answerMessage: AssistantMessage | null;
+}
+
+/**
+ * A show_widget call that renders as a card. Widget cards are hoisted out of
+ * ProcessDetailsGroup and stay above the turn's answer: collapsing the process
+ * details must never hide a rendered widget (its whole point is being seen).
+ */
+export function isHoistableWidgetBlock(block: AssistantContentBlock): boolean {
+  if (block.type !== "toolCall") return false;
+  const view = widgetBlockView({ toolName: block.toolName, parsedInput: block.input });
+  return view !== null && view !== "streaming";
 }
 
 // Message objects are immutable (any change produces a new object), so the
@@ -1616,6 +1629,9 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 const { answerMessage: finalAnswerMessage, processMessage: finalProcessMessage } = getFinalSplit(finalAssistant);
 
                 const processViews: ReactNode[] = [];
+                // Widget cards hoisted out of the process group, rendered above
+                // the answer so collapsing the group never hides them.
+                const hoistedWidgets: ReactNode[] = [];
                 let processToolCount = 0;
                 let processRefIdx: number | undefined;
                 let revealProcess = false;
@@ -1632,12 +1648,31 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   const blocks = getDisplayableAssistantBlocks(message);
                   if (blocks.length === 0) continue;
                   processRefIdx ??= visibleRefIndexByMessage.get(processIdx);
-                  processToolCount += countToolCallBlocks(blocks);
+                  // Widget toolCall blocks leave the group and render above the
+                  // answer; everything else stays collapsible process content.
+                  let hoistedFromMessage = 0;
+                  for (const block of blocks) {
+                    if (!isHoistableWidgetBlock(block)) continue;
+                    hoistedFromMessage += 1;
+                    const toolCall = block as ToolCallContent;
+                    hoistedWidgets.push(
+                      <WidgetToolView
+                        key={`hoisted-widget-${toolCall.toolCallId}`}
+                        block={toolCall}
+                        view={widgetBlockView({ toolName: toolCall.toolName, parsedInput: toolCall.input })!}
+                        result={toolResultsMap.get(toolCall.toolCallId)}
+                      />,
+                    );
+                  }
+                  const rest = hoistedFromMessage > 0 ? blocks.filter((block) => !isHoistableWidgetBlock(block)) : blocks;
+                  processToolCount += countToolCallBlocks(rest);
                   revealProcess ||= Boolean(pendingSearchScroll && entryIds[processIdx] === pendingSearchScroll.entryId && (!searchBlock || blocks.includes(searchBlock)));
+                  if (rest.length === 0) continue;
+                  const groupMessage = rest === blocks ? message : { ...message, content: rest };
                   processViews.push(renderMessage(processIdx, {
                     attachRef: false,
                     keyPrefix: "process",
-                    messageOverride: message,
+                    messageOverride: groupMessage,
                     showTimestamp: false,
                   }));
                 }
@@ -1656,6 +1691,14 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                       <ProcessDetailsGroup key={finalAnswerMessage ? "answered" : "unanswered"} messageCount={processViews.length} toolCallCount={processToolCount} defaultExpanded={!finalAnswerMessage} reveal={revealProcess} t={t}>
                         {processViews}
                       </ProcessDetailsGroup>
+                    </div>,
+                  );
+                }
+
+                if (hoistedWidgets.length > 0) {
+                  rendered.push(
+                    <div key={`widget-cards-${messageKeys[groupStartIdx] ?? groupStartIdx}`} style={{ marginBottom: 14 }}>
+                      {hoistedWidgets}
                     </div>,
                   );
                 }

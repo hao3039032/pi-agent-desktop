@@ -1,6 +1,6 @@
 import { access, chmod, copyFile, cp, mkdir, readdir, rm } from "node:fs/promises";
-import { constants } from "node:fs";
-import { spawn } from "node:child_process";
+import { constants, existsSync, chmodSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -193,6 +193,98 @@ async function assembleServer() {
     stagedNodeModulesDir,
   });
 
+  // The generative-ui package (`lib/generative-ui.ts`, `lib/widget-window.ts`)
+  // is resolved from the working directory at runtime —
+  // createRequire(process.cwd()) — so the file tracer never sees it, and the
+  // same is true of the glimpseui window host /api/widgets/open loads through
+  // require.resolve("glimpseui") (including the native binaries its
+  // postinstall builds per platform). Without staging, every packaged session
+  // loses the show_widget guidelines and the pop-out window; stage both
+  // complete packages at the top level of node_modules.
+  await stageCompletePackage({
+    name: "@ryan_nookpi/pi-extension-generative-ui",
+    sources: [join(rootDir, "node_modules", "@ryan_nookpi", "pi-extension-generative-ui")],
+    stagedNodeModulesDir,
+  });
+  await stageCompletePackage({
+    name: "glimpseui",
+    sources: [join(rootDir, "node_modules", "glimpseui")],
+    stagedNodeModulesDir,
+  });
+  // glimpseui builds its window host in a postinstall script (swiftc on macOS,
+  // dotnet on Windows), which npm only runs while the package is approved in
+  // package.json `allowScripts` — the extension is otherwise fine with the
+  // files alone. On those platforms a missing host means the approval was
+  // dropped and every show_widget would throw at spawn, so fail the build
+  // instead of shipping a broken widget default. Linux falls back to the
+  // chromium backend when the optional native build was skipped, so a missing
+  // binary there is not an error.
+  const stagedGlimpseHost = process.platform === "win32"
+    ? join(stagedNodeModulesDir, "glimpseui", "native", "windows", "bin", "glimpse.exe")
+    : process.platform === "darwin"
+      ? join(stagedNodeModulesDir, "glimpseui", "src", "glimpse")
+      : undefined;
+  if (stagedGlimpseHost && !existsSync(stagedGlimpseHost)) {
+    throw new Error(
+      `glimpseui's native host is missing at ${stagedGlimpseHost}. ` +
+      `Run npm rebuild glimpseui with the package approved in package.json allowScripts ` +
+      `(needs Xcode Command Line Tools on macOS, .NET 8 SDK on Windows), then re-run desktop:prepare.`,
+    );
+  }
+  // Cross-arch macOS builds (Intel package from an Apple Silicon runner —
+  // mac-build-test.yml's x86_64 target) stage a glimpse host the postinstall
+  // compiled for the runner's own arch. Same failure mode as a wrong-arch
+  // Node ("Bad CPU type in executable"), just at the first show_widget:
+  // check the staged Mach-O and recompile for the target when it does not
+  // carry the required cpu type. The Swift source ships in the package, and
+  // the same runner that built the app has the swiftc for either target.
+  if (stagedGlimpseHost && process.platform === "darwin") {
+    const requiredCpuType = requiredMachOCpuType(targetTriple);
+    const cpuTypes = readMachOCpuTypes(stagedGlimpseHost);
+    if (cpuTypes === null) {
+      throw new Error(`The staged glimpse host at ${relative(rootDir, stagedGlimpseHost)} is not a Mach-O binary.`);
+    }
+    if (!cpuTypes.includes(requiredCpuType)) {
+      // glimpse.swift uses `underPageBackgroundColor` (macOS 12+ only, in the
+      // config.transparent branch) with no #available guard, so the
+      // deployment target must be macOS 12 — the version the runner-side
+      // native build implicitly assumes when swiftc picks the host OS. A
+      // lower target (macosx11) fails to compile the very source we stage.
+      const crossTarget = `${targetTriple.split("-")[0]}-apple-macosx12`;
+      const glimpseSource = join(stagedNodeModulesDir, "glimpseui", "src", "glimpse.swift");
+      const result = spawnSync(
+        "swiftc",
+        ["-O", "-target", crossTarget, glimpseSource, "-o", stagedGlimpseHost],
+        { stdio: "inherit" },
+      );
+      if (result.status !== 0) {
+        throw new Error(
+          `The staged glimpse host does not carry ${targetTriple} (found cpu types ${cpuTypes.map((type) => `0x${type.toString(16)}`).join(", ")}) ` +
+          `and recompiling it with swiftc -target ${crossTarget} failed.`,
+        );
+      }
+      chmodSync(stagedGlimpseHost, 0o755);
+    }
+  }
+
+  // sharp (pulled in by Next's production image optimizer) ships glibc and
+  // musl builds of its native libvips on Linux. The AppImage bundler's
+  // linuxdeploy walks every ELF under the resources and resolves its
+  // dependencies; the musl builds need `libc.musl-x86_64.so.1`, which no
+  // glibc system provides, so bundling dies with "Could not find dependency:
+  // libc.musl-x86_64.so.1" — the error tauri reports as an opaque "failed to
+  // run linuxdeploy". The packaged server always runs on the bundled glibc
+  // Node, so the musl variant is dead weight in every bundle; drop it here.
+  if (targetTriple.endsWith("-unknown-linux-gnu")) {
+    const imgDir = join(serverResourcesDir, "node_modules", "@img");
+    const imgEntries = await readdir(imgDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of imgEntries) {
+      if (entry.isDirectory() && entry.name.includes("linuxmusl")) {
+        await rm(join(imgDir, entry.name), { recursive: true, force: true });
+      }
+    }
+  }
+
   // pi-ai loads Amazon Bedrock through a variable specifier
   // (`import(runtimeSpecifier)` in bedrock-converse-stream.lazy.js) so bundlers
   // cannot follow it into the Node-only AWS SDK. Next's file tracer is one of
@@ -221,7 +313,6 @@ async function assembleServer() {
     sourceRoot: rootDir,
     stagedNodeModulesDir,
   });
-
   // sharp (pulled in by Next's production image optimizer) ships glibc and
   // musl builds of its native libvips on Linux. The AppImage bundler's
   // linuxdeploy walks every ELF under the resources and resolves its

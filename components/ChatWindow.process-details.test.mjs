@@ -30,3 +30,19 @@ test("resets process details when the turn gains or loses its final answer", () 
     /<ProcessDetailsGroup key=\{finalAnswerMessage \? "answered" : "unanswered"\}[\s\S]*?defaultExpanded=\{!finalAnswerMessage\}/,
   );
 });
+
+test("hoists widget cards out of the group so collapsing never hides them", () => {
+  // A rendered show_widget card is the reply's centerpiece: it leaves the
+  // collapsible process group and stays above the final answer.
+  assert.match(source, /function isHoistableWidgetBlock\(block: AssistantContentBlock\): boolean/);
+  assert.match(source, /const hoistedWidgets: ReactNode\[\] = \[\]/);
+  assert.match(source, /for \(const block of blocks\) \{\s*\n\s*if \(!isHoistableWidgetBlock\(block\)\) continue;/);
+  assert.match(source, /<WidgetToolView\s*\n\s*key=\{`hoisted-widget-\$\{toolCall\.toolCallId\}`\}/);
+  // The group itself only carries the non-widget remainder.
+  assert.match(source, /processToolCount \+= countToolCallBlocks\(rest\)/);
+  assert.match(source, /if \(rest\.length === 0\) continue/);
+  // Rendered after the group, before the final answer push.
+  const hoistIndex = source.indexOf("if (hoistedWidgets.length > 0)");
+  const answerIndex = source.indexOf("if (finalAnswerMessage) {");
+  assert.ok(hoistIndex > -1 && answerIndex > hoistIndex, "hoisted widgets render above the answer");
+});
