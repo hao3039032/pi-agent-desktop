@@ -267,6 +267,11 @@ test("desktop staging ships the generative-ui default and its glimpseui window h
   assert.match(prepareSource, /requiredMachOCpuType\(targetTriple\)/);
   assert.match(prepareSource, /readMachOCpuTypes\(stagedGlimpseHost\)/);
   assert.match(prepareSource, /"-target", crossTarget, glimpseSource/);
+  // The cross target's deployment target must be macOS 12: glimpse.swift uses
+  // `underPageBackgroundColor` (macOS 12+) without an #available guard, and a
+  // macosx11 target fails to compile the staged source (the 0.7.102 release
+  // died exactly there).
+  assert.match(prepareSource, /-apple-macosx12`;/);
 });
 
 test("glimpseui's install script stays approved so its native host builds", async () => {

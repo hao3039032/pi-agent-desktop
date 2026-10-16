@@ -245,7 +245,12 @@ async function assembleServer() {
       throw new Error(`The staged glimpse host at ${relative(rootDir, stagedGlimpseHost)} is not a Mach-O binary.`);
     }
     if (!cpuTypes.includes(requiredCpuType)) {
-      const crossTarget = `${targetTriple.split("-")[0]}-apple-macosx11`;
+      // glimpse.swift uses `underPageBackgroundColor` (macOS 12+ only, in the
+      // config.transparent branch) with no #available guard, so the
+      // deployment target must be macOS 12 — the version the runner-side
+      // native build implicitly assumes when swiftc picks the host OS. A
+      // lower target (macosx11) fails to compile the very source we stage.
+      const crossTarget = `${targetTriple.split("-")[0]}-apple-macosx12`;
       const glimpseSource = join(stagedNodeModulesDir, "glimpseui", "src", "glimpse.swift");
       const result = spawnSync(
         "swiftc",
