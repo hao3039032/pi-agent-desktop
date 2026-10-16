@@ -18,6 +18,22 @@ const zh = {
   loadError: "读取配置失败",
 };
 
+const zhTW: typeof zh = {
+  setupTitle: "連線服務",
+  setupIntro: "首次使用請填寫服務位址和 API Key，之後可在「設定 → 一般 → 服務設定」中修改。",
+  sectionTitle: "服務設定",
+  sectionHint: "模型對話和網路搜尋共用這裡的服務位址與 API Key。位址變更後在此修改即可。",
+  baseUrl: "服務位址 (Base URL)",
+  apiKey: "API Key",
+  apiKeyKeep: "已儲存，留空則保持不變",
+  npmMirrorLabel: "使用中國大陸 npm 鏡像（registry.npmmirror.com）加速外掛與技能安裝",
+  save: "儲存",
+  saving: "儲存中…",
+  saved: "已儲存",
+  later: "稍後",
+  loadError: "讀取設定失敗",
+};
+
 const en: typeof zh = {
   setupTitle: "Connect to the service",
   setupIntro: "Enter the service address and API key to get started. You can change them later in Settings → General → Service.",
@@ -36,6 +52,16 @@ const en: typeof zh = {
 
 export type DistroStrings = typeof zh;
 
+/**
+ * Traditional Chinese follows lib/i18n/registry.ts's zh-TW resolution (zh-TW,
+ * zh-Hant*, zh-HK, zh-MO); every other zh* variant reads Simplified.
+ */
 export function distroStrings(locale: string): DistroStrings {
-  return locale.toLowerCase().startsWith("zh") ? zh : en;
+  const normalized = locale.toLowerCase();
+  const traditional = normalized === "zh-tw" || normalized.startsWith("zh-tw-")
+    || normalized === "zh-hk" || normalized.startsWith("zh-hk-")
+    || normalized === "zh-mo" || normalized.startsWith("zh-mo-")
+    || normalized === "zh-hant" || normalized.startsWith("zh-hant-");
+  if (traditional) return zhTW;
+  return normalized.startsWith("zh") ? zh : en;
 }

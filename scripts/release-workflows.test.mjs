@@ -186,6 +186,20 @@ test("release workflow publishes Apple Silicon, Linux x64, and Windows x64 insta
   assert.match(workflow, /gh release edit "v\$version" --draft=false --latest/);
 });
 
+test("the distro release workflow builds on the macOS 26 SDK", async () => {
+  const workflow = await readFile(
+    join(root, ".github", "workflows", "distro-release.yml"),
+    "utf8",
+  );
+
+  // The distro release signs and publishes the same AppKit window controls;
+  // the same SDK gate as release.yml applies (0.7.1 shipped legacy traffic
+  // lights from a macOS 15 runner).
+  assert.match(workflow, /runner: macos-26/);
+  assert.doesNotMatch(workflow, /macos-15/);
+  assert.match(workflow, /--show-sdk-version\)"\n\s+echo "macOS SDK \$sdk"\n\s+test "\$\{sdk%%\.\*\}" -ge 26/);
+});
+
 test("nothing reintroduces a literal homedir() into an fs call", async () => {
   // This is what broke the Windows build for every release: @vercel/nft folds
   // homedir() at build time and globs the whole user profile, which dies on the

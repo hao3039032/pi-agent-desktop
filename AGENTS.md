@@ -87,6 +87,7 @@ app/api/
   desktop/save/route.ts           POST copy a file to, or write bytes at, a natively-picked path
   desktop/describe-paths/route.ts POST classify dropped absolute paths (directory/image/file)
   artifacts/settings/route.ts     GET/PUT the "artifacts in the side panel" prompt switch
+  widgets/open/route.ts           POST — pop a widget out into a native glimpseui window
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
@@ -115,6 +116,7 @@ lib/
   normalize.ts        normalizeToolCalls() — field name mismatch between file format and our types
   workspace-state.ts  persisted session/cwd/file-tab restore for desktop cold starts
   worktree.ts         project/worktree resolution and git worktree operations
+  widget-window.ts    glimpseui pop-out window host for show_widget
 
 components/
   AppShell.tsx        layout + URL state + tab management

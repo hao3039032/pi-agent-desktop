@@ -31,7 +31,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc --bundles nsis
             apple_signing_identity: ""
-          - runner: macos-15
+          - runner: macos-26
             platform: macos
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
@@ -39,7 +39,7 @@ jobs:
           # Cross-compiled on the Apple Silicon runner (macOS 12 dropped the
           # last Intel images): Rust targets x86_64-apple-darwin natively, and
           # the bundled Node runtime is swapped below for a darwin-x64 build.
-          - runner: macos-15
+          - runner: macos-26
             platform: macos
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
@@ -82,6 +82,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      # The window controls are drawn by the AppKit the binary links, not the
+      # one it runs on: an SDK 15 build shows the legacy traffic lights even on
+      # macOS 26+, and with different button geometry (0.7.1 shipped from a
+      # macOS 15 runner that way). Fail here instead of shipping that again.
+      - name: Require the macOS 26 SDK
+        if: runner.os == 'macOS'
+        run: |
+          sdk="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK $sdk"
+          test "${sdk%%.*}" -ge 26
 
       - name: Stage an x86_64 Node runtime for the Intel macOS build
         # The Apple Silicon runner's own Node cannot serve an x86_64 bundle:
