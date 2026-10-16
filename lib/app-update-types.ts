@@ -9,7 +9,7 @@
 
 export type AppUpdateProjectId = "pi-agent-desktop";
 
-export type AppReleaseStatus = "available" | "unpublished" | "unknown";
+export type AppReleaseStatus = "available" | "unpublished" | "unknown" | "error";
 
 export interface AppComponentReleaseInfo {
   project: AppUpdateProjectId;
