@@ -112,11 +112,74 @@
       "reason": "Adds ignores for the desktop build output directories.",
       "disposition": "accepted"
     },
+    "lib/subagent-extension.ts": {
+      "risk": "medium",
+      "drift": 68,
+      "structuralDrift": 68,
+      "disposition": "accepted",
+      "reason": "Fork precedence policy: preferPiSubagentsExtension detects loaded pi-subagents files and removes the built-in host plus resolved conflicts. Preserve package-first precedence and the detection flag when upstream changes extension registration; tool-name matching must not return."
+    },
+    "lib/subagent-runtime.ts": {
+      "risk": "medium",
+      "drift": 36,
+      "structuralDrift": 36,
+      "disposition": "accepted",
+      "reason": "Fork start/resume guard combines the process-wide detection flag with global package activation. Upstream lifecycle changes must retain this best-effort gate without blocking existing children from get/steer/notification paths."
+    },
+    "lib/subagent-settings.ts": {
+      "risk": "medium",
+      "drift": 43,
+      "structuralDrift": 43,
+      "disposition": "accepted",
+      "reason": "Fork package-activation reader and shared package identity support both the runtime guard and Agents panel. Preserve npm/versioned/local-path recognition and extensions: [] disable semantics when upstream changes settings persistence."
+    },
+    "components/AgentsConfig.tsx": {
+      "risk": "medium",
+      "drift": 55,
+      "structuralDrift": 51,
+      "disposition": "accepted",
+      "reason": "Fork pi-subagents notice disables the built-in switch and hides builtin profiles from both the sidebar and detail selection. Upstream form or selection changes can silently restore an orphaned builtin pane; retain visibleProfiles and settings-response wiring."
+    },
+    "app/api/subagents/settings/route.ts": {
+      "risk": "low",
+      "drift": 13,
+      "structuralDrift": 13,
+      "disposition": "accepted",
+      "reason": "Fork GET and PUT responses add legacyPackage from global package settings. Preserve both response paths when upstream changes the built-in settings API; the read does not activate extensions."
+    },
+    "lib/api-types.ts": {
+      "risk": "low",
+      "drift": 16,
+      "structuralDrift": 16,
+      "disposition": "accepted",
+      "reason": "Shared API types have drifted again since the earlier update-type extraction, including SubagentSettingsResponse.legacyPackage. Keep the field consistent with both settings route responses and AgentsConfig."
+    },
+    "lib/i18n/messages/en.ts": {
+      "risk": "high",
+      "drift": 488,
+      "structuralDrift": 488,
+      "disposition": "accepted",
+      "reason": "Accumulated fork UI translations, including the pi-subagents priority notice and reversed builtInDescription. Counts cover all current drift, not just this feature; upstream locale edits require review to retain fork keys and cross-locale parity."
+    },
+    "lib/i18n/messages/zh-CN.ts": {
+      "risk": "high",
+      "drift": 492,
+      "structuralDrift": 492,
+      "disposition": "accepted",
+      "reason": "Accumulated fork UI translations, including the pi-subagents priority notice and reversed builtInDescription. Counts cover all current drift, not just this feature; upstream locale edits require review to retain fork keys and cross-locale parity."
+    },
+    "lib/i18n/messages/zh-TW.ts": {
+      "risk": "high",
+      "drift": 480,
+      "structuralDrift": 480,
+      "disposition": "accepted",
+      "reason": "Accumulated fork UI translations, including the pi-subagents priority notice and reversed builtInDescription. Counts cover all current drift, not just this feature; upstream locale edits require review to retain fork keys and cross-locale parity."
+    },
     "lib/rpc-manager.ts": {
       "risk": "high",
-      "drift": 109,
-      "reason": "Small fork edit in a file upstream changes often; watch it despite the low drift count.",
-      "structuralDrift": 595,
+      "drift": 452,
+      "reason": "Upstream frequently changes session startup. Preserve the fork extension override composition and both subagent guard dependencies alongside the existing fork lifecycle wiring.",
+      "structuralDrift": 452,
       "disposition": "accepted"
     },
     "components/BranchNavigator.tsx": {
@@ -221,6 +284,7 @@
     "reduce": "Drift that can be removed without losing anything \u2014 desktop-only code that belongs in components/desktop/, or fork additions sitting in an upstream file that can move to a fork-owned one. Act on these."
   },
   "decisionLog": [
+    "2026-10-16 — Registered the pi-subagents precedence boundary from b6352fc: extension detection, runtime guard, settings reader, AgentsConfig selection, settings API/type, and all three locale files. Refreshed rpc-manager counts. Measurements use the unchanged pi-web baseline 6fcd7d4 and include accumulated drift, not merely this commit. These are accepted product-policy differences; medium/high incoming overlaps must request review even when git merges cleanly. No upstream implementation was moved across files; existing behavior tests plus per-file classifier regressions guard this boundary.",
     "2026-07-26 \u2014 lib/api-types.ts: fork update types moved to lib/app-update-types.ts; file now matches upstream and left the manifest.",
     "2026-07-26 \u2014 components/AppShell.tsx: desktop window chrome moved to components/desktop/ (-53 structural). The remaining 376 lines are the top-bar redesign; accepted.",
     "2026-07-26 \u2014 TabBar, FileExplorer, useTheme, FileViewer: assessed as generic improvements with zero desktop coupling. Upstreaming was declined, so accepted rather than reverted \u2014 reverting would delete working features to save CI review time.",
