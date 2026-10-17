@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const chatWindowSource = await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8");
+const chatWindowSource = (await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8")).replaceAll("\r\n", "\n");
 const useDragDropSource = await readFile(new URL("../hooks/useDragDrop.ts", import.meta.url), "utf8");
 const useDesktopDragDropSource = await readFile(new URL("../hooks/useDesktopDragDrop.ts", import.meta.url), "utf8");
 const windowSource = await readFile(new URL("../src-tauri/src/shell/window.rs", import.meta.url), "utf8");

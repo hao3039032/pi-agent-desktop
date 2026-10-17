@@ -276,43 +276,6 @@ test("desktop staging drops sharp's musl native builds for Linux bundles", async
   assert.match(prepareSource, /entry\.name\.includes\("linuxmusl"\)/);
 });
 
-test("desktop staging ships the generative-ui default and its glimpseui window host", async () => {
-  const prepareSource = await readFile(new URL("./prepare-desktop.mjs", import.meta.url), "utf8");
-  // The generative-ui default extension and the glimpseui window host it loads
-  // at runtime are both invisible to Next's file tracer, so packaging must
-  // stage them explicitly — and on macOS/Windows the host only exists when the
-  // glimpseui postinstall (approved via package.json allowScripts) actually
-  // ran, so a missing binary must fail the build instead of shipping a default
-  // whose every show_widget call throws at spawn.
-  assert.match(prepareSource, /"@ryan_nookpi\/pi-extension-generative-ui"/);
-  assert.match(prepareSource, /name: "glimpseui"/);
-  assert.match(prepareSource, /stagedGlimpseHost/);
-  assert.match(prepareSource, /"win32"\s*\?\s*join\(stagedNodeModulesDir, "glimpseui", "native", "windows", "bin", "glimpse\.exe"\)/);
-  assert.match(prepareSource, /"darwin"\s*\?\s*join\(stagedNodeModulesDir, "glimpseui", "src", "glimpse"\)/);
-  // Cross-arch macOS packages (Intel from an ARM runner) must not ship the
-  // runner-arch glimpse host: every show_widget would die with "Bad CPU type
-  // in executable". The guard recompiles with swiftc -target when the staged
-  // Mach-O lacks the target cpu type.
-  assert.match(prepareSource, /requiredMachOCpuType\(targetTriple\)/);
-  assert.match(prepareSource, /readMachOCpuTypes\(stagedGlimpseHost\)/);
-  assert.match(prepareSource, /"-target", crossTarget, glimpseSource/);
-  // The cross target's deployment target must be macOS 12: glimpse.swift uses
-  // `underPageBackgroundColor` (macOS 12+) without an #available guard, and a
-  // macosx11 target fails to compile the staged source (the 0.7.102 release
-  // died exactly there).
-  assert.match(prepareSource, /-apple-macosx12`;/);
-});
-
-test("glimpseui's install script stays approved so its native host builds", async () => {
-  const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-  // npm's allow-scripts gate blocks install scripts by default and everything
-  // else in the tree survives on prebuilds; glimpseui has none — its postinstall
-  // compiles the macOS/Windows window host. Keep the name-level (unpinned)
-  // approval so a dependency bump cannot silently re-block it.
-  assert.equal(pkg.allowScripts?.glimpseui, true);
-  assert.equal(pkg.allowScripts?.["glimpseui@0.6.2"], undefined);
-});
-
 test("every workflow step that compiles the app embeds the updater public key", async () => {
   // lib.rs registers tauri-plugin-updater only when option_env! sees
   // PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY while the Rust code compiles; the

@@ -49,7 +49,6 @@ import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./c
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
 import { createArtifactGuideExtension } from "./artifact-guide-extension";
 import { findSecurityExtensionPaths } from "./permission-system-package";
-import { createGenerativeUiExtension, preferBuiltinGenerativeUiExtension } from "./generative-ui";
 import { registerSecurityChildExtensions, unregisterSecurityChildExtensions } from "./required-child-extensions";
 import { createPiWebBuiltinExtensions } from "./builtin-extensions";
 import type { McpHost } from "./mcp-host";
@@ -2687,11 +2686,6 @@ export async function startRpcSession(
     // after the session is created, so the getter is filled in below.
     const exactSystemPromptRef: { current?: () => string } = {};
     const exactSystemPromptExtension = createExactSystemPromptExtension(() => exactSystemPromptRef.current?.());
-    // Pi Web's generative-ui tools load as an inline factory in normal
-    // sessions only: Chat-only sessions load no extensions by design, and
-    // subagent tool sets stay governed by their profile's load_extensions
-    // switch. The extension never opens windows itself — the frontend renders
-    // widgets inline and /api/widgets/open pops them out on request.
     const usesExactSystemPrompt = chatOnly || subagentResources?.exactSystemPrompt !== undefined;
     // codemode, tool-search, and mcp, as the pi CLI loads them, and the host that decides
     // which MCP servers the session connects (ADR 0006).
@@ -2728,7 +2722,6 @@ export async function startRpcSession(
               ...(builtins?.extensions ?? []),
               createReadOnlyMcpPolicyExtension(),
               createArtifactGuideExtension(),
-              createGenerativeUiExtension(),
               createProjectCommandBashExtension({
                 cwd: sessionCwd,
                 settings: settingsManager,
@@ -2739,7 +2732,7 @@ export async function startRpcSession(
                 isBuiltInSubagentsEnabled,
               ),
             ],
-            extensionsOverride: (base) => preferUserBashExtension(preferBuiltinGenerativeUiExtension(preferPiSubagentsExtension(base))),
+            extensionsOverride: (base) => preferUserBashExtension(preferPiSubagentsExtension(base)),
           },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });

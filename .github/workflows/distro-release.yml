@@ -144,11 +144,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Test artifact rendering and upgrade cache cleanup
+        run: node --experimental-strip-types --test lib/artifacts.test.mjs lib/artifact-only-tools.test.mjs components/MarkdownBody.test.mjs components/MessageView.test.mjs scripts/desktop-route-cache.test.mjs
+
       - name: Write component manifest
         run: npm run release:manifest
 
       - name: Prepare packaged Next.js server
         run: npm run desktop:prepare
+
+      - name: Verify packaged frontend after an overwrite upgrade
+        run: node scripts/verify-packaged-frontend.mjs
 
       - name: Verify packaged server
         # The verify script is exercised on mac/linux; its Windows path

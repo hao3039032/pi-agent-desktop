@@ -10,8 +10,6 @@ import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantB
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
-import { TurnWidgetResults } from "./TurnWidgetResults";
-import { collectTurnWidgets, isTurnWidgetBlock } from "@/lib/widget-tool";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ConversationNavigator, type ConversationTurnLocation } from "./ConversationNavigator";
@@ -170,15 +168,6 @@ interface FinalSplitEntry {
   processMessage: AssistantMessage;
   /** The final answer bubble; also kept for error/truncation notices without answer text. */
   answerMessage: AssistantMessage | null;
-}
-
-/**
- * A show_widget call that renders in the turn results area. Widget calls are
- * excluded from ProcessDetailsGroup and stay at the end of the turn, after
- * the final answer.
- */
-export function isHoistableWidgetBlock(block: AssistantContentBlock): boolean {
-  return isTurnWidgetBlock(block);
 }
 
 // Message objects are immutable (any change produces a new object), so the
@@ -1551,7 +1540,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   <MessageView
                     key={`${keyPrefix}-view-${messageKey}`}
                     message={msg}
-                    suppressWidgets
                     toolResults={toolResultsMap}
                     modelNames={modelNames}
                     cwd={messageCwd}
@@ -1600,7 +1588,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 // leading segment anyway instead of flattening the whole turn.
                 const userIdx = hasAnchor ? idx : -1;
                 const groupStartIdx = hasAnchor ? idx : 0;
-                const turnKey = hasAnchor ? messageKeys[groupStartIdx] ?? groupStartIdx : "leading";
                 let endIdx = Math.min(idx + 1, messages.length);
                 while (endIdx < messages.length && !isMessageGroupAnchor(messages[endIdx])) endIdx += 1;
 
@@ -1614,16 +1601,6 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 const { answerMessage: finalAnswerMessage, processMessage: finalProcessMessage } = finalAssistant
                   ? getFinalSplit(finalAssistant)
                   : { answerMessage: null, processMessage: null };
-
-                const turnWidgets = collectTurnWidgets(
-                  messages.slice(userIdx + 1, endIdx),
-                  toolResultsMap,
-                  {
-                    isStreaming: isLiveTail,
-                    entryIds: entryIds.slice(userIdx + 1, endIdx),
-                    streamingMessage,
-                  },
-                );
 
                 const processViews: ReactNode[] = [];
                 let processToolCount = 0;
@@ -1643,17 +1620,12 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   const blocks = getDisplayableAssistantBlocks(message);
                   if (blocks.length === 0) continue;
                   processRefIdx ??= visibleRefIndexByMessage.get(processIdx);
-                  // Widget toolCall blocks leave the group and render in TurnWidgetResults
-                  // after the answer; everything else stays collapsible process content.
-                  const rest = blocks.filter((block) => !isHoistableWidgetBlock(block));
-                  processToolCount += countToolCallBlocks(rest);
+                  processToolCount += countToolCallBlocks(blocks);
                   revealProcess ||= Boolean(pendingSearchScroll && entryIds[processIdx] === pendingSearchScroll.entryId && (!searchBlock || blocks.includes(searchBlock)));
-                  if (rest.length === 0) continue;
-                  const groupMessage = rest === blocks ? message : { ...message, content: rest };
                   processViews.push(renderMessage(processIdx, {
                     attachRef: false,
                     keyPrefix: "process",
-                    messageOverride: groupMessage,
+                    messageOverride: message,
                     showTimestamp: false,
                   }));
                 }
@@ -1691,19 +1663,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
 
                 if (streamingMessage && hasStreamingContent) {
                   rendered.push(
-                    <MessageView key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} suppressWidgets />,
-                  );
-                }
-
-                // One keyed sibling owns this turn's results throughout generation and settlement.
-                if (turnWidgets.length > 0) {
-                  rendered.push(
-                    <TurnWidgetResults
-                      key={`widget-results-${turnKey}`}
-                      entries={turnWidgets}
-                      streamingMessage={streamingMessage}
-                      revealToolCallId={pendingSearchScroll ? turnWidgets.find((entry) => entry.entryId === pendingSearchScroll.entryId && (!searchBlock || (searchBlock.type === "toolCall" && entry.toolCallId === searchBlock.toolCallId)))?.toolCallId : undefined}
-                    />,
+                    <MessageView key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />,
                   );
                 }
 

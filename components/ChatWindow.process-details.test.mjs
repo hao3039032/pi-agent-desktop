@@ -31,18 +31,7 @@ test("resets process details when the turn gains or loses its final answer", () 
   );
 });
 
-test("moves widget results to the turn end so collapsing never hides them and text answer comes first", () => {
-  // A rendered show_widget card is the reply's centerpiece: it leaves the
-  // collapsible process group and renders after the final answer in TurnWidgetResults.
-  assert.match(source, /function isHoistableWidgetBlock\(block: AssistantContentBlock\): boolean/);
-  assert.match(source, /const turnWidgets = collectTurnWidgets\(/);
-  assert.match(source, /const rest = blocks\.filter\(\(block\) => !isHoistableWidgetBlock\(block\)\);/);
-  assert.match(source, /<TurnWidgetResults[\s\S]*?entries=\{turnWidgets\}/);
-  // The group itself only carries the non-widget remainder.
-  assert.match(source, /processToolCount \+= countToolCallBlocks\(rest\)/);
-  assert.match(source, /if \(rest\.length === 0\) continue/);
-  // Rendered after the final answer push.
-  const answerIndex = source.indexOf("if (finalAnswerMessage && finalAssistant) {");
-  const widgetResultsIndex = source.indexOf("// One keyed sibling owns this turn");
-  assert.ok(answerIndex > -1 && widgetResultsIndex > answerIndex, "widget results render after the answer");
+test("tool calls use the ordinary process group without a separate widget renderer", () => {
+  assert.match(source, /processToolCount \+= countToolCallBlocks\(blocks\)/);
+  assert.doesNotMatch(source, /TurnWidgetResults|isHoistableWidgetBlock|suppressWidgets/);
 });

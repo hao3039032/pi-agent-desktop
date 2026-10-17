@@ -29,6 +29,22 @@ function renderMessage(message, props = {}) {
   );
 }
 
+test("assistant chart artifacts reach the preview renderer, not literal directive text", () => {
+  const text = [
+    ':::artifact{identifier="chart-tools-demo" type="html" title="Chart demo"}',
+    '```html',
+    '<!DOCTYPE html><html><body><svg viewBox="0 0 100 100"><rect width="20" height="80" /></svg><script>void 0;</script></body></html>',
+    '```',
+    ':::',
+  ].join("\n");
+  const html = renderMessage({ role: "assistant", content: [{ type: "text", text }] });
+  assert.doesNotMatch(html, /:::artifact/);
+  // Without AppShell's opener, the artifact uses its inline preview fallback.
+  // Scripted history still requires a deliberate Preview click.
+  assert.match(html, /title="Preview HTML"/);
+  assert.doesNotMatch(html, /<iframe/);
+});
+
 test("updates a reused message when its written files change", () => {
   const props = { message: { role: "assistant", content: [] } };
   assert.equal(MessageView.compare(props, props), true);
