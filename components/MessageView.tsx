@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useState, useRef, useEffect, useMemo } from "react";
+import { memo, useState, useRef, useEffect, useMemo, useContext } from "react";
 import ReactMarkdown from "react-markdown";
 import { MarkdownBody } from "./MarkdownBody";
 import { ImagePreview } from "./ImagePreview";
@@ -21,7 +21,10 @@ import { skillExpansionToCommand } from "@/lib/slash-display";
 import type { SubagentToolDetails } from "@/lib/subagent-extension";
 import { CODEMODE_TOOL_NAME, codemodeCalls, codemodeScript, codemodeScriptPreview, stripCodemodeHeader } from "@/lib/codemode-view";
 import { CodemodeCallList } from "./CodemodeToolView";
-import { imageSource, resultImageFileName } from "@/lib/result-image";
+import { imageSource } from "@/lib/result-image";
+import { generatedImageIndices, customGeneratedImage } from "@/lib/turn-result-images";
+import { ToolResultImages } from "./ToolResultImages";
+import { TurnImageTargetContext, TurnImageReference } from "./TurnResultImages";
 import { mcpToolLabel, prettyMcpResultText } from "@/lib/mcp-tool-display";
 import type {
   AgentMessage,
@@ -282,6 +285,11 @@ function haveSameRelevantToolResults(
 }
 
 export const MessageView = memo(function MessageView({ message, isStreaming, toolResults, modelNames, cwd, onOpenFile, onOpenSession, entryId, searchBlock, onFork, forking, onEditContent, onCancelEdit, isEditing, showTimestamp, prevTimestamp, sessionId, writtenFiles, onCompact, isCompacting, compactError }: Props) {
+  const turnImageTarget = useContext(TurnImageTargetContext);
+  const generatedImage = customGeneratedImage(message);
+  if (generatedImage) {
+    return turnImageTarget ? null : <ToolResultImages images={[generatedImage]} isError={false} />;
+  }
   if (message.role === "user") {
     return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onEditContent={onEditContent} onCancelEdit={onCancelEdit} isEditing={isEditing} />;
   }
@@ -1139,7 +1147,11 @@ function ToolCallBlock({ block, result, duration, aborted, defaultExpanded, onOp
     ? resultContent.filter((b): b is { type: "text"; text: string } => b.type === "text").map((b) => b.text).join("\n")
     : null;
   const resultText = mcpLabel && joinedResultText !== null ? prettyMcpResultText(joinedResultText) : joinedResultText;
-  const resultImages = getMessageImages(resultContent);
+  const turnImageTarget = useContext(TurnImageTargetContext);
+  const promotedIndices = turnImageTarget && result ? generatedImageIndices(result) : new Set<number>();
+  const resultImages = getMessageImages(result
+    ? result.content.filter((_, index) => !promotedIndices.has(index))
+    : resultContent);
   const resultIsEmpty = resultText === null ? false : (resultText.trim() === "(no output)" || resultText.trim() === "");
   const isError = (result?.isError ?? false)
     || (isApplyPatchToolName(block.toolName) && applyPatchResultHasFailures(result?.details));
@@ -1255,7 +1267,8 @@ function ToolCallBlock({ block, result, duration, aborted, defaultExpanded, onOp
       )}
 
       {/* ── Result images — always visible, independent of the collapsed details ── */}
-      {resultImages.length > 0 && <ResultImages images={resultImages} isError={isError} />}
+      {resultImages.length > 0 && <ToolResultImages images={resultImages} isError={isError} />}
+      {promotedIndices.size > 0 && <TurnImageReference />}
 
       {/* ── Expanded: applied-patch split diff ── */}
       {expanded && patchFiles && (
@@ -1657,60 +1670,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// Images a tool returned — including ones a codemode script generated with an image model,
-// which pi never writes to disk — so each one can be saved.
-function ResultImages({ images, isError }: { images: ImageContent[]; isError: boolean }) {
-  const { t } = useI18n();
-  return (
-    <div
-      style={{
-        display: "flex",
-        gap: 8,
-        flexWrap: "wrap",
-        padding: "10px",
-        background: "var(--bg)",
-        borderTop: `1px solid ${isError ? "rgba(248,113,113,0.3)" : "rgba(34,197,94,0.15)"}`,
-      }}
-    >
-      {images.map((image, index) => {
-        const src = imageSource(image);
-        if (!src) return null;
-        return (
-          <div key={index} className="result-image" style={{ maxWidth: "100%" }}>
-            <ImagePreview src={src} style={{ maxWidth: "100%" }}>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={src}
-                alt=""
-                loading="lazy"
-                style={{
-                  display: "block",
-                  maxWidth: "min(100%, 720px)",
-                  maxHeight: 520,
-                  borderRadius: 6,
-                  objectFit: "contain",
-                  border: "var(--hairline) solid var(--border)",
-                }}
-              />
-            </ImagePreview>
-            <button
-              type="button"
-              className="result-image-save"
-              onClick={() => {
-                void import("@/lib/desktop-native")
-                  .then(({ downloadUrlAsFile }) => downloadUrlAsFile(src, resultImageFileName(imageMediaType(image), index)))
-                  .catch((error: unknown) => console.error("Failed to save image:", error));
-              }}
-            >
-              {t("chat.saveImage")}
-            </button>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 function PairedResult({ text, isEmpty, isError }: {
   text: string;
   isEmpty: boolean;
@@ -2059,10 +2018,6 @@ function getMessageText(content: CustomMessage["content"] | UserMessage["content
 function getMessageImages(content: CustomMessage["content"] | UserMessage["content"]): ImageContent[] {
   if (typeof content === "string") return [];
   return content.filter((b): b is ImageContent => b.type === "image");
-}
-
-function imageMediaType(img: ImageContent): string | undefined {
-  return img.source?.media_type ?? (img as unknown as { mimeType?: string }).mimeType;
 }
 
 function safeJson(value: unknown): string {

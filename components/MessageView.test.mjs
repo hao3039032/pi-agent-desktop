@@ -448,7 +448,7 @@ test("shows tool-result images while the tool details stay collapsed", () => {
     content: [block],
   }, { toolResults: new Map([[block.toolCallId, result]]) });
 
-  assert.match(html, /<button[^>]+aria-label="Preview image"[^>]*>/);
+  assert.match(html, /<button[^>]+aria-label="Preview image: Image 1"[^>]*>/);
   assert.match(html, /<img[^>]+src="data:image\/png;base64,YWJj"/);
   assert.doesNotMatch(html, /captured-1280x720/);
   assert.doesNotMatch(html, /"tabId"/);

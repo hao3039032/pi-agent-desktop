@@ -10,6 +10,8 @@ import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantB
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
+import { collectTurnResultImages, customGeneratedImage } from "@/lib/turn-result-images";
+import { TurnImageOwner, TurnImageTargetContext } from "./TurnResultImages";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ConversationNavigator, type ConversationTurnLocation } from "./ConversationNavigator";
@@ -1522,6 +1524,9 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 const currentRefIdx = visibleRefIndexByMessage.get(idx);
                 const keyPrefix = options.keyPrefix ?? "message";
                 const messageKey = messageKeys[idx] ?? idx;
+                // These messages are owned by the turn gallery, including custom
+                // images arriving after the last assistant message.
+                if (customGeneratedImage(msg)) return null;
                 let showTimestamp = false;
                 if (msg.role === "assistant") {
                   showTimestamp = true;
@@ -1602,6 +1607,11 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   ? getFinalSplit(finalAssistant)
                   : { answerMessage: null, processMessage: null };
 
+                const turnImageId = `turn-images-${encodeURIComponent(messageKeySessionId ?? "new")}-${encodeURIComponent(String(messageKeys[groupStartIdx] ?? groupStartIdx))}`;
+                const turnMessages = messages.slice(userIdx + 1, endIdx);
+                const turnImageKeys = messageKeys.slice(userIdx + 1, endIdx);
+                if (streamingMessage) turnMessages.push(streamingMessage);
+                const turnImages = collectTurnResultImages(turnMessages, toolResultsMap, turnImageKeys);
                 const processViews: ReactNode[] = [];
                 let processToolCount = 0;
                 let processRefIdx: number | undefined;
@@ -1610,6 +1620,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                 for (let processIdx = userIdx + 1; processIdx <= finalAssistantIdx; processIdx++) {
                   const processMessage = messages[processIdx];
                   if (processMessage.role === "custom") {
+                    if (customGeneratedImage(processMessage)) continue;
                     revealProcess ||= Boolean(pendingSearchScroll && pendingSearchScroll.entryId === entryIds[processIdx]);
                     processViews.push(renderMessage(processIdx, { attachRef: false, keyPrefix: "process" }));
                     continue;
@@ -1630,7 +1641,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                   }));
                 }
 
-                if (processViews.length > 0) {
+                if (processViews.length > 0 || turnImages.length > 0) {
                   rendered.push(
                     <div
                       key={`process-group-${messageKeys[groupStartIdx] ?? groupStartIdx}`}
@@ -1641,9 +1652,11 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
                           would otherwise stay open once its answer shows up, e.g. when
                           switching between an answered and an unanswered leaf of the same
                           turn. Manual toggles survive every other re-render. */}
-                      <ProcessDetailsGroup key={finalAnswerMessage ? "answered" : "unanswered"} messageCount={processViews.length} toolCallCount={processToolCount} defaultExpanded={!finalAnswerMessage} reveal={revealProcess} t={t}>
-                        {processViews}
-                      </ProcessDetailsGroup>
+                      <TurnImageOwner id={turnImageId} images={turnImages}>
+                        {processViews.length > 0 && <ProcessDetailsGroup key={finalAnswerMessage ? "answered" : "unanswered"} messageCount={processViews.length} toolCallCount={processToolCount} defaultExpanded={!finalAnswerMessage} reveal={revealProcess} t={t}>
+                          {processViews}
+                        </ProcessDetailsGroup>}
+                      </TurnImageOwner>
                     </div>,
                   );
                 }
@@ -1663,12 +1676,18 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
 
                 if (streamingMessage && hasStreamingContent) {
                   rendered.push(
-                    <MessageView key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />,
+                    <TurnImageTargetContext.Provider key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} value={turnImages.length ? turnImageId : null}>
+                      <MessageView message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />
+                    </TurnImageTargetContext.Provider>,
                   );
                 }
 
                 for (let renderIdx = Math.max(finalAssistantIdx + 1, userIdx + 1); renderIdx < endIdx; renderIdx++) {
-                  rendered.push(renderMessage(renderIdx));
+                  rendered.push(
+                    <TurnImageTargetContext.Provider key={`tail-${messageKeys[renderIdx] ?? renderIdx}`} value={turnImages.length ? turnImageId : null}>
+                      {renderMessage(renderIdx)}
+                    </TurnImageTargetContext.Provider>,
+                  );
                 }
                 idx = endIdx;
                 if (endIdx === messages.length) break;

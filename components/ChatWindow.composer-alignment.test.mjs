@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const source = await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8");
+const source = (await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const inputSource = await readFile(new URL("./ChatInput.tsx", import.meta.url), "utf8");
 
 test("keeps the message scrollbar track so the column cannot move with content", () => {

@@ -52,6 +52,13 @@ On mount `useAgentSession` loads the history, then `GET /api/sessions/[id]/state
 - Prompt runs carry a monotonic run id; late SSE or reconciliation answers from an old run must be ignored, or they resurrect stale streaming bubbles.
 - Every SSE (re)connection is gated on `sessionHookMountedRef`. Under React Strict Mode (`next dev`) the mount-only effect's cleanup clears it and restores it only after the warm-session effect re-runs, so that effect must re-assert it before `maintainEventsConnected()`, or a dev tab never opens its stream.
 
+## Generated image deliverables
+
+- `pi-model-images` keeps its CLI + marker protocol. Its extension tags newly injected tool-result images with `details.modelImages = { version: 1, outputs: [{ blockIndex, kind: "generated-image", filePath }] }`. `lib/tool-result-details.ts` retains only bounded version/kind/index metadata through history and SSE; file paths and arbitrary payloads are not forwarded. History media deferral remaps these indices if an unsupported image is omitted, while URL block indices still address the original entry.
+- `lib/turn-result-images.ts` collects only explicitly tagged images from the active turn, plus the extension's `display: true` `model-image` custom messages (nested Code mode calls). Untagged `read`, browser screenshot and ordinary Code mode Image Blocks remain process output. There is no legacy stdout-marker inference or path-based file read.
+- `TurnImageOwner` in `ChatWindow` owns the gallery outside `ProcessDetailsGroup`, in the same render-window slot. It is not keyed on final-answer availability. Context suppresses only promoted images inside memoized tool cards; they offer a link to the gallery instead. Streaming and trailing tool views use the same ownership context. `ToolResultImages` supplies shared preview/save/load-error UI and the standalone fallback. More than four generated images can be expanded independently of the trace.
+- Tests: `lib/turn-result-images.test.mjs`, `components/TurnResultImages.test.mjs`, `node e2e/image-results.mjs` (isolated browser component test, no Next build or model requests; `PLAYWRIGHT_CHANNEL=msedge` can use installed Edge).
+
 ## Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then makes the generated HTML's recursive tree helpers iterative, so very deep linear sessions do not overflow the browser call stack.
 
