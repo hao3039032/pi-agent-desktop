@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { desktopTargetTriple } from "./desktop-platform.mjs";
+import { desktopTargetTriple, readMachOCpuTypes, requiredMachOCpuType } from "./desktop-platform.mjs";
 import { piPackageDirNames } from "./pi-packages.mjs";
 import { dedupeNestedPackages, externalPackageSpecifiers, findNestedPiScopePackages, stageCompletePackage, stageResolvedClosure } from "./stage-package.mjs";
 
@@ -14,6 +14,24 @@ const standaloneDir = join(desktopBuildDir, "standalone");
 const serverResourcesDir = join(rootDir, "src-tauri", "resources", "server");
 const serverHelperDir = join(rootDir, "src-tauri", "resources", "Pi Agent Server.app");
 const nodeResourcesDir = join(rootDir, "src-tauri", "resources", "node");
+
+// Cross-arch builds (x86_64 macOS from an Apple Silicon runner) must not bundle
+// the host's Node, so the workflow tells this script what it is building and
+// where the matching Node binary lives. Without the override the host's
+// process.execPath is copied — correct whenever host arch == target arch.
+const KNOWN_DESKTOP_TRIPLES = new Set([
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]);
+
+const targetTriple = process.env.PI_DESKTOP_TARGET_TRIPLE ?? desktopTargetTriple();
+if (!KNOWN_DESKTOP_TRIPLES.has(targetTriple)) {
+  throw new Error(
+    `Unknown PI_DESKTOP_TARGET_TRIPLE ${JSON.stringify(process.env.PI_DESKTOP_TARGET_TRIPLE)} — expected one of:\n  ${[...KNOWN_DESKTOP_TRIPLES].join("\n  ")}`,
+  );
+}
 
 async function runNextBuild() {
   const require = createRequire(import.meta.url);
@@ -52,6 +70,9 @@ async function assembleServer() {
   await rm(serverResourcesDir, { recursive: true, force: true });
   await mkdir(dirname(serverResourcesDir), { recursive: true });
   await cp(standaloneDir, serverResourcesDir, { recursive: true });
+  // Ship immutable prerender seeds only; route-cache is regenerated at runtime
+  // and can otherwise preserve HTML/RSC pointing at a previous build's chunks.
+  await rm(join(serverResourcesDir, ".next-desktop", "server", "route-cache"), { recursive: true, force: true });
 
   // Next's file tracer follows normal imports but intentionally omits files
   // reached through dynamic provider/export/plugin paths. These packages are
@@ -59,7 +80,8 @@ async function assembleServer() {
   // package.json rides along so dedupeNestedPackages() can read the top-level
   // version: without it a nested duplicate survives dedupe and ships (the
   // 0.4.7 installer shipped exactly that, #72).
-  for (const packageName of await piPackageDirNames()) {
+  const directPiPackages = await piPackageDirNames();
+  for (const packageName of directPiPackages) {
     const packageSource = join(rootDir, "node_modules", "@earendil-works", packageName);
     const packageDestination = join(
       serverResourcesDir,
@@ -72,6 +94,49 @@ async function assembleServer() {
       force: true,
     });
     await copyFile(join(packageSource, "package.json"), join(packageDestination, "package.json"));
+  }
+
+  // pi-subagents' detached runner resolves its host peer aliases from the
+  // bundled SDK tree (PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT in
+  // src-tauri/src/lib.rs): every export subpath of the scope's packages,
+  // including ones no app code imports (`pi-agent-core/node`) and transitive
+  // scope packages (`chord`, `pi-telemetry`). Next's tracer ships only
+  // fragments of those — a nested chord holding nothing but `dist/context/`
+  // — which fails the runner's completeness probe with "does not provide
+  // @earendil-works/pi-agent-core/node, @earendil-works/chord". Mirror the
+  // complete `dist/` of the remaining top-level scope packages and of the
+  // copies npm nested under every scope package, so every subpath resolves.
+  const scopeSource = join(rootDir, "node_modules", "@earendil-works");
+  const scopeDestination = join(serverResourcesDir, "node_modules", "@earendil-works");
+  for (const entry of await readdir(scopeSource, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const packageSource = join(scopeSource, entry.name);
+    const packageDestination = join(scopeDestination, entry.name);
+
+    if (!directPiPackages.includes(entry.name)) {
+      await cp(join(packageSource, "dist"), join(packageDestination, "dist"), { recursive: true, force: true });
+      // The tracer may not have staged this package at all; without the
+      // manifest its `exports` map cannot resolve the alias targets.
+      await copyFile(join(packageSource, "package.json"), join(packageDestination, "package.json"));
+    }
+
+    const nestedSource = join(packageSource, "node_modules", "@earendil-works");
+    const nestedEntries = await readdir(nestedSource, { withFileTypes: true }).catch(() => []);
+    for (const nested of nestedEntries) {
+      if (!nested.isDirectory()) continue;
+      const nestedSourcePackage = join(nestedSource, nested.name);
+      const nestedDestinationPackage = join(
+        packageDestination,
+        "node_modules",
+        "@earendil-works",
+        nested.name,
+      );
+      await cp(join(nestedSourcePackage, "dist"), join(nestedDestinationPackage, "dist"), { recursive: true, force: true });
+      await copyFile(
+        join(nestedSourcePackage, "package.json"),
+        join(nestedDestinationPackage, "package.json"),
+      );
+    }
   }
 
   // node-pty loads its native binding through a runtime-computed path
@@ -130,6 +195,24 @@ async function assembleServer() {
     sources: [join(piCodingAgentModules, "quickjs-wasi"), join(rootDir, "node_modules", "quickjs-wasi")],
     stagedNodeModulesDir,
   });
+
+  // sharp (pulled in by Next's production image optimizer) ships glibc and
+  // musl builds of its native libvips on Linux. The AppImage bundler's
+  // linuxdeploy walks every ELF under the resources and resolves its
+  // dependencies; the musl builds need `libc.musl-x86_64.so.1`, which no
+  // glibc system provides, so bundling dies with "Could not find dependency:
+  // libc.musl-x86_64.so.1" — the error tauri reports as an opaque "failed to
+  // run linuxdeploy". The packaged server always runs on the bundled glibc
+  // Node, so the musl variant is dead weight in every bundle; drop it here.
+  if (targetTriple.endsWith("-unknown-linux-gnu")) {
+    const imgDir = join(serverResourcesDir, "node_modules", "@img");
+    const imgEntries = await readdir(imgDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of imgEntries) {
+      if (entry.isDirectory() && entry.name.includes("linuxmusl")) {
+        await rm(join(imgDir, entry.name), { recursive: true, force: true });
+      }
+    }
+  }
 
   // pi-ai loads Amazon Bedrock through a variable specifier
   // (`import(runtimeSpecifier)` in bedrock-converse-stream.lazy.js) so bundlers
@@ -224,7 +307,9 @@ async function findNpmSource() {
 }
 
 async function bundleNodeRuntime() {
-  const triple = desktopTargetTriple();
+  const triple = targetTriple;
+  const sourceNodePath = process.env.PI_DESKTOP_NODE_BINARY ?? process.execPath;
+  await access(sourceNodePath, constants.R_OK);
   await rm(serverHelperDir, { recursive: true, force: true });
   await rm(nodeResourcesDir, { recursive: true, force: true });
 
@@ -237,23 +322,51 @@ async function bundleNodeRuntime() {
     const contentsDir = join(serverHelperDir, "Contents");
     binaryPath = join(contentsDir, "MacOS", "node");
     await mkdir(dirname(binaryPath), { recursive: true });
-    await copyFile(process.execPath, binaryPath);
+    await copyFile(sourceNodePath, binaryPath);
     await chmod(binaryPath, 0o755);
     await copyFile(
       join(rootDir, "desktop", "server-helper-Info.plist"),
       join(contentsDir, "Info.plist"),
     );
+    // Fork: ship npm on macOS as well, so pi can install/update packages
+    // without a system Node.js (lib/distro/runtime-env.ts puts it on PATH).
+    await cp(
+      await findNpmSource(),
+      join(nodeResourcesDir, "node_modules", "npm"),
+      { recursive: true },
+    );
   } else {
     const executableName = process.platform === "win32" ? "node.exe" : "node";
     binaryPath = join(nodeResourcesDir, executableName);
     await mkdir(nodeResourcesDir, { recursive: true });
-    await copyFile(process.execPath, binaryPath);
+    await copyFile(sourceNodePath, binaryPath);
     await chmod(binaryPath, 0o755);
     await cp(
       await findNpmSource(),
       join(nodeResourcesDir, "node_modules", "npm"),
       { recursive: true },
     );
+  }
+
+  // Wrong-arch staging is silent at build time and fatal on the target
+  // machine ("Bad CPU type in executable" when the shell spawns the server),
+  // so gate it here: the bundled Mach-O must contain the target's cpu type.
+  if (triple.endsWith("-apple-darwin")) {
+    const cpuTypes = readMachOCpuTypes(binaryPath);
+    if (cpuTypes === null) {
+      throw new Error(
+        `Bundled Node at ${relative(rootDir, binaryPath)} is not a Mach-O binary; expected a darwin Node build for ${triple}.`,
+      );
+    }
+    const required = requiredMachOCpuType(triple);
+    if (!cpuTypes.includes(required)) {
+      throw new Error(
+        `Bundled Node at ${relative(rootDir, binaryPath)} carries no ${triple} code ` +
+          `(cpu types: ${cpuTypes.map((type) => `0x${type.toString(16).padStart(8, "0")}`).join(", ")}). ` +
+          "When cross-building, download a Node runtime for the target architecture and point " +
+          "PI_DESKTOP_NODE_BINARY at it (with PI_DESKTOP_TARGET_TRIPLE set to match).",
+      );
+    }
   }
 
   return { binaryPath, triple };

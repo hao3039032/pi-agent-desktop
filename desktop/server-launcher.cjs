@@ -125,6 +125,19 @@ try {
   console.error("[Pi Agent] stale-dependency cleanup failed:", cleanupError);
 }
 
+// Runtime route-cache entries take precedence over immutable server/app seeds.
+// Their namespace is route-based, not BUILD_ID-based: NSIS overwrite installs
+// can leave an old homepage pointing at old JS while APIs run the new code.
+// Drop only this regenerable cache BEFORE Next initializes its memory cache.
+// Keep server/app (the fresh build seeds), static assets and user data intact.
+try {
+  fs.rmSync(path.join(__dirname, ".next-desktop", "server", "route-cache"), { recursive: true, force: true });
+} catch (error) {
+  // Do not silently boot with a mixed-version UI when cleanup is denied.
+  console.error("[Pi Agent] could not clear stale Next.js route cache:", error);
+  throw error;
+}
+
 // The standalone Next.js entrypoint is CommonJS.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 require("./server.js");

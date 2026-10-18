@@ -1,9 +1,12 @@
 import { configureHttpDispatcher } from "@/lib/http-dispatcher";
 import { closeAllAgentEventStreams } from "@/lib/agent-event-stream";
+import { initDistro } from "@/lib/distro";
 import { startScheduler } from "@/lib/scheduled-tasks";
 
-export function registerNodeInstrumentation(): void {
+export async function registerNodeInstrumentation(): Promise<void> {
   configureHttpDispatcher();
+  // Fork: distribution overlay (bundled npm/Git Bash on PATH, pre-installed packages).
+  await initDistro();
 
   // Scheduled tasks must fire without anyone having opened a page, and the
   // packaged app keeps this server alive while its window is hidden in the tray.
