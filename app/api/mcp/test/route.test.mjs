@@ -41,6 +41,9 @@ const FIXTURE = fileURLToPath(new URL("../../../../lib/__fixtures__/mcp-env-serv
 const globalPath = join(agentDir, "mcp.json");
 const projectPath = join(cwd, ".pi", "mcp.json");
 const marker = join(root, "command-ran");
+// Only base64 reaches the shell: Windows paths stay JS data, not shell escapes.
+const markerScript = Buffer.from(`require("node:fs").writeFileSync(${JSON.stringify(marker)}, ""); process.stdout.write("ok");`).toString("base64");
+const markerCommand = `!"${process.execPath.replaceAll("\\", "/")}" -e "eval(Buffer.from('${markerScript}', 'base64').toString())"`;
 const envFile = join(root, "env-names.json");
 const store = new ProjectTrustStore(agentDir);
 const SECRET = "literal-header-secret-value";
@@ -58,7 +61,7 @@ beforeEach(async () => {
   delete process.env.PI_WEB_DISABLE_MCP;
   clearMcpStatuses();
   await writeFile(globalPath, `${JSON.stringify({ mcpServers: globalServers }, null, 2)}\n`);
-  await writeFile(projectPath, `${JSON.stringify({ mcpServers: { repo: fixture({ TOKEN: `!touch ${marker} && echo ok` }) } }, null, 2)}\n`);
+  await writeFile(projectPath, `${JSON.stringify({ mcpServers: { repo: fixture({ TOKEN: markerCommand }) } }, null, 2)}\n`);
   await rm(marker, { force: true });
   store.set(cwd, null);
 });

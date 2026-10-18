@@ -13,6 +13,9 @@
 # testing
 /coverage
 /test-results/
+# Exact leftovers from the old Windows MCP route-test !touch commands.
+/CUsershao30AppDataLocalTemppi-web-mcp-sign-in-route-TJGVP9command-ran
+/CUsershao30AppDataLocalTemppi-web-mcp-test-route-W0qc3icommand-ran
 
 # next.js
 /.next/
