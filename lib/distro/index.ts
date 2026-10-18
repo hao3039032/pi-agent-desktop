@@ -1,0 +1,47 @@
+import {
+  applyAutoReviewWorkspaceOptOut,
+  applyUpstreamWebUpdateSkip,
+  configureDistroPath,
+  findDistroResourcesDir,
+  runPortableGitPostInstall,
+} from "./runtime-env";
+import { seedAgentDir } from "./seed";
+import { ensureBundledBashShellPath } from "./shell-path";
+import { applyNpmMirrorEnvFromSettings } from "./npm-mirror";
+
+/**
+ * Server-start hook for the distribution overlay (called from
+ * instrumentation-node.ts). A no-op in dev builds and in upstream-style
+ * bundles without `resources/pi-seed`. Never throws: a seeding problem must
+ * not keep the app from starting.
+ */
+export async function initDistro(): Promise<void> {
+  const resourcesDir = findDistroResourcesDir();
+  if (!resourcesDir) return;
+  try {
+    configureDistroPath(resourcesDir);
+    // Read once at extension-factory creation, before any session starts.
+    applyAutoReviewWorkspaceOptOut();
+    // Read at module scope by /api/app-update, which loads after this
+    // instrumentation runs: the packaged app must not advertise upstream
+    // pi-web releases it updates past as a whole.
+    applyUpstreamWebUpdateSkip();
+    runPortableGitPostInstall(resourcesDir);
+    await seedAgentDir(resourcesDir);
+  } catch (error) {
+    console.error("[distro] initialization failed:", error);
+  }
+  // After seedAgentDir: it flushes its own SettingsManager snapshot, and the
+  // pin is a locked field-level write of its own (see shell-path.ts for why
+  // the PATH prepend alone is not enough on real machines).
+  try {
+    await ensureBundledBashShellPath(resourcesDir);
+  } catch (error) {
+    console.warn("[distro] bundled Git Bash could not be pinned:", error);
+  }
+  try {
+    applyNpmMirrorEnvFromSettings();
+  } catch (error) {
+    console.warn("[distro] npm mirror could not be applied:", error);
+  }
+}

@@ -9,6 +9,9 @@ const eslintConfig = [
       ".next-desktop/**",
       "test-results/**",
       "src-tauri/resources/server/**",
+      // Fork: distro build artifacts (third-party code).
+      "src-tauri/resources/pi-seed/**",
+      "src-tauri/resources/git/**",
       "src-tauri/target/**",
       // demo/ is a separate Next.js project with its own lint config.
       "demo/**",

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -189,6 +189,20 @@ test("release workflow publishes Apple Silicon, Linux x64, and Windows x64 insta
   assert.match(workflow, /gh release edit "v\$version" --draft=false --latest --prerelease=false/);
 });
 
+test("the distro release workflow builds on the macOS 26 SDK", async () => {
+  const workflow = await readFile(
+    join(root, ".github", "workflows", "distro-release.yml"),
+    "utf8",
+  ).then((text) => text.replaceAll("\r\n", "\n"));
+
+  // The distro release signs and publishes the same AppKit window controls;
+  // the same SDK gate as release.yml applies (0.7.1 shipped legacy traffic
+  // lights from a macOS 15 runner).
+  assert.match(workflow, /runner: macos-26/);
+  assert.doesNotMatch(workflow, /macos-15/);
+  assert.match(workflow, /--show-sdk-version\)"\n\s+echo "macOS SDK \$sdk"\n\s+test "\$\{sdk%%\.\*\}" -ge 26/);
+});
+
 test("nothing reintroduces a literal homedir() into an fs call", async () => {
   // This is what broke the Windows build for every release: @vercel/nft folds
   // homedir() at build time and globs the whole user profile, which dies on the
@@ -255,6 +269,48 @@ test("desktop staging ships the Amazon Bedrock SDK the file tracer cannot see", 
   assert.match(prepareSource, /@smithy\/node-http-handler/);
   assert.match(prepareSource, /http-proxy-agent/);
   assert.match(prepareSource, /https-proxy-agent/);
+});
+
+test("desktop staging drops sharp's musl native builds for Linux bundles", async () => {
+  const prepareSource = await readFile(new URL("./prepare-desktop.mjs", import.meta.url), "utf8");
+  // npm installs sharp's glibc and musl libvips variants on Linux. The musl
+  // .so files need libc.musl-x86_64.so.1, which no glibc system provides, so
+  // linuxdeploy (the AppImage bundler's dependency walker) fails with
+  // "Could not find dependency: libc.musl-x86_64.so.1" — the opaque
+  // "failed to run linuxdeploy" that killed the Linux release from v0.6.504
+  // (misdiagnosed as the .relr.dyn/strip issue tauri#14796). Staging must
+  // delete the linuxmusl packages when targeting linux-gnu.
+  assert.match(prepareSource, /endsWith\("-unknown-linux-gnu"\)/);
+  assert.match(prepareSource, /entry\.name\.includes\("linuxmusl"\)/);
+});
+
+test("every workflow step that compiles the app embeds the updater public key", async () => {
+  // lib.rs registers tauri-plugin-updater only when option_env! sees
+  // PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY while the Rust code compiles; the
+  // pubkey a workflow step writes into tauri.conf.json is NOT read on that
+  // path. A `tauri build` step (directly or through tauri-action) without the
+  // env var therefore ships an app whose updater plugin is missing entirely:
+  // check() invokes plugin:updater|check, the command does not exist, and the
+  // app can never detect updates. mac-build-test.yml did exactly that while
+  // its own header claimed it was for iterating on "updater behavior".
+  const offenders = [];
+  for (const file of await readdir(join(root, ".github", "workflows"))) {
+    if (!file.endsWith(".yml")) continue;
+    const text = await readFile(join(root, ".github", "workflows", file), "utf8");
+    // Steps start at `      - name:` (six-space job indent); everything up to
+    // the next one belongs to the same step, env block included.
+    for (const chunk of text.split(/\n(?=      - name:)/)) {
+      if (!/tauri build|uses: tauri-apps\/tauri-action/.test(chunk)) continue;
+      if (!chunk.includes("PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY")) {
+        offenders.push(`${file}: ${/^      - name: (.*)$/m.exec(chunk)?.[1] ?? "(unnamed step)"}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "these steps compile the app without PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY, so the updater plugin is never registered (see lib.rs option_env! gate)",
+  );
 });
 
 test("the Tauri crates stay on the npm packages' major/minor", async () => {

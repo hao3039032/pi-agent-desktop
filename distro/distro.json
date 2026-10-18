@@ -1,0 +1,291 @@
+{
+  "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
+  "id": "lw",
+  "revision": 1,
+  "app": {
+    "productName": "Pi Agent LW",
+    "identifier": "com.hao3039032.pi-agent-lw",
+    "repository": "hao3039032/pi-agent-desktop"
+  },
+  "defaultBaseUrl": "https://ai-new-api.91prize.com",
+  "npmMirrorUrl": "https://registry.npmmirror.com",
+  "provider": {
+    "id": "lw",
+    "name": "LW",
+    "api": "anthropic-messages",
+    "defaultModel": "glm-5.3",
+    "models": [
+      {
+        "id": "glm-5.3",
+        "name": "glm-5.3",
+        "reasoning": true,
+        "input": [
+          "text"
+        ],
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "thinkingLevelMap": {
+          "xhigh": null,
+          "max": "max",
+          "high": "high",
+          "low": "low"
+        }
+      },
+      {
+        "id": "glm-5.3-flash",
+        "name": "glm-5.3-flash",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 128000,
+        "thinkingLevelMap": {
+          "max": "max",
+          "high": "high",
+          "low": "low"
+        }
+      },
+      {
+        "id": "claude-opus-5-5",
+        "name": "Claude Opus 5.5",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1000000,
+        "maxTokens": 128000
+      },
+      {
+        "id": "gpt-6-astra",
+        "name": "GPT-6 Astra",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 922000,
+        "maxTokens": 128000
+      },
+      {
+        "id": "gemini-3.8-flash",
+        "name": "Gemini 3.8 Flash",
+        "api": "google-generative-ai",
+        "baseUrl": "https://ai-new-api.91prize.com/v1beta",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 65536,
+        "thinkingLevelMap": {
+          "xhigh": "high",
+          "max": "high",
+          "high": "high",
+          "medium": "medium",
+          "low": "low",
+          "minimal": "minimal"
+        }
+      },
+      {
+        "id": "gemini-3.5-flash-lite",
+        "name": "Gemini 3.5 Flash Lite",
+        "api": "google-generative-ai",
+        "baseUrl": "https://ai-new-api.91prize.com/v1beta",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1048576,
+        "maxTokens": 65536,
+        "thinkingLevelMap": {
+          "max": "high",
+          "high": "high",
+          "medium": "medium",
+          "low": "low",
+          "minimal": "minimal"
+        }
+      },
+      {
+        "id": "deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "api": "openai-completions",
+        "baseUrl": "https://ai-new-api.91prize.com/v1",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "contextWindow": 1000000,
+        "maxTokens": 384000,
+        "compat": {
+          "thinkingFormat": "deepseek",
+          "requiresReasoningContentOnAssistantMessages": true,
+          "maxTokensField": "max_tokens",
+          "supportsStore": false,
+          "supportsDeveloperRole": false
+        }
+      }
+    ]
+  },
+  "packages": [
+    "npm:pi-subagents",
+    "npm:pi-web-access",
+    "git:github.com/hao3039032/pi-model-images",
+    "npm:pi-omp-advisor",
+    "git:github.com/hao3039032/pi-plan-vanguard",
+    "npm:@gotgenes/pi-permission-system",
+    "npm:@erichll/pi-auto-review"
+  ],
+  "settingsDefaults": {
+    "defaultThinkingLevel": "high",
+    "defaultTools": [
+      "+codemode"
+    ]
+  },
+  "webSearch": {
+    "baseUrlKey": "geminiBaseUrl",
+    "apiKeyKey": "geminiApiKey",
+    "defaults": {
+      "allowBrowserCookies": true,
+      "provider": "gemini",
+      "searchModel": "gemini-3.8-flash",
+      "summaryModel": "gemini-3.5-flash-lite",
+      "youtube": {
+        "enabled": true,
+        "preferredModel": "gemini-3.5-flash-lite"
+      },
+      "video": {
+        "enabled": true,
+        "preferredModel": "gemini-3.5-flash-lite"
+      },
+      "workflow": "auto-summary",
+      "autoOpenBrowser": false
+    }
+  },
+  "imageGen": {
+    "configFile": "pi-model-images.json",
+    "baseUrlSuffix": "/v1"
+  },
+  "agentFiles": {
+    "extensions/pi-auto-review/config.json": {
+      "model": "lw/gemini-3.5-flash-lite",
+      "reasoning": "low",
+      "timeoutMs": 90000,
+      "maxTokens": 1024,
+      "retries": 2,
+      "maxUserTranscriptTokens": 1200,
+      "maxToolTranscriptTokens": 1200,
+      "maxRelevantResultTokens": 800,
+      "maxReviewerInputTokens": 8192,
+      "breakGlassEnabled": true,
+      "failureMode": "deny",
+      "grantTtlMs": 60000,
+      "autoConfirmBoundedAllows": ["external_directory", "path"],
+      "policyAudit": {
+        "enabled": true,
+        "retentionDays": 180
+      }
+    },
+    "extensions/pi-permission-system/config.json": {
+      "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
+      "debugLog": false,
+      "permissionReviewLog": true,
+      "yoloMode": true,
+      "permissionDialogKeys": {
+        "approve": "1",
+        "approveSession": "2",
+        "approveSessionBoth": "3",
+        "deny": "4",
+        "denyWithReason": "5"
+      },
+      "promptNotifications": ["bell"],
+      "promptTimeoutMs": 120000,
+      "authorizerChain": ["pi-auto-review"],
+      "shellTools": {
+        "powershell": { "commandArgument": "command" }
+      },
+      "permission": {
+        "*": "ask",
+        "path": "allow",
+        "external_directory": "allow",
+        "bash": {
+          "*": "ask",
+          "rm -rf /": "deny",
+          "rm -fr /": "deny",
+          "rm -r /": "deny",
+          "rm -f /": "deny",
+          "rm -rf ~": "deny",
+          "rm -fr ~": "deny",
+          "rm -r ~": "deny",
+          "rm -f ~": "deny",
+          "rm * ~": "deny",
+          "rm -rf /?": "deny",
+          "rm -fr /?": "deny",
+          "rm -r /?": "deny",
+          "rm -rf /?/": "deny",
+          "rm -fr /?/": "deny",
+          "rm -r /?/": "deny",
+          "mkfs*": "deny",
+          "dd if=* of=/dev/*": "deny",
+          "dd * of=\\\\.\\*": "deny",
+          "rm * ?:\\": "deny",
+          "rm * ?:": "deny",
+          "Remove-Item * ?:\\": "deny",
+          "Remove-Item * ?:": "deny",
+          "remove-item * ?:\\": "deny",
+          "remove-item * ?:": "deny",
+          "REMOVE-ITEM * ?:\\": "deny",
+          "REMOVE-ITEM * ?:": "deny",
+          "format ?:*": "deny",
+          "Format ?:*": "deny",
+          "FORMAT ?:*": "deny",
+          "Format-Volume*": "deny",
+          "format-volume*": "deny",
+          "FORMAT-VOLUME*": "deny",
+          "Clear-Disk*": "deny",
+          "clear-disk*": "deny",
+          "CLEAR-DISK*": "deny",
+          "Remove-Partition*": "deny",
+          "remove-partition*": "deny",
+          "REMOVE-PARTITION*": "deny"
+        },
+        "read": "allow",
+        "grep": "allow",
+        "find": "allow",
+        "ls": "allow"
+      }
+    },
+    "extensions/subagent/config.json": {
+      "timeoutMs": 3600000,
+      "checkpointBeforeDeadlineMs": 300000
+    },
+    "pi-plan-vanguard.json": {
+      "defaultPlanTools": [
+        "read",
+        "bash",
+        "grep",
+        "find",
+        "ls",
+        "web_enable",
+        "web_search",
+        "source_check",
+        "fetch_content",
+        "get_search_content"
+      ]
+    }
+  },
+  "legacyAgentFiles": {
+    "pi-plan-vanguard.json": [
+      "pi-plan-mode.json",
+      "plan-mode.json"
+    ]
+  },
+  "agentTextFiles": {
+    "WATCHDOG.yml": "# pi-omp-advisor 全局配置(用户级,所有项目生效)\n# main: false —— 常规 pi 会话默认不启动 advisor(按需用 /advisor on 临时开启)\nmain: false\nsubagents: false\n\nadvisors:\n  - name: advisor\n    model: lw/gemini-3.8-flash\n    tools: [read, grep, glob]\n    contextTokens: 48000\n"
+  }
+}
