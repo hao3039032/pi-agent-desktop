@@ -9,7 +9,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { I18nProvider } = await jiti.import("@/hooks/useI18n.tsx");
+const { I18nProvider } = await jiti.import("@/hooks/useI18n");
 const { McpConfig, McpConfigView } = await jiti.import("./McpConfig.tsx");
 const { ConfigSidebarGroupSwitch } = await jiti.import("./SettingsUi.tsx");
 const { englishMessages } = await jiti.import("@/lib/i18n/locale-plugins.ts");
