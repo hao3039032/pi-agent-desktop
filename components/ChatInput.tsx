@@ -914,6 +914,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const valueRef = useRef(value);
   const attachedImagesRef = useRef(attachedImages);
   const pendingImageCountRef = useRef(0);
+  const imageReadGenerationRef = useRef(0);
+  useLayoutEffect(() => () => {
+    imageReadGenerationRef.current += 1;
+    pendingImageCountRef.current = 0;
+  }, [draftKey, cwd, chatOnly]);
   const {
     hashQuery, setHashQuery, hashMenuOpen, setHashMenuOpen, hashActiveIndex, setHashActiveIndex,
     hashMatches, hashItemRefs, sessionIndex, sessionMentionTargetsRef, updateHashQuery, applyHashCompletion,
@@ -1177,6 +1182,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       .slice(0, remaining);
     if (!imageFiles.length) return;
     pendingImageCountRef.current += imageFiles.length;
+    const generation = imageReadGenerationRef.current;
     try {
       const newImages = await Promise.all(
         imageFiles.map(async (file) => ({
@@ -1184,9 +1190,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           previewUrl: URL.createObjectURL(file),
         }))
       );
+      if (generation !== imageReadGenerationRef.current) {
+        newImages.forEach(revokeImagePreview);
+        return;
+      }
       appendAttachedImages(newImages);
     } finally {
-      pendingImageCountRef.current -= imageFiles.length;
+      if (generation === imageReadGenerationRef.current) pendingImageCountRef.current -= imageFiles.length;
     }
   }, [appendAttachedImages, compact]);
 

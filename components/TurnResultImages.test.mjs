@@ -32,6 +32,7 @@ test("expanding the process shows a reference rather than a duplicate image", ()
     assert.equal((markup.match(/<img /g) ?? []).length, 1);
     assert.match(markup, /View result images/);
     assert.match(markup, /imagegen/);
+    assert.doesNotMatch(markup, /\(no output\)/i, "promoted images are output even without inline images");
   } finally {
     setToolCallExpanded("g1", false);
   }
