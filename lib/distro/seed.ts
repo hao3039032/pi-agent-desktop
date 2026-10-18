@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, imageGenBaseUrl, rebaseDistroModelUrls } from "./config";
+import { DISTRO, imageGenBaseUrl, mergeDistroModels, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -54,6 +54,10 @@ function refreshProviderModels(): void {
     const existing = providers[DISTRO.provider.id];
     if (!isRecord(existing)) return;
     const storedBaseUrl = typeof existing.baseUrl === "string" ? existing.baseUrl : DISTRO.defaultBaseUrl;
+    const models = mergeDistroModels(
+      existing.models,
+      rebaseDistroModelUrls(DISTRO.provider.models, storedBaseUrl),
+    );
     writeModelsConfig({
       ...config,
       providers: {
@@ -62,7 +66,7 @@ function refreshProviderModels(): void {
           ...existing,
           name: DISTRO.provider.name,
           api: DISTRO.provider.api,
-          models: rebaseDistroModelUrls(DISTRO.provider.models, storedBaseUrl),
+          models,
         },
       },
     });

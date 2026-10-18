@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, imageGenBaseUrl, rebaseDistroModelUrls } from "./config";
+import { DISTRO, imageGenBaseUrl, mergeDistroModels, rebaseDistroModelUrls } from "./config";
 import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
 import { isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -91,7 +91,10 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
         baseUrl,
         api: DISTRO.provider.api,
         apiKey,
-        models: rebaseDistroModelUrls(DISTRO.provider.models, baseUrl),
+        models: mergeDistroModels(
+          existing.models,
+          rebaseDistroModelUrls(DISTRO.provider.models, baseUrl),
+        ),
       },
     },
   });

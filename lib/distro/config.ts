@@ -55,6 +55,26 @@ export interface DistroConfig {
 
 export const DISTRO: DistroConfig = distroJson as unknown as DistroConfig;
 
+/** Update distro models by id, while retaining every other existing model. */
+export function mergeDistroModels(existingModels: unknown, distroModels: DistroModel[]): DistroModel[] {
+  const byId = new Map(distroModels.map((model) => [model.id, model]));
+  const merged: DistroModel[] = [];
+  const seen = new Set<string>();
+  const existing = Array.isArray(existingModels) ? existingModels : [];
+
+  for (const value of existing) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+    const id = (value as { id?: unknown }).id;
+    if (typeof id !== "string" || !id || seen.has(id)) continue;
+    merged.push(byId.get(id) ?? value as DistroModel);
+    seen.add(id);
+  }
+  for (const model of distroModels) {
+    if (!seen.has(model.id)) merged.push(model);
+  }
+  return merged;
+}
+
 /**
  * Rebase per-model absolute baseUrls that point at the distro's default
  * service onto `baseUrl` (the one the user configured), keeping any suffix
