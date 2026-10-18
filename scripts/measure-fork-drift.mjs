@@ -20,7 +20,10 @@ import { execFileSync } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { readForkOwnership } from "./fork-ownership.mjs";
+import {
+  parseUpstreamBaselineRev,
+  readForkOwnership,
+} from "./fork-ownership.mjs";
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const git = (...args) => execFileSync("git", args, { cwd: rootDir, encoding: "utf8" });
@@ -55,9 +58,11 @@ function resolveBaseline(explicit) {
   try {
     return git("merge-base", "HEAD", "pi-web-upstream/main").trim();
   } catch {
-    const manifest = baselineFromManifest();
-    console.error(`No pi-web-upstream remote; falling back to tag ${manifest}.`);
-    return manifest;
+    // upstreamBaseline is a human-readable label ("main@6fcd7d4 (v0.10.0)"),
+    // not a legal rev — git diff would reject it, so parse the sha out.
+    const rev = parseUpstreamBaselineRev(baselineFromManifest());
+    console.error(`No pi-web-upstream remote; falling back to tag ${rev}.`);
+    return rev;
   }
 }
 
