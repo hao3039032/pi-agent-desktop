@@ -39,7 +39,8 @@ import {
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 import {
   createSubagentExtension,
-  preferPiWebSubagentExtension,
+  isPiSubagentsPreferred,
+  preferPiSubagentsExtension,
 } from "./subagent-extension";
 import {
   listSubagentProfiles,
@@ -48,11 +49,13 @@ import {
   SUBAGENT_CONTROL_TOOL_NAMES,
 } from "./subagents";
 import { createSubagentController } from "./subagent-runtime";
-import { isBuiltInSubagentsEnabled } from "./subagent-settings";
+import { isBuiltInSubagentsEnabled, readPiSubagentsPackageActive } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
 import { createArtifactGuideExtension } from "./artifact-guide-extension";
+import { findSecurityExtensionPaths } from "./permission-system-package";
+import { registerSecurityChildExtensions, unregisterSecurityChildExtensions } from "./required-child-extensions";
 import { createPiWebBuiltinExtensions } from "./builtin-extensions";
 import type { McpHost } from "./mcp-host";
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
@@ -2193,6 +2196,7 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   wrapper.onDestroy(() => {
     if (registry.get(sessionId) !== wrapper) return;
     registry.delete(sessionId);
+    unregisterSecurityChildExtensions(sessionId);
     // A destroyed wrapper leaves the running set (idle shutdown, branch
     // switch, fork/clone replacement); push the new set so sidebars clear
     // its spinner instead of waiting for the next broadcast.
@@ -2206,6 +2210,9 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   registry.set(sessionId, wrapper);
   wrapper.start();
   if (!wrapper.isChatOnly()) wrapper.beginExtensionBinding();
+  // pi-subagents children load no ambient extensions; require the security
+  // packages for every child this session launches (lib/required-child-extensions.ts).
+  if (!wrapper.isChatOnly()) void registerSecurityChildExtensions(sessionId);
 }
 
 const SUBAGENT_CONTROLLER = createSubagentController({
@@ -2225,6 +2232,8 @@ const SUBAGENT_CONTROLLER = createSubagentController({
   resolveSessionPath,
   invalidateSessionList: invalidateSessionListCache,
   isBuiltInSubagentsEnabled,
+  isPiSubagentsPreferred,
+  isPiSubagentsPackageActive: readPiSubagentsPackageActive,
 });
 
 export function getSubagentRun(sessionId: string) {
@@ -2721,6 +2730,18 @@ export async function startRpcSession(
       current?: { resourceLoader: { getSkills(): { skills: { filePath: string; baseDir: string }[] } } };
     } = {};
     const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+    // Subagent sessions load no extensions by default, which would leave their
+    // bash ungated by the permission system (and the authorizer chain
+    // unresolvable when a model reviewer is configured). Inject the installed
+    // security package directories as additional extension paths: the resource
+    // loader loads those even under noExtensions, and only those, so the child
+    // keeps its isolation while catastrophic-operation denies still hold.
+    const securityExtensionPaths = subagentResources && !subagentResources.loadExtensions
+      ? findSecurityExtensionPaths(
+        settingsManager.getGlobalSettings().packages as Array<string | { source: string }> | undefined,
+        agentDir,
+      )
+      : [];
     // Chat-only sessions and subagents that replace Pi's prompt send an exact
     // system prompt. The prompt is resolved at prompt time through this inline
     // extension: it may read the session's context files, which exist only
@@ -2740,6 +2761,9 @@ export async function startRpcSession(
       resourceLoaderOptions: subagentResources
         ? {
             noExtensions: !subagentResources.loadExtensions,
+            ...(securityExtensionPaths.length > 0
+              ? { additionalExtensionPaths: securityExtensionPaths }
+              : {}),
             noSkills: !subagentResources.loadSkills,
             noPromptTemplates: true,
             noThemes: true,
@@ -2804,7 +2828,7 @@ export async function startRpcSession(
                 isBuiltInSubagentsEnabled,
               ),
             ],
-            extensionsOverride: (base) => preferUserBashExtension(preferPiWebSubagentExtension(base)),
+            extensionsOverride: (base) => preferUserBashExtension(preferPiSubagentsExtension(base)),
           },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });

@@ -7,16 +7,14 @@ import {
   type ToolExposure,
 } from "@earendil-works/pi-coding-agent";
 import {
-  SUBAGENT_CONTROL_TOOL_NAMES,
   type SubagentProfile,
   type SubagentRunInfo,
 } from "./subagents";
+import { PI_SUBAGENTS_PACKAGE_NAME } from "./subagent-settings";
 import { MAX_SUBAGENT_INPUT_FILES } from "./subagent-input";
 
 export const HOST_SUBAGENT_EXTENSION_NAME = "pi-web-subagents";
 const HOST_SUBAGENT_EXTENSION_PATH = `<inline:${HOST_SUBAGENT_EXTENSION_NAME}>`;
-const SUBAGENT_TOOL_NAMES = new Set<string>(SUBAGENT_CONTROL_TOOL_NAMES);
-const LEGACY_SUBAGENT_PACKAGE_NAME = "pi-subagents";
 const TERMINAL_SUBAGENT_STATUSES = new Set<SubagentRunInfo["status"]>(["completed", "failed", "aborted", "interrupted"]);
 /**
  * The control tools are declared to the model and activated on registration like `direct` tools,
@@ -316,33 +314,61 @@ export function createSubagentExtension(
   };
 }
 
-/** Keep Pi Web's integrated implementation when the legacy package is loaded. */
-export function preferPiWebSubagentExtension(base: LoadExtensionsResult): LoadExtensionsResult {
-  const host = base.extensions.find((extension) => extension.path === HOST_SUBAGENT_EXTENSION_PATH);
-  if (!host?.tools.has("Agent")) return base;
+let piSubagentsPreferred = false;
+
+/**
+ * Whether the most recent extension load in this process detected a pi-subagents
+ * extension file. Best effort only: a hot reload resets it to false until the
+ * next session load refreshes it. The Agents panel's `legacyPackage` hint and
+ * the settings-file switch remain the authoritative gates.
+ */
+export function isPiSubagentsPreferred(): boolean {
+  return piSubagentsPreferred;
+}
+
+function isPiSubagentsExtensionFile(path: string, source: string | undefined): boolean {
+  if ((source ?? "").replace(/^npm:/, "").split("@")[0] === PI_SUBAGENTS_PACKAGE_NAME) return true;
+  // Path segments of either the extension file or its package source: covers the
+  // npm install layout (`.../node_modules/pi-subagents/...`) and the absolute
+  // pi-seed paths the distro seeder writes as package sources.
+  const segments = [path, source ?? ""]
+    .flatMap((value) => value.replaceAll("\\", "/").split("/"));
+  return segments.some((segment) => segment === PI_SUBAGENTS_PACKAGE_NAME);
+}
+
+const TOOL_CONFLICT_MESSAGE = /^Tool "(.+)" conflicts with (.+)$/;
+
+/**
+ * Yield to the pi-subagents package whenever its extension files are loaded:
+ * its delegation tools are the ones the session should expose, so the
+ * integrated host extension (and the conflict errors its removal dissolves)
+ * is dropped instead. pi-subagents 0.78 registers `subagent`, not the
+ * reserved tool names, so detection is by package source or path only — a
+ * tool-name condition would never match the current package. The host
+ * registers no tools while the built-in switch is off, so without `Agent`
+ * there is nothing to yield and everything stays as loaded.
+ */
+export function preferPiSubagentsExtension(base: LoadExtensionsResult): LoadExtensionsResult {
   const legacyPaths = new Set(base.extensions
     .filter((extension) => extension.path !== HOST_SUBAGENT_EXTENSION_PATH)
-    .filter((extension) => {
-      const source = extension.sourceInfo?.source ?? "";
-      const sourcePackage = source.replace(/^npm:/, "").split("@")[0];
-      const pathSegments = extension.path.replaceAll("\\", "/").split("/");
-      return sourcePackage === LEGACY_SUBAGENT_PACKAGE_NAME
-        || pathSegments.some((segment) => segment === LEGACY_SUBAGENT_PACKAGE_NAME);
-    })
-    .filter((extension) => [...SUBAGENT_TOOL_NAMES].some((name) => extension.tools.has(name)))
+    .filter((extension) => isPiSubagentsExtensionFile(extension.path, extension.sourceInfo?.source))
     .map((extension) => extension.path));
+  piSubagentsPreferred = legacyPaths.size > 0;
   if (legacyPaths.size === 0) return base;
+  const host = base.extensions.find((extension) => extension.path === HOST_SUBAGENT_EXTENSION_PATH);
+  if (!host?.tools.has("Agent")) return base;
   return {
     ...base,
-    extensions: base.extensions.filter((extension) => !legacyPaths.has(extension.path)),
+    extensions: base.extensions.filter((extension) => extension.path !== HOST_SUBAGENT_EXTENSION_PATH),
     errors: base.errors.filter((error) => {
-      if (legacyPaths.has(error.path)) return false;
-      if (error.path !== HOST_SUBAGENT_EXTENSION_PATH) return true;
-      return ![...legacyPaths].some((legacyPath) =>
-        [...SUBAGENT_TOOL_NAMES].some((name) =>
-          error.error === `Tool "${name}" conflicts with ${legacyPath}`
-        )
-      );
+      const conflict = TOOL_CONFLICT_MESSAGE.exec(error.error);
+      if (!conflict) return true;
+      const owner = conflict[2];
+      // The loader orders file extensions before inline ones, so the host path
+      // usually carries these; either direction dissolves with the host removed.
+      if (error.path === HOST_SUBAGENT_EXTENSION_PATH) return !legacyPaths.has(owner);
+      if (legacyPaths.has(error.path)) return owner !== HOST_SUBAGENT_EXTENSION_PATH;
+      return true;
     }),
   };
 }
