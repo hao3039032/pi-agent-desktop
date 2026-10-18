@@ -33,7 +33,7 @@ interface UpdateCheckState {
 type UpdateProject = (typeof APP_UPDATE_PROJECTS)[number];
 
 declare global {
-  var __piWebAppUpdateCheck: Promise<AppUpdatesResponse> | undefined;
+  var __piWebAppUpdateCheck: { refresh: boolean; promise: Promise<AppUpdatesResponse> } | undefined;
 }
 
 function statePath(): string {
@@ -142,6 +142,7 @@ async function performUpdateCheck(forceRefresh = false): Promise<AppUpdatesRespo
   })));
   const updates: AppUpdateInfo[] = [];
   const errors: NonNullable<AppUpdatesResponse["errors"]> = [];
+  const failed = new Set<AppUpdateProjectId>();
   let stateChanged = false;
 
   for (let index = 0; index < settled.length; index++) {
@@ -162,6 +163,7 @@ async function performUpdateCheck(forceRefresh = false): Promise<AppUpdatesRespo
         });
       }
     } else {
+      failed.add(project.id);
       errors.push({
         project: project.id,
         message: result.reason instanceof Error ? result.reason.message : String(result.reason),
@@ -177,8 +179,15 @@ async function performUpdateCheck(forceRefresh = false): Promise<AppUpdatesRespo
   return {
     checkedAt: new Date(now).toISOString(),
     nextCheckAt: new Date(nextCheck).toISOString(),
+    // A project whose check just failed must not surface its stale cached
+    // release as if it were current — that reads as "up to date" on networks
+    // where GitHub is unreachable, hiding real updates behind old data.
+    // The state file keeps the last good release so the next successful
+    // check resumes from it; only this response says "error".
     components: APP_UPDATE_PROJECTS.map((project) => (
-      state.releases[project.id] ?? getUnknownAppReleaseInfo(project)
+      failed.has(project.id)
+        ? { ...getUnknownAppReleaseInfo(project), releaseStatus: "error" as const }
+        : state.releases[project.id] ?? getUnknownAppReleaseInfo(project)
     )),
     updates,
     ...(errors.length > 0 && { errors }),
@@ -187,15 +196,22 @@ async function performUpdateCheck(forceRefresh = false): Promise<AppUpdatesRespo
 
 export async function GET(request: Request) {
   const forceRefresh = new URL(request.url).searchParams.get("refresh") === "1";
-  if (!globalThis.__piWebAppUpdateCheck) {
-    globalThis.__piWebAppUpdateCheck = performUpdateCheck(forceRefresh)
-      .finally(() => {
-        globalThis.__piWebAppUpdateCheck = undefined;
-      });
+  // A forced refresh must never piggyback on an in-flight cached check (or it
+  // would return yesterday's answer for "refresh=1"), while a cached poll may
+  // reuse a refresh already in flight — its answer is simply fresher.
+  const inFlight = globalThis.__piWebAppUpdateCheck;
+  const joinable = inFlight && (!forceRefresh || inFlight.refresh) ? inFlight : undefined;
+
+  const entry = joinable ?? { refresh: forceRefresh, promise: performUpdateCheck(forceRefresh) };
+  if (!joinable) {
+    globalThis.__piWebAppUpdateCheck = entry;
+    entry.promise.finally(() => {
+      if (globalThis.__piWebAppUpdateCheck === entry) globalThis.__piWebAppUpdateCheck = undefined;
+    }).catch(() => {});
   }
 
   try {
-    return Response.json(await globalThis.__piWebAppUpdateCheck);
+    return Response.json(await entry.promise);
   } catch (error) {
     return Response.json(
       { error: error instanceof Error ? error.message : String(error) },
