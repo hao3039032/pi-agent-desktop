@@ -40,6 +40,7 @@ import { PluginsConfig } from "./PluginsConfig";
 import { AppUpdatesSection } from "./AppUpdatesSection";
 import { DesktopAppSection } from "./desktop";
 import { McpConfig } from "./McpConfig";
+import { DistroSettingsSection } from "./distro";
 import { ConfigButton, ConfigSwitch } from "./SettingsUi";
 import { ArtifactsSettingRow } from "./ArtifactsSettingRow";
 import { ChatsSettingsSection } from "./ChatsSettingsSection";
@@ -200,6 +201,7 @@ function GeneralSettings({
             <p className="settings-general-tagline">{t("appSettings.taglineDetails")}</p>
           </section>
           <AppUpdatesSection onBusyChange={onBusyChange} />
+          <DistroSettingsSection />
 
           <section className="settings-general-section">
             <h3 className="settings-general-heading">{t("settings.chat")}</h3>

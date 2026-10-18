@@ -15,5 +15,8 @@
 ; hook existed.
 !macro NSIS_HOOK_PREINSTALL
   RMDir /r "$INSTDIR\resources\server\node_modules"
-  RMDir /r "$INSTDIR\resources\server\.next-desktop\server\route-cache"
+  ; Next's runtime route-cache wins over fresh prerendered pages. Clear the
+  ; entire generated build payload so old HTML/RSC and hashed JS cannot survive
+  ; an upgrade. The installer supplies the new build; sessions live elsewhere.
+  RMDir /r "$INSTDIR\resources\server\.next-desktop"
 !macroend

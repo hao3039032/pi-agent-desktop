@@ -149,7 +149,10 @@ try {
 // Tie the cache to the build: when BUILD_ID differs from the one recorded next
 // to it (or nothing was recorded yet, as on installs that predate this check),
 // drop the cache and record the new id. The marker is written only after the
-// delete succeeded, so a failure is retried on the next start.
+// delete succeeded, so a failure is retried on the next start — and a real
+// delete failure throws rather than booting a mixed-version UI. Only this
+// regenerable cache is dropped: server/app (the fresh build seeds), static
+// assets and user data stay intact.
 try {
   const nextDir = path.join(__dirname, ".next-desktop");
   const buildIdPath = path.join(nextDir, "BUILD_ID");
@@ -171,8 +174,11 @@ try {
     }
   }
 } catch (cacheError) {
-  // Cleanup must never keep the server from starting.
-  console.error("[Pi Agent] route-cache cleanup failed:", cacheError);
+  // A mixed-version UI is worse than a failed start: keep the LW behaviour of
+  // failing loudly when the stale cache could not be cleared.
+  console.error("[Pi Agent] could not clear the stale Next.js route cache:", cacheError);
+  throw cacheError;
+}
 }
 
 // The standalone Next.js entrypoint is CommonJS.

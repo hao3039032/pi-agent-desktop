@@ -41,6 +41,7 @@
   "exclude": [
     "node_modules",
     "demo",
-    "test-results"
+    "test-results",
+    "src-tauri/resources"
   ]
 }
