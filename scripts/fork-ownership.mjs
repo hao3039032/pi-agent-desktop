@@ -26,6 +26,23 @@ export async function readForkOwnership() {
 }
 
 /**
+ * Extract a usable git rev from the manifest's `upstreamBaseline` label
+ * ("main@6fcd7d4 (v0.10.0)"). The field is prose for humans; `git diff` needs
+ * a rev that resolves, so the drift script's no-remote fallback parses the
+ * sha out instead of handing git the whole string.
+ */
+export function parseUpstreamBaselineRev(baseline) {
+  const match = /main@([0-9a-f]{7,40})/.exec(baseline ?? "");
+  if (!match) {
+    throw new Error(
+      `cannot parse a git rev out of scripts/fork-ownership.json upstreamBaseline ${JSON.stringify(baseline)} — ` +
+        `expected the form main@<sha>. Fix the field, or pass an explicit baseline ref to measure-fork-drift.mjs.`,
+    );
+  }
+  return match[1];
+}
+
+/**
  * Intersect an incoming upstream changeset with the fork's drifted files.
  *
  * @param {string[]} changedFiles paths upstream changed since our last sync
