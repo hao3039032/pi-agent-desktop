@@ -25,6 +25,7 @@ import { isFilePathReferencedBySession } from "@/lib/session-file-references";
 import { hasJsonContentType, isApiRequestAllowed } from "@/lib/request-security";
 import {
   inspectUploadTargets,
+  MAX_IMPORT_FILES,
   parseUploadConflictStrategy,
   validateUploadFileNames,
 } from "@/lib/file-upload";
@@ -53,7 +54,6 @@ const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
 const MAX_IMPORT_JSON_BYTES = 256 * 1024;
-const MAX_IMPORT_FILES = 100;
 const HTML_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
 // Local HTML previews are rendered in a same-origin iframe whose sandbox
 // attribute has no allow-scripts. This CSP is the defense-in-depth layer for
@@ -241,7 +241,7 @@ export async function POST(
         return NextResponse.json({ error: `Select at most ${MAX_IMPORT_FILES} files` }, { status: 400 });
       }
 
-      const sources: Array<{ sourcePath: string; fileName: string; size: number }> = [];
+      const sources: Array<{ sourcePath: string; fileName: string }> = [];
       for (const rawPath of body.sourcePaths) {
         const trimmed = rawPath.trim();
         if (!trimmed || trimmed.includes("\0")) {
@@ -262,14 +262,12 @@ export async function POST(
         if (!stat.isFile() || stat.isSymbolicLink()) {
           return NextResponse.json({ error: `Not a regular file: ${path.basename(sourcePath)}` }, { status: 400 });
         }
-        if (stat.size > MAX_UPLOAD_FILE_BYTES) {
-          return NextResponse.json({ error: "Each upload must be 25MB or smaller" }, { status: 413 });
-        }
-        sources.push({ sourcePath, fileName: path.basename(sourcePath), size: stat.size });
-      }
-
-      if (sources.reduce((total, file) => total + file.size, 0) > MAX_UPLOAD_TOTAL_BYTES) {
-        return NextResponse.json({ error: "Uploads must total 100MB or less" }, { status: 413 });
+        // No byte cap here: unlike the multipart upload the browser path
+        // uses, this branch copies local disk to local disk (the request body
+        // only carries paths), and it is desktop-token guarded. The HTTP size
+        // limits exist to bound a request body; a local copy has none to
+        // bound — the agent's own tools copy files of any size the same way.
+        sources.push({ sourcePath, fileName: path.basename(sourcePath) });
       }
 
       const fileNames = sources.map((file) => file.fileName);

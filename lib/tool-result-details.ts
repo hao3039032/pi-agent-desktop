@@ -12,6 +12,8 @@
 // - `preview` / `result`       apply_patch rendering + lib/turn-written-files.ts
 // - `kind === "pi-web-subagent"` details are kept whole (MessageView subagent card)
 
+import { projectModelImages } from "./turn-result-images";
+
 const KEPT_DETAIL_KEYS = ["patch", "diff", "preview", "result"] as const;
 
 const SUBAGENT_DETAILS_KIND = "pi-web-subagent";
@@ -46,6 +48,12 @@ export function projectToolResultDetails(details: unknown): unknown {
       projected[key] = details[key];
       kept = true;
     }
+  }
+  // Preserve only bounded presentation metadata, not paths or image bytes in details.
+  const modelImages = projectModelImages(details.modelImages);
+  if (modelImages) {
+    projected.modelImages = modelImages;
+    kept = true;
   }
   return kept ? projected : undefined;
 }

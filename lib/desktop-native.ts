@@ -293,6 +293,34 @@ export async function saveLocalFileAs(
   return true;
 }
 
+export type DesktopDropPathKind = "file" | "directory" | "missing" | "other";
+
+export type DesktopDropPathInfo = {
+  path: string;
+  kind: DesktopDropPathKind;
+  imageMime?: string;
+  /** Byte size for `kind: "file"`, so callers can pre-filter oversized drops. */
+  size?: number;
+};
+
+/** Describe absolute paths dropped onto the desktop window (kind + image-ness). */
+export async function describeDroppedPaths(paths: string[]): Promise<DesktopDropPathInfo[]> {
+  if (paths.length === 0) return [];
+  const response = await fetch("/api/desktop/describe-paths", {
+    method: "POST",
+    headers: await desktopApiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ paths }),
+  });
+  const data = await response.json().catch(() => ({})) as {
+    error?: string;
+    items?: DesktopDropPathInfo[];
+  };
+  if (!response.ok) {
+    throw new Error(data.error || `Failed to inspect dropped items (HTTP ${response.status})`);
+  }
+  return Array.isArray(data.items) ? data.items : [];
+}
+
 export type DesktopImageAttachment = {
   name: string;
   mimeType: string;

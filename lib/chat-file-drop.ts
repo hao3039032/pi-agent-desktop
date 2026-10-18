@@ -32,6 +32,17 @@ export function mentionPathsForUploadResult(data: ProjectUploadResponse): string
   return [...(data.uploaded ?? []), ...(data.skipped ?? [])];
 }
 
+/**
+ * Format dropped directory paths for the composer: one per line, quoted when
+ * they contain whitespace so the model reads them as single paths.
+ */
+export function formatDroppedPathsForComposer(paths: string[]): string {
+  return paths
+    .filter((entryPath) => typeof entryPath === "string" && entryPath.trim().length > 0)
+    .map((entryPath) => (/\s/.test(entryPath) ? `"${entryPath}"` : entryPath))
+    .join("\n");
+}
+
 export interface ImportDroppedProjectFilesResult {
   mentionText: string;
   uploaded: string[];
