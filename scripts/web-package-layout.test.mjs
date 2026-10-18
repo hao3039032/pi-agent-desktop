@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { nodeCliInvocation } from "../lib/node-cli.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -23,14 +24,11 @@ test("the npm package ships the handoff helper and no other lib file", async () 
     await writeFile(join(dir, "lib/not-shipped.js"), "module.exports = {};\n");
     await writeFile(join(dir, "bin/pi-web.js"), "#!/usr/bin/env node\n");
 
-    const packed = spawnSync(
-      process.platform === "win32" ? "cmd.exe" : "npm",
-      process.platform === "win32"
-        ? ["/d", "/s", "/c", "npm pack --dry-run --json --ignore-scripts"]
-        : ["pack", "--dry-run", "--json", "--ignore-scripts"],
-      { cwd: dir, encoding: "utf8" },
-    );
-    assert.equal(packed.status, 0, packed.stderr);
+    // npm.cmd cannot be spawned directly on Windows; invoke its JS entry
+    // through Node, just like the application's package-install path.
+    const invocation = nodeCliInvocation("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"]);
+    const packed = spawnSync(invocation.command, invocation.args, { cwd: dir, encoding: "utf8" });
+    assert.equal(packed.status, 0, packed.error?.message ?? packed.stderr);
     const result = JSON.parse(packed.stdout);
     const listing = Array.isArray(result) ? result : Object.values(result);
     const files = listing[0].files.map((file) => file.path.replaceAll("\\", "/"));

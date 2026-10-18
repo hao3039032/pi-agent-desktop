@@ -1,2 +1,13 @@
+# Source assertions and bundled preview hashes must see identical bytes on all OSes.
+* text=auto eol=lf
 # Keep generated JavaScript byte counts consistent with its checked-in manifest.
 public/preview-runtime/*.js text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.wasm binary
+*.pdf binary

@@ -29,6 +29,11 @@ Typecheck: `node_modules/.bin/tsc --noEmit` · Lint: `npm run lint`
 
 ## Local environment traps
 
+- **Windows test environment:** `.gitattributes` pins LF because source assertions and preview manifest byte counts depend on identical checkout bytes. Do not fix those failures by regenerating hashes from CRLF files. Jiti on Windows can load `@/hooks/useI18n.tsx` and `@/hooks/useI18n` as different cache entries (slash/backslash resolution); tests must import stateful modules with the same spelling as components (`@/hooks/useI18n`, `@/lib/draft-store`).
+- `npm test` globs must use escaped **double quotes** in package.json: single quotes survive Windows cmd parsing and Node 22 can report success with **0 tests**. Always inspect the test count. Spawn npm through `nodeCliInvocation()` (Node + npm-cli.js), never bare `spawn("npm")` on Windows.
+- Some server integration tests require POSIX chmod semantics, file-symlink privileges, or Unix process cleanup behavior. Missing npm packages are not the cause of `0600` mode mismatches / symlink `EPERM` / child-cwd `EBUSY`. Use Linux CI/WSL for the full suite; do not weaken security assertions or silently enable system developer mode.
+- **The app shell's own SDK variables break test attribution.** Running tests from inside the packaged app exports `PI_PACKAGE_DIR`, `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` and `JITI_ALIAS`, so `lib/pi-sdk-internals.ts` and Jiti resolve the *installed* application's packages instead of this checkout. Whole files then fail with SDK identity mismatches that look like source regressions. Clear them for the test process before blaming a diff: `env -u PI_PACKAGE_DIR -u PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT -u JITI_ALIAS node --experimental-strip-types --test <file>`.
+
 - **Building (or starting a fresh `next dev`) from inside the Pi desktop app's shell
   fails.** The app exports `NODE_ENV=production`, `__NEXT_PRIVATE_ORIGIN` and
   `__NEXT_PRIVATE_STANDALONE_CONFIG` (its own serialized Next config, from which function
