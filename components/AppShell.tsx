@@ -2761,6 +2761,7 @@ export function AppShell() {
               onProjectChange={selectedSession || isChatWorkspaceActive ? undefined : handleProjectChangeFromComposer}
               onOpenModelsConfig={() => setSettingsSection("models")}
               onOpenFile={isChatWorkspaceActive ? undefined : handleOpenLinkedFile}
+              onProjectFilesImported={() => setExplorerRefreshKey((key) => key + 1)}
               onOpenSession={handleOpenSession}
               onAskInNewChat={handleAskInNewChat}
               quoteSelectionEnabled={quoteSelectionEnabled}

@@ -812,6 +812,13 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
   const openFile = chatOnly ? undefined : onOpenFile;
   const dropBusyRef = useRef(false);
   const dropZoneRef = useRef<HTMLDivElement | null>(null);
+  const dropGenerationRef = useRef(0);
+  // Invalidate even A -> B -> A and unmounts, before an async drop can touch
+  // the shared composer or notice state. The old run must not unlock a new one.
+  useLayoutEffect(() => () => {
+    dropGenerationRef.current += 1;
+    dropBusyRef.current = false;
+  }, [session?.id, session?.cwd, newSessionDraftKey, newSessionCwd, chatOnly]);
 
   // Share the import path between the browser drop and the "+" file picker.
   const importProjectFiles = useCallback((projectFiles: File[]) => {
@@ -826,10 +833,14 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     }
     if (dropBusyRef.current) return;
     dropBusyRef.current = true;
+    const generation = dropGenerationRef.current;
+    const sessionId = sessionIdRef.current;
+    const isCurrentDrop = () => generation === dropGenerationRef.current && sessionId === sessionIdRef.current;
 
     void (async () => {
       try {
         const result = await importDroppedProjectFiles(cwd, projectFiles);
+        if (!isCurrentDrop()) return;
         if (result.mentionText) {
           chatInputRef?.current?.insertText(result.mentionText);
           chatInputRef?.current?.focus();
@@ -854,15 +865,16 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           });
         }
       } catch (error) {
+        if (!isCurrentDrop()) return;
         addNotice({
           type: "error",
           message: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        dropBusyRef.current = false;
+        if (generation === dropGenerationRef.current) dropBusyRef.current = false;
       }
     })();
-  }, [addNotice, chatInputRef, chatOnly, cwd, onProjectFilesImported, t]);
+  }, [addNotice, chatInputRef, chatOnly, cwd, onProjectFilesImported, sessionIdRef, t]);
 
   const onDrop = useCallback((files: File[], directories: string[] = []) => {
     // Native paths own desktop drops; never import the same drop twice.
@@ -906,10 +918,14 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
   const handleDesktopDropPaths = useCallback((paths: string[]) => {
     if (dropBusyRef.current) return;
     dropBusyRef.current = true;
+    const generation = dropGenerationRef.current;
+    const sessionId = sessionIdRef.current;
+    const isCurrentDrop = () => generation === dropGenerationRef.current && sessionId === sessionIdRef.current;
 
     void (async () => {
       try {
         const items = await describeDroppedPaths(paths);
+        if (!isCurrentDrop()) return;
         const rejected: Array<{ name: string; reason: string }> = [];
         const directoryPaths = items
           .filter((item) => item.kind === "directory")
@@ -979,11 +995,13 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           // steps down with it.
           try {
             const attachments = await readDesktopImageAttachments(imagePaths);
+            if (!isCurrentDrop()) return;
             chatInputRef?.current?.addImages(
               attachments.map((attachment) =>
                 base64ToImageFile(attachment.data, attachment.mimeType, attachment.name)),
             );
           } catch (error) {
+            if (!isCurrentDrop()) return;
             addNotice({
               type: "error",
               message: error instanceof Error ? error.message : String(error),
@@ -1003,6 +1021,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
               conflict: "skip",
               encodeDestPath: encodeFilePathForApi,
             });
+            if (!isCurrentDrop()) return;
             if (status < 200 || status >= 300 && status !== 207) {
               throw new Error(data.error ?? `Import failed (HTTP ${status})`);
             }
@@ -1046,15 +1065,16 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           });
         }
       } catch (error) {
+        if (!isCurrentDrop()) return;
         addNotice({
           type: "error",
           message: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        dropBusyRef.current = false;
+        if (generation === dropGenerationRef.current) dropBusyRef.current = false;
       }
     })();
-  }, [addNotice, chatInputRef, chatOnly, cwd, onProjectFilesImported, sessionBusy, t]);
+  }, [addNotice, chatInputRef, chatOnly, cwd, onProjectFilesImported, sessionBusy, sessionIdRef, t]);
 
   const { isDragOver: desktopDragOver } = useDesktopDragDrop({
     dropZoneRef,

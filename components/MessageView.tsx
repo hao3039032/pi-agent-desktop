@@ -1287,7 +1287,7 @@ function ToolCallBlock({ block, result, duration, aborted, defaultExpanded, onOp
           <PairedDiffResult
             diff={resultDiff}
           />
-        ) : (!resultIsEmpty || resultImages.length === 0) && (
+        ) : (!resultIsEmpty || (resultImages.length === 0 && promotedIndices.size === 0)) && (
           <PairedResult
             text={resultText ?? ""}
             isEmpty={resultIsEmpty}
