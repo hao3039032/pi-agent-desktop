@@ -1,4 +1,19 @@
-# Pi Web - Development Notes
+# Pi Agent LW - Development Notes
+
+## 直接上游与历史整理（最高优先级）
+
+- 当前仓库是 `hao3039032/pi-agent-desktop`，**直接上游是 https://github.com/abcwyc/pi-agent-desktop**（remote `abcwyc`）。`agegr/pi-web`（remote `piweb`）是上游的上游，不是本仓库默认 rebase 目标。
+- 用户说“rebase 上游 vX.Y.Z”时，默认指 **abcwyc 的 release tag**。禁止仅凭本地裸标签 `vX.Y.Z` 判断来源：两个仓库存在同名标签。必须先检查 `git remote -v` 和 `git ls-remote --tags abcwyc 'vX.Y.Z*'`，再用 `git fetch --no-tags abcwyc refs/tags/vX.Y.Z:refs/remotes/abcwyc/vX.Y.Z` 获取，使用 `abcwyc/vX.Y.Z^{commit}` 校验实际提交。
+- 本次直接上游基线：**abcwyc v0.7.4 = `2e0e3e714866f1b3772c65b34b51cac530fb5316`**；原基线 v0.7.2 = `156aedb31affccb1fc876002b51203acfe6741d7`。本地裸 `v0.7.4` 属于 pi-web，不能使用。
+- 压缩提交只整理直接上游基线之后的 **LW 自有提交**；不得压缩、重写或重新归类 abcwyc 的桌面历史。先检查 merge-base、双方独有提交和变更范围；若范围突然变成数百个提交，停止并核对上游。
+- 重写前保留 backup 分支；压缩后比对完整 Git tree，确保代码不变；rebase 后核验目标祖先关系并做行为回归。不得把 abort/回滚称为完成，不得在未授权时 force-push。
+- 以下继承文档中的“fork/pi-web baseline”多指 **abcwyc 相对 pi-web 的维护边界**（例如 `scripts/fork-ownership.json`、CSS hash 基线）；不能据此决定 LW 的 rebase 范围。保留这些检查，但将直接上游整合与祖先项目的漂移统计分开。
+
+### LW 功能合并边界
+- `pi-subagents` 优先于内置子代理；按扩展来源识别，不按工具名猜测，并保留安全扩展对子代理的继承。
+- 桌面原生拖放与浏览器 HTML5 拖放互斥，文件夹只插入路径，文件导入无本地字节上限。保留上游 `+` 文件选择器修复；非项目 Chats 仍只允许图片，不能通过原生拖放绕过。
+- 生成图片展示在折叠过程之外；Artifacts 是生成页面的唯一应用级通道，不恢复已移除的 widget 工具与依赖。
+- 上游已抽出的 hooks、组件和 `lib/i18n/locale-plugins.ts` 保持抽出状态；冲突时把 LW 接线迁移到新位置，不把旧实现整块覆盖回来。
 
 ## Quick Start
 
@@ -37,7 +52,7 @@ Typecheck: `node_modules/.bin/tsc --noEmit` · Lint: `npm run lint`
   fails tests that pin newer SDK behaviour. `npm test` runs `npm run check:deps` first and
   stops with the mismatched packages; `npm ci` fixes it.
 - **`next dev` rewrites `AGENTS.md`**: it appends a "This is NOT the Next.js you know" block
-  to this file on every start. Run `git checkout -- AGENTS.md` before committing; it is not part of the work.
+  to this file on every start. Remove only that generated block before committing; do not discard intentional edits to this file.
 
 ---
 
@@ -217,7 +232,7 @@ Each one undid a real regression; the linked note has the reasoning.
 - **In-session branch** (Continue button / BranchNavigator): calls `navigate_tree` within the same file. Multiple entries share the same `parentId`. Switching between them calls `/api/sessions/[id]/context?leafId=`.
 
 ### Upstream merge sentinels (not the same "fork" as session fork)
-This repo is a fork of `agegr/pi-web` and periodically merges upstream. `components/fork-extractions.test.mjs` guards the failure mode that a clean merge can still be wrong: code this fork *moved* to another file reappears at its origin, or a fork change is silently reverted. Git does not track cross-file moves, so neither shows up in `tsc`, eslint, or the upstream suite.
+This repo directly forks `abcwyc/pi-agent-desktop`. The following sentinels were inherited from abcwyc's fork of `agegr/pi-web`; they protect that older maintenance boundary, not the target of LW rebases. `components/fork-extractions.test.mjs` guards the failure mode that a clean merge can still be wrong: code this fork *moved* to another file reappears at its origin, or a fork change is silently reverted. Git does not track cross-file moves, so neither shows up in `tsc`, eslint, or the upstream suite.
 
 When one of those assertions fails, the default is to restore the behaviour, not to delete the assertion. A failure saying a marker is "absent from the origin but also from the extraction targets — it looks deleted, not moved" means the feature is probably gone: that is exactly how the project-picker filter box was found missing after a restyle had left every project past the 7-row cap unreachable. Risk levels live in `scripts/fork-ownership.json`; the reasoning is in `docs/ownership-boundaries.md`.
 
@@ -226,7 +241,7 @@ The third direction is `forbiddenMarkers` on a `FORK_FEATURES` entry: a region t
 ### Upstream merge decisions (standing rules)
 Full per-merge reasoning (segments E, F, G, with what was adopted and what was declined) is in [merge-history.md](docs/merge-history.md). The rules that still bind a future merge:
 - **Upstream owns SDK adaptation.** Exact system prompts go through `lib/exact-system-prompt.ts` (`before_agent_start`); the session list comes from `lib/session-list-scanner.ts`; MCP and Code mode run on ADR 0006's `builtin:*` extensions (`createMcpExtension()` is never passed as a bare inline factory) and `resolveActiveToolNames()` replaced `withExtensionTools()`. Do not re-add a second path for any of these.
-- **Declined upstream UI stays declined**: the sidebar explorer and resizable session/explorer panes (`data-resize-handle="sidebar-sections"`), `DirectoryPicker`, `SessionSearch`, `ChatMinimap`, `getSessionListIndices` windowing, the second mobile toolbar group, the topbar models/skills/settings quick-buttons, `ExtensionStatusBar` (the fork's `ExtensionStatusLine` replaces it). A merge that brings one back is re-introducing declined UI, not a test to satisfy.
+- **Declined upstream UI stays declined**: the sidebar explorer and resizable session/explorer panes (`data-resize-handle="sidebar-sections"`), `ChatMinimap`, `getSessionListIndices` windowing, the second mobile toolbar group, the topbar models/skills/settings quick-buttons, `ExtensionStatusBar` (the fork's `ExtensionStatusLine` replaces it). A merge that brings one back is re-introducing declined UI, not a test to satisfy.
 - **Fork layers that must survive a merge**: `userHome()` routing instead of literal `homedir()`, models-config literal-key redaction, `resolveSessionReferences` in the send/queue paths, the monotonic request-id guards in `useAgentSession`, the project-tree sidebar with the full-height layout, desktop i18n and Settings sections.
 - **`lib/startup-preferences.ts` stays deleted** (new-session model picks are session-scoped); `PUT /api/models/default` is the only writer of global defaults.
 - **`package-lock.json` keeps the tauri plugin versions pinned to `src-tauri/Cargo.lock`**: restore HEAD's lock before `npm install --package-lock-only`, or the carets re-resolve and `release-workflows.test.mjs` fails.

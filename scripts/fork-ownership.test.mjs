@@ -121,6 +121,37 @@ test("high and medium overlaps require review; low-only does not", () => {
   assert.equal(low.highestRisk, "low");
 });
 
+test("each pi-subagents policy seam independently requires upstream review", () => {
+  // One incoming file is enough: a combined changeset containing rpc-manager
+  // would mask a missing entry for any of the other policy seams.
+  const expectedRisks = {
+    "lib/subagent-extension.ts": "medium",
+    "lib/subagent-runtime.ts": "medium",
+    "lib/subagent-settings.ts": "medium",
+    "components/AgentsConfig.tsx": "medium",
+    "lib/rpc-manager.ts": "high",
+    "lib/i18n/locale-plugins.ts": "high",
+  };
+  for (const [path, risk] of Object.entries(expectedRisks)) {
+    const result = classifyIncomingChanges([path], manifest);
+    assert.equal(result.reviewRequired, true, `${path}: incoming changes must request review`);
+    assert.equal(result.highestRisk, risk, path);
+    assert.deepEqual(result.overlaps.map((entry) => entry.path), [path]);
+    assert.equal(result.overlaps[0].disposition, "accepted", path);
+  }
+});
+
+test("the subagent settings response and type are tracked low-risk overlaps", () => {
+  for (const path of ["app/api/subagents/settings/route.ts", "lib/api-types.ts"]) {
+    const result = classifyIncomingChanges([path], manifest);
+    assert.deepEqual(result.overlaps.map((entry) => entry.path), [path]);
+    assert.equal(result.highestRisk, "low", path);
+    // Recording the boundary must not silently change the existing low-only policy.
+    assert.equal(result.reviewRequired, false, path);
+    assert.equal(result.overlaps[0].disposition, "accepted", path);
+  }
+});
+
 test("untouched and ignored files never trigger review", () => {
   const result = classifyIncomingChanges(
     ["app/api/skills/route.ts", "lib/bounded-form-data.ts", "package-lock.json", ""],
