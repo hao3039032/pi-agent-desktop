@@ -12,6 +12,7 @@ import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
 import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-result-images";
 import { projectToolResultDetails, slimToolResultMessage } from "./tool-result-details";
+import { projectModelImages } from "./turn-result-images";
 import { resolveProject, type ProjectInfo } from "./worktree";
 import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
 import { listSessionsIncremental, type ScannedSessionInfo } from "./session-list-scanner";
@@ -893,7 +894,9 @@ function deferToolResultBase64Images(
   let omitted = 0;
   let bytes = 0;
   const mimes = new Set<string>();
+  const retainedIndices = new Map<number, number>();
   const content = message.content.flatMap((block, blockIndex) => {
+    retainedIndices.set(blockIndex, blockIndex - omitted);
     const image = base64ImageInfo(block);
     if (!image) return [block];
 
@@ -915,6 +918,7 @@ function deferToolResultBase64Images(
     }
 
     // Retain the old bounded fallback for callers that do not have a session id.
+    retainedIndices.delete(blockIndex);
     omitted += 1;
     bytes += image.bytes;
     if (image.mime) mimes.add(image.mime);
@@ -927,6 +931,17 @@ function deferToolResultBase64Images(
     type: "text",
     text: `[${omitted} tool result image${omitted === 1 ? "" : "s"} omitted from initial history payload${mimeText}, ~${bytes} bytes]`,
   });
+  const details = isRecord(message.details) ? message.details : undefined;
+  const metadata = projectModelImages(details?.modelImages);
+  if (metadata) {
+    return { ...message, content, details: { ...details, modelImages: {
+      version: 1,
+      outputs: metadata.outputs.flatMap((output) => {
+        const blockIndex = retainedIndices.get(output.blockIndex);
+        return blockIndex === undefined ? [] : [{ ...output, blockIndex }];
+      }),
+    } } };
+  }
   return { ...message, content };
 }
 

@@ -1,5 +1,8 @@
 export const MAX_ATTACHED_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_ATTACHED_IMAGES = 10;
+// Base64 expands by roughly one third and the renderer creates preview copies;
+// one selection must stay below the heap ceiling.
+export const MAX_ATTACHED_IMAGE_SELECTION_BYTES = 50 * 1024 * 1024;
 
 export interface Base64ImageAttachment {
   data: string;
@@ -53,4 +56,18 @@ export function validateAgentImages(value: unknown): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Rebuild a File from base64 attachment data so path-based desktop flows can
+ * feed the composer's `addImages(files)` entry point (compression, caps, and
+ * previews keep working unchanged).
+ */
+export function base64ToImageFile(data: string, mimeType: string, name: string): File {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], name, { type: mimeType });
 }

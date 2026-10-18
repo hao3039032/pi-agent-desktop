@@ -385,7 +385,8 @@ test("delegates event stream readiness and hides an empty agent phase", () => {
   assert.match(ensureSource, /eventConnectionRef\.current!\.ensureConnected\(sid\)/);
   assert.match(ensureSource, /eventConnectionRef\.current!\.maintain\(sid\)/);
   assert.match(chatWindowSource, /const hasStreamingContent = Boolean\(streamState\.streamingMessage\?\.content\.length\)/);
-  assert.match(chatWindowSource, /streamState\.isStreaming && hasStreamingContent && streamState\.streamingMessage/);
+  assert.match(chatWindowSource, /const streamingMessage = isLiveTail && streamState\.isStreaming \? streamState\.streamingMessage : null/);
+  assert.match(chatWindowSource, /if \(streamingMessage && hasStreamingContent\)/);
   assert.match(chatWindowSource, /agentRunning && !hasStreamingContent && \(agentPhase \|\| isCompacting\)/);
   // Compaction is what the user needs to know while a turn is being compacted, so it is
   // forwarded to the label instead of letting the stream phase read as a hang.
@@ -533,7 +534,7 @@ test("reconnects active shell output to its streaming tool call", () => {
   assert.match(updateSource, /content,/);
   assert.match(endSource, /setActiveToolResults[\s\S]*next\.delete\(id\)/);
   assert.match(chatWindowSource, /const map = new Map\(activeToolResults\)/);
-  assert.match(chatWindowSource, /<MessageView message=\{streamState\.streamingMessage as AgentMessage\} toolResults=\{toolResultsMap\}/);
+  assert.match(chatWindowSource, /<MessageView message=\{streamingMessage\} toolResults=\{toolResultsMap\}/);
 });
 
 test("reports a running script's newest call as its progress", () => {

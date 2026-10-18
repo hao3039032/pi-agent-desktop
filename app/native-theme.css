@@ -7034,6 +7034,55 @@ span.linenumber {
 }
 .result-image-save:hover { color: var(--text); }
 
+/* Generated deliverables live outside the collapsed execution trace. */
+.tool-result-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px;
+  background: var(--bg);
+  border-top: var(--hairline) solid var(--border);
+}
+.tool-result-images[data-error] { border-color: var(--danger); }
+.result-image, .turn-result-image { min-width: 0; max-width: 100%; }
+.result-image-preview { max-width: 100%; }
+.result-image-preview > img {
+  display: block;
+  max-width: min(100%, 720px);
+  max-height: 520px;
+  border-radius: 8px;
+  object-fit: contain;
+  border: var(--hairline) solid var(--border);
+}
+.turn-result-images { margin: 0 0 16px; scroll-margin-block: 24px; }
+.turn-result-images:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.turn-result-images-grid { display: grid; gap: 12px; }
+.turn-result-images-grid[data-multiple] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.turn-result-images-grid[data-multiple] .result-image-preview > img { max-height: 320px; }
+.result-image-failure {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.turn-image-reference, .result-image-failure button {
+  padding: 6px 10px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.turn-image-reference:hover, .result-image-failure button:hover { background: var(--bg-hover); color: var(--text); }
+@media (max-width: 640px) {
+  .turn-result-images-grid[data-multiple] { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* ==========================================================================
    Scheduled — sidebar entry and the task page (components/scheduled/*).
    New fork classes only; nothing here overrides an upstream rule.
