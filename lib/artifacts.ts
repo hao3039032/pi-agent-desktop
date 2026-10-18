@@ -124,7 +124,9 @@ function isClosingFence(line: string, char: string, length: number): boolean {
 export function splitArtifacts(markdown: string): ArtifactSegment[] {
   if (!markdown.includes(":::artifact")) return [{ kind: "text", text: markdown }];
 
-  const lines = markdown.split("\n");
+  // Match CommonMark's LF, CRLF and CR line endings. Leaving a trailing CR
+  // makes directive/fence regexes miss valid blocks and exposes their source.
+  const lines = markdown.split(/\r\n|\r|\n/);
   const segments: ArtifactSegment[] = [];
   let text: string[] = [];
   let outerFence: { char: string; length: number } | null = null;

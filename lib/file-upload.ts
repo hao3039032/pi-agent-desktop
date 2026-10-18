@@ -4,6 +4,11 @@ import path from "path";
 export const UPLOAD_CONFLICT_STRATEGIES = ["error", "overwrite", "skip"] as const;
 export type UploadConflictStrategy = typeof UPLOAD_CONFLICT_STRATEGIES[number];
 
+// Cap for one request that copies files into a project directory. Shared by
+// the files route's `type=import` flow and the desktop describe-paths route,
+// which pre-classifies a drop so it never accepts more paths than import takes.
+export const MAX_IMPORT_FILES = 100;
+
 const UPLOAD_CONFLICT_STRATEGY_SET = new Set<string>(UPLOAD_CONFLICT_STRATEGIES);
 
 export interface UploadTargetInspection {

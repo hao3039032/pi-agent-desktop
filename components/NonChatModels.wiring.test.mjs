@@ -6,6 +6,7 @@ const read = (path) => readFile(new URL(path, import.meta.url), "utf8");
 const modelsConfig = await read("./ModelsConfig.tsx");
 const settingsPanel = await read("./SettingsPanel.tsx");
 const messageView = await read("./MessageView.tsx");
+const resultImages = await read("./ToolResultImages.tsx");
 
 test("Settings › Models lists classifier and image models in their own entry", () => {
   assert.match(modelsConfig, /if \(selection\?\.type === "nonchat"\) return <NonChatModelsDetail onOpenMcp=\{onOpenMcp\} \/>;/);
@@ -15,5 +16,6 @@ test("Settings › Models lists classifier and image models in their own entry",
 });
 
 test("tool-result images can be saved, since pi never writes generated images to disk", () => {
-  assert.match(messageView, /downloadUrlAsFile\(src, resultImageFileName\(imageMediaType\(image\), index\)\)/);
+  assert.match(messageView, /<ToolResultImages images=\{resultImages\}/);
+  assert.match(resultImages, /downloadUrlAsFile\(src, resultImageFileName\(imageMediaType\(image\), index\)\)/);
 });

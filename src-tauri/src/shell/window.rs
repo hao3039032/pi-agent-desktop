@@ -54,8 +54,8 @@ pub fn build_window(app: &tauri::AppHandle, app_url: Url) -> tauri::Result<Webvi
         // `app_ready` in shell/mod.rs), so the user never sees an empty
         // webview while Next.js loads.
         .visible(false)
-        // Pi Agent already handles browser drag/drop for image attachments.
-        .disable_drag_drop_handler()
+        // Keep Tauri's native drag/drop handler enabled: only native events
+        // expose absolute file and folder paths to hooks/useDesktopDragDrop.ts.
         .on_navigation(move |url| {
             if same_origin(url, &navigation_origin) || is_inline_frame_document(url) {
                 true
