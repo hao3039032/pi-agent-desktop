@@ -176,6 +176,7 @@ export function AgentsConfig({
   const [toggling, setToggling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [builtInEnabled, setBuiltInEnabled] = useState(false);
+  const [legacyPackage, setLegacyPackage] = useState(false);
   const [maxConcurrent, setMaxConcurrent] = useState(10);
   const [settingsLoading, setSettingsLoading] = useState(true);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -183,9 +184,16 @@ export function AgentsConfig({
   const [reloadNeeded, setReloadNeeded] = useState(false);
   const [reloading, setReloading] = useState(false);
 
+  // While the pi-subagents package is active the sidebar hides the builtin group;
+  // the detail pane must not resolve a hidden builtin either, or its Enable/Disable
+  // switch renders as an orphaned no-op over the empty state.
+  const visibleProfiles = useMemo(
+    () => (legacyPackage ? profiles.filter((profile) => profile.scope !== "builtin") : profiles),
+    [profiles, legacyPackage],
+  );
   const selected = useMemo(
-    () => profiles.find((profile) => profileKey(profile) === selectedKey) ?? null,
-    [profiles, selectedKey],
+    () => visibleProfiles.find((profile) => profileKey(profile) === selectedKey) ?? null,
+    [visibleProfiles, selectedKey],
   );
   const modelSelectorOptions = useMemo(() => modelOptions.map((model) => ({
     provider: model.provider,
@@ -206,6 +214,7 @@ export function AgentsConfig({
       const chosen = next.find((profile) => profileKey(profile) === rememberedKey)
         ?? next.find((profile) => profile.scope === "project")
         ?? next.find((profile) => profile.scope === "global")
+        ?? next.find((profile) => profile.scope !== "builtin")
         ?? next[0]
         ?? null;
       setSelectedKey(chosen ? profileKey(chosen) : null);
@@ -240,6 +249,7 @@ export function AgentsConfig({
           throw new Error(data.error ?? `HTTP ${response.status}`);
         }
         setBuiltInEnabled(data.enabled);
+        setLegacyPackage(data.legacyPackage === true);
         if (typeof data.maxConcurrent === "number") setMaxConcurrent(data.maxConcurrent);
       } catch (cause) {
         if (controller.signal.aborted) return;
@@ -425,6 +435,7 @@ export function AgentsConfig({
         throw new Error(data.error ?? `HTTP ${response.status}`);
       }
       setBuiltInEnabled(data.enabled);
+      setLegacyPackage(data.legacyPackage === true);
       setReloadNeeded(Boolean(sessionId));
     } catch (cause) {
       setSettingsError(cause instanceof Error ? cause.message : String(cause));
@@ -445,6 +456,7 @@ export function AgentsConfig({
       const data = await response.json() as Partial<SubagentSettingsResponse> & { error?: string };
       if (!response.ok || data.error || typeof data.maxConcurrent !== "number") throw new Error(data.error ?? `HTTP ${response.status}`);
       setMaxConcurrent(data.maxConcurrent);
+      setLegacyPackage(data.legacyPackage === true);
     } catch (cause) {
       setSettingsError(cause instanceof Error ? cause.message : String(cause));
     }
@@ -464,6 +476,8 @@ export function AgentsConfig({
       setReloading(false);
     }
   };
+  const builtInSwitchDisabled = settingsLoading || reloading || legacyPackage;
+  const piSubagentsNotice = t("agents.piSubagentsPreferredNotice");
 
   return (
     <ConfigPanelShell embedded={embedded} title={t("common.agents")} subtitle={shortenPath(cwd)} closeLabel={t("agents.close")} onClose={onClose}>
@@ -471,6 +485,16 @@ export function AgentsConfig({
         <div className="agents-feature-copy">
           <strong>{t("agents.builtInTitle")}</strong>
           <span>{t("agents.builtInDescription")}</span>
+          {legacyPackage && (
+            <span
+              id="pi-subagents-preferred-notice"
+              role="status"
+              className="agents-feature-reload-notice"
+              title={piSubagentsNotice}
+            >
+              {piSubagentsNotice}
+            </span>
+          )}
           {reloadNeeded && <span role="status" className="agents-feature-reload-notice">{t("agents.reloadRequired")}</span>}
         </div>
         <div className="agents-feature-actions">
@@ -492,13 +516,19 @@ export function AgentsConfig({
               onBlur={() => void updateMaxConcurrent(maxConcurrent)}
             />
           </label>
-          <ConfigSwitch
-            checked={builtInEnabled}
-            disabled={settingsLoading || reloading}
-            loading={settingsSaving}
-            label={t("agents.builtInTitle")}
-            onChange={(enabled) => void toggleBuiltInSubagents(enabled)}
-          />
+          <span
+            title={legacyPackage ? piSubagentsNotice : undefined}
+            style={{ display: "inline-flex" }}
+          >
+            <ConfigSwitch
+              checked={builtInEnabled}
+              disabled={builtInSwitchDisabled}
+              loading={settingsSaving}
+              label={t("agents.builtInTitle")}
+              describedBy={legacyPackage ? "pi-subagents-preferred-notice" : undefined}
+              onChange={(enabled) => void toggleBuiltInSubagents(enabled)}
+            />
+          </span>
         </div>
       </div>
       <ConfigSplitView>
@@ -506,7 +536,10 @@ export function AgentsConfig({
           <ConfigSidebarList>
               {loading ? (
                 <div style={{ padding: 10, color: "var(--text-dim)", fontSize: 12 }}>{t("agents.loading")}</div>
-              ) : (["project", "global", "workspace", "builtin"] as const).map((scope) => {
+              ) : (legacyPackage
+                ? (["project", "global", "workspace"] as const)
+                : (["project", "global", "workspace", "builtin"] as const)
+              ).map((scope) => {
                 const scopedProfiles = profiles.filter((profile) => profile.scope === scope);
                 if (scopedProfiles.length === 0) return null;
                 return (

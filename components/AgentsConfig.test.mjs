@@ -38,6 +38,15 @@ test("marks profiles shadowed by a higher-precedence source", () => {
   assert.match(cssSource, /\.agents-overridden-label \{[\s\S]*?white-space: nowrap;/);
 });
 
+test("never resolves a hidden builtin profile in the detail pane while the pi-subagents package is active", () => {
+  // The sidebar hides the builtin group while legacyPackage is true; the detail pane
+  // derives from the same filtered list so it cannot orphan a builtin behind it.
+  assert.match(source, /const visibleProfiles = useMemo\(\s*\(\) => \(legacyPackage \? profiles\.filter\(\(profile\) => profile\.scope !== "builtin"\) : profiles\),\s*\[profiles, legacyPackage\],\s*\)/);
+  assert.match(source, /=> visibleProfiles\.find\(\(profile\) => profileKey\(profile\) === selectedKey\) \?\? null,\s*\[visibleProfiles, selectedKey\]/);
+  // The remembered selection and the last-resort fallback both prefer a non-builtin.
+  assert.match(source, /\?\? next\.find\(\(profile\) => profile\.scope !== "builtin"\)\s*\?\? next\[0\]/);
+});
+
 test("treats global and project profiles as directly editable", () => {
   assert.match(source, /scope === "global" \|\| scope === "project"/);
   assert.match(source, /setMode\(isWritableScope\(profile\.scope\) \? "edit" : "view"\)/);

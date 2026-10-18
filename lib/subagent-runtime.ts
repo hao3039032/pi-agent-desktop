@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike } from "./pi-types";
 import {
+  isPiSubagentsPreferred,
   subagentNotificationText,
   subagentToolDetails,
   type ResumeSubagentRequest,
@@ -33,10 +34,11 @@ import {
 import type { SessionEntry } from "./types";
 import { buildSubagentPromptPlan } from "./subagent-prompt";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
+import { findSecurityExtensionPaths } from "./permission-system-package";
 import { appendSubagentInputFiles, loadSubagentInputFiles } from "./subagent-input";
 import { projectTrustReloadOptions } from "./project-trust";
 import { resolveShellTools } from "./powershell-settings";
-import { isBuiltInSubagentsEnabled, readSubagentSettings } from "./subagent-settings";
+import { isBuiltInSubagentsEnabled, readPiSubagentsPackageActive, readSubagentSettings } from "./subagent-settings";
 import { SubagentQueue } from "./subagent-queue";
 import { addWorktree, removeWorktree } from "./worktree";
 import { randomUUID } from "node:crypto";
@@ -60,6 +62,13 @@ export interface SubagentRuntimeDependencies {
   resolveSessionPath(sessionId: string): Promise<string | null>;
   invalidateSessionList(): void;
   isBuiltInSubagentsEnabled?(): boolean;
+  /**
+   * Best-effort second gate, armed only while both halves hold: the most recent
+   * extension load in the process detected pi-subagents AND the global settings
+   * activate the package. Fires rarely (stale `Agent` calls) and asks for a reload.
+   */
+  isPiSubagentsPreferred?(): boolean;
+  isPiSubagentsPackageActive?(): boolean;
 }
 
 export interface SubagentController {
@@ -194,6 +203,11 @@ export function createSubagentController(
   async function start(request: StartSubagentRequest): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
+    const preferred = dependencies.isPiSubagentsPreferred ?? isPiSubagentsPreferred;
+    const packageActive = dependencies.isPiSubagentsPackageActive ?? readPiSubagentsPackageActive;
+    if (preferred() && packageActive()) {
+      throw new Error("Pi Web built-in sub-agents are inactive: the pi-subagents extension takes precedence. Ask the user to reload the session to apply this change");
+    }
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
     const parent = dependencies.getSession(parentSessionId);
     if (!parent?.isAlive()) throw new Error("Parent session is no longer available");
@@ -224,6 +238,18 @@ export function createSubagentController(
       const agentDir = getAgentDir();
       const parentModelRuntime = (parent.inner as unknown as { modelRuntime: ModelRuntime }).modelRuntime;
       const settingsManager = SettingsManager.create(childCwd, agentDir);
+      // Subagent sessions load no extensions by default, which would leave their
+      // bash ungated by the permission system (and the authorizer chain
+      // unresolvable when a model reviewer is configured). Inject the installed
+      // security package directories as additional extension paths: the resource
+      // loader loads those even under noExtensions, and only those, so the child
+      // keeps its isolation while catastrophic-operation denies still hold.
+      const securityExtensionPaths = profile.loadExtensions
+        ? []
+        : findSecurityExtensionPaths(
+          settingsManager.getGlobalSettings().packages as Array<string | { source: string }> | undefined,
+          agentDir,
+        );
       const inheritedParentContext = inheritContext
         ? `The following is the active conversation context from the parent session. Use it only as background for the delegated task:\n${parentContextText(parent)}`
         : undefined;
@@ -246,6 +272,9 @@ export function createSubagentController(
         settingsManager,
         resourceLoaderOptions: {
           noExtensions: !profile.loadExtensions,
+          ...(securityExtensionPaths.length > 0
+            ? { additionalExtensionPaths: securityExtensionPaths }
+            : {}),
           noSkills: !profile.loadSkills,
           noPromptTemplates: true,
           noThemes: true,
@@ -479,6 +508,11 @@ export function createSubagentController(
   async function resume(request: ResumeSubagentRequest): Promise<SubagentExecution> {
     const enabled = dependencies.isBuiltInSubagentsEnabled ?? isBuiltInSubagentsEnabled;
     if (!enabled()) throw new Error("Pi Web built-in sub-agents are disabled");
+    const preferred = dependencies.isPiSubagentsPreferred ?? isPiSubagentsPreferred;
+    const packageActive = dependencies.isPiSubagentsPackageActive ?? readPiSubagentsPackageActive;
+    if (preferred() && packageActive()) {
+      throw new Error("Pi Web built-in sub-agents are inactive: the pi-subagents extension takes precedence. Ask the user to reload the session to apply this change");
+    }
     const parentSessionId = request.parentContext.sessionManager.getSessionId();
     const existing = await get(request.sessionId);
     if (!existing) throw new Error(`Subagent not found: ${request.sessionId}`);
