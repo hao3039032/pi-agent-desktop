@@ -2,6 +2,8 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { writePrivateFileAtomicSync } from "./atomic-file";
+import { packageKey, type PackageEntry } from "./distro/packages";
+import { getGlobalSettingsPath } from "./global-settings-file";
 
 export interface SubagentSettings {
   builtInEnabled: boolean;
@@ -165,4 +167,48 @@ export function writeSubagentMaxConcurrent(
     maxConcurrent,
   }, null, 2));
   return readSubagentSettings(settingsPath);
+}
+
+export const PI_SUBAGENTS_PACKAGE_NAME = "pi-subagents";
+const PI_SUBAGENTS_PACKAGE_KEY = `npm:${PI_SUBAGENTS_PACKAGE_NAME}`;
+
+/**
+ * Whether a settings `packages` entry activates the pi-subagents extension: an
+ * `npm:pi-subagents` source (versioned or not, via `packageKey`) or an absolute
+ * path whose segments name the package (the pi-seed form the distro seeder
+ * writes before a running app rewrites it to `npm:pi-subagents`). An object
+ * entry whose `extensions` filter is an empty array was disabled through the
+ * Plugins panel, so it activates nothing.
+ */
+function packageEntryActivatesPiSubagents(entry: PackageEntry): boolean {
+  const source = typeof entry === "string" ? entry : entry?.source;
+  if (typeof source !== "string" || !source.trim()) return false;
+  if (typeof entry === "object"
+    && Array.isArray(entry.extensions)
+    && entry.extensions.length === 0) return false;
+  if (packageKey(source) === PI_SUBAGENTS_PACKAGE_KEY) return true;
+  return packageKey(source) === null
+    && source.replaceAll("\\", "/").split("/").some((segment) => segment === PI_SUBAGENTS_PACKAGE_NAME);
+}
+
+/**
+ * Whether the user's global settings activate the pi-subagents package. This
+ * only drives the Agents panel hint (`legacyPackage`) — the authoritative
+ * signal for sessions is the extension load result (`isPiSubagentsPreferred`).
+ * A missing or damaged settings file reads as inactive, and so does a package
+ * entry disabled through the Plugins panel.
+ */
+export function readPiSubagentsPackageActive(
+  settingsPath = getGlobalSettingsPath(),
+): boolean {
+  try {
+    if (!existsSync(settingsPath)) return false;
+    const parsed: unknown = JSON.parse(readFileSync(settingsPath, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const packages = (parsed as { packages?: unknown }).packages;
+    if (!Array.isArray(packages)) return false;
+    return packages.some((entry) => packageEntryActivatesPiSubagents(entry as PackageEntry));
+  } catch {
+    return false;
+  }
 }

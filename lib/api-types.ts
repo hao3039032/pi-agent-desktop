@@ -9,6 +9,8 @@ export interface SubagentProfilesResponse {
 export interface SubagentSettingsResponse {
   enabled: boolean;
   maxConcurrent: number;
+  /** The pi-subagents package is active in global settings; the built-in switch yields to it. */
+  legacyPackage: boolean;
 }
 
 /** Code mode's one choice (ADR 0006): Automatic writes nothing, Always on adds `+codemode` to the global defaultTools. */
