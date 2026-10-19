@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { DISTRO, imageGenBaseUrl, mergeDistroModels, rebaseDistroModelUrls } from "./config";
+import { LAZY_TOOL_ACTIVATION } from "./lazy-tool-activation";
 import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
 import { isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -100,9 +101,25 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
   });
 
   const agentDir = getAgentDir();
-  const webSearch = readJsonObject(webSearchPath(agentDir));
+  const webSearchFile = webSearchPath(agentDir);
+  // pi-web-access resolves its config as <agentDir>/web-search.json (when it
+  // exists) → ~/.pi/web-search.json (legacy) → defaults, so the file is created
+  // here, on the first service-config save, instead of being seeded as a bare
+  // `agentFiles` entry: an existing user who still configures the legacy file
+  // would otherwise be switched to an empty agent-dir file and lose their
+  // provider/apiKey. The lazy switch goes in only when the file has no content
+  // yet (missing or empty) — the key is a one-shot seed, so a file that already
+  // holds settings (including one where the user deleted the key to fall back to
+  // the extensions' `auto`) is never touched.
+  // It also cannot live in `webSearch.defaults`: those are re-merged on every
+  // save, which would put the key back after such a deletion.
+  const webSearch = readJsonObject(webSearchFile);
+  // An empty (0-byte or all-whitespace) file counts as not written yet: it holds
+  // no user choice to respect, so it is treated as a first creation.
+  const webSearchHasContent = webSearch !== null && Object.keys(webSearch).length > 0;
   if (webSearch) {
-    writeJsonObject(webSearchPath(agentDir), {
+    writeJsonObject(webSearchFile, {
+      ...(webSearchHasContent ? {} : { toolActivation: LAZY_TOOL_ACTIVATION }),
       ...DISTRO.webSearch.defaults,
       ...webSearch,
       [DISTRO.webSearch.baseUrlKey]: baseUrl,

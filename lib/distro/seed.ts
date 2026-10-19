@@ -7,6 +7,7 @@ import { reconcilePackages, type ManagedState, type PackageEntry } from "./packa
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
 import { defaultToolEntries, getGlobalSettingsPath, updateGlobalSettings } from "../global-settings-file";
 import { runMcpAdapterMigration } from "./mcp-migration";
+import { applyLazyToolActivation } from "./lazy-tool-activation";
 
 export interface SeedManifest {
   distro: string;
@@ -178,6 +179,32 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
       if (applied) console.log("[distro] Code mode enabled by default (+codemode)");
     } catch (error) {
       console.warn("[distro] could not seed the default Code mode switch:", error);
+    }
+  }
+
+  // One-time lazy tool activation (v0.7.402): the bundled pi-subagents and
+  // pi-web-access start a fresh session with only their loader tool
+  // (`subagents_enable` / `web_enable`) instead of declaring eight tool schemas
+  // on the first request. Existing installs are the reason this is a migration
+  // rather than an `agentFiles` default: their config files already exist, and
+  // a value they chose themselves is never overwritten.
+  if (!migrations.toolActivation) {
+    try {
+      const report = applyLazyToolActivation(agentDir);
+      migrations.toolActivation = true;
+      if (report.written.length > 0 || report.kept.length > 0 || report.invalid.length > 0) {
+        console.log(
+          `[distro] lazy tool activation: wrote ${report.written.join(", ") || "nothing"}`
+            + `; kept ${report.kept.join(", ") || "nothing"}`
+            + (report.invalid.length ? `; left unparsable: ${report.invalid.join(", ")}` : ""),
+        );
+      }
+    } catch (error) {
+      // A write failure must not skip the rest of the seed (agentFiles,
+      // WATCHDOG.yml, desktop-distro.json); the flag stays unset so the next
+      // start retries. A config file that is not valid JSON is not retried: it
+      // is reported and left alone for good, like every other migration here.
+      console.warn("[distro] could not seed lazy tool activation:", error);
     }
   }
 
