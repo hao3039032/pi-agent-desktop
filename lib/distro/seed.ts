@@ -8,6 +8,7 @@ import { readModelsConfig, writeModelsConfig } from "../models-config-store";
 import { defaultToolEntries, getGlobalSettingsPath, updateGlobalSettings } from "../global-settings-file";
 import { runMcpAdapterMigration } from "./mcp-migration";
 import { applyLazyToolActivation } from "./lazy-tool-activation";
+import { applyPlanToolsMigration } from "./plan-tools-migration";
 
 export interface SeedManifest {
   distro: string;
@@ -205,6 +206,33 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
       // start retries. A config file that is not valid JSON is not retried: it
       // is reported and left alone for good, like every other migration here.
       console.warn("[distro] could not seed lazy tool activation:", error);
+    }
+  }
+
+  // One-time plan-mode delegation fix (distro revision 3): the lazy loaders from
+  // revision 2 made pi-plan-vanguard's Plan policy block `subagents_enable`
+  // (an extension tool without a readOnlyHint needs explicit selection), so a
+  // Plan workflow could never activate delegation. Adds the loader plus
+  // `subagent`/`subagent_supervisor` to an existing revision-2
+  // `defaultPlanTools` seed; a list the user edited themselves is kept, and a
+  // missing file is left to the agentFiles seed.
+  if (!migrations.planTools) {
+    try {
+      const report = applyPlanToolsMigration(agentDir);
+      migrations.planTools = true;
+      if (report.written || report.kept.length > 0) {
+        console.log(
+          `[distro] plan-mode delegation tools: ${
+            report.written
+              ? "added subagents_enable/subagent/subagent_supervisor to defaultPlanTools"
+              : `kept existing pi-plan-vanguard.json (${report.kept.join("; ")})`
+          }`,
+        );
+      }
+    } catch (error) {
+      // Same contract as the toolActivation migration above: a failure must not
+      // skip the rest of the seed, and the flag stays unset so it retries.
+      console.warn("[distro] could not seed plan-mode delegation tools:", error);
     }
   }
 
