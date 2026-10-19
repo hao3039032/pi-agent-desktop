@@ -81,6 +81,41 @@ test("model-load failures stay visible through bounded retries and clear on reco
   assert.ok(recovered.writes.some(([name, value]) => name === "NewSessionDefaultThinkingLevel" && value === "high"));
 });
 
+test("model loads work in WebViews without AbortSignal.throwIfAborted", async () => {
+  const state = setup(async () => Response.json({
+    models: { "custom:test": "Test" },
+    modelList: [{ provider: "custom", id: "test", name: "Test" }],
+    defaultModel: { provider: "custom", modelId: "test" },
+  }));
+  Object.defineProperty(state.context.controller.signal, "throwIfAborted", { value: undefined });
+  await state.run();
+  assert.deepEqual(state.delays, []);
+  assert.deepEqual(state.writes.filter(([name]) => name === "ModelError"), [["ModelError", null]]);
+  assert.ok(state.writes.some(([name, value]) => name === "ModelList" && value[0].id === "test"));
+  assert.ok(state.writes.some(([name, value]) => name === "NewSessionDefaultModel" && value.modelId === "test"));
+});
+
+test("legacy WebViews discard model responses cancelled while reading JSON", async () => {
+  for (const hasReason of [false, true]) {
+    const reason = new Error("Project changed");
+    const state = setup(async () => ({
+      ok: true,
+      json: async () => {
+        state.context.controller.abort(reason);
+        return { models: {}, modelList: [] };
+      },
+    }));
+    const signal = state.context.controller.signal;
+    Object.defineProperty(signal, "throwIfAborted", { value: undefined });
+    if (!hasReason) Object.defineProperty(signal, "reason", { value: undefined });
+    await assert.rejects(state.context.loadModels(signal), (error) => hasReason
+      ? error === reason
+      : error instanceof DOMException && error.name === "AbortError");
+    assert.deepEqual(state.writes, []);
+    assert.deepEqual(state.delays, []);
+  }
+});
+
 test("cancelling model loads prevents state writes and further retries", async () => {
   for (const status of [200, 403]) {
     const reading = Promise.withResolvers();

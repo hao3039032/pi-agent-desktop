@@ -11,6 +11,9 @@ pi ≥ 0.99 catalogs classifier (Jev) and image models (OpenRouter image models 
 ## Thinking-level state model (post-0.9.1)
 Four states, not one: `newSessionThinkingLevel` (composer pre-send), `newSessionDefaultThinkingLevel` (from `/api/models` pins + `defaultThinkingLevel`), `currentThinkingOverride` (explicit user choice), `liveThinkingLevel` (wrapper-reported). `thinkingLevel` returned to the UI is `displayThinkingLevel ?? "auto"`. "auto" clears all overrides and leaves pi's setting untouched. The selector prefers the live wrapper model/thinking over persisted response metadata.
 
+## Model loading in older desktop WebViews
+`loadModels()` in `hooks/useAgentSession.ts` checks `signal.aborted` after reading JSON and before updating state. Do not replace this with `signal.throwIfAborted()`: older macOS WebViews lack that method, so even a successful `/api/models` response becomes a visible model error. Preserve `signal.reason` when available and fall back to an `AbortError` for older engines. `hooks/model-loading.test.mjs` covers missing-method compatibility and cancellation during JSON parsing.
+
 ## Model defaults for new sessions
 `GET /api/models` returns `defaultModel` read from `~/.pi/agent/settings.json`. `ChatWindow` pre-selects this on mount for new sessions. A model picked in the browser is session-scoped, as in the TUI: it is applied atomically during `AgentSession` construction and never written to the global defaults (upstream #871 removed `lib/startup-preferences.ts`; saving a default is its own request, `PUT /api/models/default`, offered by the model selector's star and `defaultModel`/`savedDefaultThinkingLevel` props).
 

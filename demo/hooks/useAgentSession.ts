@@ -2178,7 +2178,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         throw new Error(detail || `Failed to load models (HTTP ${res.status})`);
       }
       d = await res.json() as ModelsResponse;
-      signal?.throwIfAborted();
+      // Older macOS WebViews lack throwIfAborted; still discard cancelled responses.
+      if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
     } catch (e) {
       if (!signal?.aborted && !(e instanceof DOMException && e.name === "AbortError")) {
         setModelError(e instanceof Error ? e.message : String(e));
