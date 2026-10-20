@@ -57,8 +57,31 @@ test("launcher clears stale route responses before Next reads the new build seed
   assert.match(run.stdout, /seed ready/);
   assert.equal(fs.existsSync(path.join(server, "route-cache")), false);
   assert.equal(await readFile(`${seed}.html`, "utf8"), "<html>new-artifact-ui</html>");
-  assert.equal((await cache().get(key, context)).value.html, "<html>new-artifact-ui</html>");
-  assert.equal((await cache().get(key, context)).value.rscData.toString(), "new-artifact-ui");
+  // Where the launcher dropped the scoped entry, Next's FileSystemCache.get falls
+  // back to the build seed (`server/app/index.html`) for a `/$/`-scoped route key,
+  // guarded by the seed's own .meta routeCache owner. That legacy path, not the
+  // launcher, is what serves the new page here, so an upgrade that stops reading
+  // the seed (or changes that guard) fails this assertion for a Next reason.
+  const viaSeedFallback = (what) => `served ${what} through Next's legacy /$/ seed fallback`;
+  assert.equal((await cache().get(key, context)).value.html, "<html>new-artifact-ui</html>", viaSeedFallback("html"));
+  assert.equal(
+    (await cache().get(key, context)).value.rscData.toString(),
+    "new-artifact-ui",
+    viaSeedFallback("RSC payload"),
+  );
+});
+
+test("the build-id marker is written only after the stale route cache is gone", () => {
+  // Reconcile note: the launcher catches and logs a failed delete so the server
+  // still starts, which makes this ordering the only protection left. Swap it and
+  // a denied delete records the new BUILD_ID without clearing the old page: the
+  // next start sees matching ids and serves the previous version forever, with
+  // every test in this suite still green.
+  const cleared = launcher.indexOf('"route-cache"), { recursive: true, force: true })');
+  const marked = launcher.indexOf("writeFileSync(markerPath");
+  assert.ok(cleared > 0, "the launcher must drop .next-desktop/server/route-cache");
+  assert.ok(marked > 0, "the launcher must record the BUILD_ID it cleared the cache for");
+  assert.ok(cleared < marked, "the route-cache delete must come first, so a failing delete leaves the marker unwritten");
 });
 
 test("distro release verifies the staged HTTP homepage on every platform before bundling", async () => {

@@ -9098,9 +9098,15 @@ html.native-desktop :is(
   align-items: center;
   gap: 6px;
 }
-.subagent-fleet-steer-controls select {
+/* The steer-mode picker is a caption-size control sharing a row with two action
+   buttons, so it undoes the shared trigger's full width and control height. The
+   rule must target .app-select-trigger: the only <select> left in the row is
+   Radix's 1px, aria-hidden bubble select, never the visible control. Border and
+   chevron come from .app-select-trigger; only the compact metrics are restated. */
+.subagent-fleet-steer-controls .app-select-trigger {
+  width: auto;
+  min-height: 0;
   padding: 2px 4px;
-  border: var(--hairline) solid var(--border);
   border-radius: 4px;
   background: var(--bg);
   color: var(--text-muted);

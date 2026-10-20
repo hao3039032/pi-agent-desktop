@@ -34,6 +34,29 @@ test("sends only the API's four actions with server-known identifiers", () => {
   assert.doesNotMatch(source, /index: row/);
 });
 
+test("the steer picker offers the API's three delivery modes, labelled", () => {
+  // The route accepts "steer" | "follow_up" | "auto". A camelCase value
+  // ("followUp"), a renamed label or a wrong cast all satisfy the compiler at
+  // this call site, and the browser regression only drives the default `steer`
+  // path (which omits `mode` from the request), so nothing else would catch it.
+  assert.match(source, /import \{ AppSelect \} from "\.\/AppSelect"/);
+  assert.doesNotMatch(source, /<select/);
+  assert.match(source, /<AppSelect\s+aria-label=\{t\("subagentFleet\.steerMode"\)\}/);
+  for (const [value, label] of [
+    ["steer", "subagentFleet.mode.steer"],
+    ["follow_up", "subagentFleet.mode.followUp"],
+    ["auto", "subagentFleet.mode.auto"],
+  ]) {
+    assert.ok(
+      source.includes(`{ value: "${value}", label: t("${label}") }`),
+      `the picker must offer ${value} labelled ${label}`,
+    );
+  }
+  assert.match(source, /mode: value as "steer" \| "follow_up" \| "auto"/);
+  // The default mode is omitted from the request; only a non-default pick adds it.
+  assert.match(source, /\.\.\.\(steer\.mode !== "steer" \? \{ mode: steer\.mode \} : \{\}\)/);
+});
+
 test("operations follow the server-computed flags, never client-side guesses", () => {
   assert.match(source, /row\.operations\.steer/);
   assert.match(source, /row\.operations\.stop/);

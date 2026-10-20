@@ -22,7 +22,9 @@ for (const path of UPSTREAM_CSS_FILES) {
       baseline.files[path],
       `${path} differs from upstream pi-web ${baseline.upstreamRef}. Fork styling belongs in ` +
         "app/native-theme.css (see docs/native-theme.md): move the rule there and restore " +
-        `the file with \`git checkout ${baseline.upstreamRef} -- ${path}\` (fetch pi-web-upstream first). ` +
+        `the file with \`git checkout ${baseline.upstreamRef} -- ${path}\` (fetch the \`upstream\` ` +
+        "remote first: it is abcwyc/pi-agent-desktop, and `upstreamRef` records which of its refs " +
+        "these hashes came from). " +
         "If you just merged upstream, run `node scripts/upstream-css-baseline.mjs update <upstream-ref>`.",
     );
   });
