@@ -26,6 +26,11 @@ async function fixture(t) {
     await writeFile(`${file}.rsc`, version);
     await writeFile(`${file}.meta`, JSON.stringify({ routeCache: { key, owner, isFallback: false } }));
   }
+  // A real packaged upgrade: the new build ships its own BUILD_ID while the
+  // marker on disk still names the previous one (installer-hooks.nsh deletes
+  // the payload on Windows; this path covers installs made before that hook).
+  await writeFile(path.join(root, ".next-desktop", "BUILD_ID"), "build-new\n");
+  await writeFile(path.join(root, ".next-desktop", ".route-cache-build-id"), "build-old\n");
   await mkdir(path.join(root, "node_modules", "@earendil-works"), { recursive: true });
   await writeFile(path.join(root, "desktop-server.cjs"), launcher);
   const cache = () => new FileSystemCache({

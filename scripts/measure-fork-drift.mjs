@@ -69,10 +69,10 @@ function resolveBaseline(explicit) {
 let cachedManifest;
 function baselineFromManifest() {
   cachedManifest ??= manifest;
-  // The manifest also carries a human label, e.g. "main@6fcd7d4 (v0.10.0)".
-  // Resolve its commit rather than passing that whole label to git as a ref.
-  return cachedManifest.upstreamBaseline.match(/@([0-9a-f]{7,40})(?:\s|$)/)?.[1]
-    ?? cachedManifest.upstreamBaseline;
+  // Return the manifest's human label ("main@6fcd7d4 (v0.10.0)") unchanged:
+  // resolveBaseline() parses the sha out of it exactly once. Extracting the sha
+  // here as well made the parser reject its own output.
+  return cachedManifest.upstreamBaseline;
 }
 
 const manifest = await readForkOwnership();

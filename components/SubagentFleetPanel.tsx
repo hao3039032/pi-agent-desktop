@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
+import { AppSelect } from "./AppSelect";
 import type {
   PiSubagentRunRow,
   PiSubagentsStatusView,
@@ -357,17 +358,18 @@ export function SubagentFleetPanel({ sessionId }: Props) {
                           }}
                         />
                         <div className="subagent-fleet-steer-controls">
-                          <select
-                            value={steer.mode}
-                            onChange={(event) => setSteer((current) => current
-                              ? { ...current, mode: event.target.value as "steer" | "follow_up" | "auto" }
-                              : current)}
+                          <AppSelect
                             aria-label={t("subagentFleet.steerMode")}
-                          >
-                            <option value="steer">{t("subagentFleet.mode.steer")}</option>
-                            <option value="follow_up">{t("subagentFleet.mode.followUp")}</option>
-                            <option value="auto">{t("subagentFleet.mode.auto")}</option>
-                          </select>
+                            value={steer.mode}
+                            onValueChange={(value) => setSteer((current) => current
+                              ? { ...current, mode: value as "steer" | "follow_up" | "auto" }
+                              : current)}
+                            options={[
+                              { value: "steer", label: t("subagentFleet.mode.steer") },
+                              { value: "follow_up", label: t("subagentFleet.mode.followUp") },
+                              { value: "auto", label: t("subagentFleet.mode.auto") },
+                            ]}
+                          />
                           <button type="submit" className="subagent-fleet-action" disabled={busy !== null || !steer.message.trim()}>
                             {t("subagentFleet.steerSend")}
                           </button>

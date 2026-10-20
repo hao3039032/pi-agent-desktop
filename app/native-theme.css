@@ -8911,6 +8911,7 @@ html.native-desktop :is(
 
 .saved-file-card-reveal:hover {
   background: var(--bg-hover);
+}
 /* pi-subagents composer tag: replace the inert TUI snapshot with native
    controls in the existing expanded widget surface, never a workspace tab. */
 .extension-widget-panels.is-subagent-fleet {

@@ -15,8 +15,12 @@
 ; hook existed.
 !macro NSIS_HOOK_PREINSTALL
   RMDir /r "$INSTDIR\resources\server\node_modules"
-  ; Next's runtime route-cache wins over fresh prerendered pages. Clear the
-  ; entire generated build payload so old HTML/RSC and hashed JS cannot survive
-  ; an upgrade. The installer supplies the new build; sessions live elsewhere.
+  ; Next's runtime route-cache wins over fresh prerendered pages, and its
+  ; namespace is route-based rather than build-id-based, so an upgrade would
+  ; keep serving the previous UI. Clear it explicitly, then drop the whole
+  ; generated build payload (which subsumes it) so old HTML/RSC and hashed JS
+  ; cannot survive either. The installer immediately writes the new build;
+  ; sessions and settings live outside it.
+  RMDir /r "$INSTDIR\resources\server\.next-desktop\server\route-cache"
   RMDir /r "$INSTDIR\resources\server\.next-desktop"
 !macroend
