@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "upstreamBaseline": "main@6fcd7d4 (v0.10.0)",
-  "note": "Single source of truth for the pi-web merge boundary. `driftedUpstreamFiles` lists files agegr/pi-web owns that this fork has also edited — every one is a potential merge conflict, and a potential SILENT semantic conflict when git merges cleanly but the two sides changed different things. The automated sync (.github/workflows/component-updates.yml) intersects each incoming upstream release with this map to decide whether it may push to main unattended. Human-facing rationale lives in docs/ownership-boundaries.md.",
+  "note": "Single source of truth for the pi-web merge boundary. `driftedUpstreamFiles` lists files agegr/pi-web owns that this fork has also edited \u2014 every one is a potential merge conflict, and a potential SILENT semantic conflict when git merges cleanly but the two sides changed different things. The automated sync (.github/workflows/component-updates.yml) intersects each incoming upstream release with this map to decide whether it may push to main unattended. Human-facing rationale lives in docs/ownership-boundaries.md.",
   "ignored": [
     "package-lock.json",
     "bun.lock",
@@ -13,28 +13,28 @@
       "high": 250,
       "medium": 30
     },
-    "note": "Risk follows STRUCTURAL drift, not total drift. Replacing an upstream inline style object with a className produces a large diff, but an upstream edit to the same line conflicts textually and fails the sync loudly — that is safe. Rewritten JSX trees and code moved across files are what merge cleanly while being wrong. components/ModelsConfig.tsx is the reference: 146 changed lines, only 12 structural, correctly rated low. Recompute with the hunk classifier described in docs/ownership-boundaries.md after any significant change to a shared file."
+    "note": "Risk follows STRUCTURAL drift, not total drift. Replacing an upstream inline style object with a className produces a large diff, but an upstream edit to the same line conflicts textually and fails the sync loudly \u2014 that is safe. Rewritten JSX trees and code moved across files are what merge cleanly while being wrong. components/ModelsConfig.tsx is the reference: 146 changed lines, only 12 structural, correctly rated low. Recompute with the hunk classifier described in docs/ownership-boundaries.md after any significant change to a shared file."
   },
   "autoPushPolicy": {
     "blockOnRisk": [
       "high",
       "medium"
     ],
-    "note": "Risk levels that force the sync to open a reviewed PR instead of pushing straight to main and triggering a signed release. Most upstream releases will land here, because the remaining drift is accepted by decision rather than pending cleanup — see `dispositions` and `decisionLog`. Narrow this list only if the drift itself actually goes away."
+    "note": "Risk levels that force the sync to open a reviewed PR instead of pushing straight to main and triggering a signed release. Most upstream releases will land here, because the remaining drift is accepted by decision rather than pending cleanup \u2014 see `dispositions` and `decisionLog`. Narrow this list only if the drift itself actually goes away."
   },
   "driftedUpstreamFiles": {
     "components/SessionSidebar.tsx": {
       "risk": "high",
-      "drift": 3504,
+      "drift": 3875,
       "reason": "~500 lines were MOVED OUT into components/ProjectPicker.tsx and components/path-ui.tsx, which do not exist upstream. git merge does not track cross-file moves: an upstream edit to the project-picker block can merge back cleanly and silently resurrect a second copy.",
-      "structuralDrift": 2969,
+      "structuralDrift": 3307,
       "disposition": "accepted"
     },
     "components/AppShell.tsx": {
       "risk": "high",
-      "drift": 2385,
+      "drift": 2381,
       "reason": "Top-bar redesign (toolbar consolidated into a more-menu, inline styles to classNames) plus the mount point for desktop chrome. The desktop-only parts moved to components/desktop/; the remaining 376 structural lines are the fork's own interaction design, not desktop plumbing, so this file stays high risk by design rather than by neglect.",
-      "structuralDrift": 1984,
+      "structuralDrift": 1980,
       "disposition": "accepted"
     },
     "components/FileExplorer.tsx": {
@@ -46,16 +46,16 @@
     },
     "components/TabBar.tsx": {
       "risk": "medium",
-      "drift": 92,
+      "drift": 153,
       "reason": "Accessibility work plus the terminal-tab affordance: role=\"tab\", aria-selected, roving tabIndex, keyboard activation, and a New terminal button. The terminal action is fork interaction design inside an upstream-owned component, so incoming TabBar changes require review.",
-      "structuralDrift": 55,
+      "structuralDrift": 106,
       "disposition": "accepted"
     },
     "components/ChatWindow.tsx": {
       "risk": "high",
-      "drift": 779,
-      "reason": "Redesigned empty state — the new-session branding header (app icon + PRODUCT_NAME) is removed and only the update chip remains. Part of the fork's interaction design. Kept deliberately.",
-      "structuralDrift": 657,
+      "drift": 1073,
+      "reason": "Redesigned empty state \u2014 the new-session branding header (app icon + PRODUCT_NAME) is removed and only the update chip remains. Part of the fork's interaction design. Kept deliberately.",
+      "structuralDrift": 951,
       "disposition": "accepted"
     },
     "hooks/useTheme.ts": {
@@ -67,23 +67,23 @@
     },
     "components/ChatInput.tsx": {
       "risk": "high",
-      "drift": 1249,
+      "drift": 1372,
       "reason": "Single circular Send/Stop replaces the upstream Steer/Follow-up controls. ComposerOutbox docks editable pending messages above the composer; ordinary submissions queue until completion. Preserve concentric geometry and the independent Config control. Covered by ChatInput tests and e2e/composer-outbox.mjs.",
-      "structuralDrift": 937,
+      "structuralDrift": 1056,
       "disposition": "accepted"
     },
     "hooks/useAgentSession.ts": {
       "risk": "high",
-      "drift": 533,
+      "drift": 551,
       "reason": "Fork session lifecycle guards plus editable composer outbox submission, queue events and per-message edit/send/delete. Restoring an edited pending message must target the original session draft and preserve current input. Never replace with upstream direct followUp submission.",
-      "structuralDrift": 533,
+      "structuralDrift": 551,
       "disposition": "accepted"
     },
     "components/MessageView.tsx": {
       "risk": "high",
-      "drift": 337,
+      "drift": 524,
       "reason": "Message bubble markup adjusted.",
-      "structuralDrift": 340,
+      "structuralDrift": 327,
       "disposition": "accepted"
     },
     "lib/i18n/registry.ts": {
@@ -96,14 +96,14 @@
     "next.config.ts": {
       "risk": "medium",
       "drift": 21,
-      "reason": "Desktop standalone build branch. Also holds serverExternalPackages, which upstream updates whenever it adds a pi package — do NOT auto-derive that list here.",
+      "reason": "Desktop standalone build branch. Also holds serverExternalPackages, which upstream updates whenever it adds a pi package \u2014 do NOT auto-derive that list here.",
       "disposition": "accepted"
     },
     "app/layout.tsx": {
       "risk": "low",
-      "drift": 18,
+      "drift": 25,
       "reason": "native-theme.css import, branding title, dark-mode bootstrap script.",
-      "structuralDrift": 18,
+      "structuralDrift": 23,
       "disposition": "accepted"
     },
     "eslint.config.mjs": {
@@ -114,8 +114,8 @@
     },
     "lib/subagent-extension.ts": {
       "risk": "medium",
-      "drift": 68,
-      "structuralDrift": 68,
+      "drift": 82,
+      "structuralDrift": 82,
       "disposition": "accepted",
       "reason": "Fork precedence policy: preferPiSubagentsExtension detects loaded pi-subagents files and removes the built-in host plus resolved conflicts. Preserve package-first precedence and the detection flag when upstream changes extension registration; tool-name matching must not return."
     },
@@ -135,8 +135,8 @@
     },
     "components/AgentsConfig.tsx": {
       "risk": "medium",
-      "drift": 55,
-      "structuralDrift": 51,
+      "drift": 73,
+      "structuralDrift": 66,
       "disposition": "accepted",
       "reason": "Fork pi-subagents notice disables the built-in switch and hides builtin profiles from both the sidebar and detail selection. Upstream form or selection changes can silently restore an orphaned builtin pane; retain visibleProfiles and settings-response wiring."
     },
@@ -162,22 +162,22 @@
     },
     "lib/rpc-manager.ts": {
       "risk": "high",
-      "drift": 452,
+      "drift": 567,
       "reason": "Upstream frequently changes session startup. Preserve the fork extension override composition, both subagent guard dependencies, the fork runtime integration and editable ComposerQueue admission alongside the existing fork lifecycle wiring. Drain pending queue messages only after full SDK/RPC idle, preserve prompt preflight and MCP preparation, pause delivery on Stop, and never clear/rebuild SDK queues from a single queue action.",
-      "structuralDrift": 452,
+      "structuralDrift": 567,
       "disposition": "accepted"
     },
     "components/BranchNavigator.tsx": {
       "risk": "medium",
       "drift": 121,
-      "reason": "className hook only, no structural change — the intended shape for every restyled file.",
+      "reason": "className hook only, no structural change \u2014 the intended shape for every restyled file.",
       "structuralDrift": 93,
       "disposition": "accepted"
     },
     "package.json": {
       "risk": "low",
       "drift": 13,
-      "reason": "Desktop scripts and Tauri deps. Name stays @agegr/pi-web on purpose — see docs/ownership-boundaries.md.",
+      "reason": "Desktop scripts and Tauri deps. Name stays @agegr/pi-web on purpose \u2014 see docs/ownership-boundaries.md.",
       "disposition": "accepted"
     },
     "tsconfig.json": {
@@ -195,13 +195,13 @@
     "README.md": {
       "risk": "low",
       "drift": 264,
-      "reason": "Fork-specific product docs, English and the language switcher's default entry point. Conflicts here are noisy but harmless — resolve by keeping the fork version.",
+      "reason": "Fork-specific product docs, English and the language switcher's default entry point. Conflicts here are noisy but harmless \u2014 resolve by keeping the fork version.",
       "disposition": "accepted"
     },
     "README.zh-CN.md": {
       "risk": "low",
       "drift": 264,
-      "reason": "Fork-specific product docs, Simplified Chinese translation of README.md. Same handling as README.md. Upstream's other translations (ja, ru) are deleted in this fork on purpose — if a sync resurrects them, delete them again rather than translating Pi Agent docs into a language nobody here maintains.",
+      "reason": "Fork-specific product docs, Simplified Chinese translation of README.md. Same handling as README.md. Upstream's other translations (ja, ru) are deleted in this fork on purpose \u2014 if a sync resurrects them, delete them again rather than translating Pi Agent docs into a language nobody here maintains.",
       "disposition": "accepted"
     },
     "lib/file-access.ts": {
@@ -209,35 +209,35 @@
       "drift": 31,
       "structuralDrift": 31,
       "disposition": "accepted",
-      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile — the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
+      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile \u2014 the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
     },
     "app/api/default-cwd/route.ts": {
       "risk": "low",
-      "drift": 6,
-      "structuralDrift": 12,
+      "drift": 5,
+      "structuralDrift": 5,
       "disposition": "accepted",
-      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile — the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
+      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile \u2014 the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
     },
     "lib/directory-browser.ts": {
       "risk": "low",
       "drift": 25,
       "structuralDrift": 25,
       "disposition": "accepted",
-      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile — the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
+      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile \u2014 the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
     },
     "lib/skill-lock.ts": {
       "risk": "low",
       "drift": 4,
       "structuralDrift": 4,
       "disposition": "accepted",
-      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile — the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
+      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile \u2014 the walk that made every Windows build fail. One import plus call swaps; conflicts here would be textual."
     },
     "app/api/cwd/validate/route.ts": {
       "risk": "medium",
       "drift": 40,
       "structuralDrift": 40,
       "disposition": "accepted",
-      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile — the walk that made every Windows build fail. Also recognizes the hidden Chat workspace and returns its server-owned identity instead of treating it as a project. Incoming changes to path validation require review."
+      "reason": "Routes homedir() through userHome() so Next's file tracer stops folding it into a build-time glob of the whole user profile \u2014 the walk that made every Windows build fail. Also recognizes the hidden Chat workspace and returns its server-owned identity instead of treating it as a project. Incoming changes to path validation require review."
     },
     "components/ExtensionWidgets.tsx": {
       "risk": "medium",
@@ -292,10 +292,11 @@
     "app/api/agent/[id]/subagents/",
     "lib/pi-subagents-rpc.ts",
     "lib/pi-subagents-view.ts",
-    "components/SubagentFleetPanel.tsx"  ],
+    "components/SubagentFleetPanel.tsx"
+  ],
   "dispositions": {
     "accepted": "Reviewed and kept. The drift is either the fork's own interaction design or a generic improvement with no desktop coupling, so it cannot be extracted into components/desktop/. Removing it would mean deleting a feature. These files stay permanent review points; that is the running cost of a UI fork, not a backlog item. Do not reopen without new information.",
-    "reduce": "Drift that can be removed without losing anything — desktop-only code that belongs in components/desktop/, or fork additions sitting in an upstream file that can move to a fork-owned one. Act on these."
+    "reduce": "Drift that can be removed without losing anything \u2014 desktop-only code that belongs in components/desktop/, or fork additions sitting in an upstream file that can move to a fork-owned one. Act on these."
   },
   "decisionLog": [
     "2026-07-26 \u2014 lib/api-types.ts: fork update types moved to lib/app-update-types.ts; file now matches upstream and left the manifest.",
@@ -317,5 +318,7 @@
     "2026-10-17 \u2014 lib/i18n/messages/{en,zh-CN,zh-TW}.ts: restored to upstream shape; fork additions, replacements, and deliberate deletions moved to lib/i18n/locale-plugins.ts. Runtime message maps are unchanged, but future upstream locale edits no longer conflict with a rewritten fork pack.",
     "2026-10-19 \u2014 Rebased local menu/composer customizations onto desktop 0.7.4 (3b6a877), keeping upstream component extractions and SDK 1.3.0. Shared AppSelect/AppCombobox and app-menu tokens (including 4px row gaps) apply to the extracted settings/project/session menus; Config remains a separate entry. Runtime userHome tracing guards, concentric composer geometry and right-aligned toolbar survive. Synchronization procedure: docs/fork-sync.zh-CN.md.",
     "2026-10-20 \u2014 Registered the pi-subagents fleet monitor boundary: the restricted per-session API (app/api/agent/[id]/subagents), its event-bus RPC client (lib/pi-subagents-rpc.ts, ping/status/steer/interrupt/stop only), the bounded projection (lib/pi-subagents-view.ts), the subagentsEventBus + lifecycle abort on the wrapper (lib/rpc-manager.ts drift grows within its registered high-risk entry), and the composer-tag panel (components/SubagentFleetPanel.tsx, mounted by ExtensionWidgets; no workspace tab). Steering targets run ids only \u2014 the async snapshot carries no authoritative child indexes \u2014 and a child-scoped stop forwards the package-reported childId. No upstream implementation was moved across files; the route/panel tests pin the boundary.",
-    "2026-10-20 \u2014 components/ExtensionWidgets.tsx joined the manifest: mounting the pi-subagents fleet panel for the two package widget keys (by public widget identity, not tool names), gated on a project session, with Escape from the panel or its trigger collapsing the tag rather than stopping the agent. 48 drifted lines, 43 structural, accepted as the composer seam that keeps the fleet monitor out of the workspace tabs."  ]
+    "2026-10-20 \u2014 components/ExtensionWidgets.tsx joined the manifest: mounting the pi-subagents fleet panel for the two package widget keys (by public widget identity, not tool names), gated on a project session, with Escape from the panel or its trigger collapsing the tag rather than stopping the agent. 48 drifted lines, 43 structural, accepted as the composer seam that keeps the fleet monitor out of the workspace tabs.",
+    "2026-10-20 \u2014 Rebased the fork onto desktop upstream v0.7.5 (2909e09a, was 2e0e3e71/v0.7.4): 14 fork commits replayed, no upstream commit rewritten. Upstream now owns the chat tool policy in lib/chat-workspace-policy.ts (chats keep no coding tools, no shell and no file editing of their own, but a trusted MCP server's tools may write or run commands); the fork deleted its second inline policy path and adopted that file, so AGENTS.md's 'chats are tool-less' wording now describes upstream's rule instead of the fork's older stricter one. Also adopted upstream's BUILD_ID-tied route-cache self-heal in desktop/server-launcher.cjs (the fork's unconditional delete kept the fork's own desktop-route-cache test passing only by contradicting upstream's four route-cache-cleanup tests; the fork test now stages a real upgrade with a changed BUILD_ID) and kept the fork's wider installer hook line alongside upstream's narrower one so both suites hold. Components must use AppSelect/AppCombobox, not browser-native select: SubagentFleetPanel's steer-mode picker was converted. Drift numbers refreshed against the unchanged pi-web baseline; scripts/measure-fork-drift.mjs double-parsed the manifest baseline and broke whenever no pi-web-upstream remote existed \u2014 now it parses once."
+  ]
 }

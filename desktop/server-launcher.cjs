@@ -174,11 +174,10 @@ try {
     }
   }
 } catch (cacheError) {
-  // A mixed-version UI is worse than a failed start: keep the LW behaviour of
-  // failing loudly when the stale cache could not be cleared.
-  console.error("[Pi Agent] could not clear the stale Next.js route cache:", cacheError);
-  throw cacheError;
-}
+  // Cleanup must never keep the server from starting. The marker is only
+  // written after a successful delete, so a denied delete retries next start
+  // instead of silently pinning the stale page forever.
+  console.error("[Pi Agent] route-cache cleanup failed:", cacheError);
 }
 
 // The standalone Next.js entrypoint is CommonJS.
