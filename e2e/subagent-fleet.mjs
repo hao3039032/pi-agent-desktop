@@ -111,6 +111,18 @@ try {
     { action: "steer", runId: "run-1", message: "Focus on the diff" },
     { action: "stop", runId: "run-1", childId: "lane-key" },
   ]);
+  // The picker's value is what reaches the wire: a non-default mode must be sent
+  // as an explicit `mode`, while the default `steer` above omits the field.
+  await row.getByRole("button", { name: "Steer", exact: true }).click();
+  await row.locator("textarea").fill("Wait for the tests");
+  await row.getByRole("combobox", { name: "Delivery mode" }).click();
+  await page.getByRole("option", { name: "Follow-up", exact: true }).click();
+  const followUpReply = page.waitForResponse(actionReply("steer"));
+  await row.getByRole("button", { name: "Send", exact: true }).click();
+  await followUpReply;
+  assert.deepEqual(requests.filter(r => r.method === "POST").at(-1).body, {
+    action: "steer", runId: "run-1", message: "Wait for the tests", mode: "follow_up",
+  });
   // A poll round trip just finished, and the panel schedules the next GET only
   // after it: no request is in flight when the tag collapses.
   await page.waitForResponse((response) => response.request().method() === "GET"
@@ -154,7 +166,7 @@ try {
   await page.keyboard.press("Escape");
   await page.waitForFunction((before) => (window.__escapesToWindow ?? 0) === before + 1, escapesBefore);
   assert.deepEqual(errors, []);
-  console.log("PASS: composer tag opens native controls; inspect/steer/child-stop, collapse, session isolation, generic widgets, mobile, height cap and Escape");
+  console.log("PASS: composer tag opens native controls; inspect/steer/child-stop, steer-mode wire value, collapse, session isolation, generic widgets, mobile, height cap and Escape");
 } finally {
   await browser?.close();
   await new Promise(resolve => server.close(resolve));

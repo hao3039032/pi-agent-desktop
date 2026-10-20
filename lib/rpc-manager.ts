@@ -2789,10 +2789,11 @@ export async function startRpcSession(
     // session's extension event bus (`pi.events`). Pi Web creates the bus and
     // hands it to the resource loader, so it stays reachable from the wrapper
     // for the restricted subagents API without touching the package's
-    // internals or any global registry (lib/pi-subagents-rpc.ts). Chats and
-    // subagent children get no bridge: the package's policy for non-project
-    // chats is enforced server-side, and child sessions are not API targets.
-    const subagentsEventBus = subagentResources || chatOnly ? undefined : createEventBus();
+    // internals or any global registry (lib/pi-subagents-rpc.ts). Only the
+    // project branch below passes it to the loader: chats and subagent children
+    // get no bridge, because the package's policy for non-project chats is
+    // enforced server-side and child sessions are not API targets.
+    const subagentsEventBus = subagentResources || chatOnly || chatWorkspace ? undefined : createEventBus();
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
