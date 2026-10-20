@@ -8904,4 +8904,248 @@ html.native-desktop :is(
 
 .saved-file-card-reveal:hover {
   background: var(--bg-hover);
+/* pi-subagents composer tag: replace the inert TUI snapshot with native
+   controls in the existing expanded widget surface, never a workspace tab. */
+.extension-widget-panels.is-subagent-fleet {
+  max-height: min(440px, 50dvh);
+}
+.extension-widget-panels.is-subagent-fleet .subagent-fleet-body {
+  overflow-y: visible;
+}
+.subagent-fleet-panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+}
+.subagent-fleet-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.subagent-fleet-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text);
+  font-size: var(--fs-small);
+}
+.subagent-fleet-summary small {
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
+  margin-left: auto;
+}
+.subagent-fleet-empty,
+.subagent-fleet-unavailable {
+  padding: 18px 10px;
+  color: var(--text-dim);
+  font-size: var(--fs-small);
+  text-align: center;
+}
+.subagent-fleet-unavailable {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+}
+.subagent-fleet-unavailable p { margin: 0; color: var(--text-muted); }
+.subagent-fleet-unavailable small {
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
+  overflow-wrap: anywhere;
+}
+.subagent-fleet-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 9px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.subagent-fleet-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.subagent-fleet-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 8px;
+  border-radius: 6px;
+}
+.subagent-fleet-row:hover:not(.is-active) { background: var(--bg-hover); }
+/* --bg, not --bg-panel: the panel's only container is the expanded widget
+   surface, which is itself --bg-panel (upstream globals.css). */
+.subagent-fleet-row.is-active { background: var(--bg); }
+.subagent-fleet-row-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.subagent-fleet-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--text-dim);
+}
+.subagent-fleet-status.is-running { background: var(--accent); }
+.subagent-fleet-status.is-complete { background: #16a34a; }
+.subagent-fleet-status.is-failed { background: #dc2626; }
+.subagent-fleet-status.is-stopped { background: #d97706; }
+.subagent-fleet-status.is-paused { background: #a855f7; }
+.subagent-fleet-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--fs-small);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-fleet-state {
+  margin-left: auto;
+  flex: none;
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
+}
+.subagent-fleet-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  padding-left: 14px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+}
+.subagent-fleet-goal {
+  padding-left: 14px;
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.subagent-fleet-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 14px;
+}
+.subagent-fleet-action {
+  padding: 2px 9px;
+  border: var(--hairline) solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+.subagent-fleet-action:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.subagent-fleet-action:disabled { opacity: 0.45; cursor: default; }
+.subagent-fleet-action.is-danger { color: #dc2626; }
+.subagent-fleet-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  line-height: 1.4;
+}
+.subagent-fleet-steer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 5px;
+  background: var(--bg);
+}
+.subagent-fleet-steer textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border: var(--hairline) solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--fs-small);
+  line-height: 1.45;
+  resize: vertical;
+}
+.subagent-fleet-steer-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.subagent-fleet-steer-controls select {
+  padding: 2px 4px;
+  border: var(--hairline) solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+}
+.subagent-fleet-inspect {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 14px;
+}
+.subagent-fleet-inspect-loading {
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
+}
+.subagent-fleet-transcript {
+  margin: 0;
+  padding: 8px;
+  border: var(--hairline) solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.subagent-fleet-foreground {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+  border-top: var(--hairline) solid var(--border);
+}
+.subagent-fleet-foreground-title {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.subagent-fleet-omitted,
+.subagent-fleet-foreground > small {
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
 }

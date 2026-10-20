@@ -1928,14 +1928,14 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
         {aboveEditorWidgets.length > 0 && (
           <div className="mb-2 w-full" style={{ padding: "0 16px" }}>
             <div style={{ maxWidth: "var(--chat-content-max-width, 820px)", margin: "0 auto" }}>
-              <ExtensionWidgets widgets={aboveEditorWidgets} />
+              <ExtensionWidgets key={`above:${messageKeySessionId}`} widgets={aboveEditorWidgets} sessionId={chatOnly ? undefined : messageKeySessionId ?? undefined} />
             </div>
           </div>
         )}
         {chatInputElement}
         {(belowEditorWidgets.length > 0 || hasExtensionStatus) && (
           <div className={`extension-status-shelf${belowEditorWidgets.length > 0 ? " has-widgets" : ""}${hasExtensionStatus ? " has-status" : ""}`}>
-            {belowEditorWidgets.length > 0 && <ExtensionWidgets widgets={belowEditorWidgets} />}
+            {belowEditorWidgets.length > 0 && <ExtensionWidgets key={`below:${messageKeySessionId}`} widgets={belowEditorWidgets} sessionId={chatOnly ? undefined : messageKeySessionId ?? undefined} />}
             {hasExtensionStatus && <ExtensionStatusLine statuses={extensionStatuses} />}
           </div>
         )}

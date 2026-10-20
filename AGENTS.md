@@ -81,6 +81,7 @@ app/api/
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
   agent/[id]/route.ts             GET state | POST any command
   agent/[id]/events/route.ts      GET SSE stream
+  agent/[id]/subagents/route.ts   GET/POST restricted pi-subagents fleet view + control actions
   agent/running/route.ts          GET currently-running session ids
   agent/running/events/route.ts   GET SSE stream of currently-running session ids
   auth/all-providers/route.ts     GET API-key provider list
@@ -130,6 +131,8 @@ lib/
   markdown.ts          shared markdown helpers
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for pi SDK objects
+  pi-subagents-rpc.ts client for the pi-subagents package's event-bus RPC (ping/status/steer/interrupt/stop only)
+  pi-subagents-view.ts  bounded projection of status replies into the fleet panel's view types
   rpc-manager.ts      AgentSessionWrapper + registry + startRpcSession
   scheduled-tasks/    scheduler, runner, cron, store, run index for scheduled tasks (see docs/agents/scheduled-tasks.md)
   session-reader.ts   SessionManager wrappers + path cache + buildSessionContext adapter
@@ -152,6 +155,7 @@ components/
   ModelsConfig.tsx    modal for editing models.json (opened from sidebar bottom)
   EnabledModelsSection.tsx  model switches inside ModelsConfig, backed by enabledModels
   AgentsConfig.tsx    built-in subagent toggle + agent profile editor
+  SubagentFleetPanel.tsx  native fleet controls opened by the composer's pi-subagents widget tags
   PluginsConfig.tsx   modal for installed package plugins
   SkillsConfig.tsx    modal for loaded/search/installable skills
   scheduled/          Scheduled page (list, detail, editor, run history) and its sidebar row
@@ -189,6 +193,7 @@ Read the doc for the area you touch before changing it. Upstream docs (no prefix
 - [files-and-access.md](docs/agents/files-and-access.md): worktrees and project grouping, the file access allow-list (the `/api/files` security boundary), file tree visibility, web password throttling. Files: `app/api/files/**`, `app/api/cwd/**`, `app/api/worktrees/**`, `app/api/file-index/**`, `app/api/web-auth/**`, `proxy.ts`, `lib/path-security.ts`, `lib/file-access.ts`, `lib/linked-directory.ts`, `lib/session-file-references*.ts`, `lib/file-tree-visibility.ts`, `lib/worktree.ts`, `lib/paths.ts`, `lib/auth-throttle.ts`, `components/FileExplorer.tsx`.
 - [settings-ui.md](docs/agents/settings-ui.md): Plugins and Skills routes, sidebar group switches, the shared `SettingsUi` blocks every settings panel and add pane uses. Files: `app/api/plugins/**`, `app/api/skills/**`, `components/SettingsUi.tsx`, `components/settings-ui-helpers.ts`, `components/SkillsConfig.tsx`, `components/PluginsConfig.tsx`; also before adding a settings section or add pane.
 - [subagents.md](docs/agents/subagents.md): the built-in subagent setting, profiles and their files, run status, completion notifications. Files: `lib/subagent*.ts`, `app/api/subagents/**`, `components/AgentsConfig.tsx`.
+- [fork-tools-subagents.md](docs/agents/fork-tools-subagents.md) § restricted API: the pi-subagents fleet monitor — `app/api/agent/[id]/subagents`, `lib/pi-subagents-rpc.ts`, `lib/pi-subagents-view.ts`, the `subagentsEventBus` on the wrapper, `components/SubagentFleetPanel.tsx`.
 - [scheduled-tasks.md](docs/agents/scheduled-tasks.md): scheduled tasks (the Scheduled page): server-side scheduler and its lease, catch-up and overlap rules, read-only default, the run index that hides runs from the project tree, why shared state is on `globalThis`. Files: `lib/scheduled-tasks/**`, `app/api/scheduled-tasks/**`, `instrumentation-node.ts`, `hooks/useScheduledTasks.ts`, `components/scheduled/**`, the Scheduled row in `components/SessionSidebar.tsx`, the page overlay in `components/AppShell.tsx`.
 - [artifacts.md](docs/agents/artifacts.md): inline HTML/SVG/React previews and `:::artifact` blocks: what renders where, the sandbox rules and the desktop `about:srcdoc` allowance, the auto-run rule for scripted pages, the bundled React runtime (inlined, because sandboxed frames cannot reach localhost; `npm run preview-runtime` regenerates it), the fix flow and the prompt switch. Files: `lib/artifacts.ts`, `lib/artifact-store.ts`, `lib/html-preview.ts`, `lib/artifact-settings.ts`, `lib/artifact-guide-extension.ts`, `hooks/useArtifactPublisher.ts`, `hooks/useHtmlPreviewFrame.ts`, `lib/preview-runtime.ts`, `scripts/build-preview-runtime.mjs`, `public/preview-runtime/`, `components/Artifact*.tsx`, `components/HtmlPreview*.tsx`, `components/artifact-tabs.ts`, `app/api/artifacts/**`, `is_inline_frame_document` in `src-tauri/src/lib.rs`.
 - [client-platform.md](docs/agents/client-platform.md): mobile software keyboard and viewport height, completion sound. Files: `hooks/useViewportHeight.ts`, `hooks/useAudio.ts`, the keyboard-open CSS.

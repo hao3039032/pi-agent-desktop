@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { createJiti } from "jiti";
+
+const source = await readFile(new URL("./ExtensionWidgets.tsx", import.meta.url), "utf8");
 
 const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
@@ -11,6 +14,7 @@ const { renderToStaticMarkup } = await jiti.import("react-dom/server");
 const {
   DEFAULT_EXPANDED_WIDGET_LINES,
   ExtensionWidgets,
+  isSubagentFleetWidget,
   formatExtensionWidgetContent,
   getNextExpandedWidgetKey,
   getUpdatedExtensionWidgetKeys,
@@ -147,6 +151,24 @@ test("keeps one-line widgets compact but expandable", () => {
   assert.doesNotMatch(html, /<pre/);
 });
 
+test("only the package's exact fleet widget keys get native controls", () => {
+  assert.equal(isSubagentFleetWidget("subagent-fleet-status"), true);
+  assert.equal(isSubagentFleetWidget("subagent-async"), true);
+  assert.equal(isSubagentFleetWidget("subagent-other"), false);
+  assert.equal(isSubagentFleetWidget("subagent"), false);
+  for (const key of ["subagent-fleet-status", "subagent-async"]) {
+    const html = renderWidgets({ sessionId: "s1", widgets: [{ key, lines: ["running", "←/→ select"], placement: "belowEditor" }] });
+    assert.match(html, /aria-expanded="false"/);
+    assert.doesNotMatch(html, /←\/→|subagent-fleet-panel/);
+  }
+});
+
+test("without a project session the fleet widget keeps its generic text renderer", () => {
+  const html = renderWidgets({ widgets: [{ key: "subagent-fleet-status", lines: ["running", "←/→ select"], placement: "belowEditor" }] });
+  assert.match(html, /←\/→ select/);
+  assert.doesNotMatch(html, /subagent-fleet-panel/);
+});
+
 test("keeps empty widgets non-interactive", () => {
   const html = renderWidgets({
     widgets: [{ key: "empty-widget", lines: [], placement: "aboveEditor" }],
@@ -156,4 +178,21 @@ test("keeps empty widgets non-interactive", () => {
   assert.doesNotMatch(html, /<button/);
   assert.doesNotMatch(html, /aria-expanded/);
   assert.match(html, /title="empty-widget - Above editor widget"/);
+});
+
+test("mounts the fleet panel for the package's fleet widget keys", () => {
+  // A static render never reaches the expanded state, so the mount itself is
+  // asserted at the source level: the fleet branch must keep rendering the panel.
+  assert.match(source, /isSubagentFleetWidget\(widget\.key\) \? \(\s*<SubagentFleetPanel/);
+});
+
+test("one Escape handler covers the expanded panel and its trigger row", () => {
+  const section = source.slice(source.indexOf("<section"), source.indexOf("</section>"));
+  assert.ok(section.length > 0);
+  // The handler moved off the panel: Escape from the trigger (a sibling of the
+  // panel) used to fall through to the global shortcut that stops the agent.
+  assert.doesNotMatch(section, /onKeyDown/);
+  assert.match(source, /onKeyDown=\{\(event: KeyboardEvent<HTMLDivElement>\)/);
+  const wrapper = source.slice(source.indexOf("onKeyDown={(event: KeyboardEvent"), source.indexOf("extension-widget-triggers\""));
+  assert.match(wrapper, /setExpandedWidgetKey\(null\)/);
 });

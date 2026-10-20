@@ -83,6 +83,10 @@ interface SkillLike {
 interface ResourceLoaderLike {
   getSkills(): { skills: SkillLike[] };
   getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
+  /** The session's extension load result; used to detect the pi-subagents package by source. */
+  getExtensions?(): {
+    extensions: Array<{ path: string; sourceInfo?: { source?: string } }>;
+  };
 }
 
 export interface NavigateTreeOptions {

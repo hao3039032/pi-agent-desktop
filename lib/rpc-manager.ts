@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -42,6 +42,7 @@ import {
   isPiSubagentsPreferred,
   preferPiSubagentsExtension,
 } from "./subagent-extension";
+import type { SubagentEventBus } from "./pi-subagents-rpc";
 import {
   listSubagentProfiles,
   readSubagentRun,
@@ -146,6 +147,13 @@ type AgentSessionWrapperOptions = {
   suppressCompletionNotifications?: boolean;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
   mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
+  /**
+   * The session's extension event bus, created and kept by `startRpcSession()`
+   * so the restricted subagents API can speak the pi-subagents package's
+   * public event-bus RPC (lib/pi-subagents-rpc.ts). Only normal project
+   * sessions get one; chats and subagent children never do.
+   */
+  subagentsEventBus?: SubagentEventBus;
 };
 
 export const MCP_WAIT_STOPPED_MESSAGE = "Stopped while MCP servers were connecting; the message was not sent.";
@@ -338,6 +346,7 @@ export class AgentSessionWrapper {
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
   private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
+  private readonly subagentsEventBus?: SubagentEventBus;
   private mcpHostDisposed = false;
   // The MCP wait of the prompt being admitted; Stop ends it.
   private mcpPromptWait: { controller: AbortController; done: Promise<void> } | null = null;
@@ -356,6 +365,10 @@ export class AgentSessionWrapper {
   // but lookups must treat the wrapper as gone from this point on.
   private closing = false;
   private readonly composerQueue: ComposerQueue;
+  // Aborted when shutdown() or destroy() starts: in-flight subagent RPC on the
+  // wrapper's extension bus must not outlive the session it belongs to
+  // (lib/pi-subagents-rpc.ts takes it as its AbortSignal).
+  private readonly lifecycleAbort = new AbortController();
 
   constructor(
     public readonly inner: AgentSessionLike,
@@ -378,6 +391,7 @@ export class AgentSessionWrapper {
         errorMessage: error instanceof Error ? error.message : String(error),
       }),
     });
+    this.subagentsEventBus = options.subagentsEventBus;
   }
 
   get sessionId(): string {
@@ -459,6 +473,21 @@ export class AgentSessionWrapper {
 
   isChatWorkspace(): boolean {
     return this.chatWorkspace;
+  }
+
+  /**
+   * This session's extension event bus, when the wrapper was given one — the
+   * transport the pi-subagents extension's `subagents:rpc:v1` bridge listens
+   * on. Absent for chats, subagent children and wrappers started before the
+   * bridge existed; callers treat that as "not available".
+   */
+  getSubagentsEventBus(): SubagentEventBus | undefined {
+    return this.subagentsEventBus;
+  }
+
+  /** Aborts once shutdown() or destroy() starts; scoped subagent RPC uses it as its cancellation signal. */
+  getLifecycleAbortSignal(): AbortSignal {
+    return this.lifecycleAbort.signal;
   }
 
   hasSuppressedCompletionNotifications(): boolean {
@@ -1420,6 +1449,7 @@ export class AgentSessionWrapper {
     if (!this._alive) return;
     this._alive = false;
     this.composerQueue.dispose();
+    if (!this.lifecycleAbort.signal.aborted) this.lifecycleAbort.abort(new Error("AgentSessionWrapper destroyed"));
     this.disposeMcpHost();
     // Tell attached SSE listeners to drop this instance so the browser
     // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
@@ -1474,6 +1504,7 @@ export class AgentSessionWrapper {
     // Closing starts before the first await, so a request that arrives while
     // extensions shut down starts a fresh wrapper instead of prompting this one.
     this.closing = true;
+    if (!this.lifecycleAbort.signal.aborted) this.lifecycleAbort.abort(new Error("AgentSessionWrapper shutting down"));
 
     this.shutdownPromise = (async () => {
       try {
@@ -2660,6 +2691,14 @@ export async function startRpcSession(
     const builtins = subagentResources || chatOnly
       ? undefined
       : await createPiWebBuiltinExtensions({ agentDir });
+    // The pi-subagents extension registers its `subagents:rpc:v1` bridge on the
+    // session's extension event bus (`pi.events`). Pi Web creates the bus and
+    // hands it to the resource loader, so it stays reachable from the wrapper
+    // for the restricted subagents API without touching the package's
+    // internals or any global registry (lib/pi-subagents-rpc.ts). Chats and
+    // subagent children get no bridge: the package's policy for non-project
+    // chats is enforced server-side, and child sessions are not API targets.
+    const subagentsEventBus = subagentResources || chatOnly ? undefined : createEventBus();
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
@@ -2714,6 +2753,10 @@ export async function startRpcSession(
               extensionFactories: [exactSystemPromptExtension],
             }
         : {
+            // The bus pi-web owns (see above): the loader hands it to every
+            // extension as `pi.events`, so the pi-subagents RPC bridge in this
+            // session listens on it.
+            eventBus: subagentsEventBus,
             extensionFactories: [
               ...(builtins?.extensions ?? []),
               createReadOnlyMcpPolicyExtension(),
@@ -2821,6 +2864,7 @@ export async function startRpcSession(
       },
       suppressCompletionNotifications: Boolean(subagentResources),
       ...(builtins?.mcpHost ? { mcpHost: builtins.mcpHost } : {}),
+      ...(subagentsEventBus ? { subagentsEventBus } : {}),
     });
     const realSessionId = inner.sessionId as string;
     registerRpcWrapper(wrapper);
