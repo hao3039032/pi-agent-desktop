@@ -336,6 +336,21 @@ function isPiSubagentsExtensionFile(path: string, source: string | undefined): b
   return segments.some((segment) => segment === PI_SUBAGENTS_PACKAGE_NAME);
 }
 
+/**
+ * Whether a session's extension load result contains a pi-subagents extension
+ * file — the restricted subagents API (`app/api/agent/[id]/subagents`) gates on
+ * this, detecting the package by its source or path the same way
+ * `preferPiSubagentsExtension()` does, never by tool names.
+ */
+export function loadResultHasPiSubagentsExtension(
+  extensions: Iterable<{ path: string; sourceInfo?: { source?: string } }>,
+): boolean {
+  for (const extension of extensions) {
+    if (isPiSubagentsExtensionFile(extension.path, extension.sourceInfo?.source)) return true;
+  }
+  return false;
+}
+
 const TOOL_CONFLICT_MESSAGE = /^Tool "(.+)" conflicts with (.+)$/;
 
 /**

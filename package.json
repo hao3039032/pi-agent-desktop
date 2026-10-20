@@ -63,6 +63,7 @@
     "release": "npm version patch --no-git-tag-version && npm run build && npm publish --access public",
     "postinstall": "node bin/prepare-terminal.js",
     "test:terminal": "node e2e/terminal.mjs",
+    "test:subagent-fleet": "node e2e/subagent-fleet.mjs",
     "test:e2e": "node e2e/chat-prompt-anchor.mjs && node e2e/composer-outbox.mjs && node e2e/option-controls.mjs && node e2e/streaming-markdown.mjs && node e2e/run.mjs"
   },
   "dependencies": {

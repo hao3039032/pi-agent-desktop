@@ -1,9 +1,16 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { AnsiText } from "@/components/AnsiText";
 import type { ExtensionWidgetItem } from "@/lib/types";
+import { SubagentFleetPanel } from "./SubagentFleetPanel";
+
+// Public widget identities emitted by pi-subagents, not tool-name heuristics.
+// The API independently verifies that the package is loaded in this session.
+export function isSubagentFleetWidget(key: string): boolean {
+  return key === "subagent-fleet-status" || key === "subagent-async";
+}
 
 export const DEFAULT_EXPANDED_WIDGET_LINES = 3;
 export const WIDGET_UPDATE_IDLE_MS = 1100;
@@ -32,8 +39,9 @@ export function getUpdatedExtensionWidgetKeys(
   }).filter((key): key is string => key !== null);
 }
 
-function getDefaultExpandedWidgetKey(widgets: ExtensionWidgetItem[]): string | null {
+function getDefaultExpandedWidgetKey(widgets: ExtensionWidgetItem[], sessionId?: string): string | null {
   return widgets.find((widget) => {
+    if (sessionId && isSubagentFleetWidget(widget.key)) return false;
     const lineCount = widget.lines.length;
     return lineCount > 1 && lineCount <= DEFAULT_EXPANDED_WIDGET_LINES;
   })?.key ?? null;
@@ -46,13 +54,13 @@ export function getNextExpandedWidgetKey(
   return currentKey === requestedKey ? null : requestedKey;
 }
 
-export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }) {
+export function ExtensionWidgets({ widgets, sessionId }: { widgets: ExtensionWidgetItem[]; sessionId?: string }) {
   const { t } = useI18n();
   const idPrefix = useId();
   const previousContentsRef = useRef<Map<string, string[]> | null>(null);
   const updateClearTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   const [expandedWidgetKey, setExpandedWidgetKey] = useState<string | null>(
-    () => getDefaultExpandedWidgetKey(widgets),
+    () => getDefaultExpandedWidgetKey(widgets, sessionId),
   );
   const [updatingWidgetKeys, setUpdatingWidgetKeys] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -106,7 +114,7 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
 
   const expandedWidget = widgets.find((widget) => (
     widget.key === expandedWidgetKey
-    && widget.lines.length > 0
+    && (widget.lines.length > 0 || Boolean(sessionId && isSubagentFleetWidget(widget.key)))
   ));
 
   const toggleWidget = (widget: ExtensionWidgetItem) => {
@@ -114,9 +122,22 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
   };
 
   return (
-    <>
+    // `display: contents` keeps the panels and the trigger row direct flex
+    // children of the composer shelf while one keydown handler covers both:
+    // Escape from the still-focused trigger must collapse the panel instead of
+    // reaching the global shortcut that stops the running agent.
+    <div
+      style={{ display: "contents" }}
+      onKeyDown={(event: KeyboardEvent<HTMLDivElement>) => {
+        if (!expandedWidget || event.key !== "Escape" || event.nativeEvent.isComposing) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setExpandedWidgetKey(null);
+        document.getElementById(`${idPrefix}-trigger-${widgets.indexOf(expandedWidget)}`)?.focus();
+      }}
+    >
       {expandedWidget && (
-        <div className="extension-widget-panels">
+        <div className={`extension-widget-panels${sessionId && isSubagentFleetWidget(expandedWidget.key) ? " is-subagent-fleet" : ""}`}>
           {(() => {
             const widget = expandedWidget;
             const index = widgets.indexOf(widget);
@@ -130,9 +151,13 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
                 aria-labelledby={triggerId}
               >
                 <div className="extension-widget-panel-heading">{widget.key}</div>
-                <pre className="extension-widget-content">
-                  <AnsiText text={formatExtensionWidgetContent(widget.lines)} />
-                </pre>
+                {sessionId && isSubagentFleetWidget(widget.key) ? (
+                  <SubagentFleetPanel key={sessionId} sessionId={sessionId} />
+                ) : (
+                  <pre className="extension-widget-content">
+                    <AnsiText text={formatExtensionWidgetContent(widget.lines)} />
+                  </pre>
+                )}
               </section>
             );
           })()}
@@ -140,7 +165,7 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
       )}
       <div className="extension-widget-triggers" aria-label={t("chat.extensionWidgets")}>
         {widgets.map((widget, index) => {
-          const expandable = widget.lines.length > 0;
+          const expandable = widget.lines.length > 0 || Boolean(sessionId && isSubagentFleetWidget(widget.key));
           const expanded = expandable && widget.key === expandedWidget?.key;
           const updating = updatingWidgetKeys.has(widget.key);
           const lineCountLabel = t(
@@ -203,6 +228,6 @@ export function ExtensionWidgets({ widgets }: { widgets: ExtensionWidgetItem[] }
           );
         })}
       </div>
-    </>
+    </div>
   );
 }
