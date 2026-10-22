@@ -4,7 +4,7 @@
 
 - 当前仓库是 `hao3039032/pi-agent-desktop`，**直接上游是 https://github.com/abcwyc/pi-agent-desktop**（remote `abcwyc`）。`agegr/pi-web`（remote `piweb`）是上游的上游，不是本仓库默认 rebase 目标。
 - 用户说“rebase 上游 vX.Y.Z”时，默认指 **abcwyc 的 release tag**。禁止仅凭本地裸标签 `vX.Y.Z` 判断来源：两个仓库存在同名标签。必须先检查 `git remote -v` 和 `git ls-remote --tags abcwyc 'vX.Y.Z*'`，再用 `git fetch --no-tags abcwyc refs/tags/vX.Y.Z:refs/remotes/abcwyc/vX.Y.Z` 获取，使用 `abcwyc/vX.Y.Z^{commit}` 校验实际提交。
-- 本次直接上游基线：**abcwyc v0.7.5 = `2909e09a7af13e74635ac5027d55afb4b180b4f1`**（前一基线 v0.7.4 = `2e0e3e714866f1b3772c65b34b51cac530fb5316`，再前 v0.7.2 = `156aedb31affccb1fc876002b51203acfe6741d7`）。本地裸 `v0.7.4` 属于 pi-web，不能使用；同名标签在两个仓库都存在，必须用 `upstream/vX.Y.Z^{commit}` 校验。
+- 本次直接上游基线：**abcwyc v0.7.6 = `67340ed4bf85a37ab20d2c0eccfe62af4cb1afbc`**（前一基线 v0.7.5 = `2909e09a7af13e74635ac5027d55afb4b180b4f1`，再前 v0.7.4 = `2e0e3e714866f1b3772c65b34b51cac530fb5316`）。本地裸 `v0.7.4` 属于 pi-web，不能使用；同名标签在两个仓库都存在，必须用 `upstream/vX.Y.Z^{commit}`（上游 remote 在本仓库叫 `upstream`，不是 `abcwyc`）校验。
 - 压缩提交只整理直接上游基线之后的 **LW 自有提交**；不得压缩、重写或重新归类 abcwyc 的桌面历史。先检查 merge-base、双方独有提交和变更范围；若范围突然变成数百个提交，停止并核对上游。
 - 重写前保留 backup 分支；压缩后比对完整 Git tree，确保代码不变；rebase 后核验目标祖先关系并做行为回归。不得把 abort/回滚称为完成，不得在未授权时 force-push。
 - 以下继承文档中的“fork/pi-web baseline”多指 **abcwyc 相对 pi-web 的维护边界**（例如 `scripts/fork-ownership.json`、CSS hash 基线）；不能据此决定 LW 的 rebase 范围。保留这些检查，但将直接上游整合与祖先项目的漂移统计分开。
