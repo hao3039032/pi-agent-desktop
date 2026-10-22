@@ -33,13 +33,17 @@ async function describeChat(id: string): Promise<{ access: ChatAccess; filePath:
     return { access: { chat: false, folder: null, unlocked: false, available: false }, filePath };
   }
   const folder = isChatFolderPath(cwd) ? cwd : null;
+  const available = Boolean(folder) && !isNetworkExposedServer();
   let unlocked = false;
-  if (live?.isAlive()) unlocked = live.isChatUnlocked();
-  else if (filePath && existsSync(filePath)) {
-    unlocked = readChatUnlocked(openSessionManager(filePath).getEntries() as unknown as SessionEntry[]);
+  // Describe effective access, not a stored preference the runtime cannot honour.
+  if (available) {
+    if (live?.isAlive()) unlocked = live.isChatUnlocked();
+    else if (filePath && existsSync(filePath)) {
+      unlocked = readChatUnlocked(openSessionManager(filePath).getEntries() as unknown as SessionEntry[]);
+    }
   }
   return {
-    access: { chat: true, folder, unlocked, available: Boolean(folder) && !isNetworkExposedServer() },
+    access: { chat: true, folder, unlocked, available },
     filePath,
   };
 }

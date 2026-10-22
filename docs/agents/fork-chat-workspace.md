@@ -153,7 +153,9 @@ the client then re-attaches like after a tool-preset change (`handleChatAccessRe
   session out once it has an assistant message; an entry added earlier would be lost in the
   restart) and never while it runs. A server open to other machines (`isNetworkExposedServer`)
   never honours it: the switch is hidden, the POST fails and `startRpcSession()` ignores a
-  stored unlock.
+  stored unlock. `GET chat-access` likewise reports effective access (`unlocked: false`),
+  for both live wrappers and persisted sessions; a root or legacy chat cannot advertise
+  an unlock either.
 - The switch lives in the composer's run menu (`ChatAccessRows`), with a confirmation
   (`ChatConfirmDialog`) in both directions; locking again goes back to the folder-confined
   loadout.

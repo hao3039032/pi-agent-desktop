@@ -35,12 +35,12 @@ const CONTENT_KEY = Buffer.from('"content":');
 const DETAILS_KEY = Buffer.from('"details":');
 const IS_ERROR_KEY = Buffer.from(',"isError":');
 const TIMESTAMP_KEY = Buffer.from(',"timestamp":');
-// Details the UI renders must survive (KEPT_DETAIL_KEYS + subagent cards in
-// lib/tool-result-details.ts). Seeing any of them means "use the normal path".
+// Details the UI renders must survive (KEPT_DETAIL_KEYS, modelImages and
+// subagent cards in lib/tool-result-details.ts). Seeing any means "use the normal path".
 // Tested on a latin1 view of the span: ASCII bytes map 1:1, so this cannot miss
 // a marker, and one regex pass is ~6x faster than five Buffer.indexOf scans
 // (short, quote-led needles hit `"` on every few bytes of DOM-outline JSON).
-const KEPT_DETAIL_MARKERS = /"(?:patch|diff|preview|result)":|"pi-web-subagent"/;
+const KEPT_DETAIL_MARKERS = /"(?:patch|diff|preview|result|modelImages)":|"pi-web-subagent"/;
 
 type RawEntry = Record<string, unknown>;
 
@@ -51,6 +51,33 @@ function parseLine(text: string): RawEntry | null {
   } catch {
     return null; // malformed lines are skipped, matching the SDK loader
   }
+}
+
+/** Only cut a single container value, never siblings hidden before the tail anchor. */
+function isSingleDetailsContainer(line: Buffer, start: number, end: number): boolean {
+  // Other JSON value shapes take the full parser; browser outlines are objects.
+  if (line[start] !== 0x7b && line[start] !== 0x5b) return false;
+  let depth = 0;
+  for (let pos = start; pos < end; pos++) {
+    const byte = line[pos];
+    if (byte === 0x22) {
+      // Skip long outline strings with native search rather than a JS byte loop.
+      let quote = pos;
+      do {
+        quote = line.indexOf(0x22, quote + 1);
+        if (quote < 0 || quote >= end) return false;
+        let slash = quote - 1;
+        while (slash > pos && line[slash] === 0x5c) slash--;
+        if ((quote - 1 - slash) % 2 === 0) break;
+      } while (true);
+      pos = quote;
+    } else if (byte === 0x7b || byte === 0x5b) {
+      depth++;
+    } else if (byte === 0x7d || byte === 0x5d) {
+      if (--depth === 0) return pos + 1 === end;
+    }
+  }
+  return false;
 }
 
 /**
@@ -68,13 +95,14 @@ function stripDetails(buf: Buffer, start: number, end: number): string | null {
   const contentAt = line.indexOf(CONTENT_KEY);
   if (contentAt < 0 || contentAt > detailsAt) return null;
 
-  // `isError` / `timestamp` are the keys pi writes after `details`; the last
-  // occurrence of each is the message-level one, the first byte after the value.
+  // `isError` / `timestamp` are candidate tail anchors, not proof of the
+  // details boundary: usage, nestedCalls or future siblings can precede them.
   let tailAt = line.lastIndexOf(IS_ERROR_KEY);
   if (tailAt < detailsAt) tailAt = line.lastIndexOf(TIMESTAMP_KEY);
   if (tailAt < detailsAt) return null;
 
   if (KEPT_DETAIL_MARKERS.test(line.toString("latin1", detailsAt, tailAt))) return null;
+  if (!isSingleDetailsContainer(line, detailsAt + DETAILS_KEY.length, tailAt)) return null;
 
   return line.toString("utf8", 0, detailsAt - 1) + line.toString("utf8", tailAt);
 }
