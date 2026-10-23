@@ -1,0 +1,96 @@
+# pi CLI 后端切换:调用面盘点与差距表(v1)
+
+状态:进行中(阶段 0 产出)
+分支:wip/pi-cli-backend
+决策(用户已确认):一步到位,**不留 pi-sdk 进程内路径**。本表是重写地图,按里程碑推进。
+
+## 一、替换目标
+
+`lib/rpc-manager.ts` 的 `AgentSessionWrapper`(~2000 行)包装进程内 SDK session(`AgentSessionLike`,见 lib/pi-types.ts)。新后端:每个 pi-web 会话 = 一个 `pi --mode rpc [--no-session]` 子进程,JSONL over stdio(pi v1.4.0 协议,docs/rpc.md)。
+
+## 二、方法调用面映射(AgentSessionLike → RPC 命令)
+
+### A. 直接映射(有对应命令,重写为命令调用)
+
+| AgentSessionLike | RPC 命令 | 备注 |
+|---|---|---|
+| prompt() | `prompt` | disposition: handled/queued/started;options.images 待确认参数名 |
+| steer()/followUp() | `steer` / `follow_up` | 返回 handled/queued |
+| abort() | `abort` | |
+| clearQueue() | `clear_queue` | |
+| setModel() | `set_model` | 参数为完整 model 对象 |
+| model 运行时枚举 | `get_available_models` | 返回完整 Model 对象(含 cost) |
+| setThinkingLevel() | `set_thinking_level` | |
+| getAvailableThinkingLevels() | `get_available_thinking_levels` | |
+| setSteeringMode/setFollowUpMode | `set_steering_mode` / `set_follow_up_mode` | |
+| compact() | `compact` | |
+| abortCompaction() | `abort`(compaction 中)| 文档确认 compaction 的 abort 语义 |
+| setAutoCompactionEnabled | `set_auto_compaction` | |
+| setAutoRetryEnabled | `set_auto_retry` | |
+| abortRetry() | `abort_retry` | |
+| executeBash()/abortBash() | `bash` / `abort_bash` | 流式输出走 bash_execution_update 事件(带命令 id) |
+| getSessionStats() | `get_session_stats` | 字段几乎 1:1(tokens/cost/contextUsage) |
+| getLastAssistantText() | `get_last_assistant_text` | |
+| setSessionName() | `set_session_name` | |
+| navigateTree(无 summarize) | `get_tree` + `get_entries`/`get_messages` 定位 | 见 D 区复杂项 |
+| — | `fork` / `clone` / `switch_session` / `new_session` | pi-web 的 session-replacement.ts(fork/clone 写文件)改走命令 |
+| — | `get_commands` | 替代 promptTemplates/skills 枚举(source: prompt/skill/extension) |
+
+### B. 状态读取(轮询/事件维护替代属性)
+
+AgentSessionLike 的同步属性(isStreaming/isCompacting/isIdle/model/pendingMessageCount/steeringMode...)改为:
+- 启动时 `get_state` 全量拉取
+- 之后由事件流增量维护(agent_start/agent_end/agent_settled/message_*/queue_* 事件,json.md 的 Event sequence 就是状态机)
+- 必要时 get_state 重对账(每次 agent_settled 后)
+
+### C. 事件流(subscribe(listener) 的替代)
+
+json.md 事件 ↔ AgentSessionEvent 映射:agent_start/turn_start/message_start/message_update/message_end/turn_end/agent_end/agent_settled/tool 事件/queue 事件/compaction 事件/retry 事件/extension_error。**结构高度同源**(两者本来就是同一套 SDK 事件),预期 adapter 是字段级微调而非翻译。
+RPC 额外:bash_execution_update(带命令 id 关联)、extension_ui_request(独立子协议)。
+
+### D. 差距项(无直接命令,需设计)
+
+| 能力 | 现状用途 | 候选方案 | 风险 |
+|---|---|---|---|
+| **setActiveToolsByName**(动态工具白名单) | chat-only 模式、chat-unlock、setRpcSessionTools | RPC 无对应命令。①给 pi 提 PR(set_active_tools);②会话级 --tool 参数重建会话;③fork+重载 | **最大差距之一** |
+| **navigateTree({summarize})**(分支摘要) | 会话树导航 UI | 无 RPC 命令 | 功能暂缺或提 PR |
+| sendCustomMessage | 自定义消息类型注入 | 无 RPC 命令 | 使用面盘点后定 |
+| getExtensions()/resourceLoader(扩展加载结果) | pi-subagents 检测(preferPiSubagents) | extension_ui/extension_error 事件里带 path;get_commands 的 sourceInfo 部分覆盖 | 中 |
+| systemPrompt(渲染后的系统提示) | 设置页展示 | 无直接命令;get_entries 可能含 system 消息 | 低(展示功能) |
+| promptTemplates/skills 完整列表 | 命令面板 | get_commands 覆盖大部分(sourceInfo 结构不同) | 低 |
+| reload() | 会话重载(信任变化等) | **switch_session 或杀进程重启**(会话文件在磁盘,RPC resume 恢复) | 中,行为语义变化 |
+| dispose() | 会话销毁 | 关 stdin(有序关停,文档明确)+ 兜底 kill | 直接 |
+| sessionManager/settingsManager 直访 | 会话列表、设置读写 | **大项**:见 E 区 | **最大差距之二** |
+
+### E. 67 个 runtime import 的处置分类(不含 rpc-manager 本体)
+
+1. **仅类型**(32 个 type-only):改本地声明或从 pi npm 包仅 import type(类型可以留依赖?——不留 pi-sdk = 运行时依赖删除;类型依赖保留与否见里程碑 M0 决策)
+2. **配置/文件工具类**(getAgentDir、SettingsManager、SessionManager、loadMcpConfig、主题等):改为 pi-web 自己实现文件读写(~/.pi/agent 的 jsonl/json 格式已稳定,pi-web 已有 session-reader 等平行实现)或走 RPC 命令
+3. **扩展工厂**(createCodemodeExtension/createMcpExtension/createToolSearchExtension + pi-web 宿主扩展群):**迁移为 pi CLI 加载的扩展文件/包**。RPC extension_ui 子协议支持 dialog + fire-and-forget(实测事件流通),但 ctx.mode="rpc" 下部分 UI API 降级(custom/theme 等 no-op,见 rpc-extension-ui.md Limitations)
+4. **模型/Provider 定义**(models 配置读取):get_available_models 返回完整 Model 对象(含 baseUrl/cost),大部分场景够用;自定义模型配置写盘(~/.pi/agent/models.json)pi CLI 自己会读
+
+### F. MCP host(mcp-host.ts)
+
+pi CLI 自带 MCP 加载(mcp.json);pi-web 的进程内 transport 包装(wrapTransportFactory)失效。MCP 服务器连接/代理职责移交 pi CLI 子进程;pi-web 只保留 mcp.json 的配置读写 UI。**净效果是简化**。
+
+### G. subagent 体系
+
+pi-subagents 扩展在 pi CLI 子进程内运行(实测 standalone 加载用户 ~/.pi 扩展 OK);pi-web 的 pi-subagents-rpc.ts(进程内 EventBus RPC)改为走 extension_ui/事件流转发。上游 wip 分支(c44a1d2c)的 "RPC adapter groundwork" 可参考。
+
+## 三、里程碑(分支内推进,不留旧路径)
+
+- **M0 地基**:PiRpcClient(JSONL 分帧,id 关联,事件订阅,extension_ui 子协议,退避重连);pi.exe 定位/下载(distro 组件);类型基线(type-only import 迁移策略)。**产出可运行 smoke:spawn→get_state→prompt→事件流→回复。**
+- **M1 会话核**:RpcAgentSession 实现 AgentSessionLike 的 A/B/C 区(A 命令 + B 状态机 + C 事件 adapter);rpc-manager 的 wrapper 换内芯;API routes 不动。
+- **M2 会话树/管理**:fork/clone/switch/new_session 替换 session-replacement;会话列表走文件直读(session-reader 已有);E2 类工具收编。
+- **M3 扩展迁移**:宿主扩展群(E3)改造成 pi CLI 扩展文件;chat-unlock/permission-system 的策略执行点迁移。
+- **M4 清理**:删 pi-sdk runtime 依赖(package.json、node_modules、distro 打包);67 个 import 归零(E 分类完成);文档。
+- **M5 集成**:三平台打包、distro 组件(pi-cli)、updater 链路、回归。
+
+## 四、已实测验证(2026-10-24)
+
+- pi.exe 1.4.0 RPC:0.7-0.9s 净启动、3.1s 全扩展;get_state/bash/prompt/agent_settled/get_last_assistant_text 全通;用户 ~/.pi 扩展生态在子进程内激活;stdin 关闭有序退出。
+- extension_ui_request 事件流(实测 setWidget/setStatus)正常到达客户端。
+
+## 五、给上游提 PR 的候选清单(增强 pi CLI RPC,反哺生态)
+
+set_active_tools、navigate_tree(+summarize)、send_custom_message、get_extensions、get_system_prompt。这些能让 pi CLI 成为完整的桌面后端,对 OpenClaw 等集成同样有价值。
