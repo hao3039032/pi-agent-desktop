@@ -42,6 +42,12 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 # Avoid libappindicator's GTK menu bridge, which can render blank labels under GNOME.
 ksni = "0.2.2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Native startup-failure dialog: the setup hook runs before the Tauri event
+# loop, so a plain MessageBoxW is the only thing that can be shown there.
+# 0.52 is already in the tree via tauri/wry; this only declares it.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

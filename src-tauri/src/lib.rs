@@ -51,6 +51,13 @@ const DEV_SERVER_URL: &str = "http://127.0.0.1:30141";
 const DESKTOP_SERVER_PORT: u16 = 38471;
 #[cfg(feature = "custom-protocol")]
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// Slow-start budget for the retry attempt. Cold caches and real-time
+/// antivirus scanning can push the first module load well past the initial
+/// window (thousands of bundled JS files are read before the server answers);
+/// one respawn with this larger budget recovers machines that merely need
+/// more time, instead of panic-exiting with no window at all.
+#[cfg(feature = "custom-protocol")]
+const SERVER_START_TIMEOUT_SLOW: Duration = Duration::from_secs(120);
 /// How often startup checks whether the server answers. The probe is a local
 /// socket round trip, so a short interval costs nothing and trims up to this
 /// much off every launch.
@@ -616,8 +623,9 @@ fn wait_for_server(
     address: SocketAddr,
     expected_instance_id: &str,
     log_path: &Path,
+    timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now() + SERVER_START_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             return Err(io::Error::other(format!(
@@ -643,11 +651,46 @@ fn wait_for_server(
         io::ErrorKind::TimedOut,
         format!(
             "Pi Agent server did not start within {} seconds; see {}",
-            SERVER_START_TIMEOUT.as_secs(),
+            timeout.as_secs(),
             log_path.display()
         ),
     ))
 }
+
+/// Last-resort notice when the server never came up. The setup hook runs
+/// before the Tauri event loop starts, so plugin-based dialogs cannot be
+/// shown here; a native Windows MessageBox works without any event loop.
+#[cfg(all(windows, feature = "custom-protocol"))]
+fn show_startup_error_dialog(first_error: &io::Error, retry_error: &io::Error, log_path: &Path) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
+
+    let text = format!(
+        "Pi Agent could not start its local server.\n\n\
+         First attempt: {first_error}\n\
+         Retry attempt: {retry_error}\n\n\
+         Details: {}\n\n\
+         The machine may be busy (antivirus scans, cold caches). Try launching again.",
+        log_path.display()
+    );
+    let title = "Pi Agent failed to start";
+    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that
+    // outlive the call; MessageBoxW returns only after the user clicks OK.
+    unsafe {
+        MessageBoxW(
+            0,
+            wide_text.as_ptr(),
+            wide_title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+#[cfg(any(not(windows), not(feature = "custom-protocol")))]
+fn show_startup_error_dialog(_first_error: &io::Error, _retry_error: &io::Error, _log_path: &Path) {}
 
 /// pi-subagents background (async) children detach into their own Pi host
 /// process. The extension attributes the host npm package by walking up from
@@ -704,54 +747,94 @@ fn start_packaged_server(
     let log_dir = app.path().app_log_dir()?;
     fs::create_dir_all(&log_dir)?;
     let log_path = log_dir.join("server.log");
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let stderr = stdout.try_clone()?;
 
-    let port = choose_port(app)?;
-    let mut command = Command::new(&node_path);
-    if let Ok(cache_dir) = app.path().app_cache_dir() {
-        command.env(COMPILE_CACHE_DIR_ENV, cache_dir.join("node-compile-cache"));
+    // Spawn lives in a closure so the slow-start retry can launch a fresh
+    // server process (a cold first attempt often leaves the child wedged or
+    // merely slow; a respawn under a bigger budget succeeds on slow machines).
+    let spawn_server = || -> io::Result<(Child, SocketAddr)> {
+        // The log handles are consumed by Stdio; reopen for every spawn.
+        let stdout = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let stderr = stdout.try_clone()?;
+
+        let port = choose_port(app)?;
+        let mut command = Command::new(&node_path);
+        if let Ok(cache_dir) = app.path().app_cache_dir() {
+            command.env(COMPILE_CACHE_DIR_ENV, cache_dir.join("node-compile-cache"));
+        }
+        command
+            .arg(&server_script)
+            .current_dir(&server_dir)
+            .env("HOSTNAME", "127.0.0.1")
+            .env("PORT", port.to_string())
+            .env("NODE_ENV", "production")
+            .env("NEXT_TELEMETRY_DISABLED", "1")
+            .env("PI_WEB_PARENT_PID", std::process::id().to_string())
+            .env(
+                PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT_ENV,
+                pi_subagents_package_root(&server_dir),
+            )
+            .env(DESKTOP_API_TOKEN_ENV, desktop_api_token)
+            .env(DESKTOP_INSTANCE_ID_ENV, desktop_instance_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+
+        if let Some(path) = server_process_path(&node_path) {
+            command.env("PATH", path);
+        }
+
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+
+        let child = command.spawn()?;
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        Ok((child, address))
+    };
+
+    let (mut child, mut address) = spawn_server()?;
+    if let Err(first_error) = wait_for_server(
+        &mut child,
+        address,
+        desktop_instance_id,
+        &log_path,
+        SERVER_START_TIMEOUT,
+    ) {
+        desktop_log(
+            app,
+            &format!(
+                "server not ready in {}s ({first_error}); respawning once with a {}s budget",
+                SERVER_START_TIMEOUT.as_secs(),
+                SERVER_START_TIMEOUT_SLOW.as_secs()
+            ),
+        );
+        DesktopServer::running(child).stop();
+
+        let (mut retry_child, retry_address) = spawn_server()?;
+        match wait_for_server(
+            &mut retry_child,
+            retry_address,
+            desktop_instance_id,
+            &log_path,
+            SERVER_START_TIMEOUT_SLOW,
+        ) {
+            Ok(()) => {
+                child = retry_child;
+                address = retry_address;
+            }
+            Err(retry_error) => {
+                DesktopServer::running(retry_child).stop();
+                show_startup_error_dialog(&first_error, &retry_error, &log_path);
+                return Err(retry_error.into());
+            }
+        }
     }
-    command
-        .arg(&server_script)
-        .current_dir(&server_dir)
-        .env("HOSTNAME", "127.0.0.1")
-        .env("PORT", port.to_string())
-        .env("NODE_ENV", "production")
-        .env("NEXT_TELEMETRY_DISABLED", "1")
-        .env("PI_WEB_PARENT_PID", std::process::id().to_string())
-        .env(
-            PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT_ENV,
-            pi_subagents_package_root(&server_dir),
-        )
-        .env(DESKTOP_API_TOKEN_ENV, desktop_api_token)
-        .env(DESKTOP_INSTANCE_ID_ENV, desktop_instance_id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
 
-    if let Some(path) = server_process_path(&node_path) {
-        command.env("PATH", path);
-    }
-
-    #[cfg(unix)]
-    command.process_group(0);
-    #[cfg(windows)]
-    command.creation_flags(CREATE_NO_WINDOW);
-
-    let mut child = command.spawn()?;
-
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-    if let Err(error) = wait_for_server(&mut child, address, desktop_instance_id, &log_path) {
-        let server = DesktopServer::running(child);
-        server.stop();
-        return Err(error.into());
-    }
-
-    let url = format!("http://127.0.0.1:{port}").parse()?;
+    let url = format!("http://127.0.0.1:{}", address.port()).parse()?;
     Ok((url, DesktopServer::running(child)))
 }
 
