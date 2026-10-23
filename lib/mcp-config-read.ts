@@ -732,7 +732,7 @@ async function codemodeInfo(
     ? { state: "not-checked" }
     : peek.available
       ? { state: "available" }
-      : { state: "unavailable", error: peek.reason };
+      : { state: "unavailable", error: peek.reason, ...(peek.retryInMs === undefined ? {} : { retryInMs: peek.retryInMs / 1000 }) };
   const info: McpCodemodeInfo = { sandbox, builtinDisabled: codemodeSwitch?.enabled === false };
   if (codemodeSwitch?.settingsPath) info.builtinSettingsPath = codemodeSwitch.settingsPath;
   // What the global `extensions` alone say, which is what Always on, a global setting, depends on.

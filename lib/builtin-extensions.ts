@@ -125,19 +125,78 @@ export async function runCodemodeSelfTest(options: CodemodeSelfTestOptions = {})
   }
 }
 
-// Hot reload re-evaluates this module; globalThis keeps one self-test per process.
+// Hot reload re-evaluates this module; globalThis keeps one sandbox state per process.
 const CODEMODE_SANDBOX_KEY: symbol = Symbol.for("pi-web.codemodeSandbox");
 
-/** The sandbox self-test, run once per server process on the first normal session. */
-export function checkCodemodeSandbox(): Promise<BuiltinFeatureStatus> {
-  const store = globalThis as Record<symbol, Promise<BuiltinFeatureStatus> | undefined>;
-  return store[CODEMODE_SANDBOX_KEY] ??= runCodemodeSelfTest().then((status) => {
-    if (!status.available) console.warn(`[pi-web] Code mode is off: ${status.reason}`);
-    return status;
+/** Backoff after a failed self-test: 60s, 120s, 240s... capped at 1h. */
+const CODEMODE_RETRY_BASE_MS = 60_000;
+const CODEMODE_RETRY_MAX_MS = 60 * 60_000;
+
+interface CodemodeSandboxState {
+  settled: BuiltinFeatureStatus | null;
+  attempts: number;
+  lastAttemptAt: number | null;
+  pending: Promise<BuiltinFeatureStatus> | null;
+}
+
+function codemodeRetryDelayMs(failures: number): number {
+  return Math.min(CODEMODE_RETRY_BASE_MS * 2 ** Math.max(0, failures - 1), CODEMODE_RETRY_MAX_MS);
+}
+
+function codemodeSandboxState(): CodemodeSandboxState {
+  const store = globalThis as Record<symbol, CodemodeSandboxState | undefined>;
+  return (store[CODEMODE_SANDBOX_KEY] ??= {
+    settled: null,
+    attempts: 0,
+    lastAttemptAt: null,
+    pending: null,
   });
 }
 
-export type CodemodeSandboxPeek = { checked: false } | ({ checked: true } & BuiltinFeatureStatus);
+/**
+ * Whether a failed self-test is old enough to be tried again. A start under a
+ * busy machine (antivirus scan, cold caches) can time out without the sandbox
+ * being broken, so one failure must not disable Code mode for the whole
+ * server lifetime: each new normal session retries once the backoff window
+ * has passed. A sandbox that keeps failing backs off exponentially, and a
+ * success stays cached as before.
+ */
+function shouldRetryCodemodeSelfTest(state: CodemodeSandboxState): boolean {
+  if (state.settled?.available) return false;
+  if (state.settled === null || state.lastAttemptAt === null) return true;
+  return Date.now() - state.lastAttemptAt >= codemodeRetryDelayMs(state.attempts);
+}
+
+/**
+ * The sandbox self-test, run on the first normal session and retried (with
+ * backoff) on later sessions after a failure. Concurrent callers share one
+ * in-flight run; within the backoff window the previous failure is returned
+ * as-is. Tests replace `runSelfTest` to avoid the real sandbox.
+ */
+export function checkCodemodeSandbox(runSelfTest: () => Promise<BuiltinFeatureStatus> = runCodemodeSelfTest): Promise<BuiltinFeatureStatus> {
+  const state = codemodeSandboxState();
+  if (state.pending) return state.pending;
+  if (state.settled !== null && !shouldRetryCodemodeSelfTest(state)) {
+    return Promise.resolve(state.settled);
+  }
+  state.attempts += 1;
+  state.lastAttemptAt = Date.now();
+  return (state.pending = runSelfTest().then((status) => {
+    state.settled = status;
+    if (status.available) {
+      state.attempts = 0;
+    } else {
+      console.warn(
+        `[pi-web] Code mode is off for this session (attempt ${state.attempts}, will retry in ${Math.round(codemodeRetryDelayMs(state.attempts) / 1000)}s): ${status.reason}`,
+      );
+    }
+    return status;
+  })).finally(() => {
+    state.pending = null;
+  });
+}
+
+export type CodemodeSandboxPeek = { checked: false } | ({ checked: true } & BuiltinFeatureStatus & { retryInMs?: number });
 
 const NOT_SETTLED: unique symbol = Symbol("not settled");
 
@@ -145,15 +204,31 @@ const NOT_SETTLED: unique symbol = Symbol("not settled");
  * The self-test's result once it has settled, without ever starting it: the
  * first normal session runs it, and Settings only reports what it found. A
  * test still running, or not started since the server did, is `checked:
- * false`. A promise that has already settled wins the race against one
- * resolved now, because their reactions run in the order they were attached.
+ * false`. A failure carries `retryInMs`: how long until the next normal
+ * session may retry it (rounded up). A promise that has already settled wins
+ * the race against one resolved now, because their reactions run in the order
+ * they were attached.
  */
 export async function peekCodemodeSandbox(): Promise<CodemodeSandboxPeek> {
-  const store = globalThis as Record<symbol, Promise<BuiltinFeatureStatus> | undefined>;
-  const pending = store[CODEMODE_SANDBOX_KEY];
-  if (!pending) return { checked: false };
-  const settled = await Promise.race([pending, Promise.resolve(NOT_SETTLED)]);
-  return settled === NOT_SETTLED ? { checked: false } : { checked: true, ...settled };
+  const store = globalThis as Record<symbol, CodemodeSandboxState | undefined>;
+  const state = store[CODEMODE_SANDBOX_KEY];
+  if (!state) return { checked: false };
+  const pending = state.pending;
+  if (pending) {
+    const settled = await Promise.race([pending, Promise.resolve(NOT_SETTLED)]);
+    if (settled === NOT_SETTLED) return { checked: false };
+    return settled.available ? { checked: true, ...settled } : withRetryIn(state, settled);
+  }
+  if (state.settled === null) return { checked: false };
+  return state.settled.available
+    ? { checked: true, ...state.settled }
+    : withRetryIn(state, state.settled);
+}
+
+function withRetryIn(state: CodemodeSandboxState, status: { available: false; reason: string }): CodemodeSandboxPeek {
+  const elapsed = state.lastAttemptAt === null ? Infinity : Date.now() - state.lastAttemptAt;
+  const retryInMs = Math.max(0, codemodeRetryDelayMs(state.attempts) - elapsed);
+  return { checked: true, ...status, retryInMs: Math.round(retryInMs / 1000) * 1000 };
 }
 
 // ---------------------------------------------------------------------------

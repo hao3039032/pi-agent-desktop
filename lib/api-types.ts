@@ -452,7 +452,8 @@ export type CodemodeSandboxStatus =
   /** No normal session has started since the server did, so the self-test has not run. */
   | { state: "not-checked" }
   | { state: "available" }
-  | { state: "unavailable"; error: string };
+  /** `retryInMs`: seconds until the next normal session retries the self-test after this failure. */
+  | { state: "unavailable"; error: string; retryInMs?: number };
 
 export interface McpCodemodeInfo {
   /** Absent when the global settings file cannot be read; see `preferenceError`. */
