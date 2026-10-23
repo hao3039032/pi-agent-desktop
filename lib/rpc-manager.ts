@@ -1607,6 +1607,106 @@ export class AgentSessionWrapper {
     pending.resolve(response);
   }
 
+  /**
+   * RPC-engine bridge: a dialog raised by an extension inside the pi child.
+   * Reuses the pending-UI maps, so a late SSE subscriber sees the dialog on
+   * replay and Stop cancels it, exactly like an in-process extension dialog;
+   * the caller (lib/pi-rpc/core.ts) returns the response to the child. A
+   * timeout or abort resolves with `cancelled` so the child never blocks.
+   */
+  relayExternalUiRequest(request: {
+    id: string;
+    method: "select" | "confirm" | "input" | "editor";
+    timeout?: number;
+    [key: string]: unknown;
+  }): Promise<ExtensionUiResponse> {
+    const stopSignal = this.extensionUiAbortController.signal;
+    if (stopSignal.aborted || !this.isAlive()) {
+      return Promise.resolve({ type: "extension_ui_response", id: request.id, cancelled: true });
+    }
+    const cancelled = (): ExtensionUiResponse => ({ type: "extension_ui_response", id: request.id, cancelled: true });
+    // The child enforces its own timeout (it auto-resolves with a default),
+    // so the local one only bounds the stale replay window: give it slack.
+    const timeout = typeof request.timeout === "number" && request.timeout > 0 ? request.timeout + 2_000 : undefined;
+
+    const fullRequest = {
+      type: "extension_ui_request",
+      ...request,
+      ...(timeout ? { timeout, expiresAt: Date.now() + timeout } : {}),
+    } as AgentEvent;
+
+    return new Promise<ExtensionUiResponse>((resolve) => {
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        stopSignal.removeEventListener("abort", onAbort);
+        this.pendingUiRequests.delete(request.id);
+        this.pendingUiResponses.delete(request.id);
+        if (this.isAlive()) this.emit({ type: "extension_ui_closed", id: request.id });
+      };
+      const settle = (value: ExtensionUiResponse) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(stopSignal.aborted ? cancelled() : value);
+      };
+      const onAbort = () => settle(cancelled());
+
+      if (timeout) timeoutId = setTimeout(() => settle(cancelled()), timeout);
+      stopSignal.addEventListener("abort", onAbort, { once: true });
+
+      this.pendingUiRequests.set(request.id, fullRequest);
+      this.pendingUiResponses.set(request.id, {
+        resolve: (response) => settle(response),
+        cancel: () => settle(cancelled()),
+      });
+      this.emit(fullRequest);
+    });
+  }
+
+  /**
+   * RPC-engine bridge: fire-and-forget UI from the child's extensions
+   * (notify / setStatus / setWidget / setTitle / set_editor_text). The record
+   * is emitted as-is — the wire shape is the same family as the in-process
+   * events — while status and widget maps stay in sync for `get_state`.
+   */
+  relayExternalUiEvent(event: AgentEvent & { method?: string }): void {
+    if (!this.isAlive()) return;
+    switch (event.method) {
+      case "setStatus": {
+        const key = event.statusKey;
+        if (typeof key === "string") {
+          const text = event.statusText;
+          if (typeof text === "string") this.extensionStatuses.set(key, text);
+          else this.extensionStatuses.delete(key);
+        }
+        break;
+      }
+      case "setWidget": {
+        const key = event.widgetKey;
+        if (typeof key === "string") {
+          this.extensionWidgetGenerations.set(key, (this.extensionWidgetGenerations.get(key) ?? 0) + 1);
+          const lines = event.widgetLines;
+          if (Array.isArray(lines) && lines.every((line) => typeof line === "string")) {
+            this.extensionWidgets.set(key, {
+              key,
+              lines,
+              placement: event.widgetPlacement === "belowEditor" ? "belowEditor" : "aboveEditor",
+            });
+          } else {
+            this.extensionWidgets.delete(key);
+          }
+        }
+        break;
+      }
+      default:
+        // notify / setTitle / set_editor_text: stateless, the event carries everything.
+        break;
+    }
+    this.emit(event);
+  }
+
   private getRoutedModel(): RoutedModelInfo | undefined {
     const routed = this.inner.routedModel;
     if (!routed) return undefined;

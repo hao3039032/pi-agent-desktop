@@ -55,7 +55,8 @@ export class PiRpcClient {
   private child: ChildProcessByStdio<Writable, Readable, Readable>;
   private pending = new Map<string, Pending>();
   private listeners = new Set<(record: PiRpcRecord) => void>();
-  private uiHandlers = new Map<string, (params: PiRpcRecord) => void>();
+  private uiHandlers = new Map<string, (params: PiRpcRecord) => unknown>();
+  private exitListeners = new Set<(code: number | null) => void>();
   private stdoutBuffer = "";
   private exiting = false;
   private exitCode: number | null | undefined;
@@ -93,6 +94,7 @@ export class PiRpcClient {
           : new Error(`pi process exited unexpectedly (code ${this.exitCode ?? "?"})`),
       );
       this.options.onExit?.(this.exitCode);
+      for (const listener of [...this.exitListeners]) listener(this.exitCode);
     });
     // The child keeps the server's event loop alive: a session must never
     // be silently dropped by an idle process, and shutdown is explicit
@@ -117,6 +119,13 @@ export class PiRpcClient {
   onUi(method: string, handler: (params: PiRpcRecord) => unknown): () => void {
     this.uiHandlers.set(method, handler);
     return () => this.uiHandlers.delete(method);
+  }
+
+  /** Multi-listener child-exit subscription (`options.onExit` stays single-slot). */
+  onProcessExit(listener: (code: number | null) => void): () => void {
+    this.exitListeners.add(listener);
+    if (this.exited) listener(this.exitCode ?? null);
+    return () => this.exitListeners.delete(listener);
   }
 
   /**
@@ -221,8 +230,24 @@ export class PiRpcClient {
       if (id && method) {
         const handler = this.uiHandlers.get(method);
         if (handler) {
-          const value = handler(record);
-          if (value !== undefined) this.respondUi(id, { value });
+          // A relayed dialog handler is async: it waits for the user. pi
+          // blocks until the answer arrives, so await the promise instead of
+          // answering with the promise object.
+          try {
+            const value = handler(record);
+            if (value && typeof (value as Promise<unknown>).then === "function") {
+              (value as Promise<Record<string, unknown> | undefined>).then(
+                (resolved) => {
+                  if (resolved !== undefined) this.respondUi(id, resolved);
+                },
+                () => this.respondUi(id, { cancelled: true }),
+              );
+            } else if (value !== undefined) {
+              this.respondUi(id, value as Record<string, unknown>);
+            }
+          } catch {
+            this.respondUi(id, { cancelled: true });
+          }
         } else {
           // Dialogs must be answered or pi blocks (until its own timeout);
           // an unhandled method gets a cancel so it fails fast upstream.

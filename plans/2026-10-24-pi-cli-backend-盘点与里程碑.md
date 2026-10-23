@@ -1,6 +1,6 @@
 # pi CLI 后端切换:调用面盘点与差距表(v1)
 
-状态:进行中(阶段 0 产出)
+状态:进行中(M1 后半:wrapper 换芯已验,见文末实测记录)
 分支:wip/pi-cli-backend
 决策(用户已确认):一步到位,**不留 pi-sdk 进程内路径**。本表是重写地图,按里程碑推进。
 
@@ -52,7 +52,7 @@ RPC 额外:bash_execution_update(带命令 id 关联)、extension_ui_request(独
 
 | 能力 | 现状用途 | 候选方案 | 风险 |
 |---|---|---|---|
-| **setActiveToolsByName**(动态工具白名单) | chat-only 模式、chat-unlock、setRpcSessionTools | RPC 无对应命令。①给 pi 提 PR(set_active_tools);②会话级 --tool 参数重建会话;③fork+重载 | **最大差距之一** |
+| **setActiveToolsByName**(动态工具白名单) | chat-only 模式、chat-unlock、setRpcSessionTools | **实测(2026-10-24):spawn 层已解**——pi 有 `--tools +/-name` 相对语法与 `--no-builtin-tools`;运行时切换 = 重启子进程(与 pi-web 现有的重启模式同构)。上游 PR(set_active_tools)仍值得提,消除重启成本 | 中(已降) |
 | **navigateTree({summarize})**(分支摘要) | 会话树导航 UI | 无 RPC 命令 | 功能暂缺或提 PR |
 | sendCustomMessage | 自定义消息类型注入 | 无 RPC 命令 | 使用面盘点后定 |
 | getExtensions()/resourceLoader(扩展加载结果) | pi-subagents 检测(preferPiSubagents) | extension_ui/extension_error 事件里带 path;get_commands 的 sourceInfo 部分覆盖 | 中 |
@@ -60,7 +60,7 @@ RPC 额外:bash_execution_update(带命令 id 关联)、extension_ui_request(独
 | promptTemplates/skills 完整列表 | 命令面板 | get_commands 覆盖大部分(sourceInfo 结构不同) | 低 |
 | reload() | 会话重载(信任变化等) | **switch_session 或杀进程重启**(会话文件在磁盘,RPC resume 恢复) | 中,行为语义变化 |
 | dispose() | 会话销毁 | 关 stdin(有序关停,文档明确)+ 兜底 kill | 直接 |
-| sessionManager/settingsManager 直访 | 会话列表、设置读写 | **大项**:见 E 区 | **最大差距之二** |
+| sessionManager/settingsManager 直访 | 会话列表、设置读写 | **已验(2026-10-24)**:会话文件双进程共享可行——pi-web 先写 header(自选 id/parentSession/自定义条目),子进程 `--session <path>` 无缝接手并追加;pi-web 侧每次访问重新 open 读盘(FileSessionManagerView);settingsManager 用进程内 SDK 实例读同一份 settings.json;信任经共享 trust.json 自动互通(pi-web 信任对话框写的决定,子进程直接认) | 已解(文件层) |
 
 ### E. 67 个 runtime import 的处置分类(不含 rpc-manager 本体)
 
@@ -90,6 +90,20 @@ pi-subagents 扩展在 pi CLI 子进程内运行(实测 standalone 加载用户 
 
 - pi.exe 1.4.0 RPC:0.7-0.9s 净启动、3.1s 全扩展;get_state/bash/prompt/agent_settled/get_last_assistant_text 全通;用户 ~/.pi 扩展生态在子进程内激活;stdin 关闭有序退出。
 - extension_ui_request 事件流(实测 setWidget/setStatus)正常到达客户端。
+
+### M1 后半实测(2026-10-24,lib/pi-rpc/factory.test.mjs 2/2)
+
+- **真 wrapper 换芯**:未改动的 `AgentSessionWrapper.send()/onEvent()/start()` 驱动子进程跑完整会话(prompt→事件流→settled→get_state/get_tools/get_commands/stats),含工具锁定(spawn `--tools +read,+bash,-edit,...`)与 resume(同一文件、同一 session id、转录保留)。
+- **文件所有权**:pi-web 写 header(自选 id/parentSession/tool-selection 条目)→子进程 `--session` 接手追加;两进程一文件,pi-web 侧 fresh-open 读盘。
+- **prompt 语义对齐**:pi 的 prompt 响应=受理;SDK 的 prompt promise=run 完全 idle 才 resolve。RpcAgentSession 用 run-epoch 计数补齐(started 等下一 epoch settle,queued 等当前 epoch;受理响应先于 agent_start 到达,不可用“当前 idle”判断)。wrapper.send 本就受理即返,不受影响。
+- **UI 桥**:子进程 extension_ui_request(同源 wire 形状)经 wrapper 新增的 relayExternalUiRequest/relayExternalUiEvent 复用 pending-UI 机制(SSE 重放、Stop 取消、超时回 cancelled),响应回传 client.respondUi;fire-and-forget 同步维护 extensionStatuses/extensionWidgets 供 get_state。
+- **模型恢复**:resume 后经 get_available_models+set_model 恢复保存的模型,失败(无凭据)静默保持子进程默认——与 pi-web 的 hasConfiguredAuth 回退同构。
+
+### 仍开放的差距(更新)
+
+- **无 get_tools RPC**:工具选择器只能展示 PRESET_FULL 静态名单(active=spawn 选集),子进程里激活的扩展/MCP 工具不可见——上游 PR 候选(get_tools)。
+- **reload() 未实现**:RPC 模式下 reload=杀进程重拉(文件在盘);信任变更后需重生。M2。
+- navigateTree/fork/clone/sendCustomMessage:维持 D 区原判,M2 起逐个收编。
 
 ## 五、给上游提 PR 的候选清单(增强 pi CLI RPC,反哺生态)
 

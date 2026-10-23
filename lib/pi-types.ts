@@ -12,6 +12,7 @@ import type { CacheWarmingInfo } from "./types";
 import type { UsageCostBreakdownEntry } from "./usage-breakdown";
 
 export type { PiAgentMessage };
+export type { SlashCommandInfo };
 
 export interface ContextUsage {
   percent: number | null;

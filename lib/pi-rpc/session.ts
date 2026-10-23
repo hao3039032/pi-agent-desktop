@@ -11,7 +11,7 @@
  * wiring fails loudly in tests rather than degrading in production.
  */
 
-import type { ContextUsage, ModelLike, NavigateTreeOptions, NavigateTreeResult, SessionStatsInfo, ToolInfo } from "../pi-types";
+import type { ContextUsage, ModelLike, NavigateTreeOptions, NavigateTreeResult, PiAgentMessage, SessionStatsInfo, ToolInfo } from "../pi-types";
 import type { PiRpcClient, PiRpcRecord } from "./client";
 
 export class PiRpcUnsupportedError extends Error {
@@ -54,6 +54,8 @@ export interface RpcAgentSessionOptions {
   initialState: RpcAgentSessionState;
   /** Diagnostic sink for protocol-level notes (defaults to console). */
   onLog?: (line: string) => void;
+  /** Overrides ~/.pi/agent for process-local views (tests). */
+  agentDir?: string;
 }
 
 export class RpcAgentSession {
@@ -63,6 +65,12 @@ export class RpcAgentSession {
   private readonly client: PiRpcClient;
   private readonly offEvents: () => void;
   private toolsCache: ToolInfo[] = [];
+  private bashRunning = false;
+  private lastAssistantText: string | undefined;
+  private streamingMessage: PiAgentMessage | undefined;
+  /** Bumped by every agent_start; a settle records the epoch it ended. */
+  private runEpoch = 0;
+  private settledEpoch = 0;
 
   constructor(options: RpcAgentSessionOptions) {
     this.client = options.client;
@@ -113,6 +121,10 @@ export class RpcAgentSession {
     return this.state.isIdle;
   }
 
+  get isBashRunning(): boolean {
+    return this.bashRunning;
+  }
+
   get autoCompactionEnabled(): boolean {
     return this.state.autoCompactionEnabled;
   }
@@ -141,6 +153,14 @@ export class RpcAgentSession {
     return this.state.pendingMessageCount;
   }
 
+  getSteeringMessages(): string[] {
+    return [...this.state.steeringQueue];
+  }
+
+  getFollowUpMessages(): string[] {
+    return [...this.state.followUpQueue];
+  }
+
   get messageCount(): number {
     return this.state.messageCount;
   }
@@ -154,11 +174,14 @@ export class RpcAgentSession {
   // The SDK surface below is intentionally narrow: members pi-web never
   // touches on the RPC path throw, everything else has a real command.
 
-  get sessionManager(): never {
+  // The heavy SDK members are absent on the bare protocol engine; the types
+  // stay wide so the host-side core (core.ts) can override them, and a wrong
+  // direct use still throws at runtime instead of returning undefined.
+  get sessionManager(): unknown {
     throw new PiRpcUnsupportedError("sessionManager", "M2: file-based session access (session-reader)");
   }
 
-  get settingsManager(): never {
+  get settingsManager(): unknown {
     throw new PiRpcUnsupportedError("settingsManager", "E2: file-based settings access");
   }
 
@@ -179,26 +202,40 @@ export class RpcAgentSession {
     };
   }
 
-  get extensionRunner(): never {
+  get extensionRunner(): unknown {
     // pi-subagents detection moves to extension events + get_commands (M3).
     throw new PiRpcUnsupportedError("extensionRunner", "M3: extension events / get_commands");
   }
 
-  get promptTemplates(): never {
+  get promptTemplates(): unknown {
     throw new PiRpcUnsupportedError("promptTemplates", "M3: get_commands(source=prompt/skill)");
   }
 
-  get resourceLoader(): never {
+  get resourceLoader(): unknown {
     throw new PiRpcUnsupportedError("resourceLoader", "M3: extension events / get_commands");
   }
 
   get agent(): {
     state?: {
       thinkingLevel?: string;
+      streamingMessage?: PiAgentMessage;
     };
+    waitForIdle?: () => Promise<void>;
   } {
-    const thinkingLevel = () => this.state.thinkingLevel;
-    return { state: { get thinkingLevel() { return thinkingLevel(); } } };
+    // A fresh object each read: `agent.state` is a live view of the event
+    // machine, and the wrapper holds it only within one synchronous read.
+    return {
+      state: {
+        thinkingLevel: this.state.thinkingLevel,
+        streamingMessage: this.streamingMessage,
+      },
+      waitForIdle: () => this.waitForIdle(),
+    };
+  }
+
+  /** The assistant message currently being streamed, as the event stream last reported it. */
+  get currentStreamingMessage(): PiAgentMessage | undefined {
+    return this.streamingMessage;
   }
 
   // --- commands ------------------------------------------------------------
@@ -230,6 +267,67 @@ export class RpcAgentSession {
       ? response.disposition
       : "started";
     options?.preflightResult?.(disposition);
+    // The wrapper models the SDK contract, where the prompt promise resolves
+    // only once the run is fully idle: a started submission waits for the
+    // NEXT run epoch to settle (the admission response arrives before
+    // agent_start), a queued one for the current epoch's settle; "handled"
+    // (an extension command) starts no run.
+    if (disposition === "started") {
+      await this.waitForSettle(this.runEpoch + 1);
+    } else if (disposition === "queued") {
+      await this.waitForSettle(this.runEpoch);
+    }
+  }
+
+  /**
+   * Resolves once the run of `minEpoch` (or later) has settled; rejects if
+   * the child dies mid-wait. Mirrors the SDK prompt promise that resolves
+   * only once the run is fully idle.
+   */
+  waitForSettle(minEpoch = 0): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        offRecord();
+        offExit();
+        if (error) reject(error);
+        else resolve();
+      };
+      const offRecord = this.subscribe((record) => {
+        if (record.type === "agent_settled" && this.settledEpoch >= minEpoch) finish();
+      });
+      const offExit = this.client.onProcessExit((code) => {
+        finish(new Error(`pi process exited during the run (code ${code ?? "?"})`));
+      });
+      // A settle for minEpoch may already have been processed (a queued
+      // message delivered by a run that ended while our command was in
+      // flight); no new agent_start can precede the admission response.
+      if (this.settledEpoch >= minEpoch && !this.state.isStreaming) finish();
+    });
+  }
+
+  /** Resolves once no run, retry backoff or queued continuation is pending. */
+  async waitForIdle(): Promise<void> {
+    if (this.state.isIdle !== false && !this.state.isStreaming) return;
+    await this.waitForSettle(this.runEpoch);
+    // agent_settled covers the run; isIdle also flips there in practice, but
+    // re-check once for the post-run pipeline.
+    if (this.state.isIdle === false) {
+      await new Promise<void>((resolve) => {
+        const off = this.subscribe((record) => {
+          if (record.type === "agent_settled") {
+            off();
+            resolve();
+          }
+        });
+        if (this.state.isIdle !== false) {
+          off();
+          resolve();
+        }
+      });
+    }
   }
 
   async steer(text: string, images?: Array<{ type: "image"; data: string; mimeType: string }>): Promise<"handled" | "queued"> {
@@ -335,11 +433,13 @@ export class RpcAgentSession {
         onChunk?.(record.delta);
       }
     });
+    this.bashRunning = true;
     try {
       const data: Record<string, unknown> = { command, id: bashId };
       if (options?.excludeFromContext !== undefined) data.excludeFromContext = options.excludeFromContext;
       return await this.client.command<{ output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string }>("bash", data, 600_000);
     } finally {
+      this.bashRunning = false;
       off();
     }
   }
@@ -347,12 +447,6 @@ export class RpcAgentSession {
   abortBash(): void {
     void this.client.command("abort_bash", {}, 30_000).catch(() => {});
   }
-
-  get isBashRunning(): boolean {
-    return this.bashRunning;
-  }
-
-  private bashRunning = false;
 
   setSessionName(name: string): void {
     void this.client.command("set_session_name", { name }, 30_000).catch(() => {});
@@ -377,8 +471,6 @@ export class RpcAgentSession {
   getLastAssistantText(): string | undefined {
     return this.lastAssistantText;
   }
-
-  private lastAssistantText: string | undefined;
 
   getContextUsage(): ContextUsage | undefined {
     return this.statsCache.contextUsage;
@@ -426,10 +518,17 @@ export class RpcAgentSession {
         this.thinkingLevelsCache = Array.isArray(result?.levels) ? result.levels : [];
       })
       .catch(() => {});
-    void this.client.command<{ tools?: ToolInfo[] }>("get_commands", {}, 30_000)
-      .then(() => {})
-      .catch(() => {});
     void this.refreshStats().catch(() => {});
+    // A resumed session shows its last assistant message before any new run;
+    // awaited so the wrapper's first get_last_assistant_text cannot race it.
+    try {
+      const result = await this.client.command<{ text?: string }>("get_last_assistant_text", {}, 30_000);
+      if (!this.lastAssistantText && typeof result?.text === "string") {
+        this.lastAssistantText = result.text;
+      }
+    } catch {
+      // A fresh session has none; the child may answer empty.
+    }
   }
 
   async refreshStats(): Promise<void> {
@@ -460,16 +559,30 @@ export class RpcAgentSession {
     if (typeof patch.pendingMessageCount === "number") this.state.pendingMessageCount = patch.pendingMessageCount;
   }
 
+  /** Feed a child record straight to subscribers without touching the state machine (UI relay). */
+  emitRpcRecord(record: PiRpcRecord): void {
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(record);
+      } catch {
+        // A listener failing must not break others.
+      }
+    }
+  }
+
   private async onRecord(record: PiRpcRecord): Promise<void> {
     switch (record.type) {
       case "agent_start":
         this.state.isStreaming = true;
         this.state.isIdle = false;
+        this.runEpoch += 1;
         break;
       case "agent_settled":
         this.state.isStreaming = false;
         this.state.isIdle = true;
         this.state.retryAttempt = 0;
+        this.streamingMessage = undefined;
+        this.settledEpoch = this.runEpoch;
         // Reconcile counters and stats once the run is over; cheap and
         // authoritative after any amount of missed event bookkeeping.
         void this.client.command<Partial<RpcAgentSessionState>>("get_state", {}, 30_000)
@@ -482,8 +595,17 @@ export class RpcAgentSession {
           })
           .catch(() => {});
         break;
+      case "message_start":
+      case "message_update": {
+        const message = (record as { message?: { role?: string } }).message;
+        if (message?.role === "assistant") {
+          this.streamingMessage = record.message as PiAgentMessage;
+        }
+        break;
+      }
       case "message_end":
         if ((record.message as { role?: string } | undefined)?.role === "assistant") {
+          this.streamingMessage = record.message as PiAgentMessage;
           const content = (record.message as { content?: unknown }).content;
           this.state.messageCount += 1;
           const text = typeof content === "string"
