@@ -237,7 +237,10 @@ export async function startCliRpcSessionFromManager(
   const client = new PiRpcClient(executable, {
     args,
     cwd: sessionCwd,
-    env: options.env ?? buildCliEnv(),
+    env: buildCliEnv({
+      ...(options.agentDir ? ({ PI_CODING_AGENT_DIR: options.agentDir } as Record<string, string>) : {}),
+      ...(options.env ?? {}),
+    } as NodeJS.ProcessEnv),
     onLog: (line) => options.onLog?.(line),
     onExit: (code) => {
       options.onLog?.(`[pi-rpc] child exited (code ${code ?? "?"})`);
