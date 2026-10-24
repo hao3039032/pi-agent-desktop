@@ -2846,13 +2846,29 @@ export async function startRpcSession(
   const chatOnly = sessionPolicy.kind === "chat-only";
   const finishStartingSession = trackStartingSession(sessionCwd);
   const starting = (async () => {
-    // The CLI engine (M2): normal project sessions run on a `pi --mode rpc`
-    // child. Chats, subagent children and chat-only pins stay in-process
-    // until their policies migrate (M3).
-    if (!chatWorkspace && !subagentResources && !chatOnly) {
+    // The CLI engine (M2/M3): normal project sessions and chat-only pins run
+    // on a `pi --mode rpc` child. Chat workspaces and subagent children stay
+    // in-process until their policies migrate (M3).
+    if (!chatWorkspace && !subagentResources) {
+      // A chat-only pin sends the exact prompt built from the session cwd's
+      // context files (the same material the in-process extension reads).
+      let chatOnlyExactPrompt: string | undefined;
+      if (chatOnly) {
+        const offline = await createAgentSessionServices({
+          cwd: sessionCwd,
+          agentDir: getAgentDir(),
+          ...(projectTrustReloadOptions(sessionCwd, getAgentDir())
+            ? { resourceLoaderReloadOptions: projectTrustReloadOptions(sessionCwd, getAgentDir()) }
+            : {}),
+        });
+        chatOnlyExactPrompt = contextFilesSystemPrompt(
+          offline.resourceLoader.getAgentsFiles().agentsFiles,
+        );
+      }
       const started = await startCliRpcSessionFromManager(sessionManager, {
         sessionId,
         executable: resolvePiExecutable(),
+        ...(chatOnlyExactPrompt !== undefined ? { chatOnlyExactPrompt, chatOnly: true } : {}),
         ...(initialModel ? { initialModel } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
         onAgentRunComplete: (completedSessionId) => {

@@ -211,6 +211,17 @@ export class CliAgentSessionCore extends RpcAgentSession {
     return this.localSettings;
   }
 
+  /** Stable identity: the wrapper and tests patch `extensionRunner.emit` by reference. */
+  private extensionRunnerView: {
+    getRegisteredCommands(): Array<{
+      invocationName: string;
+      description?: string;
+      sourceInfo: SlashCommandInfo["sourceInfo"];
+    }>;
+    setUIContext?(uiContext?: unknown, mode?: "tui" | "rpc" | "json" | "print"): void;
+    emit?(event: { type: "session_shutdown"; reason: "quit" }): Promise<unknown>;
+  } | undefined;
+
   get extensionRunner(): {
     getRegisteredCommands(): Array<{
       invocationName: string;
@@ -220,24 +231,27 @@ export class CliAgentSessionCore extends RpcAgentSession {
     setUIContext?(uiContext?: unknown, mode?: "tui" | "rpc" | "json" | "print"): void;
     emit?(event: { type: "session_shutdown"; reason: "quit" }): Promise<unknown>;
   } {
-    return {
-      getRegisteredCommands: () =>
-        (this.commandsCache ?? [])
-          .filter((command) => command.source === "extension")
-          .map((command) => ({
-            invocationName: command.name,
-            description: command.description,
-            sourceInfo: command.sourceInfo,
-          })),
-      setUIContext: () => {
-        // Extensions live in the child; their UI context is the RPC
-        // subprotocol this core relays, not an in-process context.
-      },
-      emit: async () => {
-        // The child runs its own session_shutdown when stdin closes
-        // (client.close() in dispose); nothing to forward in-process.
-      },
-    };
+    if (!this.extensionRunnerView) {
+      this.extensionRunnerView = {
+        getRegisteredCommands: () =>
+          (this.commandsCache ?? [])
+            .filter((command) => command.source === "extension")
+            .map((command) => ({
+              invocationName: command.name,
+              description: command.description,
+              sourceInfo: command.sourceInfo,
+            })),
+        setUIContext: () => {
+          // Extensions live in the child; their UI context is the RPC
+          // subprotocol this core relays, not an in-process context.
+        },
+        emit: async () => {
+          // The child runs its own session_shutdown when stdin closes
+          // (client.close() in dispose); nothing to forward in-process.
+        },
+      };
+    }
+    return this.extensionRunnerView;
   }
 
   get promptTemplates(): Array<{

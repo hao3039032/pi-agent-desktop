@@ -20,7 +20,9 @@
  */
 
 import { getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentSessionWrapper } from "../rpc-manager";
 import type { SessionEntry } from "../types";
@@ -68,6 +70,14 @@ export interface StartCliSessionOptions {
    * registerRpcWrapper() owns wrapper.start().
    */
   registerWrapper?: (wrapper: AgentSessionWrapper, realSessionId: string) => void;
+  /**
+   * A chat-only pin (no tools, no extensions/skills/templates/themes, the
+   * exact prompt from the session's context files). The factory writes the
+   * prompt to a temp file and passes --system-prompt <path>.
+   */
+  chatOnlyExactPrompt?: string;
+  /** Whether the wrapper should adopt the chat-only policy (no tools UI). */
+  chatOnly?: boolean;
 }
 
 export interface StartedCliSession {
@@ -163,6 +173,13 @@ export function resolvePiExecutable(): string {
   return "pi"; // resolved from PATH by the spawn itself
 }
 
+function writeExactPromptFile(prompt: string): string {
+  const hash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+  const file = join(tmpdir(), `pi-web-exact-prompt-${hash}.txt`);
+  if (!existsSync(file)) writeFileSync(file, prompt, "utf8");
+  return file;
+}
+
 export async function startCliRpcSession(options: StartCliSessionOptions): Promise<StartedCliSession> {
   const { executable } = options;
   if (!executable) throw new Error("startCliRpcSession: executable is required");
@@ -186,10 +203,10 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
   const persistedToolNames = readSessionToolSelection(entries);
   const requested = options.resolvedToolNames !== undefined ? options.resolvedToolNames : requestedToolNames;
   const selection = persistedToolNames ?? requested;
-  // Validate before anything touches the disk: a rejected start must not
-  // leave a permanent empty tool pin behind in the session file.
-  if (selection !== undefined && selection.length === 0) {
-    throw new Error("Chat-only tool pins are not supported on the pi CLI engine yet (M3)");
+  // An empty selection is the chat-only pin; it needs the exact prompt. A
+  // rejected start must not touch the disk, so the validation stays here.
+  if (selection !== undefined && selection.length === 0 && !options.chatOnlyExactPrompt) {
+    throw new Error("An empty tool pin needs the exact prompt (chat-only sessions)");
   }
   if (persistedToolNames === undefined && requested !== undefined) {
     // A pinned selection arriving for an unpinned session is persisted
@@ -219,6 +236,21 @@ export async function startCliRpcSessionFromManager(
   // Keep the child's own session storage (/new, /branch, fork targets) on the
   // same dir pi-web chose — otherwise the child reverts to the global store.
   if (options.sessionDir) args.push("--session-dir", options.sessionDir);
+  if (options.chatOnlyExactPrompt !== undefined) {
+    // The chat-only pin mirrors CHAT_ONLY_RESOURCE_LOADER_OPTIONS: no tools,
+    // no discoverable resources, and the exact prompt (built from the
+    // session's context files) replaces pi's own — so context files must not
+    // be added a second time. The bridge stays: navigate/reload remain live.
+    args.push(
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-themes",
+      "--no-context-files",
+      "--system-prompt", writeExactPromptFile(options.chatOnlyExactPrompt),
+    );
+  }
   // The bridge owns tree navigation and reload inside the child; without it
   // the wrapper's navigate_tree would send literal command text to the model.
   args.push("--extension", resolveBridgeExtensionPath());
@@ -226,10 +258,13 @@ export async function startCliRpcSessionFromManager(
   // reads (resolveActiveToolNames), so a pinned `bash` follows the powershell
   // switch instead of enabling both shells.
   const settings = SettingsManager.create(sessionCwd, options.agentDir ?? getAgentDir());
-  const spawnToolNames = selection === undefined
-    ? undefined
-    : resolveSpawnToolNames(selection, settings.getDefaultTools());
-  if (selection !== undefined) {
+  // A chat-only pin has NO tools active; otherwise the shell-mapped selection.
+  const spawnToolNames = options.chatOnlyExactPrompt !== undefined
+    ? []
+    : selection === undefined
+      ? undefined
+      : resolveSpawnToolNames(selection, settings.getDefaultTools());
+  if (selection !== undefined && options.chatOnlyExactPrompt === undefined) {
     args.push(...buildToolArgs(selection, settings.getDefaultTools()));
   }
   if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
@@ -298,6 +333,10 @@ export async function startCliRpcSessionFromManager(
     // collapses when the wrapper's consumption narrows in M2.
     const wrapper = new AgentSessionWrapper(core as unknown as AgentSessionLike, {
       noLiveToolSwitch: true,
+      ...(options.chatOnly ? { chatOnly: true } : {}),
+      ...(options.chatOnlyExactPrompt !== undefined
+        ? { exactSystemPrompt: () => options.chatOnlyExactPrompt! }
+        : {}),
       ...(options.onAgentRunComplete ? { onAgentRunComplete: options.onAgentRunComplete } : {}),
     });
     core.attachUiRelay({
