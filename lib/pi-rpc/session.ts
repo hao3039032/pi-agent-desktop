@@ -48,6 +48,16 @@ interface QueuesSnapshot {
 
 type SessionEventListener = (event: PiRpcRecord) => void;
 
+/** Run-liveness fields a stale get_state snapshot must never overwrite (see RpcAgentSession.applyState). */
+const VOLATILE_STATE_KEYS: ReadonlyArray<keyof RpcAgentSessionState> = [
+  "isStreaming",
+  "isIdle",
+  "messageCount",
+  "pendingMessageCount",
+  "steeringQueue",
+  "followUpQueue",
+];
+
 export interface RpcAgentSessionOptions {
   client: PiRpcClient;
   /** Resolved by the factory from `get_state` when the child is ready. */
@@ -68,6 +78,8 @@ export class RpcAgentSession {
   private bashRunning = false;
   private lastAssistantText: string | undefined;
   private streamingMessage: PiAgentMessage | undefined;
+  /** Shared by every modelRuntime read (the factory does getModel→refresh→getModel). */
+  private modelsCache: Array<ModelLike & Record<string, unknown>> | undefined;
   /** Bumped by every agent_start; a settle records the epoch it ended. */
   private runEpoch = 0;
   private settledEpoch = 0;
@@ -189,15 +201,22 @@ export class RpcAgentSession {
     getModel: (provider: string, modelId: string) => ModelLike | undefined;
     refresh: (options?: { allowNetwork?: boolean }) => Promise<unknown>;
   } {
-    // Model enumeration comes from get_available_models; the cache lives here.
-    const cache: { models?: Array<ModelLike & Record<string, unknown>> } = {};
+    // The cache is an instance field: a per-access literal gave every read a
+    // fresh empty cache, so getModel after refresh still found nothing.
     return {
       getModel: (provider, modelId) =>
-        cache.models?.find((model) => model.provider === provider && model.id === modelId),
+        this.modelsCache?.find((model) => model.provider === provider && model.id === modelId),
       refresh: async () => {
-        const models = await this.client.command<Array<ModelLike & Record<string, unknown>>>("get_available_models", {}, 60_000);
-        cache.models = Array.isArray(models) ? models : [];
-        return cache.models;
+        // The wire shape is {models: [...]} (docs/rpc-commands.md); a bare
+        // array is accepted as a fallback for older builds.
+        const result = await this.client.command<{ models?: Array<ModelLike & Record<string, unknown>> } | Array<ModelLike & Record<string, unknown>>>(
+          "get_available_models",
+          {},
+          60_000,
+        );
+        const models = Array.isArray(result) ? result : result?.models;
+        this.modelsCache = Array.isArray(models) ? models : [];
+        return this.modelsCache;
       },
     };
   }
@@ -258,6 +277,11 @@ export class RpcAgentSession {
     if (options?.streamingBehavior) {
       data.streamingBehavior = options.streamingBehavior === "steer" ? "steer" : "followUp";
     }
+    // Capture the epoch BEFORE sending: the admission response can share its
+    // stdout chunk with agent_start, which the dispatcher processes
+    // synchronously before this await resumes — a runEpoch read afterwards
+    // would already include the run and wait one epoch too many (a hang).
+    const epochAtSend = this.runEpoch;
     const response = await this.client.command<{ disposition?: string }>(
       "prompt",
       data,
@@ -271,11 +295,13 @@ export class RpcAgentSession {
     // only once the run is fully idle: a started submission waits for the
     // NEXT run epoch to settle (the admission response arrives before
     // agent_start), a queued one for the current epoch's settle; "handled"
-    // (an extension command) starts no run.
+    // (an extension command) starts no run. waitForSettle re-checks
+    // settledEpoch against the captured epoch, so a run that started AND
+    // settled inside the response chunk is still detected.
     if (disposition === "started") {
-      await this.waitForSettle(this.runEpoch + 1);
+      await this.waitForSettle(epochAtSend + 1);
     } else if (disposition === "queued") {
-      await this.waitForSettle(this.runEpoch);
+      await this.waitForSettle(epochAtSend);
     }
   }
 
@@ -287,6 +313,11 @@ export class RpcAgentSession {
   waitForSettle(minEpoch = 0): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
+      // Initialized before registration: client.onProcessExit calls a
+      // listener registered on an already-exited client synchronously, so
+      // finish can run before the const declarations below would initialize.
+      let offRecord: () => void = () => {};
+      let offExit: () => void = () => {};
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
@@ -295,15 +326,16 @@ export class RpcAgentSession {
         if (error) reject(error);
         else resolve();
       };
-      const offRecord = this.subscribe((record) => {
+      offRecord = this.subscribe((record) => {
         if (record.type === "agent_settled" && this.settledEpoch >= minEpoch) finish();
       });
-      const offExit = this.client.onProcessExit((code) => {
+      offExit = this.client.onProcessExit((code) => {
         finish(new Error(`pi process exited during the run (code ${code ?? "?"})`));
       });
       // A settle for minEpoch may already have been processed (a queued
       // message delivered by a run that ended while our command was in
-      // flight); no new agent_start can precede the admission response.
+      // flight, or a whole run that fit inside the response chunk); no new
+      // agent_start can precede the admission response.
       if (this.settledEpoch >= minEpoch && !this.state.isStreaming) finish();
     });
   }
@@ -313,19 +345,30 @@ export class RpcAgentSession {
     if (this.state.isIdle !== false && !this.state.isStreaming) return;
     await this.waitForSettle(this.runEpoch);
     // agent_settled covers the run; isIdle also flips there in practice, but
-    // re-check once for the post-run pipeline.
+    // re-check once for the post-run pipeline. Bounded by the same epoch
+    // guard and the child-exit rejection as waitForSettle, so a busy flag
+    // nothing will ever clear cannot hang the caller.
     if (this.state.isIdle === false) {
-      await new Promise<void>((resolve) => {
-        const off = this.subscribe((record) => {
-          if (record.type === "agent_settled") {
-            off();
-            resolve();
-          }
+      const afterEpoch = this.settledEpoch;
+      await new Promise<void>((resolve, reject) => {
+        let done = false;
+        let offRecord: () => void = () => {};
+        let offExit: () => void = () => {};
+        const finish = (error?: Error) => {
+          if (done) return;
+          done = true;
+          offRecord();
+          offExit();
+          if (error) reject(error);
+          else resolve();
+        };
+        offRecord = this.subscribe((record) => {
+          if (record.type === "agent_settled" && this.settledEpoch > afterEpoch) finish();
         });
-        if (this.state.isIdle !== false) {
-          off();
-          resolve();
-        }
+        offExit = this.client.onProcessExit((code) => {
+          finish(new Error(`pi process exited while waiting for idle (code ${code ?? "?"})`));
+        });
+        if (this.state.isIdle !== false || this.settledEpoch > afterEpoch) finish();
       });
     }
   }
@@ -359,7 +402,9 @@ export class RpcAgentSession {
   }
 
   async setModel(model: ModelLike): Promise<void> {
-    await this.client.command("set_model", { model }, 30_000);
+    // The wire contract is a flat {provider, modelId} (docs/rpc-commands.md
+    // set_model), not a nested model object.
+    await this.client.command("set_model", { provider: model.provider, modelId: model.id }, 30_000);
     this.state.model = { ...model } as RpcAgentSessionState["model"];
   }
 
@@ -531,8 +576,15 @@ export class RpcAgentSession {
     }
   }
 
-  async refreshStats(): Promise<void> {
+  /**
+   * Refresh the stats cache. `epochAtRequest` (the runEpoch when the command
+   * was sent) drops a reply that crossed a new agent_start: the next settle
+   * re-refreshes, and an out-of-date cache is harmless but a wrong-isIdle flip
+   * is not (see the agent_settled hook).
+   */
+  async refreshStats(epochAtRequest?: number): Promise<void> {
     const stats = await this.client.command<Partial<Omit<SessionStatsInfo, "sessionName">>>("get_session_stats", {}, 30_000);
+    if (epochAtRequest !== undefined && this.runEpoch !== epochAtRequest) return;
     this.statsCache = {
       ...this.statsCache,
       ...stats,
@@ -541,33 +593,115 @@ export class RpcAgentSession {
     } as Omit<SessionStatsInfo, "sessionName">;
   }
 
-  private applyState(patch: Partial<RpcAgentSessionState>): void {
-    if (typeof patch.sessionId === "string") this.state.sessionId = patch.sessionId;
-    if (patch.sessionFile !== undefined) this.state.sessionFile = patch.sessionFile;
-    if (patch.sessionName !== undefined) this.state.sessionName = patch.sessionName;
-    if (typeof patch.isStreaming === "boolean") this.state.isStreaming = patch.isStreaming;
-    if (typeof patch.isCompacting === "boolean") this.state.isCompacting = patch.isCompacting;
-    if (patch.isIdle !== undefined) this.state.isIdle = patch.isIdle;
-    if (typeof patch.autoCompactionEnabled === "boolean") this.state.autoCompactionEnabled = patch.autoCompactionEnabled;
-    if (typeof patch.autoRetryEnabled === "boolean") this.state.autoRetryEnabled = patch.autoRetryEnabled;
-    if (typeof patch.retryAttempt === "number") this.state.retryAttempt = patch.retryAttempt;
-    if (patch.steeringMode !== undefined) this.state.steeringMode = patch.steeringMode;
-    if (patch.followUpMode !== undefined) this.state.followUpMode = patch.followUpMode;
-    if (patch.model !== undefined) this.state.model = patch.model;
-    if (patch.thinkingLevel !== undefined) this.state.thinkingLevel = patch.thinkingLevel;
-    if (typeof patch.messageCount === "number") this.state.messageCount = patch.messageCount;
-    if (typeof patch.pendingMessageCount === "number") this.state.pendingMessageCount = patch.pendingMessageCount;
+  private applyState(patch: Partial<RpcAgentSessionState>, options?: { volatile?: boolean }): void {
+    let source: Partial<RpcAgentSessionState> = patch;
+    if (options?.volatile === false) {
+      // A stale get_state snapshot (a new run started while the reply was in
+      // flight) must not flip live-run flags back to idle — dropping isIdle
+      // there once evicted a running session's wrapper mid-run. Stable fields
+      // (model, sessionName, switches) still apply.
+      const stable: Partial<RpcAgentSessionState> = {};
+      const patchEntries = Object.entries(patch) as Array<[keyof RpcAgentSessionState, unknown]>;
+      for (const [key, value] of patchEntries) {
+        if (!VOLATILE_STATE_KEYS.includes(key)) {
+          (stable as Record<string, unknown>)[key] = value;
+        }
+      }
+      source = stable;
+    }
+    if (typeof source.sessionId === "string") this.state.sessionId = source.sessionId;
+    if (source.sessionFile !== undefined) this.state.sessionFile = source.sessionFile;
+    if (source.sessionName !== undefined) this.state.sessionName = source.sessionName;
+    if (typeof source.isStreaming === "boolean") this.state.isStreaming = source.isStreaming;
+    if (typeof source.isCompacting === "boolean") this.state.isCompacting = source.isCompacting;
+    if (source.isIdle !== undefined) this.state.isIdle = source.isIdle;
+    if (typeof source.autoCompactionEnabled === "boolean") this.state.autoCompactionEnabled = source.autoCompactionEnabled;
+    if (typeof source.autoRetryEnabled === "boolean") this.state.autoRetryEnabled = source.autoRetryEnabled;
+    if (typeof source.retryAttempt === "number") this.state.retryAttempt = source.retryAttempt;
+    if (source.steeringMode !== undefined) this.state.steeringMode = source.steeringMode;
+    if (source.followUpMode !== undefined) this.state.followUpMode = source.followUpMode;
+    if (source.model !== undefined) this.state.model = source.model;
+    if (source.thinkingLevel !== undefined) this.state.thinkingLevel = source.thinkingLevel;
+    if (typeof source.messageCount === "number") this.state.messageCount = source.messageCount;
+    if (typeof source.pendingMessageCount === "number") this.state.pendingMessageCount = source.pendingMessageCount;
   }
 
-  /** Feed a child record straight to subscribers without touching the state machine (UI relay). */
-  emitRpcRecord(record: PiRpcRecord): void {
-    for (const listener of [...this.listeners]) {
-      try {
-        listener(record);
-      } catch {
-        // A listener failing must not break others.
+  /**
+   * Fold one delta-only wire `message_update` into the streaming message
+   * (docs/json.md "Reconstruct streaming messages"): text/thinking deltas
+   * append, *_end blocks replace with the authoritative content, toolcall_end
+   * replaces with the complete ToolCall; message_end replaces the message.
+   */
+  private applyStreamingDelta(record: PiRpcRecord): void {
+    const current = this.streamingMessage as ({ content?: unknown } & Record<string, unknown>) | undefined;
+    const event = record.assistantMessageEvent as {
+      type?: string;
+      contentIndex?: number;
+      delta?: string;
+      content?: string;
+      id?: string;
+      toolName?: string;
+      toolCall?: Record<string, unknown>;
+    } | undefined;
+    if (!current || !event || typeof event.type !== "string") return;
+    const blocks = (Array.isArray(current.content) ? current.content : []) as Array<Record<string, unknown>>;
+    // contentIndex addresses a block; gaps cannot appear in a real stream, so
+    // clamp to keep the array dense rather than leave holes a renderer trips on.
+    const index = typeof event.contentIndex === "number" && event.contentIndex >= 0 && event.contentIndex <= blocks.length
+      ? event.contentIndex
+      : blocks.length;
+    switch (event.type) {
+      case "text_start":
+        blocks[index] = { type: "text", text: "" };
+        break;
+      case "text_delta": {
+        const block = blocks[index]?.type === "text" ? blocks[index] : { type: "text", text: "" };
+        blocks[index] = { ...block, type: "text", text: `${block.text ?? ""}${event.delta ?? ""}` };
+        break;
       }
+      case "text_end":
+        blocks[index] = { type: "text", text: typeof event.content === "string" ? event.content : "" };
+        break;
+      case "thinking_start":
+        blocks[index] = { type: "thinking", thinking: "" };
+        break;
+      case "thinking_delta": {
+        const block = blocks[index]?.type === "thinking" ? blocks[index] : { type: "thinking", thinking: "" };
+        blocks[index] = { ...block, type: "thinking", thinking: `${block.thinking ?? ""}${event.delta ?? ""}` };
+        break;
+      }
+      case "thinking_end":
+        blocks[index] = { type: "thinking", thinking: typeof event.content === "string" ? event.content : "" };
+        break;
+      case "toolcall_start":
+        blocks[index] = { type: "toolCall", id: event.id ?? "", name: event.toolName ?? "", arguments: {} };
+        break;
+      case "toolcall_delta": {
+        // Serialized argument fragments; toolcall_end carries the parsed call,
+        // so the raw accumulation is kept only for partial display.
+        const block = blocks[index]?.type === "toolCall" ? blocks[index] : { type: "toolCall", id: "", name: "", arguments: {} };
+        blocks[index] = {
+          ...block,
+          type: "toolCall",
+          partialArguments: `${block.partialArguments ?? ""}${event.delta ?? ""}`,
+        };
+        break;
+      }
+      case "toolcall_end":
+        if (event.toolCall && typeof event.toolCall === "object") blocks[index] = { ...event.toolCall };
+        break;
+      case "start":
+      case "done":
+      case "error":
+        // Provider stream lifecycle; the agent loop reports these through
+        // message_start/message_end instead (docs/json.md).
+        break;
+      default:
+        break;
     }
+    current.content = blocks;
+    // The wire update carries the latest cumulative usage for the response.
+    if (record.usage !== undefined) current.usage = record.usage;
   }
 
   private async onRecord(record: PiRpcRecord): Promise<void> {
@@ -577,29 +711,52 @@ export class RpcAgentSession {
         this.state.isIdle = false;
         this.runEpoch += 1;
         break;
-      case "agent_settled":
+      case "agent_settled": {
         this.state.isStreaming = false;
         this.state.isIdle = true;
         this.state.retryAttempt = 0;
         this.streamingMessage = undefined;
         this.settledEpoch = this.runEpoch;
         // Reconcile counters and stats once the run is over; cheap and
-        // authoritative after any amount of missed event bookkeeping.
+        // authoritative after any amount of missed event bookkeeping. The
+        // epoch is captured at request time: if a new run started while the
+        // response was in flight, a stale snapshot must not flip the live
+        // run back to idle — the next settle refreshes those fields instead.
+        const epochAtSettle = this.runEpoch;
         void this.client.command<Partial<RpcAgentSessionState>>("get_state", {}, 30_000)
-          .then((state) => this.applyState(state))
+          .then((state) => this.applyState(state, { volatile: this.runEpoch === epochAtSettle }))
           .catch(() => {});
-        void this.refreshStats().catch(() => {});
+        void this.refreshStats(epochAtSettle).catch(() => {});
         void this.client.command<{ text?: string }>("get_last_assistant_text", {}, 30_000)
           .then((result) => {
+            // A stale reply would overwrite a newer run's text with an older one.
+            if (this.runEpoch !== epochAtSettle) return;
             this.lastAssistantText = typeof result?.text === "string" ? result.text : undefined;
           })
           .catch(() => {});
         break;
-      case "message_start":
+      }
+      case "message_start": {
+        const message = (record as { message?: { role?: string; content?: unknown } }).message;
+        if (message?.role === "assistant") {
+          // The skeleton message_update accumulates into: the wire's updates
+          // are delta-only, so own a mutable copy of the start snapshot
+          // (content blocks copied; scalars replaced whole).
+          const content = Array.isArray(message.content)
+            ? message.content.map((block) => ({ ...(block as object) }))
+            : [];
+          this.streamingMessage = { ...message, content } as unknown as PiAgentMessage;
+        }
+        break;
+      }
       case "message_update": {
         const message = (record as { message?: { role?: string } }).message;
         if (message?.role === "assistant") {
+          // In-process SDK snapshots carry the cumulative message; the wire
+          // omits it (docs/json.md "Reconstruct streaming messages").
           this.streamingMessage = record.message as PiAgentMessage;
+        } else {
+          this.applyStreamingDelta(record);
         }
         break;
       }
@@ -632,8 +789,15 @@ export class RpcAgentSession {
         if (Array.isArray(queue.followUp)) this.state.followUpQueue = queue.followUp;
         break;
       }
-      case "retry_started":
+      case "auto_retry_start":
+        // The wire names are auto_retry_start/auto_retry_end with an attempt
+        // field (docs/json.md); "retry_started" never exists on the wire.
         this.state.retryAttempt = typeof record.attempt === "number" ? record.attempt : this.state.retryAttempt + 1;
+        break;
+      case "auto_retry_end":
+        // agent_settled performs the final reset; a failed last attempt keeps
+        // the counter for the UI until the run settles or abortRetry clears it.
+        if (record.success === true) this.state.retryAttempt = 0;
         break;
       default:
         break;

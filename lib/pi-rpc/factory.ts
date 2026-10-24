@@ -19,11 +19,13 @@
  * the child honours the decision the pi-web trust dialog saved.
  */
 
-import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { AgentSessionWrapper } from "../rpc-manager";
 import type { SessionEntry } from "../types";
 import { getLatestModelChange, getLatestResponseModel } from "../session-reader";
 import { appendSessionToolSelection, readSessionToolSelection, validateSessionToolSelection } from "../session-tool-selection";
+import { sanitizeProjectCommandEnvironment } from "../project-command-env";
+import { resolveShellTools } from "../powershell-settings";
 import { PRESET_FULL } from "../tool-presets";
 import { PiRpcClient } from "./client";
 import { CliAgentSessionCore, ensureSessionFile, initialCoreState } from "./core";
@@ -46,6 +48,12 @@ export interface StartCliSessionOptions {
   executable: string;
   /** Overrides ~/.pi/agent for settings (tests pass a sandbox). */
   agentDir?: string;
+  /**
+   * Session storage directory for a NEW session (defaults to
+   * ~/.pi/agent/sessions/<encoded-cwd>/). Tests pass a sandbox dir so their
+   * sessions never enter the real store the session list reads.
+   */
+  sessionDir?: string;
   env?: NodeJS.ProcessEnv;
   onLog?: (line: string) => void;
 }
@@ -61,24 +69,53 @@ export interface StartedCliSession {
 const STRIP_ENV_KEYS = ["PI_PACKAGE_DIR", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "JITI_ALIAS"];
 
 export function buildCliEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base };
+  // The child's bash tool runs in this environment, so the host runtime
+  // variables that lib/project-command-env.ts strips from `!` commands
+  // (PORT, NODE_ENV, NEXT_*, PI_WEB_PASSWORD — the web password guards this
+  // server and no project command needs it) must not reach it either. The
+  // agent-bin PATH prepend is host-side only and stays out.
+  const env = sanitizeProjectCommandEnvironment({ ...base });
   for (const key of STRIP_ENV_KEYS) delete env[key];
   return env;
 }
 
+/** The coding tool domain, mirroring rpc-manager's CODING_TOOL_NAMES. */
+const CODING_TOOL_NAMES = [...PRESET_FULL, "powershell"];
+const CODING_TOOL_SET = new Set(CODING_TOOL_NAMES);
+
 /**
  * pi's relative tool syntax for a pinned selection: defaults, plus the
- * selected coding tools, minus the rest of the coding preset. Extension and
+ * selected coding tools, minus the rest of the coding domain. Extension and
  * MCP tools keep whatever the child's defaults gave them.
+ *
+ * `defaultTools` is the settings.json list the shell mapping reads (the
+ * powershell switch maps a selected `bash` onto `powershell`), mirroring
+ * resolveActiveToolNames() on the in-process engine. Every coding tool —
+ * bash AND powershell — gets an explicit +/- so an unselected shell can never
+ * survive through the child's defaults.
  */
-export function buildToolArgs(selection: readonly string[]): string[] {
-  if (selection.length === 0) return ["--no-builtin-tools"];
-  const selected = new Set(selection);
-  const entries: string[] = [];
-  for (const name of PRESET_FULL) {
-    entries.push(selected.has(name) ? `+${name}` : `-${name}`);
-  }
-  return ["--tools", entries.join(",")];
+export function buildToolArgs(selection: readonly string[], defaultTools?: readonly string[]): string[] {
+  return ["--tools", buildToolEntries(selection, defaultTools).join(",")];
+}
+
+/** The selection after the shell mapping — what the child actually runs. */
+export function resolveSpawnToolNames(selection: readonly string[], defaultTools?: readonly string[]): string[] {
+  return buildToolEntries(selection, defaultTools)
+    .filter((entry) => entry.startsWith("+"))
+    .map((entry) => entry.slice(1));
+}
+
+function buildToolEntries(selection: readonly string[], defaultTools?: readonly string[]): string[] {
+  const selected = new Set(
+    resolveShellTools(
+      selection.filter((name) => CODING_TOOL_SET.has(name)),
+      defaultTools,
+    ),
+  );
+  // An empty selection (chat-only) is rejected by startCliRpcSession before
+  // this point; M3 maps it onto --no-tools (which also drops extension tools,
+  // unlike --no-builtin-tools).
+  return CODING_TOOL_NAMES.map((name) => (selected.has(name) ? `+${name}` : `-${name}`));
 }
 
 export async function startCliRpcSession(options: StartCliSessionOptions): Promise<StartedCliSession> {
@@ -91,12 +128,12 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
   // 1. The session file: pi-web owns header and custom entries.
   let manager: SessionManager;
   if (options.sessionFile) {
-    manager = SessionManager.open(options.sessionFile, undefined);
+    manager = SessionManager.open(options.sessionFile, options.sessionDir);
   } else {
     if (!options.cwd) throw new Error("startCliRpcSession: cwd is required for a new session");
     manager = SessionManager.create(
       options.cwd,
-      undefined,
+      options.sessionDir,
       options.parentSession ? { parentSession: options.parentSession } : undefined,
     );
   }
@@ -104,21 +141,33 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
   const entries = manager.getEntries() as unknown as SessionEntry[];
   const persistedToolNames = readSessionToolSelection(entries);
   const selection = persistedToolNames ?? requestedToolNames;
-  if (persistedToolNames === undefined && requestedToolNames !== undefined && options.sessionFile) {
-    // A pinned selection arriving for an existing unpinned session is
-    // persisted before the child opens the file, exactly like startRpcSession.
-    appendSessionToolSelection(manager, requestedToolNames);
-  } else if (persistedToolNames === undefined && requestedToolNames !== undefined) {
-    appendSessionToolSelection(manager, requestedToolNames);
-  }
+  // Validate before anything touches the disk: a rejected start must not
+  // leave a permanent empty tool pin behind in the session file.
   if (selection !== undefined && selection.length === 0) {
     throw new Error("Chat-only tool pins are not supported on the pi CLI engine yet (M3)");
+  }
+  if (persistedToolNames === undefined && requestedToolNames !== undefined) {
+    // A pinned selection arriving for an unpinned session is persisted
+    // before the child opens the file, exactly like startRpcSession.
+    appendSessionToolSelection(manager, requestedToolNames);
   }
   const sessionFile = ensureSessionFile(manager);
 
   // 2. Spawn args.
   const args: string[] = ["--session", sessionFile];
-  if (selection !== undefined) args.push(...buildToolArgs(selection));
+  // Keep the child's own session storage (/new, /branch, fork targets) on the
+  // same dir pi-web chose — otherwise the child reverts to the global store.
+  if (options.sessionDir) args.push("--session-dir", options.sessionDir);
+  // The shell mapping reads the same settings.json the in-process engine
+  // reads (resolveActiveToolNames), so a pinned `bash` follows the powershell
+  // switch instead of enabling both shells.
+  const settings = SettingsManager.create(sessionCwd, options.agentDir ?? getAgentDir());
+  const spawnToolNames = selection === undefined
+    ? undefined
+    : resolveSpawnToolNames(selection, settings.getDefaultTools());
+  if (selection !== undefined) {
+    args.push(...buildToolArgs(selection, settings.getDefaultTools()));
+  }
   if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 
   const client = new PiRpcClient(executable, {
@@ -146,8 +195,11 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
       initialState: initialCoreState(state),
       sessionFile,
       cwd: sessionCwd,
-      spawnToolNames: selection,
-      knownToolNames: PRESET_FULL,
+      // Post-mapping names: the picker must show the shell the child actually
+      // runs (bash → powershell under the switch), and the coding domain
+      // includes powershell so both shells are listed.
+      spawnToolNames,
+      knownToolNames: CODING_TOOL_NAMES,
       ...(options.agentDir ? { agentDir: options.agentDir } : {}),
     });
     await core.refreshState();

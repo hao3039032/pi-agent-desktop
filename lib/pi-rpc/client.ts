@@ -61,6 +61,8 @@ export class PiRpcClient {
   private exiting = false;
   private exitCode: number | null | undefined;
   private exited = false;
+  /** Set when the child never spawned (ENOENT/EACCES): no 'exit' will follow. */
+  private spawnFailed = false;
   /** The first fatal transport error, rejected by every pending command. */
   private fatal: Error | undefined;
 
@@ -84,7 +86,15 @@ export class PiRpcClient {
         if (text) this.options.onLog?.(text);
       }
     });
-    this.child.on("error", (error: Error) => this.failAll(new Error(`pi process failed to start: ${error.message}`)));
+    this.child.on("error", (error: Error) => {
+      // A failed spawn emits 'error' and never 'exit'. kill() on a child that
+      // already exited can emit a second error; by then fatal/exited are set
+      // and this must not relabel the diagnostics as a spawn failure.
+      if (!this.fatal && !this.exited) {
+        this.spawnFailed = true;
+        this.failAll(new Error(`pi process failed to start: ${error.message}`));
+      }
+    });
     this.child.on("exit", (code: number | null) => {
       this.exited = true;
       this.exitCode = code ?? null;
@@ -137,8 +147,15 @@ export class PiRpcClient {
     if (this.exited || this.fatal) {
       return Promise.reject(this.fatal ?? new Error("pi process has exited"));
     }
-    const id = `pi-web-${++commandCounter}-${Date.now().toString(36)}`;
-    const record: Record<string, unknown> = { id, type, ...data };
+    // A caller-supplied `data.id` (executeBash's bashId) IS the correlation id:
+    // pi echoes it on the response and on bash_execution_update events, so it
+    // must not be replaced by a generated one. A non-string id would be
+    // spread back over ours and lose correlation — reject it here.
+    if (data.id !== undefined && typeof data.id !== "string") {
+      throw new Error(`command '${type}' id must be a string, got ${typeof data.id}`);
+    }
+    const id = typeof data.id === "string" && data.id ? data.id : `pi-web-${++commandCounter}-${Date.now().toString(36)}`;
+    const record: Record<string, unknown> = { ...data, type, id };
     return new Promise<T>((resolve, reject) => {
       const pending: Pending = {
         command: type,
@@ -170,12 +187,19 @@ export class PiRpcClient {
   async close(graceMs = 5_000): Promise<number | null> {
     if (this.exited) return this.exitCode ?? null;
     this.exiting = true;
+    // A child that never spawned (ENOENT/EACCES) emits 'error' without any
+    // 'exit'; resolving here keeps shutdown paths from hanging on it.
+    if (this.spawnFailed) return null;
     const exited = new Promise<number | null>((resolve) => {
-      this.child.once("exit", (code: number | null) => resolve(code ?? null));
+      const finish = (code: number | null | undefined) => resolve(code ?? null);
+      this.child.once("exit", finish);
+      this.child.once("error", () => finish(null));
     });
-    this.child.stdin!.end();
+    if (!this.child.stdin!.writableEnded) this.child.stdin!.end();
     const force = setTimeout(() => {
-      if (!this.exited) this.child.kill();
+      // kill() on a child without a pid is a no-op that emits 'error'; the
+      // race above already resolved in that case.
+      if (!this.exited && this.child.pid !== undefined) this.child.kill();
     }, graceMs);
     force.unref?.();
     return exited;
@@ -188,8 +212,12 @@ export class PiRpcClient {
   }
 
   private write(record: Record<string, unknown>): void {
-    if (this.child.stdin!.destroyed) return;
-    this.child.stdin!.write(JSON.stringify(record) + "\n");
+    // After close() ended stdin (or during shutdown), a write would throw
+    // ERR_STREAM_WRITE_AFTER_END; fire-and-forget commands and UI responses
+    // may still arrive there, so drop them instead.
+    const stdin = this.child.stdin!;
+    if (stdin.destroyed || stdin.writableEnded || this.exiting) return;
+    stdin.write(JSON.stringify(record) + "\n");
   }
 
   private onStdout(chunk: string): void {

@@ -30,7 +30,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { PiAgentMessage, SlashCommandInfo, ToolInfo } from "../pi-types";
 import { PiRpcClient, type PiRpcRecord } from "./client";
-import { RpcAgentSession, type RpcAgentSessionOptions, type RpcAgentSessionState } from "./session";
+import { PiRpcUnsupportedError, RpcAgentSession, type RpcAgentSessionOptions, type RpcAgentSessionState } from "./session";
 
 /** The subset of the SDK's SessionManager pi-web touches on a live wrapper. */
 export class FileSessionManagerView {
@@ -64,12 +64,30 @@ export class FileSessionManagerView {
     return this.open().getEntries();
   }
 
-  getBranch() {
-    return this.open().getBranch();
+  getBranch(fromId?: string) {
+    // Parameterized: the wrapper's clone path passes a leafId, and a
+    // zero-argument forwarding view would silently drop it and read the
+    // current leaf's branch instead (a wrong-answer, not a crash).
+    return this.open().getBranch(fromId);
   }
 
   getEntry(id: string) {
     return this.open().getEntry(id);
+  }
+
+  // The tree-writing/moving members the wrapper's fork/fork_branch/clone
+  // paths reach: unsupported on this engine, and loudly so — a silent
+  // TypeError from a missing member reads like a protocol bug.
+  isPersisted(): boolean {
+    throw new PiRpcUnsupportedError("sessionManager.isPersisted()", "M2: session tree");
+  }
+
+  getLeafId(): string | null {
+    throw new PiRpcUnsupportedError("sessionManager.getLeafId()", "M2: session tree");
+  }
+
+  getSessionDir(): string {
+    throw new PiRpcUnsupportedError("sessionManager.getSessionDir()", "M2: session tree");
   }
 
   getSessionName(): string | undefined {
@@ -293,7 +311,13 @@ export function ensureSessionFile(
     const content = [header, ...manager.getEntries()]
       .map((entry) => JSON.stringify(entry))
       .join("\n") + "\n";
-    writeFileSync(file, content, { encoding: "utf8", flag: "wx" });
+    try {
+      writeFileSync(file, content, { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      // Concurrent starts of the same file race on `wx`; whoever won, the
+      // precondition (the file exists with a header) is satisfied either way.
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+    }
     // Pi delays the first flush until a user or assistant message exists;
     // our generated entries are already on disk (persistBashOnlySession's trick).
     (manager as unknown as { flushed: boolean }).flushed = true;
@@ -311,6 +335,10 @@ export function initialCoreState(state: Partial<RpcAgentSessionState>): RpcAgent
     isCompacting: false,
     isIdle: true,
     autoCompactionEnabled: true,
+    // get_state reports no autoRetryEnabled field, so the initial value is
+    // unverified: true keeps the UI from reporting a disabled retry while the
+    // first auto_retry_start/auto_retry_end events (or a set_auto_retry)
+    // correct it from the event stream.
     autoRetryEnabled: true,
     retryAttempt: 0,
     messageCount: 0,

@@ -91,19 +91,31 @@ pi-subagents 扩展在 pi CLI 子进程内运行(实测 standalone 加载用户 
 - pi.exe 1.4.0 RPC:0.7-0.9s 净启动、3.1s 全扩展;get_state/bash/prompt/agent_settled/get_last_assistant_text 全通;用户 ~/.pi 扩展生态在子进程内激活;stdin 关闭有序退出。
 - extension_ui_request 事件流(实测 setWidget/setStatus)正常到达客户端。
 
-### M1 后半实测(2026-10-24,lib/pi-rpc/factory.test.mjs 2/2)
+### M1 后半实测(2026-10-24,lib/pi-rpc/factory.test.mjs;评审后修复批次见下)
 
 - **真 wrapper 换芯**:未改动的 `AgentSessionWrapper.send()/onEvent()/start()` 驱动子进程跑完整会话(prompt→事件流→settled→get_state/get_tools/get_commands/stats),含工具锁定(spawn `--tools +read,+bash,-edit,...`)与 resume(同一文件、同一 session id、转录保留)。
 - **文件所有权**:pi-web 写 header(自选 id/parentSession/tool-selection 条目)→子进程 `--session` 接手追加;两进程一文件,pi-web 侧 fresh-open 读盘。
-- **prompt 语义对齐**:pi 的 prompt 响应=受理;SDK 的 prompt promise=run 完全 idle 才 resolve。RpcAgentSession 用 run-epoch 计数补齐(started 等下一 epoch settle,queued 等当前 epoch;受理响应先于 agent_start 到达,不可用“当前 idle”判断)。wrapper.send 本就受理即返,不受影响。
-- **UI 桥**:子进程 extension_ui_request(同源 wire 形状)经 wrapper 新增的 relayExternalUiRequest/relayExternalUiEvent 复用 pending-UI 机制(SSE 重放、Stop 取消、超时回 cancelled),响应回传 client.respondUi;fire-and-forget 同步维护 extensionStatuses/extensionWidgets 供 get_state。
-- **模型恢复**:resume 后经 get_available_models+set_model 恢复保存的模型,失败(无凭据)静默保持子进程默认——与 pi-web 的 hasConfiguredAuth 回退同构。
+- **prompt 语义对齐**:pi 的 prompt 响应=受理;SDK 的 prompt promise=run 完全 idle 才 resolve。RpcAgentSession 用 run-epoch 计数补齐(started 等下一 epoch settle,queued 等当前 epoch;epoch 必须在发送前捕获——响应与 agent_start 同一 stdout chunk 时,await 续体晚于两者处理)。wrapper.send 本就受理即返,不受影响。
+- **UI 桥**:子进程 extension_ui_request(同源 wire 形状)经 wrapper 新增的 relayExternalUiRequest/relayExternalUiEvent 复用 pending-UI 机制(SSE 重放、Stop 取消、超时回 cancelled),响应回传 client.respondUi;fire-and-forget 同步维护 extensionStatuses/extensionWidgets 供 get_state。client.test.mjs 的探针扩展(确定性、无 LLM)验证全链。
+- **模型恢复(勘误)**:本节首版声称"已验",系被假绿掩盖——实际上存在三重 bug(get_available_models 的 `{models}` 形状解析错、set_model 应发扁平 `{provider,modelId}`、modelRuntime 缓存每次访问重建),resume 测试因保存模型==默认模型而恰好绕过。评审循环修复后由 session.unit.test.mjs 的形状/缓存单测锁定,e2e 尚未断言"恢复到不同模型"(待 M2 接线时补,需要第二个已配凭据的模型)。
+
+### 评审循环修复批次(2026-10-24,两轮)
+
+第 1 轮 3 评审找出 8 组 P1(client id 展开顺序、waitForSettle 同 chunk 竞态、工厂 spawn 失败挂起、write-after-end 崩溃、settle 后对账竞态、模型路径三重死、powershell 丢失、宿主变量泄漏)与若干 P2;修复 worker + 父循环补修后,第 2 轮 3 评审验证全部 RESOLVED(集成侧 PARTIAL 仅因文档未记,本批次补齐)。测试新增 session.unit.test.mjs(fake client、无二进制、CI 可跑)与 UI 探针 e2e;e2e 全部改用 sessionDir 沙箱(测试会话不再进入真实会话库)。
+
+### 已知分歧与推迟项(记档)
+
+- **attachUiRelay 启动窗口**:relay 在握手+refreshState+refreshCommands 之后才注册,启动期(秒级)子进程扩展的对话框会被 client 自动 cancel。M2 接线时缓冲启动期 UI 记录。
+- **autoRetryEnabled 初值**:get_state 无此字段,初值 true 未经证实(事件 auto_retry_start 才会校正);见 core.ts initialCoreState 注释。
+- **"handled" disposition 与扩展自启 run**:扩展命令可自行启动 run(不经 prompt promise 约束),与进程内 SDK "完全 idle 才 resolve"语义不同;session.unit.test.mjs 锁定当前行为,M2 接线时复审是否需要宽限期等待。
+- 并发 get_available_models refresh 无去重(重复 IO,无害);fake client 不模拟退出后 command 拒绝与退出码传递(单测若断言这些再修);双重 SettingsManager 读(factory 与 core 各一次,同快照语义)。
 
 ### 仍开放的差距(更新)
 
-- **无 get_tools RPC**:工具选择器只能展示 PRESET_FULL 静态名单(active=spawn 选集),子进程里激活的扩展/MCP 工具不可见——上游 PR 候选(get_tools)。
+- **无 get_tools RPC**:工具选择器展示编码工具静态名单(PRESET_FULL+powershell,active=shell 映射后的 spawn 选集),子进程里激活的扩展/MCP 工具不可见——上游 PR 候选(get_tools)。
 - **reload() 未实现**:RPC 模式下 reload=杀进程重拉(文件在盘);信任变更后需重生。M2。
-- navigateTree/fork/clone/sendCustomMessage:维持 D 区原判,M2 起逐个收编。
+- navigateTree/fork/clone/sendCustomMessage:维持 D 区原判,M2 起逐个收编(FileSessionManagerView 对应方法显式 throw PiRpcUnsupportedError,fork/clone 不会以 TypeError 崩)。
+- 测试待补(P2):factory get_commands 确定性断言、FileSessionManagerView 纯单测、resume 工具重锁定断言。
 
 ## 五、给上游提 PR 的候选清单(增强 pi CLI RPC,反哺生态)
 
