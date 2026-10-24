@@ -2,7 +2,6 @@ export const SETTINGS_SECTION_VALUES = [
   "general",
   "models",
   "skills",
-  "agents",
   "plugins",
   "mcp",
 ] as const;
@@ -18,7 +17,7 @@ export type SettingsDetailSection = Exclude<SettingsSection, "general">;
 const STORAGE_KEY = "pi-web:settings-navigation";
 // Sections that need a project to show anything. Settings › MCP is not one: it
 // lists the global mcp.json without a project and adds a Project group with one.
-const PROJECT_SECTIONS = new Set<SettingsSection>(["skills", "agents", "plugins"]);
+const PROJECT_SECTIONS = new Set<SettingsSection>(["skills", "plugins"]);
 
 /** Whether a section is unavailable until a project is open. */
 export function settingsSectionRequiresProject(section: SettingsSection): boolean {

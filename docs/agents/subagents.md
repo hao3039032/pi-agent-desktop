@@ -1,4 +1,13 @@
-# Built-in subagents
+# Built-in subagents (removed)
+
+> **Status: removed (M4, 2026-10-24).** Sessions run on the `pi --mode rpc` child
+> process, where the pi-subagents package spawns its own children natively; the
+> built-in controller, its profile editor (`AgentsConfig`), the `app/api/subagents`
+> routes and the completion notifications are gone. `lib/subagents.ts` keeps the
+> legacy marker readers (`readSubagentRun`, `readSubagentSessionResources`) so old
+> subagent-child session files still open and delete cleanly. The restricted fleet
+> monitor (`app/api/agent/[id]/subagents`) stays for the package. The notes below
+> describe the removed system for history.
 
 ## Built-in subagents
 - The global `builtInEnabled` in `~/.pi/agent/agents/settings.json` is off when the file or field is absent and when the file is malformed (fail closed); writes are atomic and keep unknown fields. The inline extension factory is always present, so a reload can apply the switch, but registers no tools while off; after changing it the user must reload the session explicitly, and `Agent` dispatch re-checks the setting so a stale call cannot start a subagent. When a pi-subagents extension file is in the session's load result (detected by package source or path, never by tool names — 0.78 registers `subagent`), the built-in host yields: `preferPiSubagentsExtension` removes it along with the conflict errors its removal dissolves, `start()` / `resume()` reject stale calls with a best-effort, process-wide guard — armed only while the most recent extension load in the process detected pi-subagents AND the global settings activate the package, asking the user to reload — and the Agents panel (`legacyPackage` from `readPiSubagentsPackageActive()`) disables the switch and hides the built-in group while the package is active. ADR 0003.

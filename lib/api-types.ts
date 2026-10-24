@@ -1,10 +1,5 @@
 import type { McpExposure, ResourceDiagnostic } from "@earendil-works/pi-coding-agent";
 import type { McpImportNote } from "./mcp-import-core";
-import type { SubagentProfile } from "./subagents";
-
-export interface SubagentProfilesResponse {
-  profiles: SubagentProfile[];
-}
 
 export interface SubagentSettingsResponse {
   enabled: boolean;

@@ -277,30 +277,6 @@ async function loadMcpRuntime(): Promise<McpRuntimeResult> {
  * made later reaches the project's servers on the next prompt, but this flag
  * only on the next reload.
  */
-export function createMcpExtensionConfigLoader(
-  internals: Pick<PiSdkInternals, "loadMcpConfig">,
-  agentDir: string,
-  mayReadProjectConfig: (cwd: string) => boolean = (cwd) => mayReadProjectConfigNow(cwd, agentDir),
-): (ctx: ExtensionContext) => LoadedMcpConfig {
-  return (ctx) => {
-    let autoEnableCodemode: boolean | undefined;
-    try {
-      autoEnableCodemode = internals.loadMcpConfig({
-        agentDir,
-        cwd: ctx.cwd,
-        projectTrusted: mayReadProjectConfig(ctx.cwd),
-      }).autoEnableCodemode;
-    } catch {
-      // Unreadable files are reported where servers are managed, not on every session start.
-    }
-    return { servers: [], errors: [], ...(autoEnableCodemode === undefined ? {} : { autoEnableCodemode }) };
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Whether the settings switch a built-in off
-// ---------------------------------------------------------------------------
-
 export const BUILTIN_EXTENSION_NAMES = ["codemode", "tool-search", "mcp"] as const;
 export type BuiltinExtensionName = typeof BUILTIN_EXTENSION_NAMES[number];
 
@@ -416,53 +392,4 @@ const unavailableExtension: ExtensionFactory = () => {};
 
 function builtin(name: string, factory: ExtensionFactory): InlineExtension {
   return { name, factory, replaceable: true, builtin: true };
-}
-
-export interface PiWebBuiltinExtensionsOptions {
-  agentDir: string;
-  /** Timing overrides for tests. */
-  mcpHost?: Pick<McpHostOptions, "idleMs" | "promptWaitMs">;
-}
-
-export interface PiWebBuiltinExtensions {
-  /** For the resource loader's `extensionFactories`, in the CLI's order, then the MCP host. */
-  extensions: InlineExtension[];
-  /** Decides which MCP servers the session connects; undefined while MCP is off. */
-  mcpHost: McpHost | undefined;
-}
-
-/** The built-in extensions of a normal session and the host that feeds the MCP one. */
-export async function createPiWebBuiltinExtensions(
-  options: PiWebBuiltinExtensionsOptions,
-): Promise<PiWebBuiltinExtensions> {
-  const [sandbox, mcp] = await Promise.all([checkCodemodeSandbox(), loadMcpRuntime()]);
-  const mcpHost = mcp.available
-    ? new McpHost({
-        ...options.mcpHost,
-        agentDir: options.agentDir,
-        internals: mcp.internals,
-        codemodeAvailable: () => sandbox.available,
-      })
-    : undefined;
-  const extensions = [
-    builtin("codemode", sandbox.available ? createCodemodeExtension() : unavailableExtension),
-    builtin("tool-search", createToolSearchExtension()),
-    builtin(
-      "mcp",
-      mcp.available && mcpHost
-        ? createMcpExtension({
-            loadConfig: createMcpExtensionConfigLoader(mcp.internals, options.agentDir),
-            createTransport: mcpHost.wrapTransportFactory(createPiWebMcpTransportFactory(mcp.internals)),
-            // The host already waited, and Stop ends its wait. The extension's own wait for
-            // servers with `direct` tools, at a session's first prompt, ignores Stop.
-            startupWaitMs: 0,
-            // `/mcp login` already shows the address in the chat; a browser
-            // opened on the server host is one a remote user never sees.
-            openUrl: () => {},
-          })
-        : unavailableExtension,
-    ),
-  ];
-  if (mcpHost) extensions.push(mcpHost.extension());
-  return { extensions, mcpHost };
 }

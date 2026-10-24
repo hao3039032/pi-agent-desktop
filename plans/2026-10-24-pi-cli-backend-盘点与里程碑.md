@@ -150,3 +150,10 @@ set_active_tools、navigate_tree(+summarize)、send_custom_message、get_extensi
 记录的取舍与后续:
 - **内置子代理在 CLI 引擎上闲置**(记录):CLI 会话不注册内置 Agent/get_subagent_result/steer_subagent;子代理需 pi-subagents 包(子进程内原生跑)。AgentsConfig 的开关/通知对 CLI 会话冻结;fleet API 返回 unavailable(core 的 resourceLoader 视图无 getExtensions,not-loaded 原因有误导性)。M4 删控制器时一并处理或在 UI 标注。
 - 已知漂移(接受/推迟):chat-only pin 经桥接多出 artifacts 段(进程内无);exact prompt 冻结于 spawn(进程内每 run 重算,appendSystemPrompt 未中和);enabledModels 作用域未施加于子进程默认;navigate 的 --instructions 按空白拆分;reload/navigate 120s 超时;计划任务标记可能落分支外;fork_branch 无 streaming 守卫;刷新显示磁盘尾 leaf(子进程内存 leaf 不可见);模型 bash 无 agent-bin PATH 前缀/shellCommandPrefix;源断言测试锁着不可达的进程内路径(M4 清理时同步)。
+
+## M4 落地记录(2026-10-24,死代码清理 + 内置子代理移除)
+
+- **进程内会话路径全删**:startRpcSession 不再有 createAgentSessionFromServices 分支——所有会话(项目/chat-only/聊天/遗留子代理文件)统一走 CLI 子进程。exact-system-prompt/artifact-guide/mcp 内联扩展接线、preferPiSubagents/preferUserBash extensionsOverride、scopedModels/enabledModels 进程内施加、security-child-extensions 登记一并移除。
+- **内置子代理系统移除**(用户确认舍弃):subagent-runtime.ts(控制器/通知)、AgentsConfig 组件与 app/api/subagents 路由、settings 的 agents 分区、subagent-input/profile-precedence、subagent-extension 缩到 fleet 检测 + 遗留渲染类型、subagent-settings 缩到包名常量、subagents.ts 缩到遗留标记读取器(763→172 行)。rpc-manager 保留 getSubagentRun/steerSubagent/abortSubagent 空壳(会话删除路由的清理点)。AgentSessionPanel 保留(遗留子会话树仍可浏览)。
+- **fleet 监控**:暂缓(用户指示)——app/api/agent/[id]/subagents 对 CLI 会话持续返回 unavailable/not-loaded。
+- 测试同步:删除锁死进程内启动文本的 11 条源断言(rpc-manager.test/tool-exposure);chat-workspace-policy.test 的两条改为断言 CLI 分支(fallback 链 chatSettings→factory set_model);fork-extractions 哨兵指向桥接资产;settings-navigation 去掉 agents 分区。

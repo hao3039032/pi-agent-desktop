@@ -363,8 +363,10 @@ const FORK_FEATURES = [
   },
   {
     name: "artifacts: normal sessions get the prompt section",
-    file: "lib/rpc-manager.ts",
-    markers: ["createArtifactGuideExtension()"],
+    // Moved with the CLI engine: the guide now ships inside the bridge
+    // extension every `pi --mode rpc` child loads (M3 port).
+    file: "lib/pi-rpc/assets/pi-web-bridge.mjs",
+    markers: ["ARTIFACT_GUIDE_SECTION"],
   },
   {
     name: "artifacts: General settings has the artifacts switch",

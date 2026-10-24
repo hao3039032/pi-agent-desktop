@@ -1,23 +1,18 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionServices, getAgentDir, SessionManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
 import { resolvePiExecutable, startCliRpcSessionFromManager } from "./pi-rpc/factory";
+import { createProjectCommandBashOperations } from "./project-command-env";
 import { invalidateModelsCache } from "./models-cache";
-import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
-import {
-  createProjectCommandBashExtension,
-  createProjectCommandBashOperations,
-  preferUserBashExtension,
-} from "./project-command-env";
-import { cacheSessionPath, getLatestModelChange, getLatestResponseModel, getSessionListVersion, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
+import { cacheSessionPath, getSessionListVersion, invalidateSessionListCache, readLatestSessionEntryId } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
-import type { LoadExtensionsResult, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { PRODUCT_NAME } from "./branding";
 import type { AgentSessionLike, ExtensionUiContextLike, NavigateTreeOptions, ToolInfo } from "./pi-types";
 import type {
@@ -38,30 +33,12 @@ import {
   type ExtensionCommandContextActionsLike,
 } from "./session-replacement";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
-import {
-  createSubagentExtension,
-  isPiSubagentsPreferred,
-  preferPiSubagentsExtension,
-} from "./subagent-extension";
+import { readSubagentRun, readSubagentSessionResources, SUBAGENT_CONTROL_TOOL_NAMES } from "./subagents";
 import type { SubagentEventBus } from "./pi-subagents-rpc";
-import {
-  listSubagentProfiles,
-  readSubagentRun,
-  readSubagentSessionResources,
-  SUBAGENT_CONTROL_TOOL_NAMES,
-} from "./subagents";
-import { createSubagentController } from "./subagent-runtime";
-import { isBuiltInSubagentsEnabled, readPiSubagentsPackageActive } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
-import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
-import { createExactSystemPromptExtension } from "./exact-system-prompt";
-import { createArtifactGuideExtension } from "./artifact-guide-extension";
-import { findSecurityExtensionPaths } from "./permission-system-package";
-import { registerSecurityChildExtensions, unregisterSecurityChildExtensions } from "./required-child-extensions";
-import { createPiWebBuiltinExtensions } from "./builtin-extensions";
+import { contextFilesSystemPrompt } from "./chat-only";
 import type { McpHost } from "./mcp-host";
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
-import { createReadOnlyMcpPolicyExtension } from "./mcp-read-only-policy";
 import { isNestedToolExecutionEvent } from "./agent-event-wire";
 import {
   appendClearedSessionToolSelection,
@@ -79,17 +56,14 @@ import {
 import { appendChatUnlock, readChatUnlocked } from "./chat-unlock";
 import { saveAttachedFilesToFolder } from "./chat-attachment-files";
 import { deriveSessionPolicy, type SessionPolicy } from "./session-policy";
-import { chatInstructionsSection, readChatSettings, resolveChatStartDefaults } from "./chat-settings";
-import { ChatFileGrants, isNetworkExposedServer } from "./chat-file-access";
-import { createChatDownloadsExtension } from "./chat-downloads-tool";
+import { readChatSettings } from "./chat-settings";
+import { isNetworkExposedServer } from "./chat-file-access";
 import {
   CHAT_FOLDER_TOOL_NAMES,
   CHAT_READ_TOOL_NAME,
   chatBlockedToolNames,
   chatWorkspacePrompt,
-  createChatWorkspaceExtension,
   isChatToolAllowed,
-  withoutAgentDelegation,
 } from "./chat-workspace-policy";
 import { ComposerQueue } from "./composer-queue";
 import type { PendingComposerMessage } from "./composer-queue-types";
@@ -267,7 +241,6 @@ function restrictToChatTools(session: AgentSessionLike, names: readonly string[]
 }
 
 // A tool that hands work to another agent. A chat loads no extension that registers one.
-const CHAT_DELEGATION_TOOL_NAMES: ReadonlySet<string> = new Set(SUBAGENT_CONTROL_TOOL_NAMES);
 const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 // Extensions require a complete Theme, while the web UI applies its own styling.
@@ -2347,7 +2320,6 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   wrapper.onDestroy(() => {
     if (registry.get(sessionId) !== wrapper) return;
     registry.delete(sessionId);
-    unregisterSecurityChildExtensions(sessionId);
     // A destroyed wrapper leaves the running set (idle shutdown, branch
     // switch, fork/clone replacement); push the new set so sidebars clear
     // its spinner instead of waiting for the next broadcast.
@@ -2360,43 +2332,25 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
   }
   registry.set(sessionId, wrapper);
   wrapper.start();
-  if (!wrapper.isChatOnly()) wrapper.beginExtensionBinding();
-  // pi-subagents children load no ambient extensions; require the security
-  // packages for every child this session launches (lib/required-child-extensions.ts).
-  if (!wrapper.isChatOnly()) void registerSecurityChildExtensions(sessionId);
+  wrapper.beginExtensionBinding();
 }
 
-const SUBAGENT_CONTROLLER = createSubagentController({
-  getSession: (sessionId) => getRegistry().get(sessionId),
-  registerSession: (inner, options) => {
-    const wrapper = new AgentSessionWrapper(inner, {
-      ...(options?.exactSystemPrompt !== undefined
-        ? { exactSystemPrompt: () => options.exactSystemPrompt! }
-        : {}),
-      chatOnly: options?.chatOnly,
-      suppressCompletionNotifications: true,
-    });
-    registerRpcWrapper(wrapper);
-  },
-  reopenSession: async (sessionId, sessionFile) =>
-    (await startRpcSession(sessionId, sessionFile, undefined)).session,
-  resolveSessionPath,
-  invalidateSessionList: invalidateSessionListCache,
-  isBuiltInSubagentsEnabled,
-  isPiSubagentsPreferred,
-  isPiSubagentsPackageActive: readPiSubagentsPackageActive,
-});
-
-export function getSubagentRun(sessionId: string) {
-  return SUBAGENT_CONTROLLER.get(sessionId);
+// The builtin subagent controller is gone (M4): sessions run on the pi CLI
+// child, where the pi-subagents package spawns its own children natively.
+// Legacy subagent-child session files still carry their marker (the session
+// routes read it); there is no live run behind them to steer or abort.
+export function getSubagentRun(_sessionId: string): undefined {
+  void _sessionId;
+  return undefined;
 }
 
-export function steerSubagent(sessionId: string, message: string) {
-  return SUBAGENT_CONTROLLER.steer(sessionId, message);
+export async function steerSubagent(_sessionId: string, _message: string): Promise<undefined> {
+  void _sessionId; void _message;
+  return undefined;
 }
 
-export function abortSubagent(sessionId: string) {
-  return SUBAGENT_CONTROLLER.abort(sessionId);
+export async function abortSubagent(_sessionId: string): Promise<void> {
+  void _sessionId;
 }
 
 function getLocks(): Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> {
@@ -2774,7 +2728,8 @@ export async function startRpcSession(
   cwd: string | undefined,
   options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
-  const { initialModel, allowInitialModelFallback, thinkingLevel } = options;
+  const { initialModel, thinkingLevel } = options;
+  void (options as { allowInitialModelFallback?: boolean }).allowInitialModelFallback;
   const requestedToolNames = options.toolNames === undefined
     ? undefined
     : validateSessionToolSelection(options.toolNames);
@@ -2819,37 +2774,30 @@ export async function startRpcSession(
   const chatUnlocked = chatFolder
     && !isNetworkExposedServer()
     && readChatUnlocked(sessionManager.getEntries() as unknown as SessionEntry[]);
-  const subagentResources = sessionFile && !chatWorkspace
-    ? readSubagentSessionResources(
-        sessionManager.getEntries() as unknown as SessionEntry[],
-      )
-    : null;
-  const persistedToolNames = subagentResources
-    ? undefined
-    : readSessionToolSelection(sessionManager.getEntries() as unknown as SessionEntry[]);
+  // The builtin subagent system is gone (the pi-subagents package runs its
+  // own children inside the CLI child); legacy subagent-child session files
+  // open as ordinary sessions. The marker reader stays for the session routes.
+  const persistedToolNames = readSessionToolSelection(sessionManager.getEntries() as unknown as SessionEntry[]);
   // A chat has no tool preset to pick: it loads what a project session loads, and the
   // chat policy extension withholds the coding tools (lib/chat-workspace-policy.ts).
   const selectedToolNames = chatWorkspace
     ? undefined
-    : subagentResources?.tools ?? persistedToolNames ?? requestedToolNames;
-  if (!chatWorkspace && !subagentResources && persistedToolNames === undefined && requestedToolNames !== undefined) {
+    : persistedToolNames ?? requestedToolNames;
+  if (!chatWorkspace && persistedToolNames === undefined && requestedToolNames !== undefined) {
     appendSessionToolSelection(sessionManager, requestedToolNames);
   }
-  const subagentLoadsResources = Boolean(
-    subagentResources?.loadExtensions || subagentResources?.loadSkills,
-  );
   const sessionPolicy = deriveSessionPolicy({
     chatWorkspace,
     chatUnlocked,
-    chatOnly: selectedToolNames?.length === 0 && !subagentLoadsResources,
+    chatOnly: selectedToolNames?.length === 0,
   });
   const chatOnly = sessionPolicy.kind === "chat-only";
   const finishStartingSession = trackStartingSession(sessionCwd);
   const starting = (async () => {
-    // The CLI engine (M2/M3): normal project sessions, chat-only pins and
-    // chat workspaces run on a `pi --mode rpc` child. Subagent children stay
-    // in-process until the fleet controller migrates.
-    if (!subagentResources) {
+    // The CLI engine: every session runs on a `pi --mode rpc` child (M4:
+    // the in-process path is gone; the pi-subagents package spawns its own
+    // children inside the CLI child).
+    {
       if (chatWorkspace) {
         const chatFilesEnabled = chatWorkspace && !isNetworkExposedServer();
         // A new chat starts on the model and reasoning level picked in
@@ -2919,260 +2867,6 @@ export async function startRpcSession(
       return { session: started.wrapper, realSessionId: started.realSessionId };
     }
 
-    // Some extensions access the SDK's global theme even outside the terminal UI.
-    if (!chatOnly) initTheme();
-    const agentDir = getAgentDir();
-
-    // Determine which tools to pass based on requested toolNames.
-    // Since v0.68.0, session creation expects string[] tool names instead of Tool[] instances.
-    let toolsOption: string[] | undefined = subagentResources?.tools;
-    if (!subagentResources && selectedToolNames !== undefined) {
-      // toolNames === [] -> "all off" (an empty allow-list disables every tool).
-      // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
-      // set allowedToolNames to coding builtins only, which filtered every
-      // extension/package-provided tool (e.g. subagents, web access) out of the
-      // tool registry — so they were unavailable in Pi Web sessions even though the
-      // `pi` CLI keeps them. Leaving the allow-list unset lets the SDK register all
-      // tools (and activate extension tools); we narrow the ACTIVE set below.
-      toolsOption = selectedToolNames.length === 0 ? [] : undefined;
-    }
-
-    // Build services first so extension-registered providers are available
-    // before the SDK restores the saved model from the session file.
-    // Gate untrusted project extensions so opening a repository does not run
-    // its .pi/extensions code automatically (see lib/project-trust.ts, #236).
-    const trustReloadOptions = subagentResources
-      ? subagentLoadsResources
-        ? projectTrustReloadOptions(sessionCwd, agentDir)
-        : undefined
-      : chatOnly || chatWorkspace
-        ? undefined
-        : projectTrustReloadOptions(sessionCwd, agentDir);
-    // The chat policy reads the session's own skills and cwd, which exist only once the
-    // session does, so the extension reaches them through this ref.
-    // Reading a file the user names and saving to Downloads act on this computer, so they
-    // are off when the server accepts connections from other machines.
-    const chatFilesEnabled = chatWorkspace && !isNetworkExposedServer();
-    const chatGrants = chatFilesEnabled && !chatUnlocked ? new ChatFileGrants() : undefined;
-    const chatSessionRef: {
-      current?: { resourceLoader: { getSkills(): { skills: { filePath: string; baseDir: string }[] } } };
-    } = {};
-    const settingsManager = SettingsManager.create(sessionCwd, agentDir);
-    // Subagent sessions load no extensions by default, which would leave their
-    // bash ungated by the permission system (and the authorizer chain
-    // unresolvable when a model reviewer is configured). Inject the installed
-    // security package directories as additional extension paths: the resource
-    // loader loads those even under noExtensions, and only those, so the child
-    // keeps its isolation while catastrophic-operation denies still hold.
-    const securityExtensionPaths = subagentResources && !subagentResources.loadExtensions
-      ? findSecurityExtensionPaths(
-        settingsManager.getGlobalSettings().packages as Array<string | { source: string }> | undefined,
-        agentDir,
-      )
-      : [];
-    // Chat-only sessions and subagents that replace Pi's prompt send an exact
-    // system prompt. The prompt is resolved at prompt time through this inline
-    // extension: it may read the session's context files, which exist only
-    // after the session is created, so the getter is filled in below.
-    const exactSystemPromptRef: { current?: () => string } = {};
-    const exactSystemPromptExtension = createExactSystemPromptExtension(() => exactSystemPromptRef.current?.());
-    const usesExactSystemPrompt = chatOnly || subagentResources?.exactSystemPrompt !== undefined;
-    // codemode, tool-search, and mcp, as the pi CLI loads them, and the host that decides
-    // which MCP servers the session connects (ADR 0006).
-    const builtins = subagentResources || chatOnly
-      ? undefined
-      : await createPiWebBuiltinExtensions({ agentDir });
-    // The pi-subagents extension registers its `subagents:rpc:v1` bridge on the
-    // session's extension event bus (`pi.events`). Pi Web creates the bus and
-    // hands it to the resource loader, so it stays reachable from the wrapper
-    // for the restricted subagents API without touching the package's
-    // internals or any global registry (lib/pi-subagents-rpc.ts). Only the
-    // project branch below passes it to the loader: chats and subagent children
-    // get no bridge, because the package's policy for non-project chats is
-    // enforced server-side and child sessions are not API targets.
-    const subagentsEventBus = subagentResources || chatOnly || chatWorkspace ? undefined : createEventBus();
-    const services = await createAgentSessionServices({
-      cwd: sessionCwd,
-      agentDir,
-      settingsManager,
-      resourceLoaderOptions: subagentResources
-        ? {
-            noExtensions: !subagentResources.loadExtensions,
-            ...(securityExtensionPaths.length > 0
-              ? { additionalExtensionPaths: securityExtensionPaths }
-              : {}),
-            noSkills: !subagentResources.loadSkills,
-            noPromptTemplates: true,
-            noThemes: true,
-            noContextFiles: true,
-            ...(chatOnly
-              ? {
-                  systemPrompt: " ",
-                  systemPromptOverride: () => undefined,
-                }
-              : {}),
-            appendSystemPrompt: subagentResources.appendSystemPrompt,
-            ...(usesExactSystemPrompt ? { extensionFactories: [exactSystemPromptExtension] } : {}),
-          }
-        : chatWorkspace
-          ? {
-              // Extensions, skills, prompt templates and MCP load as in a project, but no
-              // global, ancestor or project instructions may leak into a chat's prompt.
-              noContextFiles: true,
-              systemPrompt: chatWorkspacePrompt(chatFilesEnabled, { folder: chatFolder, unlocked: chatUnlocked }),
-              extensionFactories: [
-                ...(builtins?.extensions ?? []),
-                createArtifactGuideExtension(),
-                // A chat with a folder saves into it; only a legacy chat still saves to Downloads.
-                ...(chatGrants && !chatFolder
-                  ? [createChatDownloadsExtension({
-                      grants: chatGrants,
-                      confirmBeforeSaving: () => readChatSettings().confirmSave,
-                    })]
-                  : []),
-                createChatWorkspaceExtension({
-                  getSkills: () => chatSessionRef.current?.resourceLoader.getSkills().skills ?? [],
-                  getCwd: () => sessionCwd,
-                  getInstructions: () => chatInstructionsSection(readChatSettings()),
-                  getExtraTools: () => readChatSettings().allowedTools,
-                  folder: chatFolder,
-                  unrestricted: chatUnlocked,
-                  ...(chatGrants ? { grants: chatGrants } : {}),
-                }),
-              ],
-              // An unlocked chat has every tool, so extensions that hand work to an agent may load too.
-              ...(chatUnlocked
-                ? {}
-                : { extensionsOverride: (base: LoadExtensionsResult) => withoutAgentDelegation(base, CHAT_DELEGATION_TOOL_NAMES) }),
-            }
-        : chatOnly
-          ? {
-              ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS,
-              extensionFactories: [exactSystemPromptExtension],
-            }
-        : {
-            // The bus pi-web owns (see above): the loader hands it to every
-            // extension as `pi.events`, so the pi-subagents RPC bridge in this
-            // session listens on it.
-            eventBus: subagentsEventBus,
-            extensionFactories: [
-              ...(builtins?.extensions ?? []),
-              createReadOnlyMcpPolicyExtension(),
-              createArtifactGuideExtension(),
-              createProjectCommandBashExtension({
-                cwd: sessionCwd,
-                settings: settingsManager,
-              }),
-              createSubagentExtension(
-                SUBAGENT_CONTROLLER.extensionRuntime,
-                () => listSubagentProfiles(sessionCwd),
-                isBuiltInSubagentsEnabled,
-              ),
-            ],
-            extensionsOverride: (base) => preferUserBashExtension(preferPiSubagentsExtension(base)),
-          },
-      ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
-    });
-    const scope = await resolveVisibleModels(
-      services.modelRuntime,
-      services.settingsManager.getEnabledModels(),
-    );
-    const effectiveInitialModel = initialModel && (
-      !allowInitialModelFallback
-      || scope.visible.some((model) => model.provider === initialModel.provider && model.id === initialModel.modelId)
-    )
-      ? initialModel
-      : undefined;
-    const defaultProvider = services.settingsManager.getDefaultProvider();
-    const defaultModelId = services.settingsManager.getDefaultModel();
-    const branch = sessionManager.getBranch();
-    // System messages carry the prompt and tool loadout, not a conversation.
-    const hasExistingMessages = branch.some((entry) => entry.type === "message" && entry.message.role !== "system");
-    // Mirror getSessionSettings(): the pre-wrapper UI shows the last
-    // model_change, falling back to assistant response metadata — restore the
-    // same model here so the displayed model cannot jump when the wrapper
-    // lazily starts and would otherwise land on the configured default.
-    const savedModel = hasExistingMessages
-      ? getLatestModelChange(branch as unknown as SessionEntry[])
-        ?? getLatestResponseModel(branch as unknown as SessionEntry[])
-      : null;
-    const restoredModel = savedModel
-      ? services.modelRuntime.getModel(savedModel.provider, savedModel.modelId)
-      : undefined;
-    // A new chat may start on the model and reasoning level chosen in Settings › Chats; an
-    // explicit pick for this session still wins, and unset fields follow the global defaults.
-    const chatStart = chatWorkspace && !hasExistingMessages
-      ? resolveChatStartDefaults(readChatSettings(), scope.visible)
-      : {};
-    const initial = hasExistingMessages ? null : selectInitialModelScope(scope, {
-        ...((effectiveInitialModel ?? chatStart.requestedModel)
-          ? { requestedModel: effectiveInitialModel ?? chatStart.requestedModel }
-          : {}),
-        ...(defaultProvider && defaultModelId
-          ? { defaultModel: { provider: defaultProvider, modelId: defaultModelId } }
-          : {}),
-        ...((thinkingLevel ?? chatStart.thinkingLevel) ? { thinkingLevel: thinkingLevel ?? chatStart.thinkingLevel } : {}),
-      });
-    const startupModel = restoredModel && services.modelRuntime.hasConfiguredAuth(restoredModel.provider)
-      ? restoredModel
-      : initial?.model;
-    const { session: inner } = await createAgentSessionFromServices({
-      services,
-      sessionManager,
-      ...(startupModel ? { model: startupModel } : {}),
-      ...(initial?.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
-      ...(scope.scopedModels.length > 0 ? { scopedModels: [...scope.scopedModels] } : {}),
-      ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
-      ...(subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
-    });
-
-    chatSessionRef.current = inner;
-
-    // A pinned selection replaces only the coding tools of the SDK's initial loadout, which
-    // already holds the extension tools pi activates on registration and whatever
-    // `defaultTools` names (such as `+codemode`), so installed extensions stay usable in
-    // Pi Web just like in the `pi` CLI. A chat keeps `read` alone among the coding tools:
-    // its policy extension confines it to skill files, which is how a skill loads.
-    if (!subagentResources && !chatOnly) {
-      const initialToolNames = inner.getActiveToolNames();
-      const chatRestricted = chatWorkspace && !chatUnlocked;
-      const activeToolNames = resolveActiveToolNames(
-        inner,
-        chatRestricted
-          ? chatFolder ? [...CHAT_FOLDER_TOOL_NAMES] : [CHAT_READ_TOOL_NAME]
-          : selectedToolNames ?? initialToolNames,
-        initialToolNames,
-      );
-      inner.setActiveToolsByName(chatRestricted ? restrictToChatTools(inner, activeToolNames, chatFolder) : activeToolNames);
-    }
-
-    const exactSystemPrompt = subagentResources?.exactSystemPrompt !== undefined
-      ? () => subagentResources.exactSystemPrompt!
-      : chatOnly
-        ? subagentResources
-          ? () => subagentResources.appendSystemPrompt[0] ?? ""
-          : () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
-        : undefined;
-    exactSystemPromptRef.current = exactSystemPrompt;
-    const wrapper = new AgentSessionWrapper(inner, {
-      exactSystemPrompt,
-      chatOnly,
-      chatWorkspace,
-      chatFolder,
-      chatUnlocked,
-      onAgentRunComplete: (completedSessionId) => {
-        void notifySessionComplete(completedSessionId).catch((error) => {
-          console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);
-        });
-      },
-      suppressCompletionNotifications: Boolean(subagentResources),
-      ...(builtins?.mcpHost ? { mcpHost: builtins.mcpHost } : {}),
-      ...(subagentsEventBus ? { subagentsEventBus } : {}),
-    });
-    const realSessionId = inner.sessionId as string;
-    registerRpcWrapper(wrapper);
-
-    return { session: wrapper, realSessionId };
   })().finally(() => {
     locks.delete(sessionId);
     finishStartingSession();
