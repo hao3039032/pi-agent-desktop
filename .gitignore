@@ -72,4 +72,5 @@ e2e_*.mjs
 # Fork: distro build artifacts (scripts/distro-*.mjs)
 /src-tauri/resources/pi-seed/
 /src-tauri/resources/git/
+/src-tauri/resources/pi/
 /src-tauri/tauri.distro.conf.json

@@ -134,3 +134,19 @@ set_active_tools、navigate_tree(+summarize)、send_custom_message、get_extensi
 - 删 SUBAGENT_CONTROLLER 与进程内会话构造路径(startRpcSession 的 in-process 分支、exact-system-prompt/chat-workspace-policy/mcp-host 等宿主扩展接线);67 个 runtime import 清点。
 - fleet 监控(subagents API)对 CLI 会话降级为 unavailable——待上游 RPC adapter 或经子进程扩展总线重建。
 - e2e 恢复到不同模型的断言(需第二个已配凭据模型);get_commands 确定性断言;FileSessionManagerView 纯单测。
+
+### 收尾评审批次(2026-10-24,3 评审 BLOCK/BLOCK/OK-with-notes → 修复)
+
+修复项(全部落地):
+- **子进程环境继承**(P1):buildCliEnv 现以 process.env 为底再消毒——此前真实路由路径的子进程拿到近空环境(无 PATH/TEMP/凭据,PI_CODING_AGENT_DIR 部署下父子 agent 目录分叉)。补回归单测。
+- **exact-prompt 临时文件**(P1):改为每会话 mkdtemp(0700)+0600 文件,core dispose 时删除;不再用共享 tmp 的可预测文件名(信息外泄+symlink 覆写原语+无限累积)。
+- **Settings›Chats 起始默认**(P1):新聊天在 CLI 分支读 chatSettings,模型/思考默认经 factory 的 set_model 链生效(子进程目录解析兜底,等价 hasConfiguredAuth 回退)。
+- **distro 资源清单测试**(P0):期望数组补 resources/pi。
+- **CI e2e**(P1):live-wrapper 块在无 pi 二进制时显式 SKIP(CI 需 PI_CLI_BIN 才跑该块)。
+- **发布链路**(P1):distro-release 下载 pi(per-platform)并设 PI_DESKTOP_REQUIRE_PI=1;prepare-desktop 在该门下无源即拒。
+- **chatWorkspace 测试缺口**(P1):folder-chat 路由级 e2e(沙箱 agentDir、策略断言)+ buildCliEnv 继承/PI_WEB_CHAT_* 单测。
+- P2 批:.gitignore 忽略 resources/pi;bridge.unit artifacts 测试沙箱化;lifecycle 改用 resolvePiCliBin(MSYS 归一);chat instructions 补包装前缀+8000 截断+工具名 pattern/上限;bridge 的 tool-selection 解析集合对齐(不含 powershell);chat 资产 userHome 读 PI_AGENT_HOME。
+
+记录的取舍与后续:
+- **内置子代理在 CLI 引擎上闲置**(记录):CLI 会话不注册内置 Agent/get_subagent_result/steer_subagent;子代理需 pi-subagents 包(子进程内原生跑)。AgentsConfig 的开关/通知对 CLI 会话冻结;fleet API 返回 unavailable(core 的 resourceLoader 视图无 getExtensions,not-loaded 原因有误导性)。M4 删控制器时一并处理或在 UI 标注。
+- 已知漂移(接受/推迟):chat-only pin 经桥接多出 artifacts 段(进程内无);exact prompt 冻结于 spawn(进程内每 run 重算,appendSystemPrompt 未中和);enabledModels 作用域未施加于子进程默认;navigate 的 --instructions 按空白拆分;reload/navigate 120s 超时;计划任务标记可能落分支外;fork_branch 无 streaming 守卫;刷新显示磁盘尾 leaf(子进程内存 leaf 不可见);模型 bash 无 agent-bin PATH 前缀/shellCommandPrefix;源断言测试锁着不可达的进程内路径(M4 清理时同步)。

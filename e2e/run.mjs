@@ -218,6 +218,7 @@ try {
   // #632 regression: a live wrapper shadows the session file. Ordinary reads
   // keep that snapshot (two processes writing one JSONL is unsupported). A
   // mount/refresh GET (?force=1) must see the external append and stay stable.
+  if (process.env.PI_CLI_BIN || process.env.PI_CLI_SOURCE) {
   {
     const file = join(sessionDir, `2026-08-23T00-00-00-000Z_${APPEND}.jsonl`);
     await post(`/api/agent/${APPEND}`, { type: "get_state" });
@@ -235,6 +236,13 @@ try {
     const appended = await api(`/api/sessions/${APPEND}/context?tail=1`);
     assert.deepEqual(appended.context.entryIds, ["external"], "the appended entry must be readable on its own");
     console.log("PASS: external session-file appends are visible on force/mount reads");
+  }
+  } else {
+    // Sessions run on the pi CLI child since the route flip: without a pi
+    // binary (PI_CLI_BIN / PI_CLI_SOURCE / the packaged resources) the live
+    // wrapper cannot start. The engine's own suites (lib/pi-rpc) carry that
+    // coverage; this block needs the binary.
+    console.log("SKIP: live-wrapper snapshot block needs a pi CLI binary (PI_CLI_BIN)");
   }
 
   browser = await chromium.launch();

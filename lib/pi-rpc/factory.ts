@@ -20,8 +20,7 @@
  */
 
 import { getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentSessionWrapper } from "../rpc-manager";
@@ -122,13 +121,15 @@ function resolveAssetPath(file: string): string {
   );
 }
 
-export function buildCliEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  // The child's bash tool runs in this environment, so the host runtime
-  // variables that lib/project-command-env.ts strips from `!` commands
-  // (PORT, NODE_ENV, NEXT_*, PI_WEB_PASSWORD — the web password guards this
-  // server and no project command needs it) must not reach it either. The
+export function buildCliEnv(base: Partial<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
+  // The child inherits the host environment (PATH, TEMP, credentials, the
+  // documented PI_* overrides): the sanitizer then strips what must not
+  // reach it — the host runtime variables that lib/project-command-env.ts
+  // strips from `!` commands (PORT, NODE_ENV, NEXT_*, PI_WEB_PASSWORD — the
+  // web password guards this server and no project command needs it) and
+  // the app-shell vars that repoint the SDK at the packaged app. The
   // agent-bin PATH prepend is host-side only and stays out.
-  const env = sanitizeProjectCommandEnvironment({ ...base });
+  const env = sanitizeProjectCommandEnvironment({ ...process.env, ...base });
   for (const key of STRIP_ENV_KEYS) delete env[key];
   return env;
 }
@@ -196,11 +197,26 @@ function chatSpawnToolNames(chat: { folder: boolean; unlocked: boolean }): strin
   return ["read"];
 }
 
-function writeExactPromptFile(prompt: string): string {
-  const hash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
-  const file = join(tmpdir(), `pi-web-exact-prompt-${hash}.txt`);
-  if (!existsSync(file)) writeFileSync(file, prompt, "utf8");
-  return file;
+/**
+ * A private per-session dir (0700) holding the --system-prompt file (0600):
+ * the prompt carries the project's context files, so it must not sit in the
+ * shared tmp under a predictable name. The core deletes the dir on dispose —
+ * pi reads --system-prompt once at startup, so disposal timing is safe.
+ */
+function createExactPromptFile(prompt: string): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "pi-web-prompt-"));
+  const file = join(dir, "system-prompt.txt");
+  writeFileSync(file, prompt, { encoding: "utf8", mode: 0o600 });
+  return {
+    path: file,
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best effort: a held handle leaves the file behind harmlessly.
+      }
+    },
+  };
 }
 
 export async function startCliRpcSession(options: StartCliSessionOptions): Promise<StartedCliSession> {
@@ -253,6 +269,7 @@ export async function startCliRpcSessionFromManager(
   if (!executable) throw new Error("startCliRpcSession: executable is required");
   const sessionFile = ensureSessionFile(manager);
   const sessionCwd = manager.getCwd();
+  const promptCleanups: Array<() => void> = [];
 
   // 2. Spawn args.
   const args: string[] = ["--session", sessionFile];
@@ -264,6 +281,8 @@ export async function startCliRpcSessionFromManager(
     // no discoverable resources, and the exact prompt (built from the
     // session's context files) replaces pi's own — so context files must not
     // be added a second time. The bridge stays: navigate/reload remain live.
+    const promptFile = createExactPromptFile(options.chatOnlyExactPrompt);
+    promptCleanups.push(promptFile.cleanup);
     args.push(
       "--no-tools",
       "--no-extensions",
@@ -271,7 +290,7 @@ export async function startCliRpcSessionFromManager(
       "--no-prompt-templates",
       "--no-themes",
       "--no-context-files",
-      "--system-prompt", writeExactPromptFile(options.chatOnlyExactPrompt),
+      "--system-prompt", promptFile.path,
     );
   }
   if (options.chatWorkspace) {
@@ -279,9 +298,11 @@ export async function startCliRpcSessionFromManager(
     // The chat policy extension carries the tool guards, grants and the
     // save_to_downloads tool; no context files may leak into a chat's prompt
     // (the chat preamble replaces pi's system prompt).
+    const promptFile = createExactPromptFile(chat.systemPrompt);
+    promptCleanups.push(promptFile.cleanup);
     args.push(
       "--no-context-files",
-      "--system-prompt", writeExactPromptFile(chat.systemPrompt),
+      "--system-prompt", promptFile.path,
       "--extension", resolveAssetPath("pi-web-chat.mjs"),
     );
     // Delegation tools hand work to agents that carry their own tools — a
@@ -356,6 +377,9 @@ export async function startCliRpcSessionFromManager(
       spawnToolNames,
       knownToolNames: CODING_TOOL_NAMES,
       ...(options.agentDir ? { agentDir: options.agentDir } : {}),
+      ...(promptCleanups.length > 0
+        ? { onDispose: () => { for (const cleanup of promptCleanups) cleanup(); } }
+        : {}),
     });
     await core.refreshState();
     await core.refreshCommands();
@@ -413,6 +437,7 @@ export async function startCliRpcSessionFromManager(
     };
   } catch (error) {
     await client.close().catch(() => {});
+    for (const cleanup of promptCleanups) cleanup();
     throw error;
   }
 }

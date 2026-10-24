@@ -124,6 +124,8 @@ export interface CliAgentSessionCoreOptions extends RpcAgentSessionOptions {
   knownToolNames: readonly string[];
   /** Session storage dir (tests sandbox it); also the fork target dir. */
   sessionDir?: string;
+  /** Run when the core is disposed (the factory drops its prompt-file dir). */
+  onDispose?: () => void;
 }
 
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
@@ -148,6 +150,7 @@ export class CliAgentSessionCore extends RpcAgentSession {
   private readonly coreSessionFile: string;
   private readonly sessionCwd: string;
   private readonly sessionDir: string | undefined;
+  private onDisposeCallback: (() => void) | undefined;
   private readonly spawnToolNames: string[] | undefined;
   private readonly knownToolNames: readonly string[];
   private readonly localSettings: SettingsManager;
@@ -163,6 +166,7 @@ export class CliAgentSessionCore extends RpcAgentSession {
     this.spawnToolNames = options.spawnToolNames;
     this.knownToolNames = options.knownToolNames;
     this.sessionDir = options.sessionDir;
+    this.onDisposeCallback = options.onDispose;
     this.view = new FileSessionManagerView(this.coreSessionFile, this.sessionCwd, options.sessionDir);
     this.localSettings = SettingsManager.create(this.sessionCwd, options.agentDir ?? getAgentDir());
   }
@@ -196,7 +200,16 @@ export class CliAgentSessionCore extends RpcAgentSession {
       }
     }
     this.uiRelay = undefined;
+    const disposeExtras = this.onDisposeCallback;
+    this.onDisposeCallback = undefined;
     super.dispose();
+    if (disposeExtras) {
+      try {
+        disposeExtras();
+      } catch {
+        // best effort
+      }
+    }
   }
 
   // --- heavy members -------------------------------------------------------

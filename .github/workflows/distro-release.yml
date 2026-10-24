@@ -150,8 +150,29 @@ jobs:
       - name: Write component manifest
         run: npm run release:manifest
 
+      - name: Download the pi CLI for the bundled engine
+        # Sessions run on a bundled `pi` child since the route flip; stage the
+        # binary per runner platform (the plan doc's verified release URLs).
+        shell: bash
+        run: |
+          case "${{ matrix.platform }}" in
+            windows) zip="pi-windows-x64.zip"; exe="pi.exe" ;;
+            macos) zip="pi-macos-x64.zip"; exe="pi" ;;
+            linux) zip="pi-linux-x64.zip"; exe="pi" ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/pi-bin"
+          curl -fsSL "https://github.com/earendil-works/pi/releases/latest/download/$zip" -o "$RUNNER_TEMP/pi-bin/$zip"
+          unzip -o "$RUNNER_TEMP/pi-bin/$zip" -d "$RUNNER_TEMP/pi-bin"
+          test -x "$RUNNER_TEMP/pi-bin/$exe"
+          echo "PI_CLI_SOURCE=$RUNNER_TEMP/pi-bin/$exe" >> "$GITHUB_ENV"
+
       - name: Prepare packaged Next.js server
+        # Every session runs on the bundled pi CLI (route flip); a release
+        # without the binary would be dead on arrival, so the gate is hard.
         run: npm run desktop:prepare
+        env:
+          PI_DESKTOP_REQUIRE_PI: "1"
+          PI_CLI_SOURCE: ${{ env.PI_CLI_SOURCE }}
 
       - name: Verify packaged frontend after an overwrite upgrade
         run: node scripts/verify-packaged-frontend.mjs

@@ -419,6 +419,13 @@ if (piSource) {
   const piDestination = join(piResourcesDir, basename(piSource));
   await copyFile(piSource, piDestination);
   console.log(`pi CLI staged at ${relative(rootDir, piDestination)}`);
+} else if (process.env.PI_DESKTOP_REQUIRE_PI === "1") {
+  // Release context: every session runs on the pi CLI child since the route
+  // flip, so a desktop without the binary is fully broken, not degraded.
+  throw new Error(
+    "PI_DESKTOP_REQUIRE_PI=1 but neither PI_CLI_SOURCE nor PI_CLI_BIN is set: " +
+      "the packaged desktop would have no pi CLI to run sessions on.",
+  );
 } else {
   console.log("No PI_CLI_SOURCE/PI_CLI_BIN set: the desktop will resolve pi from PATH.");
 }

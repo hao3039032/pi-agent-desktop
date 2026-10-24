@@ -2852,6 +2852,16 @@ export async function startRpcSession(
     if (!subagentResources) {
       if (chatWorkspace) {
         const chatFilesEnabled = chatWorkspace && !isNetworkExposedServer();
+        // A new chat starts on the model and reasoning level picked in
+        // Settings › Chats (an explicit pick for this session still wins);
+        // the factory resolves the model against the child's own catalog,
+        // falling back to its default when unconfigured (mirrors the
+        // in-process hasConfiguredAuth guard).
+        const branch = sessionManager.getBranch();
+        const chatHasMessages = branch.some((entry) => entry.type === "message" && entry.message.role !== "system");
+        const chatSettings = !chatHasMessages ? readChatSettings() : null;
+        const chatInitialModel = initialModel ?? chatSettings?.model ?? undefined;
+        const chatThinking = thinkingLevel ?? chatSettings?.thinkingLevel ?? undefined;
         const started = await startCliRpcSessionFromManager(sessionManager, {
           sessionId,
           executable: resolvePiExecutable(),
@@ -2861,8 +2871,8 @@ export async function startRpcSession(
             filesEnabled: chatFilesEnabled,
             systemPrompt: chatWorkspacePrompt(chatFilesEnabled, { folder: chatFolder, unlocked: chatUnlocked }),
           },
-          ...(initialModel ? { initialModel } : {}),
-          ...(thinkingLevel ? { thinkingLevel } : {}),
+          ...(chatInitialModel ? { initialModel: chatInitialModel } : {}),
+          ...(chatThinking ? { thinkingLevel: chatThinking } : {}),
           onAgentRunComplete: (completedSessionId) => {
             void notifySessionComplete(completedSessionId).catch((error) => {
               console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);

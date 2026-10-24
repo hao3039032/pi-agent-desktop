@@ -32,11 +32,11 @@ test("a .0 base encodes its revision as a prerelease suffix", () => {
 
 test("distro resources extend the upstream list per platform", () => {
   assert.deepEqual(distroResources("windows", ["resources/server", "resources/node"]),
-    ["resources/server", "resources/node", "resources/pi-seed", "resources/git"]);
+    ["resources/server", "resources/node", "resources/pi-seed", "resources/pi", "resources/git"]);
   assert.deepEqual(distroResources("macos", ["resources/server"]),
-    ["resources/server", "resources/pi-seed", "resources/node"]);
+    ["resources/server", "resources/pi-seed", "resources/pi", "resources/node"]);
   assert.deepEqual(distroResources("linux", ["resources/server", "resources/node"]),
-    ["resources/server", "resources/node", "resources/pi-seed"]);
+    ["resources/server", "resources/node", "resources/pi-seed", "resources/pi"]);
 });
 
 test("seed paths match where pi installs each source", () => {
