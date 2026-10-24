@@ -156,6 +156,13 @@ type AgentSessionWrapperOptions = {
   chatFolder?: boolean;
   /** The user let this chat use their computer. */
   chatUnlocked?: boolean;
+  /**
+   * The pi CLI engine has no in-memory tool switch (pi 1.4.0): selection is
+   * spawn-time, changes respawn the child, and pi restores a branch's
+   * loadout from its transcript on navigate/reload. With this flag the
+   * wrapper skips the live re-pin instead of failing the flow.
+   */
+  noLiveToolSwitch?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
@@ -357,6 +364,7 @@ export class AgentSessionWrapper {
   /** What this session may reach; computed once at start (lib/session-policy.ts). */
   private readonly policy: SessionPolicy;
   private readonly chatFolder: boolean;
+  private readonly noLiveToolSwitch: boolean;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
   private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
@@ -395,6 +403,7 @@ export class AgentSessionWrapper {
       chatUnlocked: options.chatUnlocked,
     });
     this.chatFolder = options.chatFolder === true;
+    this.noLiveToolSwitch = options.noLiveToolSwitch === true;
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.mcpHost = options.mcpHost;
@@ -715,6 +724,11 @@ export class AgentSessionWrapper {
 
   /** Apply a coding tool selection; `carry` defaults to the tools active now. */
   setActiveToolSelection(toolNames: string[], carry: readonly string[] = this.inner.getActiveToolNames()): void {
+    if (this.noLiveToolSwitch) {
+      // The child restored the target branch's loadout itself; the pin
+      // re-applies at the next respawn (setRpcSessionTools).
+      return;
+    }
     const names = resolveActiveToolNames(this.inner, toolNames, carry);
     this.inner.setActiveToolsByName(this.chatWorkspace ? restrictToChatTools(this.inner, names, this.chatFolder) : names);
   }

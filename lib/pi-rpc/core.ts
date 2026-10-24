@@ -28,7 +28,7 @@
 import { getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { existsSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { PiAgentMessage, SlashCommandInfo, ToolInfo } from "../pi-types";
+import type { NavigateTreeOptions, NavigateTreeResult, PiAgentMessage, SlashCommandInfo, ToolInfo } from "../pi-types";
 import { PiRpcClient, type PiRpcRecord } from "./client";
 import { PiRpcUnsupportedError, RpcAgentSession, type RpcAgentSessionOptions, type RpcAgentSessionState } from "./session";
 
@@ -37,10 +37,11 @@ export class FileSessionManagerView {
   constructor(
     private readonly file: string,
     private readonly fallbackCwd: string,
+    private readonly sessionDir?: string,
   ) {}
 
   private open(): SessionManager {
-    return SessionManager.open(this.file, undefined);
+    return SessionManager.open(this.file, this.sessionDir);
   }
 
   getCwd(): string {
@@ -76,18 +77,23 @@ export class FileSessionManagerView {
   }
 
   // The tree-writing/moving members the wrapper's fork/fork_branch/clone
-  // paths reach: unsupported on this engine, and loudly so — a silent
-  // TypeError from a missing member reads like a protocol bug.
+  // paths reach. These are FILE-level operations the backing SDK manager
+  // already implements, so they work here; only in-process navigation is
+  // not (the bridge extension owns that).
   isPersisted(): boolean {
-    throw new PiRpcUnsupportedError("sessionManager.isPersisted()", "M2: session tree");
+    return this.open().isPersisted();
   }
 
   getLeafId(): string | null {
-    throw new PiRpcUnsupportedError("sessionManager.getLeafId()", "M2: session tree");
+    return this.open().getLeafId();
   }
 
   getSessionDir(): string {
-    throw new PiRpcUnsupportedError("sessionManager.getSessionDir()", "M2: session tree");
+    return this.sessionDir ?? this.open().getSessionDir();
+  }
+
+  createBranchedSession(leafId: string): string | undefined {
+    return this.open().createBranchedSession(leafId);
   }
 
   getSessionName(): string | undefined {
@@ -116,9 +122,23 @@ export interface CliAgentSessionCoreOptions extends RpcAgentSessionOptions {
   spawnToolNames?: string[];
   /** All coding tool names (the preset universe) for the degraded tool list. */
   knownToolNames: readonly string[];
+  /** Session storage dir (tests sandbox it); also the fork target dir. */
+  sessionDir?: string;
 }
 
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
+
+/** Plain text of a message content (string or blocks), the SDK's editorText derivation. */
+function contentText(content: unknown): string | undefined {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return undefined;
+  const text = content
+    .filter((block): block is { type: "text"; text: string } =>
+      typeof block === "object" && block !== null && (block as { type?: string }).type === "text")
+    .map((block) => block.text)
+    .join("");
+  return text || undefined;
+}
 
 interface GetCommandsResult {
   commands?: Array<SlashCommandInfo & { source?: string }>;
@@ -127,6 +147,7 @@ interface GetCommandsResult {
 export class CliAgentSessionCore extends RpcAgentSession {
   private readonly coreSessionFile: string;
   private readonly sessionCwd: string;
+  private readonly sessionDir: string | undefined;
   private readonly spawnToolNames: string[] | undefined;
   private readonly knownToolNames: readonly string[];
   private readonly localSettings: SettingsManager;
@@ -141,7 +162,8 @@ export class CliAgentSessionCore extends RpcAgentSession {
     this.sessionCwd = options.cwd;
     this.spawnToolNames = options.spawnToolNames;
     this.knownToolNames = options.knownToolNames;
-    this.view = new FileSessionManagerView(this.coreSessionFile, this.sessionCwd);
+    this.sessionDir = options.sessionDir;
+    this.view = new FileSessionManagerView(this.coreSessionFile, this.sessionCwd, options.sessionDir);
     this.localSettings = SettingsManager.create(this.sessionCwd, options.agentDir ?? getAgentDir());
   }
 
@@ -291,7 +313,57 @@ export class CliAgentSessionCore extends RpcAgentSession {
     throw new Error("Tool changes on the pi CLI engine restart the session; use the session factory");
   }
 
+  // --- tree navigation via the bridge extension ----------------------------
+
+  /**
+   * The bridge extension's `/pi-web:navigate` command runs the child's own
+   * navigateTree (in-memory leaf move; the file keeps every branch). The
+   * editor text for a re-edit target is computed here from the entry, the
+   * same way the SDK derives it. The `summarize` flag goes through; its
+   * branch_summary entry lands in the shared file for the reader to show.
+   * Aborting an in-flight summary is not reachable through a command, so
+   * abortBranchSummary stays unsupported on this engine.
+   */
+  override async navigateTree(targetId: string, options?: NavigateTreeOptions): Promise<NavigateTreeResult> {
+    if (this.isStreaming || this.isCompacting) {
+      throw new Error("Wait for the current response to finish before navigating the session tree.");
+    }
+    const targetEntry = this.view.getEntry(targetId);
+    if (!targetEntry) throw new Error(`Entry ${targetId} not found`);
+
+    const commandParts = ["pi-web:navigate", targetId];
+    if (options?.summarize) commandParts.push("--summarize");
+    if (typeof options?.customInstructions === "string" && options.customInstructions.trim()) {
+      commandParts.push("--instructions", options.customInstructions.trim());
+    }
+    // "handled" is the only healthy outcome: the bridge owns the command, so
+    // no run starts. A rejection (busy tree, cancelled summary) propagates
+    // exactly like the SDK's navigateTree throwing.
+    await this.rpc.command("prompt", { message: `/${commandParts.join(" ")}` }, 120_000);
+
+    // Mirror the SDK: re-editing a user (or custom) message puts its text
+    // back into the composer and moves the leaf to its parent.
+    const entry = targetEntry as { type?: string; message?: { role?: string; content?: unknown }; content?: unknown };
+    if (entry.type === "custom_message") {
+      return { cancelled: false, editorText: contentText(entry.content) };
+    }
+    if (entry.type === "message" && entry.message?.role === "user") {
+      return { cancelled: false, editorText: contentText(entry.message.content) };
+    }
+    return { cancelled: false };
+  }
+
+  /** The bridge's `/pi-web:reload` runs the child's own extension/skill/context reload. */
+  override async reload(): Promise<void> {
+    await this.rpc.command("prompt", { message: "/pi-web:reload" }, 120_000);
+  }
+
   // --- commands cache ------------------------------------------------------
+
+  /** Whether the child reports a command by invocation name (bridge health check). */
+  hasBridgeCommand(name: string): boolean {
+    return (this.commandsCache ?? []).some((command) => command.name === name);
+  }
 
   /** Refresh the get_commands-backed views; called by the factory after spawn. */
   async refreshCommands(): Promise<void> {

@@ -20,6 +20,8 @@
  */
 
 import { getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { AgentSessionWrapper } from "../rpc-manager";
 import type { SessionEntry } from "../types";
 import { getLatestModelChange, getLatestResponseModel } from "../session-reader";
@@ -67,6 +69,25 @@ export interface StartedCliSession {
 
 /** App-shell vars that repoint the SDK's module resolution at the packaged app. */
 const STRIP_ENV_KEYS = ["PI_PACKAGE_DIR", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "JITI_ALIAS"];
+
+/**
+ * The bridge extension shipped next to the server code. The server root is
+ * the process cwd in both dev and the desktop layout; an env override keeps
+ * unusual embeds workable.
+ */
+export function resolveBridgeExtensionPath(): string {
+  if (process.env.PI_WEB_BRIDGE_EXTENSION) return process.env.PI_WEB_BRIDGE_EXTENSION;
+  const candidates = [
+    join(process.cwd(), "lib", "pi-rpc", "assets", "pi-web-bridge.mjs"),
+    join(process.cwd(), "resources", "server", "lib", "pi-rpc", "assets", "pi-web-bridge.mjs"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `pi-web bridge extension not found (looked at ${candidates.join(", ")}); set PI_WEB_BRIDGE_EXTENSION`,
+  );
+}
 
 export function buildCliEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   // The child's bash tool runs in this environment, so the host runtime
@@ -158,6 +179,9 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
   // Keep the child's own session storage (/new, /branch, fork targets) on the
   // same dir pi-web chose — otherwise the child reverts to the global store.
   if (options.sessionDir) args.push("--session-dir", options.sessionDir);
+  // The bridge owns tree navigation and reload inside the child; without it
+  // the wrapper's navigate_tree would send literal command text to the model.
+  args.push("--extension", resolveBridgeExtensionPath());
   // The shell mapping reads the same settings.json the in-process engine
   // reads (resolveActiveToolNames), so a pinned `bash` follows the powershell
   // switch instead of enabling both shells.
@@ -195,6 +219,7 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
       initialState: initialCoreState(state),
       sessionFile,
       cwd: sessionCwd,
+      ...(options.sessionDir ? { sessionDir: options.sessionDir } : {}),
       // Post-mapping names: the picker must show the shell the child actually
       // runs (bash → powershell under the switch), and the coding domain
       // includes powershell so both shells are listed.
@@ -204,6 +229,12 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
     });
     await core.refreshState();
     await core.refreshCommands();
+    // The bridge is load-bearing (navigate/reload go through it); a missing
+    // command means the extension failed to load, and the literal command
+    // text would reach the model. Fail the session instead.
+    if (!core.hasBridgeCommand("pi-web:navigate")) {
+      throw new Error("pi-web bridge extension did not register its commands; refusing to start the session");
+    }
 
     // 4. Restore the saved model unless the child already runs it. pi-web's
     // in-process engine only restores a model the user can authenticate; the
@@ -221,7 +252,9 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
     // M1 bridge: the wrapper consumes AgentSessionLike; the core satisfies
     // it structurally (every member it reads is implemented). The assertion
     // collapses when the wrapper's consumption narrows in M2.
-    const wrapper = new AgentSessionWrapper(core as unknown as AgentSessionLike, {});
+    const wrapper = new AgentSessionWrapper(core as unknown as AgentSessionLike, {
+      noLiveToolSwitch: true,
+    });
     core.attachUiRelay({
       relayExternalUiRequest: (request) => wrapper.relayExternalUiRequest(request as never),
       relayExternalUiEvent: (event) => wrapper.relayExternalUiEvent(event as never),
