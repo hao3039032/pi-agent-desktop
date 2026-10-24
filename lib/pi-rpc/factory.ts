@@ -178,9 +178,12 @@ function buildToolEntries(selection: readonly string[], defaultTools?: readonly 
  */
 export function resolvePiExecutable(): string {
   if (process.env.PI_CLI_BIN && existsSync(process.env.PI_CLI_BIN)) return process.env.PI_CLI_BIN;
+  const exeName = process.platform === "win32" ? "pi.exe" : "pi";
   const packaged = [
-    join(process.cwd(), "resources", "pi", process.platform === "win32" ? "pi.exe" : "pi"),
-    join(process.cwd(), "pi", process.platform === "win32" ? "pi.exe" : "pi"),
+    join(process.cwd(), "resources", "pi", exeName),
+    join(process.cwd(), "pi", exeName),
+    // The desktop server runs with cwd = <resources>/server; pi ships beside it.
+    join(process.cwd(), "..", "pi", exeName),
   ].find((candidate) => existsSync(candidate));
   if (packaged) return packaged;
   return "pi"; // resolved from PATH by the spawn itself

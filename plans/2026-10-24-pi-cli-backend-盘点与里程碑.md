@@ -1,6 +1,6 @@
 # pi CLI 后端切换:调用面盘点与差距表(v1)
 
-状态:进行中(M1 后半:wrapper 换芯已验,见文末实测记录)
+状态:主体完成(M0-M3 全部落地,M4 清理与 fleet 监控为后续;见文末进度)
 分支:wip/pi-cli-backend
 决策(用户已确认):一步到位,**不留 pi-sdk 进程内路径**。本表是重写地图,按里程碑推进。
 
@@ -120,3 +120,17 @@ pi-subagents 扩展在 pi CLI 子进程内运行(实测 standalone 加载用户 
 ## 五、给上游提 PR 的候选清单(增强 pi CLI RPC,反哺生态)
 
 set_active_tools、navigate_tree(+summarize)、send_custom_message、get_extensions、get_system_prompt。这些能让 pi CLI 成为完整的桌面后端,对 OpenClaw 等集成同样有价值。
+
+## 六、M2/M3 落地记录(2026-10-24,提交 0ee3583c..59380f0a)
+
+- **桥接扩展**(assets/pi-web-bridge.mjs):/pi-web:navigate(含 summarize)与 /pi-web:reload 经 ExtensionCommandContext 驱动子进程内建 navigateTree/reload——RPC 1.4.0 的协议缺口由扩展命令补上;工厂验证命令已注册,未加载则拒绝会话。MCP 只读策略与 artifacts 提示词段一并移植入桥接。
+- **路由切换**:startRpcSession 将普通项目会话、chat-only pin、聊天工作区全部交给 CLI 引擎;进程内路径只剩 subagent 子会话(SUBAGENT_CONTROLLER,孤儿化待 M4 删)。
+- **会话树**:fork/clone 经文件手术(view 支持 isPersisted/getLeafId/getSessionDir/createBranchedSession);navigate 经桥接;工具锁定变更 = 重生(canLiveSwitchTools)。
+- **聊天策略资产**(assets/pi-web-chat.mjs):chat-workspace-policy/chat-file-access/chat-downloads-tool 的完整移植,grants 在子进程内从共享会话条目计算;PI_WEB_CHAT_MODE/PI_WEB_CHAT_FILES 环境变量配置;save_to_downloads 工具随行。
+- **打包**:prepare-desktop 经 PI_CLI_SOURCE/PI_CLI_BIN 把 pi.exe 布进 resources/pi(distro 资源清单已加);resolvePiExecutable 依次找 PI_CLI_BIN→打包位(cwd/resources/pi、../pi)→PATH。
+- **测试**:单测(session/bridge/chat-policy 共 23)+ 真二进制 e2e(12)+ 生命周期(61,其中 5 项需 PI_CLI_BIN、无则 skip)全绿。
+
+### M4/后续待办
+- 删 SUBAGENT_CONTROLLER 与进程内会话构造路径(startRpcSession 的 in-process 分支、exact-system-prompt/chat-workspace-policy/mcp-host 等宿主扩展接线);67 个 runtime import 清点。
+- fleet 监控(subagents API)对 CLI 会话降级为 unavailable——待上游 RPC adapter 或经子进程扩展总线重建。
+- e2e 恢复到不同模型的断言(需第二个已配凭据模型);get_commands 确定性断言;FileSessionManagerView 纯单测。

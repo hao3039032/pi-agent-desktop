@@ -49,7 +49,7 @@ export function distroVersion(upstreamVersion, revision) {
 }
 
 export function distroResources(platform, upstreamResources) {
-  const extra = ["resources/pi-seed"];
+  const extra = ["resources/pi-seed", "resources/pi"];
   // macOS bundles node inside "Pi Agent Server.app"; the distro adds the npm
   // CLI next to it under resources/node (see prepare-desktop.mjs).
   if (platform === "macos") extra.push("resources/node");

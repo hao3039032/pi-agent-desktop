@@ -2,7 +2,7 @@ import { access, chmod, copyFile, cp, mkdir, readdir, rm } from "node:fs/promise
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { desktopTargetTriple, readMachOCpuTypes, requiredMachOCpuType } from "./desktop-platform.mjs";
 import { piPackageDirNames } from "./pi-packages.mjs";
@@ -406,6 +406,22 @@ if (overlong.length > 0) {
 }
 
 const { binaryPath: nodeBinary, triple } = await bundleNodeRuntime();
+
+// The CLI engine (lib/pi-rpc) spawns `pi` children; ship the binary beside
+// the server so the desktop works without a PATH install. PI_CLI_SOURCE
+// points at the pi executable to bundle (PI_CLI_BIN works too).
+const piSource = process.env.PI_CLI_SOURCE ?? process.env.PI_CLI_BIN;
+if (piSource) {
+  await access(piSource, constants.R_OK);
+  const piResourcesDir = join(rootDir, "src-tauri", "resources", "pi");
+  await rm(piResourcesDir, { recursive: true, force: true });
+  await mkdir(piResourcesDir, { recursive: true });
+  const piDestination = join(piResourcesDir, basename(piSource));
+  await copyFile(piSource, piDestination);
+  console.log(`pi CLI staged at ${relative(rootDir, piDestination)}`);
+} else {
+  console.log("No PI_CLI_SOURCE/PI_CLI_BIN set: the desktop will resolve pi from PATH.");
+}
 
 console.log(`Desktop server staged at ${serverResourcesDir}`);
 console.log(`Node runtime staged at ${nodeBinary} (${triple})`);
