@@ -44,6 +44,8 @@ export interface StartCliSessionOptions {
   parentSession?: string;
   /** Pinned tool selection for a new session (built-in names only). */
   toolNames?: string[];
+  /** Skip reading a persisted pin (the caller already resolved selection). */
+  resolvedToolNames?: string[] | undefined;
   initialModel?: { provider: string; modelId: string };
   thinkingLevel?: string;
   /** Absolute path of the pi CLI executable. */
@@ -58,6 +60,14 @@ export interface StartCliSessionOptions {
   sessionDir?: string;
   env?: NodeJS.ProcessEnv;
   onLog?: (line: string) => void;
+  /** Completion notifications (startRpcSession wires notifySessionComplete). */
+  onAgentRunComplete?: (sessionId: string) => void;
+  /**
+   * Registration hook for the live path (startRpcSession): when present the
+   * factory hands the wrapper over instead of starting it itself —
+   * registerRpcWrapper() owns wrapper.start().
+   */
+  registerWrapper?: (wrapper: AgentSessionWrapper, realSessionId: string) => void;
 }
 
 export interface StartedCliSession {
@@ -139,6 +149,20 @@ function buildToolEntries(selection: readonly string[], defaultTools?: readonly 
   return CODING_TOOL_NAMES.map((name) => (selected.has(name) ? `+${name}` : `-${name}`));
 }
 
+/**
+ * The pi CLI executable the session engine spawns: PI_CLI_BIN (dev/tests,
+ * highest precedence), the packaged resources location, then PATH.
+ */
+export function resolvePiExecutable(): string {
+  if (process.env.PI_CLI_BIN && existsSync(process.env.PI_CLI_BIN)) return process.env.PI_CLI_BIN;
+  const packaged = [
+    join(process.cwd(), "resources", "pi", process.platform === "win32" ? "pi.exe" : "pi"),
+    join(process.cwd(), "pi", process.platform === "win32" ? "pi.exe" : "pi"),
+  ].find((candidate) => existsSync(candidate));
+  if (packaged) return packaged;
+  return "pi"; // resolved from PATH by the spawn itself
+}
+
 export async function startCliRpcSession(options: StartCliSessionOptions): Promise<StartedCliSession> {
   const { executable } = options;
   if (!executable) throw new Error("startCliRpcSession: executable is required");
@@ -158,21 +182,37 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
       options.parentSession ? { parentSession: options.parentSession } : undefined,
     );
   }
-  const sessionCwd = manager.getCwd();
   const entries = manager.getEntries() as unknown as SessionEntry[];
   const persistedToolNames = readSessionToolSelection(entries);
-  const selection = persistedToolNames ?? requestedToolNames;
+  const requested = options.resolvedToolNames !== undefined ? options.resolvedToolNames : requestedToolNames;
+  const selection = persistedToolNames ?? requested;
   // Validate before anything touches the disk: a rejected start must not
   // leave a permanent empty tool pin behind in the session file.
   if (selection !== undefined && selection.length === 0) {
     throw new Error("Chat-only tool pins are not supported on the pi CLI engine yet (M3)");
   }
-  if (persistedToolNames === undefined && requestedToolNames !== undefined) {
+  if (persistedToolNames === undefined && requested !== undefined) {
     // A pinned selection arriving for an unpinned session is persisted
     // before the child opens the file, exactly like startRpcSession.
-    appendSessionToolSelection(manager, requestedToolNames);
+    appendSessionToolSelection(manager, requested);
   }
+  return startCliRpcSessionFromManager(manager, options, selection);
+}
+
+/**
+ * The spawn half for callers that already own the session manager
+ * (startRpcSession routes project sessions here after its own policy work).
+ * `selection` is the effective pinned selection (persisted pin wins).
+ */
+export async function startCliRpcSessionFromManager(
+  manager: SessionManager,
+  options: StartCliSessionOptions,
+  selection: string[] | undefined,
+): Promise<StartedCliSession> {
+  const { executable } = options;
+  if (!executable) throw new Error("startCliRpcSession: executable is required");
   const sessionFile = ensureSessionFile(manager);
+  const sessionCwd = manager.getCwd();
 
   // 2. Spawn args.
   const args: string[] = ["--session", sessionFile];
@@ -239,7 +279,8 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
     // 4. Restore the saved model unless the child already runs it. pi-web's
     // in-process engine only restores a model the user can authenticate; the
     // child stays on its default when set_model fails, which mirrors that.
-    const savedModel = getLatestModelChange(entries) ?? getLatestResponseModel(entries);
+    const savedModel = getLatestModelChange(manager.getEntries() as unknown as SessionEntry[])
+      ?? getLatestResponseModel(manager.getEntries() as unknown as SessionEntry[]);
     const wanted = savedModel ?? (options.initialModel ?? null);
     if (wanted) {
       const current = core.model;
@@ -254,12 +295,18 @@ export async function startCliRpcSession(options: StartCliSessionOptions): Promi
     // collapses when the wrapper's consumption narrows in M2.
     const wrapper = new AgentSessionWrapper(core as unknown as AgentSessionLike, {
       noLiveToolSwitch: true,
+      ...(options.onAgentRunComplete ? { onAgentRunComplete: options.onAgentRunComplete } : {}),
     });
     core.attachUiRelay({
       relayExternalUiRequest: (request) => wrapper.relayExternalUiRequest(request as never),
       relayExternalUiEvent: (event) => wrapper.relayExternalUiEvent(event as never),
     });
-    wrapper.start();
+    if (options.registerWrapper) {
+      // The live path (startRpcSession) owns start() through registerRpcWrapper.
+      options.registerWrapper(wrapper, core.sessionId);
+    } else {
+      wrapper.start();
+    }
 
     return {
       core,

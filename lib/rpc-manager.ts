@@ -5,6 +5,7 @@ import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
+import { resolvePiExecutable, startCliRpcSessionFromManager } from "./pi-rpc/factory";
 import { invalidateModelsCache } from "./models-cache";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import {
@@ -516,6 +517,11 @@ export class AgentSessionWrapper {
 
   isChatUnlocked(): boolean {
     return this.chatUnlocked;
+  }
+
+  /** False on the pi CLI engine: tool changes need a session restart. */
+  canLiveSwitchTools(): boolean {
+    return !this.noLiveToolSwitch;
   }
 
   /**
@@ -2517,11 +2523,15 @@ export async function setRpcSessionTools(
   const crossesChatOnlyBoundary = toolNames === undefined
     || !hasCurrentResourcePolicy
     || existing.isChatOnly() !== (toolNames.length === 0);
+  // The pi CLI engine has no in-memory tool switch: even a same-boundary pin
+  // change must respawn the child for the new selection to take effect.
+  const needsRestart = crossesChatOnlyBoundary
+    || (typeof existing.canLiveSwitchTools === "function" && !existing.canLiveSwitchTools());
   if (toolNames === undefined) appendClearedSessionToolSelection(existing.inner.sessionManager);
   else appendSessionToolSelection(existing.inner.sessionManager, toolNames);
   invalidateSessionListCache();
 
-  if (toolNames !== undefined && !crossesChatOnlyBoundary) {
+  if (toolNames !== undefined && !needsRestart) {
     existing.setActiveToolSelection(toolNames);
     return { session: existing, sessionId, recreated: false };
   }
@@ -2836,6 +2846,28 @@ export async function startRpcSession(
   const chatOnly = sessionPolicy.kind === "chat-only";
   const finishStartingSession = trackStartingSession(sessionCwd);
   const starting = (async () => {
+    // The CLI engine (M2): normal project sessions run on a `pi --mode rpc`
+    // child. Chats, subagent children and chat-only pins stay in-process
+    // until their policies migrate (M3).
+    if (!chatWorkspace && !subagentResources && !chatOnly) {
+      const started = await startCliRpcSessionFromManager(sessionManager, {
+        sessionId,
+        executable: resolvePiExecutable(),
+        ...(initialModel ? { initialModel } : {}),
+        ...(thinkingLevel ? { thinkingLevel } : {}),
+        onAgentRunComplete: (completedSessionId) => {
+          void notifySessionComplete(completedSessionId).catch((error) => {
+            console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);
+          });
+        },
+        registerWrapper: (wrapper, realSessionId) => {
+          registerRpcWrapper(wrapper);
+          void realSessionId;
+        },
+      }, selectedToolNames);
+      return { session: started.wrapper, realSessionId: started.realSessionId };
+    }
+
     // Some extensions access the SDK's global theme even outside the terminal UI.
     if (!chatOnly) initTheme();
     const agentDir = getAgentDir();
