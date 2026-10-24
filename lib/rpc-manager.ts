@@ -2846,10 +2846,35 @@ export async function startRpcSession(
   const chatOnly = sessionPolicy.kind === "chat-only";
   const finishStartingSession = trackStartingSession(sessionCwd);
   const starting = (async () => {
-    // The CLI engine (M2/M3): normal project sessions and chat-only pins run
-    // on a `pi --mode rpc` child. Chat workspaces and subagent children stay
-    // in-process until their policies migrate (M3).
-    if (!chatWorkspace && !subagentResources) {
+    // The CLI engine (M2/M3): normal project sessions, chat-only pins and
+    // chat workspaces run on a `pi --mode rpc` child. Subagent children stay
+    // in-process until the fleet controller migrates.
+    if (!subagentResources) {
+      if (chatWorkspace) {
+        const chatFilesEnabled = chatWorkspace && !isNetworkExposedServer();
+        const started = await startCliRpcSessionFromManager(sessionManager, {
+          sessionId,
+          executable: resolvePiExecutable(),
+          chatWorkspace: {
+            folder: chatFolder,
+            unlocked: chatUnlocked,
+            filesEnabled: chatFilesEnabled,
+            systemPrompt: chatWorkspacePrompt(chatFilesEnabled, { folder: chatFolder, unlocked: chatUnlocked }),
+          },
+          ...(initialModel ? { initialModel } : {}),
+          ...(thinkingLevel ? { thinkingLevel } : {}),
+          onAgentRunComplete: (completedSessionId) => {
+            void notifySessionComplete(completedSessionId).catch((error) => {
+              console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);
+            });
+          },
+          registerWrapper: (wrapper, realSessionId) => {
+            registerRpcWrapper(wrapper);
+            void realSessionId;
+          },
+        }, undefined);
+        return { session: started.wrapper, realSessionId: started.realSessionId };
+      }
       // A chat-only pin sends the exact prompt built from the session cwd's
       // context files (the same material the in-process extension reads).
       let chatOnlyExactPrompt: string | undefined;

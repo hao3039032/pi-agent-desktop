@@ -78,6 +78,12 @@ export interface StartCliSessionOptions {
   chatOnlyExactPrompt?: string;
   /** Whether the wrapper should adopt the chat-only policy (no tools UI). */
   chatOnly?: boolean;
+  /**
+   * A non-project chat: loads the chat policy extension
+   * (assets/pi-web-chat.mjs) with this scope. `filesEnabled` mirrors the
+   * loopback-only rule that gates named-file reads and Downloads saving.
+   */
+  chatWorkspace?: { folder: boolean; unlocked: boolean; filesEnabled: boolean; systemPrompt: string };
 }
 
 export interface StartedCliSession {
@@ -96,16 +102,23 @@ const STRIP_ENV_KEYS = ["PI_PACKAGE_DIR", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_
  * unusual embeds workable.
  */
 export function resolveBridgeExtensionPath(): string {
-  if (process.env.PI_WEB_BRIDGE_EXTENSION) return process.env.PI_WEB_BRIDGE_EXTENSION;
+  return resolveAssetPath("pi-web-bridge.mjs");
+}
+
+/** A shipped extension asset next to the server code (bridge, chat policy). */
+function resolveAssetPath(file: string): string {
+  if (process.env.PI_WEB_BRIDGE_EXTENSION && file === "pi-web-bridge.mjs") {
+    return process.env.PI_WEB_BRIDGE_EXTENSION;
+  }
   const candidates = [
-    join(process.cwd(), "lib", "pi-rpc", "assets", "pi-web-bridge.mjs"),
-    join(process.cwd(), "resources", "server", "lib", "pi-rpc", "assets", "pi-web-bridge.mjs"),
+    join(process.cwd(), "lib", "pi-rpc", "assets", file),
+    join(process.cwd(), "resources", "server", "lib", "pi-rpc", "assets", file),
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
   }
   throw new Error(
-    `pi-web bridge extension not found (looked at ${candidates.join(", ")}); set PI_WEB_BRIDGE_EXTENSION`,
+    `pi-web extension asset not found: ${file} (looked at ${candidates.join(", ")})`,
   );
 }
 
@@ -171,6 +184,13 @@ export function resolvePiExecutable(): string {
   ].find((candidate) => existsSync(candidate));
   if (packaged) return packaged;
   return "pi"; // resolved from PATH by the spawn itself
+}
+
+/** The coding tools a chat spawns with: file tools for a folder chat, read alone for legacy, everything when unlocked. */
+function chatSpawnToolNames(chat: { folder: boolean; unlocked: boolean }): string[] {
+  if (chat.unlocked) return [...PRESET_FULL, "powershell"];
+  if (chat.folder) return ["read", "write", "edit", "grep", "find", "ls"];
+  return ["read"];
 }
 
 function writeExactPromptFile(prompt: string): string {
@@ -251,6 +271,22 @@ export async function startCliRpcSessionFromManager(
       "--system-prompt", writeExactPromptFile(options.chatOnlyExactPrompt),
     );
   }
+  if (options.chatWorkspace) {
+    const chat = options.chatWorkspace;
+    // The chat policy extension carries the tool guards, grants and the
+    // save_to_downloads tool; no context files may leak into a chat's prompt
+    // (the chat preamble replaces pi's system prompt).
+    args.push(
+      "--no-context-files",
+      "--system-prompt", writeExactPromptFile(chat.systemPrompt),
+      "--extension", resolveAssetPath("pi-web-chat.mjs"),
+    );
+    // Delegation tools hand work to agents that carry their own tools — a
+    // chat's limits would not reach them; pi-web spawns them off.
+    if (!chat.unlocked) {
+      args.push("--exclude-tools", ["Agent", "get_subagent_result", "steer_subagent"].join(","));
+    }
+  }
   // The bridge owns tree navigation and reload inside the child; without it
   // the wrapper's navigate_tree would send literal command text to the model.
   args.push("--extension", resolveBridgeExtensionPath());
@@ -261,11 +297,18 @@ export async function startCliRpcSessionFromManager(
   // A chat-only pin has NO tools active; otherwise the shell-mapped selection.
   const spawnToolNames = options.chatOnlyExactPrompt !== undefined
     ? []
+    : options.chatWorkspace
+    ? chatSpawnToolNames(options.chatWorkspace)
     : selection === undefined
       ? undefined
       : resolveSpawnToolNames(selection, settings.getDefaultTools());
-  if (selection !== undefined && options.chatOnlyExactPrompt === undefined) {
+  if (selection !== undefined && options.chatOnlyExactPrompt === undefined && !options.chatWorkspace) {
     args.push(...buildToolArgs(selection, settings.getDefaultTools()));
+  }
+  if (options.chatWorkspace && !options.chatWorkspace.unlocked) {
+    // The file tools (a folder chat) or read alone (legacy) replace the
+    // coding domain; the chat extension filters everything else per run.
+    args.push(...buildToolArgs(chatSpawnToolNames(options.chatWorkspace), settings.getDefaultTools()));
   }
   if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 
@@ -273,6 +316,12 @@ export async function startCliRpcSessionFromManager(
     args,
     cwd: sessionCwd,
     env: buildCliEnv({
+      ...(options.chatWorkspace
+        ? ({
+            PI_WEB_CHAT_MODE: options.chatWorkspace.unlocked ? "unlocked" : options.chatWorkspace.folder ? "folder" : "legacy",
+            ...(options.chatWorkspace.filesEnabled ? { PI_WEB_CHAT_FILES: "1" } : {}),
+          } as Record<string, string>)
+        : {}),
       ...(options.agentDir ? ({ PI_CODING_AGENT_DIR: options.agentDir } as Record<string, string>) : {}),
       ...(options.env ?? {}),
     } as NodeJS.ProcessEnv),
@@ -334,6 +383,9 @@ export async function startCliRpcSessionFromManager(
     const wrapper = new AgentSessionWrapper(core as unknown as AgentSessionLike, {
       noLiveToolSwitch: true,
       ...(options.chatOnly ? { chatOnly: true } : {}),
+      ...(options.chatWorkspace
+        ? { chatWorkspace: true, chatFolder: options.chatWorkspace.folder, chatUnlocked: options.chatWorkspace.unlocked }
+        : {}),
       ...(options.chatOnlyExactPrompt !== undefined
         ? { exactSystemPrompt: () => options.chatOnlyExactPrompt! }
         : {}),
