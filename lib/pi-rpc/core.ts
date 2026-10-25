@@ -361,7 +361,7 @@ export class CliAgentSessionCore extends RpcAgentSession {
     const commandParts = ["pi-web:navigate", targetId];
     if (options?.summarize) commandParts.push("--summarize");
     if (typeof options?.customInstructions === "string" && options.customInstructions.trim()) {
-      commandParts.push("--instructions", options.customInstructions.trim());
+      commandParts.push("--instructions-b64", Buffer.from(options.customInstructions.trim(), "utf8").toString("base64"));
     }
     // "handled" is the only healthy outcome: the bridge owns the command, so
     // no run starts. A rejection (busy tree, cancelled summary) propagates
@@ -382,7 +382,9 @@ export class CliAgentSessionCore extends RpcAgentSession {
 
   /** The bridge's `/pi-web:reload` runs the child's own extension/skill/context reload. */
   override async reload(): Promise<void> {
-    await this.rpc.command("prompt", { message: "/pi-web:reload" }, 120_000);
+    // Reload restarts extensions and reconnects MCP servers — the same order of
+    // work as compaction, so it gets the same generous timeout.
+    await this.rpc.command("prompt", { message: "/pi-web:reload" }, 600_000);
   }
 
   // --- commands cache ------------------------------------------------------

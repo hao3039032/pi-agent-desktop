@@ -157,3 +157,27 @@ set_active_tools、navigate_tree(+summarize)、send_custom_message、get_extensi
 - **内置子代理系统移除**(用户确认舍弃):subagent-runtime.ts(控制器/通知)、AgentsConfig 组件与 app/api/subagents 路由、settings 的 agents 分区、subagent-input/profile-precedence、subagent-extension 缩到 fleet 检测 + 遗留渲染类型、subagent-settings 缩到包名常量、subagents.ts 缩到遗留标记读取器(763→172 行)。rpc-manager 保留 getSubagentRun/steerSubagent/abortSubagent 空壳(会话删除路由的清理点)。AgentSessionPanel 保留(遗留子会话树仍可浏览)。
 - **fleet 监控**:暂缓(用户指示)——app/api/agent/[id]/subagents 对 CLI 会话持续返回 unavailable/not-loaded。
 - 测试同步:删除锁死进程内启动文本的 11 条源断言(rpc-manager.test/tool-exposure);chat-workspace-policy.test 的两条改为断言 CLI 分支(fallback 链 chatSettings→factory set_model);fork-extractions 哨兵指向桥接资产;settings-navigation 去掉 agents 分区。
+
+## 七、定位原则与漂移清单重审(2026-10-24,用户确立)
+
+**原则:pi-web 只是前端,功能由 pi 原始 CLI 承担。** 凡进程内引擎曾有、而 CLI 原生行为不同的补偿逻辑,不追求移植对齐——接受 CLI 原生语义;pi-web 的职责边界 = wire 协议、UI、桥接扩展与打包。后续清理方向:chat-workspace-policy/chat-downloads-tool 的进程内参考实现、subagents.ts 遗留读取器、mcp-host 残余,均可随旧会话数据淘汰而删。
+
+### 漂移清单(15 项 → 重审定性)
+
+**接受(CLI 原生语义,by design)**:
+- exact prompt 冻结于 spawn(--system-prompt 即 spawn 语义);appendSystemPrompt 组合同 CLI
+- enabledModels:pi 原生设置(settings.md),子进程读同一 settings.json 原生遵守——近闭
+- 模型 bash 环境(agent-bin PATH/shellCommandPrefix):子进程 bash 即 CLI 原生行为
+- 刷新显示磁盘尾 leaf、fork_branch 撞击读、计划任务标记落分支外:CLI 的 append/文件语义
+- "handled" disposition 的扩展自启 run、PI_WEB_CHAT_* 标记对子进程 bash 可见(非秘密)
+- 工具 pin 变更重生(无 set_active_tools 命令;UI 流程本就是重启语义)
+- chat-only pin 多 artifacts 段(桥接对全部子进程注入,无害)
+- set_session_name 改名瞬时窗口(前端层面 cosmetic)
+
+**上游 PR 候选(协议缺口,前端无法自救)**:
+- get_tools(工具选择器看真实激活集,含扩展/MCP 工具)
+- set_active_tools(免重生的工具切换)
+
+**已修(前端职责内的 wire 质量)**:
+- navigate 自定义摘要指令改 base64 传参(空白/字面 flag 不再损坏)
+- reload 超时 120s→600s(扩展+MCP 重连与 compact 同量级)
