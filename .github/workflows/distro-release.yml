@@ -209,9 +209,9 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ matrix.apple_signing_identity }}
         with:
           tagName: v__VERSION__
-          releaseName: Pi Agent LW v__VERSION__
+          releaseName: Pi Agent LW v__VERSION__${{ inputs.prerelease && ' [PREVIEW]' || '' }}
           releaseBody: |
-            ${{ inputs.prerelease && "[PREVIEW BUILD - CLI engine switch; manual install; not on the update channel] " || "" }}Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
+            Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
 
             - Windows: download `*_x64-setup.exe` and run it.
             - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
