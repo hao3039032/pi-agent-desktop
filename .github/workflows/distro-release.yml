@@ -211,9 +211,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: Pi Agent LW v__VERSION__
           releaseBody: |
-            ${{ inputs.prerelease && format("⚠️ PREVIEW BUILD — architecture switch: every session now runs on the bundled pi CLI child process (the in-process SDK engine is removed). Not an auto-update channel release; install manually alongside or over the previous version.
-
-") || "" }}Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
+            ${{ inputs.prerelease && "[PREVIEW BUILD — architecture switch to the bundled pi CLI engine; not on the auto-update channel. Install manually.] " || "" }}Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
 
             - Windows: download `*_x64-setup.exe` and run it.
             - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
