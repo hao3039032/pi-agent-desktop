@@ -29,10 +29,10 @@ test("opens one settings panel from a single sidebar settings entry", () => {
 });
 
 test("keeps every requested configuration surface inside the settings panel", () => {
-  for (const section of ["general", "models", "skills", "agents", "plugins", "mcp"]) {
+  for (const section of ["general", "models", "skills", "plugins", "mcp"]) {
     assert.match(panelSource, new RegExp(`id: "${section}"`));
   }
-  for (const component of ["ModelsConfig", "SkillsConfig", "AgentsConfig", "PluginsConfig", "McpConfig"]) {
+  for (const component of ["ModelsConfig", "SkillsConfig", "PluginsConfig", "McpConfig"]) {
     assert.match(panelSource, new RegExp(`<${component} embedded`));
   }
 });
@@ -68,7 +68,7 @@ test("Settings › MCP works without a project, and only project sections fall b
 test("restores the settings section and each list detail selection", async () => {
   assert.match(panelSource, /setLastSettingsSection\(initialSection\)/);
   assert.match(panelSource, /setLastSettingsSection\(nextSection\)/);
-  for (const name of ["ModelsConfig", "SkillsConfig", "AgentsConfig", "PluginsConfig", "McpConfig"]) {
+  for (const name of ["ModelsConfig", "SkillsConfig", "PluginsConfig", "McpConfig"]) {
     assert.match(
       ((await readFile(new URL(`./${name}.tsx`, import.meta.url), "utf8")).replace(/\r\n/g, "\n")).replace(/\r\n/g, "\n"),
       /getLastSettingsSelection/,
@@ -126,11 +126,11 @@ test("an Add in Settings › MCP hands the folder's new trust to the page, which
 test("trusting from Settings › MCP reloads, in place, the other mounted sections whose answer depends on trust", async () => {
   // Visited sections stay mounted (hidden), so each one that reads trust takes the page's
   // status. Still keyed by cwd alone: a remount would drop an install under way or a draft.
-  for (const name of ["SkillsConfig", "AgentsConfig", "PluginsConfig"]) {
+  for (const name of ["SkillsConfig", "PluginsConfig"]) {
     assert.match(panelSource, new RegExp(`<${name} embedded key=\\{cwd\\} cwd=\\{cwd\\}[^\\n]*? trust=\\{projectTrust\\} `), name);
   }
   const read = async (name) => ((await readFile(new URL(`./${name}.tsx`, import.meta.url), "utf8")).replace(/\r\n/g, "\n")).replace(/\r\n/g, "\n");
-  const [skills, plugins, agents] = await Promise.all(["SkillsConfig", "PluginsConfig", "AgentsConfig"].map(read));
+  const [skills, plugins] = await Promise.all(["SkillsConfig", "PluginsConfig"].map(read));
   // Skills and Plugins report "not loaded" and disable the Project scope from the trust at load
   // time: a new decision loads the list again, keeping the selection and update checks; the
   // first load stays the cwd effect's.
@@ -142,7 +142,6 @@ test("trusting from Settings › MCP reloads, in place, the other mounted sectio
     ), load);
   }
   // Agents: only the model list (GET /api/models leaves out an untrusted project's extensions).
-  assert.match(agents, /const response = await fetch\(`\/api\/models\?cwd=\$\{encodeURIComponent\(cwd\)\}`[\s\S]*?\}, \[cwd, trustKey\]\);/);
   // Models reads models.json, auth and enabledModels, none of which follows trust.
   // Its only other prop links the Code mode note of "Classifier & image models" to Settings › MCP.
   assert.match(panelSource, /sectionHost\("models", <ModelsConfig embedded cwd=\{cwd\} onClose=\{onClose\} onOpenMcp=\{\(\) => activateSection\("mcp"\)\} \/>\)/);
@@ -227,13 +226,7 @@ test("labels agent profiles as sub-agents", () => {
   assert.equal(zhMessages["agents.new"], "新建子代理");
 });
 
-test("uses the child-session robot glyph for the sub-agents tab", () => {
-  const robotGlyph = /<rect x="5" y="7" width="14" height="11" rx="2" \/>\s*<path d="M9 11h\.01M15 11h\.01M9 15h6M12 7V4M10 4h4" \/>/;
-  assert.match(panelSource, robotGlyph);
-  assert.match(sidebarSource, robotGlyph);
-  assert.match(panelSource, /section === "agents"[\s\S]*?className="settings-section-icon is-agent"/);
-  assert.match(cssSource, /\.settings-section-icon\.is-agent \{[\s\S]*?transform: scale\(1\.25\)/);
-});
+
 
 test("uses the compact controls glyph for General", () => {
   assert.match(panelSource, /section === "general"[\s\S]*?<path d="M20 7h-9M14 17H5" \/>[\s\S]*?<circle cx="7" cy="7" r="3" \/>[\s\S]*?<circle cx="17" cy="17" r="3" \/>/);

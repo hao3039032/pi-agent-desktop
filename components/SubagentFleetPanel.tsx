@@ -176,6 +176,7 @@ export function SubagentFleetPanel({ sessionId }: Props) {
       case "chat-workspace": return t("subagentFleet.unavailable.chat");
       case "not-loaded": return t("subagentFleet.unavailable.notLoaded");
       case "no-bus": return t("subagentFleet.unavailable.noBus");
+      case "unknown": return t("subagentFleet.unavailable.unknown");
       case "unresponsive": return t("subagentFleet.unavailable.unresponsive");
       case "incompatible": return t("subagentFleet.unavailable.incompatible");
       case "session-closed": return t("subagentFleet.unavailable.closed");

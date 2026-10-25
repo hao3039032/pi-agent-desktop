@@ -224,6 +224,8 @@ Each one undid a real regression; the linked note has the reasoning.
 - Never give one iframe both `allow-scripts` and `allow-same-origin`; keep `SERVE_EXT_TO_MIME` in `getServeMime`. ([fork-files-security](docs/agents/fork-files-security.md))
 - Manual-code OAuth handshake tokens are `crypto.randomUUID()`. The auth throttle stays global, and its reset window stays longer than the max delay. ([fork-files-security](docs/agents/fork-files-security.md))
 - No literal `homedir()` in session-scanner fs calls; use `userHome()`. ([fork-sessions](docs/agents/fork-sessions.md))
+- Child UI raised before the wrapper's relay exists is held by `beginUiAttachWindow()`: replay in arrival order, cancel (never approve) on deadline/overflow/exit/`close()`/`kill()`. ([fork-sessions](docs/agents/fork-sessions.md))
+- `autoRetryEnabled` starts **undefined** on the CLI engine (`get_state` has no such field); only `set_auto_retry` or an `auto_retry_start` event sets it. ([fork-sessions](docs/agents/fork-sessions.md))
 - Native-dialog routes (`/api/desktop/*`, `?type=import`) require the per-process desktop token; never a static token or User-Agent check. `read-images` derives its cap from `MAX_ATTACHED_IMAGES`. ([fork-desktop](docs/agents/fork-desktop.md))
 - Open local paths with `explorer.exe` on Windows, never `cmd.exe /C start`. ([fork-desktop](docs/agents/fork-desktop.md))
 - Native popup menus are built in Rust (`show_popup_menu`); do not go back to the JS `Menu` API. ([fork-desktop](docs/agents/fork-desktop.md))

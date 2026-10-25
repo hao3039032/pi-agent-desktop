@@ -14,7 +14,7 @@ import type {
 import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { attachmentAwareTitle } from "@/lib/chat-attachments";
-import { isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
+import { AgentCommandError, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { mergeComposerQueueSnapshot, type ComposerQueueActionResult, type PendingComposerMessage } from "@/lib/composer-queue-types";
 import { fetchWithRetry } from "@/lib/fetch-timeout";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
@@ -398,6 +398,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [pendingModel, setPendingModel] = useState<{ provider: string; modelId: string } | null>(null);
   const [modelSwitching, setModelSwitching] = useState(false);
   const [isCompacting, setIsCompacting] = useState(false);
+  const [stopPending, setStopPending] = useState(false);
+  const stopRequestRef = useRef<symbol | null>(null);
+  const [forceStopTarget, setForceStopTarget] = useState<{ sid: string; generation: number; instanceId: string } | null>(null);
+  const [forceStopBusy, setForceStopBusy] = useState(false);
   const [compactError, setCompactError] = useState<string | null>(null);
   const [compactResult, setCompactResult] = useState<CompactResultInfo | null>(null);
   const { compactNotice, setCompactNotice, reportCompactFailure } = useCompactNotice({ compactError, setCompactError, setCompactResult });
@@ -557,6 +561,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const previousIdentity = appliedIdentity;
     setAppliedIdentity(sessionIdentity);
     sessionGenerationRef.current += 1;
+    stopRequestRef.current = null;
+    setStopPending(false);
+    setForceStopTarget(null);
+    setForceStopBusy(false);
     if (previousIdentity && scrollContainerRef.current) {
       const container = scrollContainerRef.current;
       rememberScrollPosition(previousIdentity, container);
@@ -1581,6 +1589,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       }
       case "agent_start":
+        setForceStopTarget(null);
         cancelEventStreamGrace();
         sdkAgentActiveRef.current = true;
         agentRunningRef.current = true;
@@ -1660,6 +1669,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           }
         }
         break;
+      case "context_usage":
+        setContextUsage((event.contextUsage as AgentStateResponse["contextUsage"]) ?? null);
+        break;
+      case "session_process_exit": {
+        // Do not let EventSource immediately respawn a failed CLI (and its
+        // background-work recovery) on the server's ensuing stream close.
+        closeEvents();
+        sdkAgentActiveRef.current = false;
+        rpcPromptPendingRef.current = false;
+        optimisticUserMessageKeyRef.current = null;
+        bashRunningRef.current = false;
+        setBashRunning(false);
+        setPendingBash(null);
+        setIsCompacting(false);
+        setSummarizationRetry(null);
+        stopRequestRef.current = null;
+        setStopPending(false);
+        setForceStopTarget(null);
+        settleUiStage();
+        addNotice({ type: "error", message: t("chat.processExited", { code: String(event.code ?? event.signal ?? "?") }) });
+        const sid = sessionIdRef.current;
+        if (sid) void loadSession(sid);
+        break;
+      }
       case "prompt_error":
         addNotice({ type: "error", message: (event.errorMessage as string | undefined) ?? "Command failed" });
         break;
@@ -1860,7 +1893,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         handleForkAgentEvent(event);
         break;
     }
-  }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, handleForkAgentEvent, loadSession, notifyPromptStage, onAgentEnd, reportCompactFailure, scheduleEventStreamClose, scrollToBottom, setCompactNotice, settleUiStage, syncLiveModel]);
+  }, [addNotice, cancelEventStreamGrace, closeEvents, handleExtensionUiRequest, handleForkAgentEvent, loadSession, notifyPromptStage, onAgentEnd, reportCompactFailure, scheduleEventStreamClose, scrollToBottom, setCompactNotice, settleUiStage, syncLiveModel, t]);
   handleAgentEventRef.current = handleAgentEvent;
 
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
@@ -2037,21 +2070,43 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
-    if (!sid) return;
-    if (bashRunningRef.current) {
-      try {
-        await sendAgentCommand(sid, { type: "abort_bash" });
-      } catch (e) {
-        console.error("Failed to abort bash:", e);
-      }
-      return;
-    }
+    if (!sid || stopRequestRef.current) return;
+    const generation = sessionGenerationRef.current;
+    const request = Symbol("stop");
+    stopRequestRef.current = request;
+    setStopPending(true);
+    const current = () => sessionIdRef.current === sid && sessionGenerationRef.current === generation && stopRequestRef.current === request;
     try {
-      await sendAgentCommand(sid, { type: "abort" });
+      await sendAgentCommand(sid, { type: bashRunningRef.current ? "abort_bash" : "abort" }, { signal: AbortSignal.timeout(35_000) });
+      if (current()) void reconcileAgentState(sid);
     } catch (e) {
-      console.error("Failed to abort:", e);
+      if (!current()) return;
+      addNotice({ type: "error", message: t("chat.stopFailed", { error: e instanceof Error ? e.message : String(e) }) });
+      if (e instanceof AgentCommandError && e.instanceId) setForceStopTarget({ sid, generation, instanceId: e.instanceId });
+    } finally {
+      if (current()) {
+        stopRequestRef.current = null;
+        setStopPending(false);
+      }
     }
-  }, []);
+  }, [addNotice, reconcileAgentState, t]);
+
+  const handleForceStop = useCallback(async () => {
+    const target = forceStopTarget;
+    if (!target || forceStopBusy || target.sid !== sessionIdRef.current || target.generation !== sessionGenerationRef.current) return;
+    setForceStopBusy(true);
+    try {
+      await sendAgentCommand(target.sid, { type: "force_stop", instanceId: target.instanceId }, { signal: AbortSignal.timeout(15_000) });
+      if (target.generation === sessionGenerationRef.current) {
+        setForceStopTarget(null);
+        void reconcileAgentState(target.sid);
+      }
+    } catch (e) {
+      if (target.generation === sessionGenerationRef.current) addNotice({ type: "error", message: t("chat.stopFailed", { error: e instanceof Error ? e.message : String(e) }) });
+    } finally {
+      if (target.generation === sessionGenerationRef.current) setForceStopBusy(false);
+    }
+  }, [addNotice, forceStopBusy, forceStopTarget, reconcileAgentState, t]);
 
   const { handleAbortRetry, handleSetAutomation } = useSessionAutomationActions<AgentStateResponse>({
     sessionIdRef, setAutomation, addNotice, resync: syncLiveModel,
@@ -2543,15 +2598,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice, composerDraftKey, restoreSubmission]);
 
-  const handleAbortCompaction = useCallback(async () => {
-    const sid = sessionIdRef.current;
-    if (!sid) return;
-    try {
-      await sendAgentCommand(sid, { type: "abort_compaction" });
-    } catch (e) {
-      console.error("Failed to abort compaction:", e);
-    }
-  }, []);
+  // CLI abort cancels compaction too; share visible failures and force-stop fallback.
+  const handleAbortCompaction = handleAbort;
 
   const handleRecallQueue = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -3051,6 +3099,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     lastUserMsgRef, pendingScrollToUserRef, initialScrollDoneRef,
     // Actions
     branchSummaryPending, handleAbortBranchSummary, routedModel,
+    stopPending, forceStopTarget, forceStopBusy, handleForceStop,
+    dismissForceStop: () => setForceStopTarget(null),
     handleSend, handleAbort, handleAbortRetry, handleFork, handleNavigate, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction, handleQueuedMessageAction,
     handleRecallQueue,

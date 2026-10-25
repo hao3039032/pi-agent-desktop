@@ -7,7 +7,7 @@ import { readdir } from "fs/promises";
 import { isAbsolute, join, normalize as normalizePath, relative, resolve as resolvePath, sep } from "path";
 import type { AgentMessage, ImageContent, SessionEntry, SessionHeader, SessionInfo, SessionContext } from "./types";
 import { normalizeToolCalls } from "./normalize";
-import { getThinkingPreview } from "./message-display";
+import { getThinkingPreview, isSubagentNotificationType } from "./message-display";
 import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
 import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-result-images";
@@ -854,7 +854,7 @@ const MAX_TURN_EXTENSION_ENTRIES = 1500;
 function startsTurn(entry: SessionEntry): boolean {
   if (entry.type === "compaction") return true;
   if (entry.type === "custom_message") {
-    return (entry as { customType?: string }).customType === "pi-web:subagent-notification";
+    return isSubagentNotificationType((entry as { customType?: string }).customType);
   }
   if (entry.type === "branch_summary") return Boolean((entry as { summary?: string }).summary);
   return entry.type === "message" && (entry as { message?: { role?: string } }).message?.role === "user";

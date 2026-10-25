@@ -1,12 +1,11 @@
 import { NextResponse } from "next/server";
 import { getRpcSession } from "@/lib/rpc-manager";
-import { loadResultHasPiSubagentsExtension } from "@/lib/subagent-extension";
 import {
   SUBAGENT_RPC_PING_TIMEOUT_MS,
-  callSubagentRpc,
+  SubagentRpcUnsupportedError,
   subagentRpcErrorStatus,
-  type SubagentEventBus,
   type SubagentRpcReply,
+  type SubagentRpcTransport,
 } from "@/lib/pi-subagents-rpc";
 import {
   boundActionResult,
@@ -47,7 +46,7 @@ const RPC_ID_PATTERN = /^[\x21-\x7e]{1,256}$/;
 
 interface SessionGate {
   kind: "ok";
-  bus: SubagentEventBus;
+  transport: SubagentRpcTransport;
   /** Aborts when the wrapper starts closing — in-flight RPC must not outlive the session. */
   closeSignal: AbortSignal;
 }
@@ -63,9 +62,16 @@ function unavailable(reason: PiSubagentsUnavailable["reason"], error?: string): 
 
 /**
  * The shared gate for GET and POST: the session must exist and be alive, it
- * must not be a non-project chat, the pi-subagents package must be loaded in
- * it (detected by extension source or path, never by tool names), and the
- * wrapper must hold the session's extension event bus.
+ * must not be a non-project chat, and it needs an RPC transport to the child
+ * that hosts the package.
+ *
+ * The package is DETECTED BY SOURCE (extension/tool/command `sourceInfo`
+ * path or package source, never by tool name) and CONFIRMED by a real `ping`.
+ * A session whose engine cannot report that metadata answers `unknown`, and a
+ * ping that times out is `unresponsive` — neither means "the user has to
+ * install pi-subagents". The old `resourceLoader.getExtensions()` check was a
+ * false negative on the CLI engine: the package loads in the pi child, so the
+ * server-side loader has no extension list at all.
  */
 function gateSession(id: string): SessionGate | GateFailure {
   const wrapper = getRpcSession(id);
@@ -76,31 +82,38 @@ function gateSession(id: string): SessionGate | GateFailure {
     return { kind: "chat-workspace" };
   }
   if (!wrapper.isAlive()) return { kind: "unavailable", view: unavailable("session-closed") };
-  const extensions = wrapper.inner.resourceLoader.getExtensions?.().extensions;
-  if (!extensions || !loadResultHasPiSubagentsExtension(extensions)) {
-    return { kind: "unavailable", view: unavailable("not-loaded") };
-  }
-  const bus = wrapper.getSubagentsEventBus?.();
-  if (!bus) return { kind: "unavailable", view: unavailable("no-bus") };
-  return { kind: "ok", bus, closeSignal: wrapper.getLifecycleAbortSignal() };
+  const state = wrapper.piSubagentsExtensionState?.() ?? "unknown";
+  const transport = wrapper.getSubagentsRpcTransport?.();
+  // Positive evidence of absence only: a resolved "not loaded" plus no way to
+  // ask the package is the one case that may tell the user it is missing.
+  if (!transport && state === "not-loaded") return { kind: "unavailable", view: unavailable("not-loaded") };
+  // Loaded but unreachable from here (no bridge, no bus).
+  if (!transport && state === "loaded") return { kind: "unavailable", view: unavailable("no-bus") };
+  // No evidence either way: never "not loaded".
+  if (!transport) return { kind: "unavailable", view: unavailable("unknown") };
+  return { kind: "ok", transport, closeSignal: wrapper.getLifecycleAbortSignal() };
 }
 
 /** A bridge failure GET answers with 200 (the polling view) and POST with a transport error. */
 type ProbeFailure =
   | { kind: "unresponsive"; error: string }
   | { kind: "incompatible"; error: string }
-  | { kind: "closed"; error: string };
+  | { kind: "closed"; error: string }
+  | { kind: "unknown"; error: string };
 
-async function probeBridge(bus: SubagentEventBus, closeSignal: AbortSignal): Promise<SubagentRpcReply | ProbeFailure> {
+async function probeBridge(transport: SubagentRpcTransport, closeSignal: AbortSignal): Promise<SubagentRpcReply | ProbeFailure> {
   let reply: SubagentRpcReply;
   try {
-    reply = await callSubagentRpc(bus, "ping", undefined, {
+    reply = await transport.call("ping", undefined, {
       timeoutMs: SUBAGENT_RPC_PING_TIMEOUT_MS,
       signal: closeSignal,
     });
   } catch (error) {
     // The signal's own state is the truth: an abort reason need not be an AbortError.
     if (closeSignal.aborted) return { kind: "closed", error: "session closed while probing the pi-subagents bridge" };
+    // An engine whose bridge predates the subagents ops cannot say whether the
+    // package is there: report that honestly instead of "not loaded".
+    if (error instanceof SubagentRpcUnsupportedError) return { kind: "unknown", error: error.message };
     return { kind: "unresponsive", error: error instanceof Error ? error.message : String(error) };
   }
   if (reply.error) {
@@ -142,7 +155,7 @@ export async function GET(
   const gate = gateSession(id);
   if (gate.kind !== "ok") return gateFailureResponse(gate, "GET");
 
-  const ping = await probeBridge(gate.bus, gate.closeSignal);
+  const ping = await probeBridge(gate.transport, gate.closeSignal);
   if ("kind" in ping) {
     return NextResponse.json(
       unavailable(ping.kind === "closed" ? "session-closed" : ping.kind, ping.error),
@@ -152,7 +165,7 @@ export async function GET(
 
   let status: SubagentRpcReply;
   try {
-    status = await callSubagentRpc(gate.bus, "status", undefined, { signal: gate.closeSignal });
+    status = await gate.transport.call("status", undefined, { signal: gate.closeSignal });
   } catch (error) {
     if (gate.closeSignal.aborted) {
       return NextResponse.json(unavailable("session-closed"), { headers: { "Cache-Control": "no-store" } });
@@ -327,12 +340,12 @@ export async function POST(
   const gate = gateSession(id);
   if (gate.kind !== "ok") return gateFailureResponse(gate, "POST");
 
-  const ping = await probeBridge(gate.bus, gate.closeSignal);
+  const ping = await probeBridge(gate.transport, gate.closeSignal);
   if ("kind" in ping) {
     if (ping.kind === "closed") {
       return NextResponse.json({ error: ping.error, reason: "session-closed" }, { status: 409 });
     }
-    const status = ping.kind === "unresponsive" ? 504 : 502;
+    const status = ping.kind === "unresponsive" ? 504 : ping.kind === "unknown" ? 503 : 502;
     return NextResponse.json({ error: ping.error, reason: ping.kind }, { status });
   }
 
@@ -361,7 +374,7 @@ export async function POST(
   const { method, params: rpcParams } = actionRpcParams(parsed.request);
   let reply: SubagentRpcReply;
   try {
-    reply = await callSubagentRpc(gate.bus, method, rpcParams, { signal: gate.closeSignal });
+    reply = await gate.transport.call(method, rpcParams, { signal: gate.closeSignal });
   } catch (error) {
     if (gate.closeSignal.aborted) {
       return NextResponse.json(

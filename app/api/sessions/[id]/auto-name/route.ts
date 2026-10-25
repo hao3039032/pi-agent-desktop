@@ -33,7 +33,9 @@ export async function POST(
       );
     }
 
-    session.inner.setSessionName(result.title);
+    // Awaited: the CLI engine resolves only once the child confirmed the
+    // rename, and a rejection must surface to this route instead of a 200.
+    await session.inner.setSessionName(result.title);
     invalidateSessionListCache();
     return NextResponse.json({ title: result.title, usage: result.usage ?? null });
   } catch (error) {

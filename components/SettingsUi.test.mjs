@@ -11,7 +11,7 @@ const jiti = createJiti(import.meta.url);
 const { englishMessages: enMessages, forkLocalePlugins } = await jiti.import("../lib/i18n/locale-plugins.ts");
 const zhMessages = Object.fromEntries(forkLocalePlugins.map(({ id, messages }) => [id, messages]))["zh-CN"];
 const configSources = await Promise.all(
-  ["ModelsConfig", "SkillsConfig", "AgentsConfig", "PluginsConfig", "McpConfig"].map(async (name) => [
+  ["ModelsConfig", "SkillsConfig", "PluginsConfig", "McpConfig"].map(async (name) => [
     name,
     (await readFile(new URL(`./${name}.tsx`, import.meta.url), "utf8")).replace(/\r\n/g, "\n"),
   ]),
@@ -85,14 +85,14 @@ test("all subpanel sidebars share one typography scale", () => {
   for (const source of Object.values(sources)) {
     assert.match(source, /<ConfigSidebarText/);
   }
-  for (const name of ["SkillsConfig", "AgentsConfig", "PluginsConfig", "McpConfig"]) {
+  for (const name of ["SkillsConfig", "PluginsConfig", "McpConfig"]) {
     assert.match(sources[name], /<ConfigSidebarGroupLabel/);
   }
 });
 
-test("skills and sub-agents share interactive sidebar rows", () => {
+test("skills and plugins share interactive sidebar rows", () => {
   const sources = Object.fromEntries(configSources);
-  for (const name of ["SkillsConfig", "AgentsConfig", "PluginsConfig"]) {
+  for (const name of ["SkillsConfig", "PluginsConfig"]) {
     assert.match(sources[name], /<ConfigSidebarItem/);
   }
   assert.match(templateSource, /export function ConfigSidebarItem[\s\S]*?className=\{\["config-sidebar-item"/);
@@ -141,7 +141,7 @@ test("all subpanel detail panes share one content hierarchy", () => {
 test("detail header actions keep buttons and switches aligned to the right", () => {
   const sources = Object.fromEntries(configSources);
   assert.match(cssSource, /\.config-detail-actions \{[\s\S]*?justify-content: flex-end[\s\S]*?margin-left: auto/);
-  for (const name of ["SkillsConfig", "AgentsConfig", "PluginsConfig"]) {
+  for (const name of ["SkillsConfig", "PluginsConfig"]) {
     assert.match(sources[name], /<ConfigDetailActions>/);
   }
   assert.match(sources.PluginsConfig, /<ConfigDetailActions>[\s\S]*?<ConfigSwitch[\s\S]*?<\/ConfigDetailActions>/);
@@ -185,14 +185,13 @@ test("subpanel footers share sizing while maintenance actions stay secondary", (
   assert.match(cssSource, /\.config-button \{[\s\S]*?font-family: inherit/);
   assert.match(cssSource, /\.config-button-default \{[\s\S]*?height: 32px/);
   assert.match(sources.ModelsConfig, /<ConfigButton\s+variant="primary"[\s\S]*?onClick=\{handleSave\}/);
-  assert.match(sources.AgentsConfig, /<ConfigButton\s+variant="primary"[\s\S]*?onClick=\{\(\) => void save\(\)\}/);
   assert.match(sources.SkillsConfig, /<ConfigButton variant="secondary" onClick=\{\(\) => void checkForUpdates\(\)\}/);
   assert.match(sources.PluginsConfig, /<ConfigButton variant="secondary" onClick=\{\(\) => void loadPlugins\(\)\}/);
 });
 
-test("skills, agents, and plugins share enabled and disabled controls", () => {
+test("skills and plugins share enabled and disabled controls", () => {
   const sources = Object.fromEntries(configSources);
-  for (const name of ["SkillsConfig", "AgentsConfig", "PluginsConfig"]) {
+  for (const name of ["SkillsConfig", "PluginsConfig"]) {
     assert.match(sources[name], /<ConfigSwitch/);
     assert.match(sources[name], /<ConfigStatusDot/);
   }
@@ -220,7 +219,6 @@ test("every add pane chooses its scope in one place: the save target under its t
   const panes = {
     SkillsConfig: sources.SkillsConfig.match(/function AddSkillPanel[\s\S]*?\n\}\n/)?.[0] ?? "",
     PluginsConfig: sources.PluginsConfig.match(/function AddPluginPanel[\s\S]*?\n\}\n/)?.[0] ?? "",
-    AgentsConfig: sources.AgentsConfig,
     McpAddServer: (await readFile(new URL("./McpAddServer.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n"),
   };
   for (const [name, source] of Object.entries(panes)) {
@@ -234,9 +232,6 @@ test("every add pane chooses its scope in one place: the save target under its t
   assert.match(panes.SkillsConfig, /<ConfigAddSourceHeading[\s\S]*?target=\{\s*<ConfigSaveTarget/);
   assert.match(templateSource, /export function ConfigAddSourcePanel[\s\S]*?<ConfigAddSourceHeading/, "the add panel builds its heading from the same block");
   assert.match(panes.McpAddServer, /target=\{\s*<ConfigSaveTarget/);
-  // Sub-agents: where a saved profile shows its scope tag, while creating; no hand-made switch beside it.
-  assert.match(panes.AgentsConfig, /<ConfigDetailHeaderInfo>[\s\S]*?\{creating \? \(\s*<ConfigSaveTarget[\s\S]*?<ConfigScopeTag scope=\{displayedScope\}>/);
-  assert.doesNotMatch(panes.AgentsConfig, /agents\.saveScope|setTargetScope\(scope\)\}\s*disabled=/);
   assert.match(cssSource, /\.config-save-target-path \{[\s\S]*?overflow-wrap: anywhere/);
   assert.doesNotMatch(cssSource, /config-add-source-location/);
 });

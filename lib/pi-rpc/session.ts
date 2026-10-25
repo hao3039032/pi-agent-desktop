@@ -29,7 +29,12 @@ export interface RpcAgentSessionState {
   isCompacting: boolean;
   isIdle: boolean;
   autoCompactionEnabled: boolean;
-  autoRetryEnabled: boolean;
+  /**
+   * Unknown until the child proves it: get_state reports no auto-retry field,
+   * so only set_auto_retry (the UI's own choice) or an auto_retry_start event
+   * sets it. undefined means "the child never told us", never "disabled".
+   */
+  autoRetryEnabled: boolean | undefined;
   retryAttempt: number;
   steeringMode?: string;
   followUpMode?: string;
@@ -121,6 +126,11 @@ export class RpcAgentSession {
     return this.state.sessionFile;
   }
 
+  /** The name the child has confirmed (see setSessionName). */
+  get sessionName(): string | undefined {
+    return this.state.sessionName;
+  }
+
   get isStreaming(): boolean {
     return this.state.isStreaming;
   }
@@ -141,7 +151,7 @@ export class RpcAgentSession {
     return this.state.autoCompactionEnabled;
   }
 
-  get autoRetryEnabled(): boolean {
+  get autoRetryEnabled(): boolean | undefined {
     return this.state.autoRetryEnabled;
   }
 
@@ -435,11 +445,16 @@ export class RpcAgentSession {
   async compact(customInstructions?: string): Promise<unknown> {
     this.state.isCompacting = true;
     try {
-      return await this.client.command(
+      const result = await this.client.command(
         "compact",
         customInstructions === undefined ? {} : { customInstructions },
         600_000,
       );
+      // Manual compaction has no agent_settled event. The caller's immediate
+      // get_state must not read the pre-compaction cached percentage.
+      this.invalidateContextUsage();
+      await this.refreshStats().catch(() => {});
+      return result;
     } finally {
       // compaction events maintain this too; the finally is a floor for a
       // response-only race where events were missed.
@@ -447,8 +462,8 @@ export class RpcAgentSession {
     }
   }
 
-  abortCompaction(): void {
-    void this.client.command("abort", { reason: "compaction" }, 30_000).catch(() => {});
+  async abortCompaction(): Promise<void> {
+    await this.client.command("abort", {}, 30_000);
   }
 
   setAutoCompactionEnabled(enabled: boolean): void {
@@ -489,12 +504,20 @@ export class RpcAgentSession {
     }
   }
 
-  abortBash(): void {
-    void this.client.command("abort_bash", {}, 30_000).catch(() => {});
+  async abortBash(): Promise<void> {
+    await this.client.command("abort_bash", {}, 30_000);
   }
 
-  setSessionName(name: string): void {
-    void this.client.command("set_session_name", { name }, 30_000).catch(() => {});
+  /**
+   * Rename the session in the child and keep the name only after its response:
+   * the state field is the host's view of the child's session file, so setting
+   * it first would report a rename the child never performed (and a caller
+   * that refreshed the list would read the old name back). A failing command
+   * rejects to the caller instead of swallowing the error.
+   */
+  async setSessionName(name: string): Promise<void> {
+    await this.client.command("set_session_name", { name }, 30_000);
+    this.state.sessionName = name;
   }
 
   getSessionStats(): Omit<SessionStatsInfo, "sessionName"> {
@@ -582,15 +605,30 @@ export class RpcAgentSession {
    * re-refreshes, and an out-of-date cache is harmless but a wrong-isIdle flip
    * is not (see the agent_settled hook).
    */
-  async refreshStats(epochAtRequest?: number): Promise<void> {
+  private statsRequestId = 0;
+
+  private invalidateContextUsage(): void {
+    // Invalidate in-flight snapshots too: a reply requested before compaction
+    // must not restore old usage after it. Unknown is not zero.
+    this.statsRequestId += 1;
+    this.statsCache = { ...this.statsCache, contextUsage: undefined };
+    this.onRecord({ type: "context_usage", contextUsage: null });
+  }
+
+  async refreshStats(epochAtRequest = this.runEpoch): Promise<void> {
+    const requestId = ++this.statsRequestId;
     const stats = await this.client.command<Partial<Omit<SessionStatsInfo, "sessionName">>>("get_session_stats", {}, 30_000);
-    if (epochAtRequest !== undefined && this.runEpoch !== epochAtRequest) return;
+    if (this.disposed || requestId !== this.statsRequestId || this.runEpoch !== epochAtRequest) return;
     this.statsCache = {
       ...this.statsCache,
       ...stats,
       sessionId: this.state.sessionId,
       tokens: stats.tokens ?? this.statsCache.tokens,
+      // Omission means the child cannot calculate usage (e.g. no limits model),
+      // not permission to retain the last model's percentage.
+      contextUsage: stats.contextUsage,
     } as Omit<SessionStatsInfo, "sessionName">;
+    this.onRecord({ type: "context_usage", contextUsage: stats.contextUsage ?? null });
   }
 
   private applyState(patch: Partial<RpcAgentSessionState>, options?: { volatile?: boolean }): void {
@@ -780,6 +818,8 @@ export class RpcAgentSession {
         break;
       case "compaction_end":
         this.state.isCompacting = false;
+        this.invalidateContextUsage();
+        void this.refreshStats().catch(() => {});
         break;
       case "queue_update":
       case "steering_queued":
@@ -791,7 +831,9 @@ export class RpcAgentSession {
       }
       case "auto_retry_start":
         // The wire names are auto_retry_start/auto_retry_end with an attempt
-        // field (docs/json.md); "retry_started" never exists on the wire.
+        // field (docs/json.md); "retry_started" never exists on the wire. A
+        // retry that starts is the child proving its policy is on.
+        this.state.autoRetryEnabled = true;
         this.state.retryAttempt = typeof record.attempt === "number" ? record.attempt : this.state.retryAttempt + 1;
         break;
       case "auto_retry_end":

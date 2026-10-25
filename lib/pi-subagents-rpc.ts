@@ -59,6 +59,88 @@ export class SubagentRpcTimeoutError extends Error {
   }
 }
 
+/**
+ * The session's engine cannot forward this RPC at all: an older shipped bridge
+ * asset has no `subagents.*` op. That is NOT evidence the package is missing —
+ * the caller must report `unknown`, never `not-loaded`.
+ */
+export class SubagentRpcUnsupportedError extends Error {
+  constructor(detail: string) {
+    super(`this session cannot forward pi-subagents RPC: ${detail}`);
+    this.name = "SubagentRpcUnsupportedError";
+  }
+}
+
+/**
+ * Where a restricted call actually goes. On the CLI engine the package lives in
+ * the pi child, so the bridge forwards to that child's event bus; the
+ * in-process event-bus transport stays for engines that own the bus themselves
+ * and for tests.
+ */
+export interface SubagentRpcTransport {
+  readonly kind: "bridge" | "event-bus";
+  call(
+    method: SubagentRpcMethod,
+    params?: Record<string, unknown>,
+    options?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<SubagentRpcReply>;
+}
+
+/** The transport over this process's own extension event bus. */
+export function createEventBusSubagentTransport(bus: SubagentEventBus): SubagentRpcTransport {
+  return {
+    kind: "event-bus",
+    call: (method, params, options) => callSubagentRpc(bus, method, params, {
+      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+    }),
+  };
+}
+
+/** The reply body the bridge forwards: the package's answer without its ids. */
+export interface SubagentBridgeReplyBody {
+  success?: boolean;
+  data?: unknown;
+  error?: { code: string; message: string };
+}
+
+/**
+ * The transport over the child's bridge op (`subagents.<method>`). `request`
+ * rejects only when the transport failed; a reply the package refused comes
+ * back as `{ success: false, error }` and is forwarded verbatim.
+ */
+export function createBridgeSubagentTransport(
+  request: (method: SubagentRpcMethod, params: Record<string, unknown> | undefined, options: { timeoutMs?: number; signal?: AbortSignal }) => Promise<SubagentBridgeReplyBody>,
+): SubagentRpcTransport {
+  return {
+    kind: "bridge",
+    async call(method, params, options) {
+      let body: SubagentBridgeReplyBody;
+      try {
+        body = await request(method, params, {
+          ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        });
+      } catch (error) {
+        // An older bridge asset knows no subagents ops; every other failure is
+        // a transport fault with its own message.
+        if (error instanceof Error && /unknown bridge op/.test(error.message)) {
+          throw new SubagentRpcUnsupportedError(error.message);
+        }
+        throw error;
+      }
+      if (typeof body !== "object" || body === null) {
+        throw new Error(`pi-subagents bridge reply for '${method}' was not an object`);
+      }
+      if (body.success === true) return { requestId: "", ...(body.data !== undefined ? { data: body.data } : {}) };
+      if (body.success === false && body.error && typeof body.error.code === "string") {
+        return { requestId: "", error: { code: body.error.code, message: String(body.error.message ?? "").slice(0, 2_000) } };
+      }
+      throw new Error(`pi-subagents bridge reply for '${method}' carried neither data nor an error`);
+    },
+  };
+}
+
 export const SUBAGENT_RPC_PING_TIMEOUT_MS = 3_000;
 export const SUBAGENT_RPC_CALL_TIMEOUT_MS = 20_000;
 

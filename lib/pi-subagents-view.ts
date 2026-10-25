@@ -46,6 +46,11 @@ export type PiSubagentsUnavailableReason =
   | "not-loaded"
   /** The wrapper has no bridge bus (a built-in subagent child, or a pre-bridge wrapper). */
   | "no-bus"
+  /**
+   * Nothing proves either way: the engine reports no tool/command metadata, or
+   * its bridge predates the subagents ops. Never rendered as "not installed".
+   */
+  | "unknown"
   /** The extension is loaded but the RPC bridge did not answer. */
   | "unresponsive"
   /** The bridge answered but refuses this protocol version or request. */

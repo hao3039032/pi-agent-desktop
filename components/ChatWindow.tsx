@@ -330,6 +330,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     sessionIdRef, scrollContainerRef,
     lastUserMsgRef, promptAnchorActive,
     branchSummaryPending, handleAbortBranchSummary, routedModel,
+    stopPending, forceStopTarget, forceStopBusy, handleForceStop, dismissForceStop,
     handleSend, handleAbort, handleAbortRetry, handleFork, handleEditContent, cancelEdit, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction, handleQueuedMessageAction,
     retryLoad,
@@ -1366,6 +1367,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
       onSend={handleSend}
       onAttachFiles={onAttachFiles}
       onAbort={handleAbort}
+      stopPending={stopPending}
       onSteer={agentRunning ? handleSteer : undefined}
       onFollowUp={agentRunning ? handleFollowUp : undefined}
       onPromptWithStreamingBehavior={agentRunning ? handlePromptWithStreamingBehavior : undefined}
@@ -1749,18 +1751,21 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
                   }));
                 }
 
-                if (streamingMessage && hasStreamingContent) {
-                  rendered.push(
-                    <TurnImageTargetContext.Provider key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} value={turnImages.length ? turnImageId : null}>
-                      <MessageView message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={openFile} onOpenSession={onOpenSession} />
-                    </TurnImageTargetContext.Provider>,
-                  );
-                }
-
                 for (let renderIdx = Math.max(finalAssistantIdx + 1, userIdx + 1); renderIdx < endIdx; renderIdx++) {
                   rendered.push(
                     <TurnImageTargetContext.Provider key={`tail-${messageKeys[renderIdx] ?? renderIdx}`} value={turnImages.length ? turnImageId : null}>
                       {renderMessage(renderIdx)}
+                    </TurnImageTargetContext.Provider>,
+                  );
+                }
+
+                // The last textual answer can precede completed tool messages
+                // or an extension notification. The live message is newer than
+                // ALL of those entries, not merely newer than that answer.
+                if (streamingMessage && hasStreamingContent) {
+                  rendered.push(
+                    <TurnImageTargetContext.Provider key={`stream-${messageKeys[groupStartIdx] ?? groupStartIdx}`} value={turnImages.length ? turnImageId : null}>
+                      <MessageView message={streamingMessage} toolResults={toolResultsMap} isStreaming modelNames={modelNames} cwd={messageCwd} onOpenFile={openFile} onOpenSession={onOpenSession} />
                     </TurnImageTargetContext.Provider>,
                   );
                 }
@@ -1947,6 +1952,18 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           </div>
         )}
         {chatInputElement}
+        {forceStopTarget && (
+          <ChatConfirmDialog
+            title={t("chat.forceStopTitle")}
+            body={t("chat.forceStopBody")}
+            confirmLabel={t("chat.forceStopConfirm")}
+            cancelLabel={t("chat.chatConfirmCancel")}
+            danger
+            busy={forceStopBusy}
+            onCancel={dismissForceStop}
+            onConfirm={() => { void handleForceStop(); }}
+          />
+        )}
         {chatUnlockDialog && chatAccess && (
           <ChatConfirmDialog
             title={t(chatUnlockDialog === "unlock" ? "chat.chatUnlockTitle" : "chat.chatLockTitle")}

@@ -23,6 +23,7 @@ import { getAgentDir, SessionManager, SettingsManager } from "@earendil-works/pi
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { AgentSessionWrapper } from "../rpc-manager";
 import type { SessionEntry } from "../types";
 import { getLatestModelChange, getLatestResponseModel } from "../session-reader";
@@ -31,6 +32,7 @@ import { sanitizeProjectCommandEnvironment } from "../project-command-env";
 import { resolveShellTools } from "../powershell-settings";
 import { PRESET_FULL } from "../tool-presets";
 import { PiRpcClient } from "./client";
+import { redactCliDiagnostic } from "./diagnostics";
 import { CliAgentSessionCore, ensureSessionFile, initialCoreState } from "./core";
 import type { AgentSessionLike } from "../pi-types";
 
@@ -94,6 +96,14 @@ export interface StartedCliSession {
 
 /** App-shell vars that repoint the SDK's module resolution at the packaged app. */
 const STRIP_ENV_KEYS = ["PI_PACKAGE_DIR", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "JITI_ALIAS"];
+
+/**
+ * How long child UI raised during startup may wait for the wrapper's relay
+ * (a `session_start` confirm, a startup notify/status). The handshake, the
+ * bridge commands and the wrapper's construction are all local work, so this
+ * is generous; when it expires the dialog is CANCELLED, never approved.
+ */
+const STARTUP_UI_WINDOW_MS = 60_000;
 
 /**
  * The bridge extension shipped next to the server code. The server root is
@@ -336,10 +346,23 @@ export async function startCliRpcSessionFromManager(
   }
   if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
 
+  // Session binding for bridge requests, generated before the child spawns so
+  // the same nonce reaches the environment AND the core: the child's bridge
+  // extension echoes it in every reply, so an ordinary notify (or a same-named
+  // command another extension registered) can never be mistaken for a result.
+  const bridgeNonce = randomUUID();
+
+  const log = (line: string) => {
+    const safe = redactCliDiagnostic(line, { ...process.env, ...options.env });
+    if (options.onLog) options.onLog(safe);
+    else console.error(`[pi-rpc ${options.sessionId}] ${safe}`);
+  };
+  let offProcessExit: (() => void) | undefined;
   const client = new PiRpcClient(executable, {
     args,
     cwd: sessionCwd,
     env: buildCliEnv({
+      PI_WEB_BRIDGE_NONCE: bridgeNonce,
       ...(options.chatWorkspace
         ? ({
             PI_WEB_CHAT_MODE: options.chatWorkspace.unlocked ? "unlocked" : options.chatWorkspace.folder ? "folder" : "legacy",
@@ -349,11 +372,19 @@ export async function startCliRpcSessionFromManager(
       ...(options.agentDir ? ({ PI_CODING_AGENT_DIR: options.agentDir } as Record<string, string>) : {}),
       ...(options.env ?? {}),
     } as NodeJS.ProcessEnv),
-    onLog: (line) => options.onLog?.(line),
+    onLog: log,
     onExit: (code) => {
-      options.onLog?.(`[pi-rpc] child exited (code ${code ?? "?"})`);
+      log(`child pid ${client.pid ?? "?"} exited (code ${code ?? "?"}, signal ${client.terminationSignal ?? "none"})`);
     },
   });
+
+  // The child raises extension UI while it boots — `session_start` runs before
+  // our first stdin line is honoured, so a startup confirm/notify can arrive
+  // before the get_state handshake answers, and long before the wrapper (whose
+  // relay answers it) exists. Hold it: same id, bounded, replayed in arrival
+  // order once attachUiRelay registers the handlers. Without the window such a
+  // dialog would be cancelled on the spot and the user's own approval lost.
+  client.beginUiAttachWindow({ timeoutMs: STARTUP_UI_WINDOW_MS });
 
   try {
     // 3. Handshake; the child must have adopted OUR session file.
@@ -364,6 +395,10 @@ export async function startCliRpcSessionFromManager(
         `pi child opened session ${state.sessionId} instead of ${header.id}; refusing to run a stray session`,
       );
     }
+
+    // Session binding for bridge requests: the nonce generated before the
+    // spawn (PI_WEB_BRIDGE_NONCE) also authenticates the core's requests.
+    const bridgeExtensionPath = resolveBridgeExtensionPath();
 
     const core = new CliAgentSessionCore({
       client,
@@ -376,18 +411,36 @@ export async function startCliRpcSessionFromManager(
       // includes powershell so both shells are listed.
       spawnToolNames,
       knownToolNames: CODING_TOOL_NAMES,
+      bridgeExtensionPath,
+      bridgeNonce,
       ...(options.agentDir ? { agentDir: options.agentDir } : {}),
-      ...(promptCleanups.length > 0
-        ? { onDispose: () => { for (const cleanup of promptCleanups) cleanup(); } }
-        : {}),
+      onDispose: () => {
+        offProcessExit?.();
+        for (const cleanup of promptCleanups) cleanup();
+      },
     });
     await core.refreshState();
     await core.refreshCommands();
     // The bridge is load-bearing (navigate/reload go through it); a missing
-    // command means the extension failed to load, and the literal command
-    // text would reach the model. Fail the session instead.
+    // command — or one a different extension registered under the same name —
+    // means the bridge did not load, and the literal command text would reach
+    // the model. Fail the session instead.
     if (!core.hasBridgeCommand("pi-web:navigate")) {
       throw new Error("pi-web bridge extension did not register its commands; refusing to start the session");
+    }
+    // Tool operations: "unsupported" (older asset) degrades to restart-based
+    // switching with the spawn-time list; a protocol failure is logged loudly
+    // and makes every later tools read fail with the stored error instead of
+    // silently standing in a static list.
+    let liveTools = false;
+    try {
+      await core.refreshTools();
+      liveTools = core.supportsLiveToolSwitch();
+    } catch (error) {
+      options.onLog?.(
+        `[pi-rpc] bridge tool operations FAILED (${error instanceof Error ? error.message : String(error)}); `
+          + "tool reads will error until it recovers — this is a protocol fault, not a degraded mode",
+      );
     }
 
     // 4. Restore the saved model unless the child already runs it. pi-web's
@@ -408,7 +461,12 @@ export async function startCliRpcSessionFromManager(
     // it structurally (every member it reads is implemented). The assertion
     // collapses when the wrapper's consumption narrows in M2.
     const wrapper = new AgentSessionWrapper(core as unknown as AgentSessionLike, {
-      noLiveToolSwitch: true,
+      // Live tool switching needs the bridge's tool operations AND a session
+      // whose tool set is the user's to change (chats keep their spawn-time set).
+      noLiveToolSwitch: !liveTools
+        || options.chatOnly === true
+        || options.chatOnlyExactPrompt !== undefined
+        || options.chatWorkspace !== undefined,
       ...(options.chatOnly ? { chatOnly: true } : {}),
       ...(options.chatWorkspace
         ? { chatWorkspace: true, chatFolder: options.chatWorkspace.folder, chatUnlocked: options.chatWorkspace.unlocked }
@@ -417,16 +475,30 @@ export async function startCliRpcSessionFromManager(
         ? { exactSystemPrompt: () => options.chatOnlyExactPrompt! }
         : {}),
       ...(options.onAgentRunComplete ? { onAgentRunComplete: options.onAgentRunComplete } : {}),
+      terminateProcess: async () => {
+        client.kill();
+        await core.waitForChildExit();
+      },
     });
     core.attachUiRelay({
       relayExternalUiRequest: (request) => wrapper.relayExternalUiRequest(request as never),
       relayExternalUiEvent: (event) => wrapper.relayExternalUiEvent(event as never),
     });
+    // The relay owns every child-UI method now: close the window (anything left
+    // never found a handler and is cancelled) so later UI relays immediately.
+    client.endUiAttachWindow();
     if (options.registerWrapper) {
       // The live path (startRpcSession) owns start() through registerRpcWrapper.
       options.registerWrapper(wrapper, core.sessionId);
     } else {
       wrapper.start();
+    }
+
+    offProcessExit = client.onProcessExit((code) => wrapper.handleProcessExit(code, client.terminationSignal));
+    // onProcessExit calls synchronously if death raced registration.
+    if (client.hasExited) {
+      offProcessExit();
+      throw new Error("pi process exited while attaching the session wrapper");
     }
 
     return {
@@ -436,6 +508,7 @@ export async function startCliRpcSessionFromManager(
       sessionFile,
     };
   } catch (error) {
+    // Also clears any startup UI the window is still holding.
     await client.close().catch(() => {});
     for (const cleanup of promptCleanups) cleanup();
     throw error;

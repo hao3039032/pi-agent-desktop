@@ -37,6 +37,17 @@ Pi delays the first flush of a new session until an assistant message exists, so
 - `GET /api/sessions` returns a `sessionListVersion` counter; the sidebar's SSE handler refetches the list (reusing the invalidated server cache, no forced scan) whenever the version moves — that is how edits from another window/process appear.
 - The sidebar refetches the list once per running id it has no row for, because a session can start running between list fetches.
 
+## Asynchronous notification turns and streaming order
+Both the package's `subagent-notify` and historical `pi-web:subagent-notification`
+start a displayed turn, even with `display: false`. `isSubagentNotificationType`
+is shared by client grouping and the session reader's whole-turn pagination so
+paging cannot merge a package wake back into its parent's earlier answer.
+`ChatWindow` renders completed trailing messages before the streaming message:
+the last textual answer may precede later tool calls and notifications and must
+not determine the live bubble's chronological position. Regression coverage in
+`components/ChatWindow.stream-order.test.mjs` executes the component's actual
+render loop with inert leaf components and checks both pagination boundaries.
+
 ## Event pipeline: SDK → wire → client (`lib/agent-event-stream.ts`, `lib/agent-event-wire.ts`)
 - Per-agent SSE goes through `createAgentEventStream(req, id, sessionPromise)`: the session starts **asynchronously** (the route never `await`s `startRpcSession`), the stream filters events through `toClientAgentEvent()` and forwards them with one shared `TextEncoder`. Cancellation is `cancelStream(closeController)`; closing with `false` keeps the session's own listeners alive.
 - The sidebar's running-id stream (`/api/agent/running/events`) keeps the older inline `dispose` pattern and must stay registered in `app/api/agent/events-route.test.mjs`.
@@ -113,6 +124,41 @@ Switching chats does **not** remount `ChatWindow` — `AppShell.handleSelectSess
 
 ## Extension command session actions (`ctx.newSession` / `ctx.fork` / `ctx.switchSession`)
 The pi CLI's `AgentSessionRuntime` replaces its single session in place; Pi Web hosts many, so `createExtensionCommandContextActions()` in `lib/rpc-manager.ts` gives the target its own wrapper instead: `newSession` starts one through `startRpcSession()` (with `parentSession`, the source's model/thinking/tool selection, then `setup()` + `refreshContext()`), `fork` writes the file through the same `writeForkedSession()` the browser's Fork uses, and `switchSession` resolves the file's id. The source wrapper is not torn down — it finishes the command that asked for the move — and emits `session_replaced { sessionId }`, which `useAgentSession` follows through `onSessionForked`. `session_before_switch` / `session_before_fork` handlers still cancel, and `withSession` receives the target's `createReplacedSessionContext()`. These used to be stubs returning `{ cancelled: true }`, so commands built on them silently did nothing; `lib/rpc-manager-extension-session-actions.test.mjs` pins the behaviour.
+
+## Startup extension UI and unconfirmed run state (pi CLI engine)
+The child raises extension UI while it boots, before the wrapper's relay exists. `PiRpcClient.beginUiAttachWindow()` (opened by `factory.ts` before the `get_state` handshake, closed right after `core.attachUiRelay`) is an explicit bounded hold: a request keeps its original `id` and deadline, replay is strictly in arrival order (it stops at the first method with no handler, so registering handlers one at a time cannot reorder), overflow evicts the oldest, and the deadline, `close()`, `kill()` and child exit cancel — a dialog is **never** approved on the user's behalf. `CliRpcCore` holds non-bridge `notify` (and any fire-and-forget method) raised before `attachUiRelay` in a bounded backlog; bridge result envelopes are still consumed immediately, so `refreshTools` before the relay is unaffected. A dialog *awaited inside* the `session_start` handler is unanswerable over RPC (pi runs startup handlers before attaching its stdin reader and exits when the loop empties) — a startup prompt must be deferred out of the handler. `lib/pi-rpc/startup-ui.unit.test.mjs` (fake child) and `startup-ui.smoke.test.mjs` (real pi, no LLM) pin it.
+
+`get_state` reports no `autoRetryEnabled` field, so `initialCoreState` leaves it **undefined**: the UI's `automation` keeps `null` and the gear hides the switch until `set_auto_retry` or an `auto_retry_start` event proves the value. Never default it to `true` again — that claimed an enabled retry policy the child never confirmed.
+
+## CLI stop, process exit, and post-compaction usage
+
+- A CLI exit is a terminal transport event (`session_process_exit`), not successful
+  agent completion. The factory invalidates its exact wrapper, cancels lifecycle
+  consumers, clears the running set, and closes SSE. The client clears busy states
+  and closes its EventSource before shutdown can auto-reconnect and respawn the
+  failed process. Stop/steer/follow-up control requests never start a dead session.
+- Stop displays a pending state, deduplicates clicks, and reports failure instead
+  of only logging to the console. The RPC has a 30-second deadline and the HTTP
+  wait a 35-second deadline. A server-confirmed Stop failure carries a runtime
+  instance id; only explicit confirmation may force-kill that same CLI process.
+  A replacement instance is rejected. Other sessions and the app are not killed;
+  background work owned by the terminated CLI may be interrupted. This is not a
+  guarantee that all descendant processes have been reaped.
+- Exit code/signal/pid and bounded, redacted stderr lines reach the server log even
+  without a custom log callback. This improves diagnosis; code 3 alone does not
+  identify the cause of a crash or prove a provider failure.
+- Manual compaction has no `agent_settled`. After its successful RPC response the
+  adapter awaits fresh CLI stats, and `compaction_end` also invalidates/refetches
+  cached usage. Request generations discard older pre-compaction replies. The
+  `context_usage` event updates the ring; missing usage clears it. CLI null
+  tokens/percent after compaction means unknown until a subsequent response, not
+  zero. If stats refresh fails, compaction remains successful but old usage is
+  not retained. Desktop code never estimates a replacement percentage.
+- Regression tests: `lib/pi-rpc/process-exit.unit.test.mjs`,
+  `lib/pi-rpc/session.unit.test.mjs`, `hooks/useAgentSession.stop.test.mjs`,
+  `app/api/agent/[id]/control-route.test.mjs`, and
+  `lib/pi-rpc/recovery.smoke.test.mjs`. The real-CLI smoke isolates cwd/agent/session
+  storage and supplies compaction with a fixture extension (no provider request).
 
 ## Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then patches recursive tree helpers in the generated HTML to iterative versions so very deep linear sessions do not overflow the browser call stack.

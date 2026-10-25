@@ -87,9 +87,10 @@ test("collapses secondary composer chrome while the mobile keyboard is open", ()
   assert.match(cssSource, /html\[data-keyboard-open\] \.chat-content \{\s*padding-bottom: 0 !important;/);
   assert.match(cssSource, /html\[data-keyboard-open\] \.chat-input-shell \{\s*padding-bottom: 6px !important;/);
   // The main composer's send is icon-only (phone and desktop) but keeps an
-  // accessible name; only the compact quote composer shows the label.
-  assert.match(chatInputSource, /aria-label=\{t\(showStop \? "chat\.stopAgent" : isStreaming \? "chat\.queueMessage" : "chat\.send"\)\}/);
-  assert.match(chatInputSource, /\{compact && t\(showStop \? "chat\.stop" : "chat\.send"\)\}/);
+  // accessible name; only the compact quote composer shows the label. A Stop
+  // already sent says "stopping" while it waits (a11y: the click took).
+  assert.match(chatInputSource, /aria-label=\{t\(showStop \? stopPending \? "chat\.stopping" : "chat\.stopAgent" : isStreaming \? "chat\.queueMessage" : "chat\.send"\)\}/);
+  assert.match(chatInputSource, /\{showStop && stopPending \? <span role="status" className=\{compact \? undefined : "sr-only"\}>\{t\("chat\.stopping"\)\}<\/span> : compact && t\(showStop \? "chat\.stop" : "chat\.send"\)\}/);
 });
 
 test("keeps Settings › MCP usable in the 190px phone sidebar", () => {

@@ -8,6 +8,7 @@ const jiti = createJiti(import.meta.url, {
   moduleCache: false,
 });
 const { GET, POST } = await jiti.import("./route.ts");
+const { createEventBusSubagentTransport } = await jiti.import("@/lib/pi-subagents-rpc.ts");
 
 const PI_SUBAGENTS_EXTENSION = {
   path: "C:/pi-seed/npm/node_modules/pi-subagents/index.js",
@@ -116,11 +117,16 @@ function bridgeBus(options) {
   };
 }
 
-function createWrapper({ chatWorkspace = false, alive = true, bus, extensions, closeController = new AbortController() } = {}) {
+function createWrapper({ chatWorkspace = false, alive = true, bus, extensions, transport, state, closeController = new AbortController() } = {}) {
   return {
     isChatWorkspace: () => chatWorkspace,
     isAlive: () => alive,
     getSubagentsEventBus: () => bus,
+    // The engine's transport: the child bridge on the CLI engine, this bus
+    // otherwise. A `transport` override models the bridge.
+    getSubagentsRpcTransport: () => transport ?? (bus ? createEventBusSubagentTransport(bus) : undefined),
+    piSubagentsExtensionState: () => state
+      ?? (extensions === undefined ? "loaded" : extensions.length > 0 ? "loaded" : "not-loaded"),
     getLifecycleAbortSignal: () => closeController.signal,
     inner: {
       resourceLoader: {

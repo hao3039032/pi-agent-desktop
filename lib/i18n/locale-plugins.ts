@@ -16,6 +16,12 @@ const FORK_MESSAGE_PATCHES: Record<Locale, {
 }> = {
   "en": {
     "set": {
+      "chat.stopping": "Stopping…",
+      "chat.stopFailed": "Could not stop: {error}",
+      "chat.processExited": "The session CLI process exited ({code}). Send a new message to restart it.",
+      "chat.forceStopTitle": "Force terminate this session process?",
+      "chat.forceStopBody": "Normal Stop did not complete. Terminate only this session’s CLI process? Unfinished output may be lost and background sub-agent work may be interrupted. Other sessions and the app will not be terminated.",
+      "chat.forceStopConfirm": "Force terminate",
       "subagentFleet.activeCount": "{count} active",
       "subagentFleet.noRuns": "No sub-agent runs in this session",
       "subagentFleet.currentTurn": "Active work (foreground and background)",
@@ -42,6 +48,7 @@ const FORK_MESSAGE_PATCHES: Record<Locale, {
       "subagentFleet.unavailable.chat": "Sub-agents are not available in chats",
       "subagentFleet.unavailable.notLoaded": "The pi-subagents package is not loaded in this session. Install or enable it, then reload the session",
       "subagentFleet.unavailable.noBus": "This session cannot expose sub-agent runs (restarted from an older version?). Reload the session",
+      "subagentFleet.unavailable.unknown": "This session cannot tell whether pi-subagents is loaded (older bridge). Reload the session or the app",
       "subagentFleet.unavailable.unresponsive": "The pi-subagents extension did not answer. Reload the session or the app",
       "subagentFleet.unavailable.incompatible": "The installed pi-subagents version speaks an unsupported protocol. Update the package",
       "subagentFleet.unavailable.closed": "This session is closing",
@@ -671,6 +678,12 @@ const FORK_MESSAGE_PATCHES: Record<Locale, {
   },
   "zh-CN": {
     "set": {
+      "chat.stopping": "正在停止…",
+      "chat.stopFailed": "停止失败：{error}",
+      "chat.processExited": "此会话的 CLI 进程已退出（{code}）。发送新消息可重新启动。",
+      "chat.forceStopTitle": "强制终止此会话进程？",
+      "chat.forceStopBody": "普通停止未能完成。是否仅终止此会话的 CLI 进程？未完成的输出可能丢失，后台子代理任务可能中断。不会终止其他会话或整个应用。",
+      "chat.forceStopConfirm": "强制终止",
       "subagentFleet.activeCount": "{count} 个运行中",
       "subagentFleet.noRuns": "本会话暂无子代理运行",
       "subagentFleet.currentTurn": "活跃工作（前台与后台）",
@@ -697,6 +710,7 @@ const FORK_MESSAGE_PATCHES: Record<Locale, {
       "subagentFleet.unavailable.chat": "闲聊会话不提供子代理",
       "subagentFleet.unavailable.notLoaded": "本会话未加载 pi-subagents 包。请安装或启用后重新加载会话",
       "subagentFleet.unavailable.noBus": "本会话无法暴露子代理运行（从旧版本重启？）。请重新加载会话",
+      "subagentFleet.unavailable.unknown": "本会话无法判断 pi-subagents 是否已加载（桥接版本较旧）。请重新加载会话或应用",
       "subagentFleet.unavailable.unresponsive": "pi-subagents 扩展未响应。请重新加载会话或应用",
       "subagentFleet.unavailable.incompatible": "已安装的 pi-subagents 版本协议不受支持。请升级该包",
       "subagentFleet.unavailable.closed": "会话正在关闭",
@@ -1329,6 +1343,12 @@ const FORK_MESSAGE_PATCHES: Record<Locale, {
   },
   "zh-TW": {
     "set": {
+      "chat.stopping": "正在停止…",
+      "chat.stopFailed": "停止失敗：{error}",
+      "chat.processExited": "此工作階段的 CLI 程序已結束（{code}）。傳送新訊息可重新啟動。",
+      "chat.forceStopTitle": "強制終止此工作階段程序？",
+      "chat.forceStopBody": "一般停止未能完成。是否僅終止此工作階段的 CLI 程序？未完成的輸出可能遺失，背景子代理工作可能中斷。不會終止其他工作階段或整個應用程式。",
+      "chat.forceStopConfirm": "強制終止",
       "subagentFleet.activeCount": "{count} 個執行中",
       "subagentFleet.noRuns": "本工作階段暫無子代理執行",
       "subagentFleet.currentTurn": "活躍工作（前景與背景）",
@@ -1355,6 +1375,7 @@ const FORK_MESSAGE_PATCHES: Record<Locale, {
       "subagentFleet.unavailable.chat": "閒聊工作階段不提供子代理",
       "subagentFleet.unavailable.notLoaded": "本工作階段未載入 pi-subagents 套件。請安裝或啟用後重新載入工作階段",
       "subagentFleet.unavailable.noBus": "本工作階段無法暴露子代理執行（從舊版本重啟？）。請重新載入工作階段",
+      "subagentFleet.unavailable.unknown": "本工作階段無法判斷 pi-subagents 是否已載入（橋接版本較舊）。請重新載入工作階段或應用",
       "subagentFleet.unavailable.unresponsive": "pi-subagents 擴充未回應。請重新載入工作階段或應用",
       "subagentFleet.unavailable.incompatible": "已安裝的 pi-subagents 版本協定不受支援。請升級該套件",
       "subagentFleet.unavailable.closed": "工作階段正在關閉",

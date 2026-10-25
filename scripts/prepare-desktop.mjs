@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { desktopTargetTriple, readMachOCpuTypes, requiredMachOCpuType } from "./desktop-platform.mjs";
+import { piExecutableName, stagePiDistribution, stagePiExecutableOnly } from "./pi-cli-distribution.mjs";
 import { piPackageDirNames } from "./pi-packages.mjs";
 import { dedupeNestedPackages, externalPackageSpecifiers, findNestedPiScopePackages, stageCompletePackage, stageResolvedClosure } from "./stage-package.mjs";
 
@@ -407,18 +408,46 @@ if (overlong.length > 0) {
 
 const { binaryPath: nodeBinary, triple } = await bundleNodeRuntime();
 
-// The CLI engine (lib/pi-rpc) spawns `pi` children; ship the binary beside
-// the server so the desktop works without a PATH install. PI_CLI_SOURCE
-// points at the pi executable to bundle (PI_CLI_BIN works too).
+// The CLI engine (lib/pi-rpc) spawns `pi` children; ship the whole pi
+// distribution beside the server so the desktop works without a PATH install.
+// PI_CLI_DISTRIBUTION_DIR is the directory the release download step extracted
+// (the archive's own layout, binary included); resources next to the binary —
+// photon_rs_bg.wasm, theme/ — are part of the package, not optional extras.
+// PI_CLI_SOURCE alone (a bare executable) is still supported and is recorded
+// as an incomplete staging so the release gate can tell the two apart.
+const piDistributionDir = process.env.PI_CLI_DISTRIBUTION_DIR;
 const piSource = process.env.PI_CLI_SOURCE ?? process.env.PI_CLI_BIN;
-if (piSource) {
+const piResourcesDir = join(rootDir, "src-tauri", "resources", "pi");
+// The target platform is chosen by the BUILD TARGET, not the host: the Intel
+// macOS build runs on an Apple Silicon runner, and a cross build must still
+// stage `pi` (never `pi.exe`) with executable permission.
+const piTargetPlatform = triple.includes("-pc-windows")
+  ? "win32"
+  : triple.includes("-apple-darwin")
+    ? "darwin"
+    : "linux";
+if (piDistributionDir) {
+  await access(piDistributionDir, constants.R_OK);
+  const manifest = stagePiDistribution({
+    sourceDir: piDistributionDir,
+    destDir: piResourcesDir,
+    binaryName: piExecutableName(piTargetPlatform),
+    platform: piTargetPlatform,
+  });
+  console.log(`pi CLI staged at ${relative(rootDir, join(piResourcesDir, manifest.binary))} (${manifest.files.length} files from the distribution)`);
+} else if (piSource) {
+  if (process.env.PI_DESKTOP_REQUIRE_PI === "1") {
+    // Release context: the archives ship wasm + theme next to the binary; a
+    // bare executable there is a half distribution, and the release gate
+    // (complete: true in the manifest) must never pass with one.
+    throw new Error(
+      "PI_DESKTOP_REQUIRE_PI=1 requires PI_CLI_DISTRIBUTION_DIR (the archive's own directory); " +
+        `PI_CLI_SOURCE alone (${piSource}) would package an incomplete distribution.`,
+    );
+  }
   await access(piSource, constants.R_OK);
-  const piResourcesDir = join(rootDir, "src-tauri", "resources", "pi");
-  await rm(piResourcesDir, { recursive: true, force: true });
-  await mkdir(piResourcesDir, { recursive: true });
-  const piDestination = join(piResourcesDir, basename(piSource));
-  await copyFile(piSource, piDestination);
-  console.log(`pi CLI staged at ${relative(rootDir, piDestination)}`);
+  stagePiExecutableOnly({ sourcePath: piSource, destDir: piResourcesDir, platform: piTargetPlatform });
+  console.log(`pi CLI staged at ${relative(rootDir, join(piResourcesDir, basename(piSource)))} (executable only: no PI_CLI_DISTRIBUTION_DIR)`);
 } else if (process.env.PI_DESKTOP_REQUIRE_PI === "1") {
   // Release context: every session runs on the pi CLI child since the route
   // flip, so a desktop without the binary is fully broken, not degraded.
@@ -427,7 +456,7 @@ if (piSource) {
       "the packaged desktop would have no pi CLI to run sessions on.",
   );
 } else {
-  console.log("No PI_CLI_SOURCE/PI_CLI_BIN set: the desktop will resolve pi from PATH.");
+  console.log("No PI_CLI_DISTRIBUTION_DIR/PI_CLI_SOURCE/PI_CLI_BIN set: the desktop will resolve pi from PATH.");
 }
 
 console.log(`Desktop server staged at ${serverResourcesDir}`);

@@ -11,6 +11,7 @@ export async function POST(
   const { id } = await params;
   let commandType: string | undefined;
   let promptAccepted = false;
+  let instanceId: string | undefined;
 
   try {
     const body = await req.json() as { type: string; [key: string]: unknown };
@@ -26,6 +27,21 @@ export async function POST(
 
     // Fast path: already-running session
     const existing = getRpcSession(id);
+    instanceId = existing?.instanceId;
+    // Control targets the existing process only. A Stop/steer must never
+    // resurrect a dead CLI or target a replacement after an old Stop failed.
+    if (["abort", "abort_bash", "abort_compaction", "abort_retry", "abort_branch_summary", "steer", "follow_up", "force_stop"].includes(body.type)) {
+      if (!existing?.isAlive()) {
+        return NextResponse.json({ error: "Session process is closed", code: "session_closed" }, { status: 409 });
+      }
+      if (body.type === "force_stop") {
+        if (body.instanceId !== existing.instanceId) {
+          return NextResponse.json({ error: "Session process changed", code: "session_changed" }, { status: 409 });
+        }
+        await existing.forceStop(body.instanceId);
+        return NextResponse.json({ success: true });
+      }
+    }
     if (body.type === "set_tools") {
       const filePath = existing?.sessionFile || await resolveSessionPath(id) || undefined;
       if (!existing?.isAlive() && !filePath) {
@@ -63,6 +79,7 @@ export async function POST(
   } catch (error) {
     return NextResponse.json({
       error: error instanceof Error ? error.message : String(error),
+      ...(["abort", "abort_bash", "abort_compaction"].includes(commandType ?? "") && instanceId ? { instanceId } : {}),
       ...(commandType === "prompt" && !promptAccepted
         ? { code: "prompt_rejected", accepted: false }
         : {}),

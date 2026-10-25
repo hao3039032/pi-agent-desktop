@@ -8,6 +8,11 @@ export function getThinkingPreview(thinking: string): string {
   return thinking.trimStart().match(/^[^\r\n]{0,240}/u)?.[0].trimEnd() ?? "";
 }
 
+/** Both the package notification and historical built-in notification start a turn, even when display is false. */
+export function isSubagentNotificationType(customType: unknown): boolean {
+  return customType === "subagent-notify" || customType === "pi-web:subagent-notification";
+}
+
 export function isMessageGroupAnchor(message: { role?: AgentMessage["role"]; customType?: string }): boolean {
   // A background subagent completion starts a new displayed turn, same as a
   // user message or a compaction / branch summary. Other custom messages stay inside the turn.
@@ -15,7 +20,7 @@ export function isMessageGroupAnchor(message: { role?: AgentMessage["role"]; cus
     || (message.role === "custom" && (
       message.customType === "compaction"
       || message.customType === "branch_summary"
-      || message.customType === "pi-web:subagent-notification"
+      || isSubagentNotificationType(message.customType)
     ));
 }
 

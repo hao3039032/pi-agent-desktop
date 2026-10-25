@@ -12,6 +12,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPiDistributionManifest } from "./pi-cli-distribution.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const resources = join(root, "src-tauri", "resources");
@@ -25,6 +26,37 @@ const node = [
 ].find(existsSync);
 assert.ok(node, "Run desktop:prepare first");
 assert.equal(existsSync(cacheDir), false, "A package must not ship runtime route-cache");
+
+// The pi CLI ships as a distribution, not a lone executable: the archive's
+// resources (photon_rs_bg.wasm on darwin/linux, theme/) belong in the package
+// too. The manifest prepare-desktop wrote is the checklist — a pruned tree or
+// a resource left behind in the runner's temp dir fails here.
+const piResources = join(resources, "pi");
+const piManifest = readPiDistributionManifest(piResources);
+if (piManifest) {
+  assert.ok(
+    existsSync(join(piResources, piManifest.binary)),
+    `Packaged pi binary is missing: resources/pi/${piManifest.binary}`,
+  );
+  const missing = piManifest.files.filter((file) => !existsSync(join(piResources, ...file.split("/"))));
+  assert.deepEqual(missing, [], `Packaged pi distribution is missing ${missing.length} file(s)`);
+  assert.ok(piManifest.files.length >= 1);
+  // Release context: the distribution must be the archive's whole tree
+  // (complete: true), not the executable-only fallback. Dev trees without
+  // PI_DESKTOP_REQUIRE_PI keep the fallback.
+  if (process.env.PI_DESKTOP_REQUIRE_PI === "1") {
+    assert.equal(
+      piManifest.complete,
+      true,
+      "PI_DESKTOP_REQUIRE_PI=1: the packaged pi distribution is not complete (manifest.complete is not true)",
+    );
+  }
+  console.log(`OK: packaged pi distribution has ${piManifest.files.length} file(s) from the release archive.`);
+} else if (existsSync(piResources)) {
+  throw new Error("resources/pi exists without a distribution manifest: re-run desktop:prepare");
+} else {
+  console.log("No packaged pi CLI in this tree (desktop:prepare ran without one).");
+}
 const seed = await readFile(join(dist, "app", "index.html"), "utf8");
 const scripts = [...new Set([...seed.matchAll(/<script\b[^>]*\bsrc="([^"#]+)"/g)].map((match) => match[1]))];
 assert.ok(scripts.some((src) => /\/app\/page-[^/]+\.js/.test(src)), "Missing homepage chunk in build seed");

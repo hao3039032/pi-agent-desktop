@@ -203,6 +203,34 @@ test("the distro release workflow builds on the macOS 26 SDK", async () => {
   assert.match(workflow, /--show-sdk-version\)"\n\s+echo "macOS SDK \$sdk"\n\s+test "\$\{sdk%%\.\*\}" -ge 26/);
 });
 
+test("the distro release stages the pi CLI by target triple through the shared script", async () => {
+  const workflow = await readFile(
+    join(root, ".github", "workflows", "distro-release.yml"),
+    "utf8",
+  ).then((text) => text.replaceAll("\r\n", "\n"));
+
+  // The four targets differ in architecture, and one of the macOS builds runs
+  // on the other architecture's runner: the Rust target triple has to pick
+  // the archive, and scripts/pi-cli-release.mjs owns that map (the hand-written
+  // `case` on matrix.platform downloaded pi-macos-x64.zip, which the release
+  // never published — every macOS job died at this step).
+  assert.match(workflow, /node scripts\/pi-cli-release\.mjs/);
+  assert.match(workflow, /--target "\$\{\{ matrix\.target \}\}"/);
+  assert.match(workflow, /--github-env "\$GITHUB_ENV"/);
+  // prepare-desktop stages the WHOLE distribution (wasm, theme), not just the
+  // executable: the download step exports the directory it extracted into.
+  assert.match(workflow, /PI_CLI_DISTRIBUTION_DIR: \$\{\{ env\.PI_CLI_DISTRIBUTION_DIR \}\}/);
+  assert.doesNotMatch(workflow, /pi-macos-x64\.zip/);
+  assert.doesNotMatch(workflow, /releases\/latest\/download/);
+  for (const target of [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+  ]) {
+    assert.match(workflow, new RegExp(`target: ${target}`), `the matrix carries ${target}`);
+  }
+});
+
 test("nothing reintroduces a literal homedir() into an fs call", async () => {
   // This is what broke the Windows build for every release: @vercel/nft folds
   // homedir() at build time and globs the whole user profile, which dies on the

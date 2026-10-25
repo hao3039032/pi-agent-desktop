@@ -71,6 +71,7 @@ interface Props {
   /** Files picked with "+": images and other files. Without it the picker takes images only. */
   onAttachFiles?: (files: File[]) => void;
   onAbort: () => void;
+  stopPending?: boolean;
   onSteer?: (message: string, images?: AttachedImage[]) => void;
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
@@ -797,7 +798,7 @@ export function ModelScopeWarningBanner({
 }
 
 export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAttachFiles, onAbort, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, workspaceUnavailable, onRecheckWorkspace, modelScopeWarnings, onDismissModelScopeWarnings, onOpenModelsConfig, onModelChange, modelSwitching,
+  onSend, onAttachFiles, onAbort, stopPending = false, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, workspaceUnavailable, onRecheckWorkspace, modelScopeWarnings, onDismissModelScopeWarnings, onOpenModelsConfig, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, compactNotice, compactResult, summarizationRetry, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
@@ -2806,9 +2807,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             className={compact ? "native-primary-button" : "native-primary-button composer-send-button"}
             data-action={showStop ? "stop" : isStreaming ? "queue" : "send"}
             onClick={showStop ? onAbort : isStreaming ? () => void sendQueued(onFollowUp ? "followup" : "steer") : handleSend}
-            disabled={!showStop && (!canSend || (isStreaming && !onFollowUp && !onSteer))}
-            title={t(showStop ? "chat.stopAgent" : isStreaming ? "chat.queueMessage" : "chat.send")}
-            aria-label={t(showStop ? "chat.stopAgent" : isStreaming ? "chat.queueMessage" : "chat.send")}
+            disabled={!showStop && (!canSend || (isStreaming && !onFollowUp && !onSteer)) || showStop && stopPending}
+            aria-busy={showStop && stopPending || undefined}
+            title={t(showStop ? stopPending ? "chat.stopping" : "chat.stopAgent" : isStreaming ? "chat.queueMessage" : "chat.send")}
+            aria-label={t(showStop ? stopPending ? "chat.stopping" : "chat.stopAgent" : isStreaming ? "chat.queueMessage" : "chat.send")}
             style={{ flexShrink: 0, alignSelf: "flex-end", ...(compact ? { display: "flex", alignItems: "center", gap: 6 } : null) }}
           >
             {showStop ? (
@@ -2818,7 +2820,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <line x1="8" y1="13" x2="8" y2="3.5" /><polyline points="3.5 7.5 8 3 12.5 7.5" />
               </svg>
             )}
-            {compact && t(showStop ? "chat.stop" : "chat.send")}
+            {showStop && stopPending ? <span role="status" className={compact ? undefined : "sr-only"}>{t("chat.stopping")}</span> : compact && t(showStop ? "chat.stop" : "chat.send")}
           </button>
           </div>
           {/* Session controls sit below the input card, not inside it. */}

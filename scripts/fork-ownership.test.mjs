@@ -134,11 +134,12 @@ test("high and medium overlaps require review; low-only does not", () => {
 test("each pi-subagents policy seam independently requires upstream review", () => {
   // One incoming file is enough: a combined changeset containing rpc-manager
   // would mask a missing entry for any of the other policy seams.
+  // (lib/subagent-runtime.ts, components/AgentsConfig.tsx and the subagents
+  // settings route were deleted with the built-in engine (M4) and left the
+  // manifest: an upstream file we no longer carry cannot drift here.)
   const expectedRisks = {
     "lib/subagent-extension.ts": "medium",
-    "lib/subagent-runtime.ts": "medium",
     "lib/subagent-settings.ts": "medium",
-    "components/AgentsConfig.tsx": "medium",
     "lib/rpc-manager.ts": "high",
     "lib/i18n/locale-plugins.ts": "high",
   };
@@ -152,7 +153,10 @@ test("each pi-subagents policy seam independently requires upstream review", () 
 });
 
 test("the subagent settings response and type are tracked low-risk overlaps", () => {
-  for (const path of ["app/api/subagents/settings/route.ts", "lib/api-types.ts"]) {
+  // app/api/subagents/settings/route.ts went with the built-in engine (M4);
+  // lib/api-types.ts stays tracked. Recording the boundary must not silently
+  // change the existing low-only policy.
+  for (const path of ["lib/api-types.ts"]) {
     const result = classifyIncomingChanges([path], manifest);
     assert.deepEqual(result.overlaps.map((entry) => entry.path), [path]);
     assert.equal(result.highestRisk, "low", path);

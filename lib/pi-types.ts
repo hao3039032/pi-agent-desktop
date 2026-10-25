@@ -228,7 +228,7 @@ export interface AgentSessionLike {
     excludeFromContext?: boolean;
     operations?: BashOperations;
   }): Promise<{ output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string }>;
-  abortBash(): void;
+  abortBash(): void | Promise<void>;
   readonly isBashRunning: boolean;
   setModel(model: ModelLike): Promise<void>;
   navigateTree(targetId: string, options?: NavigateTreeOptions): Promise<NavigateTreeResult>;
@@ -238,7 +238,12 @@ export interface AgentSessionLike {
   refreshContext?(): void;
   setThinkingLevel(level: string): void;
   compact(customInstructions?: string): Promise<unknown>;
-  setSessionName(name: string): void;
+  /**
+   * The CLI engine confirms the rename with the child's RPC response (a
+   * resolved promise means the session file has the name); in-process engines
+   * return void.
+   */
+  setSessionName(name: string): Promise<void> | void;
   getSessionStats(): Omit<SessionStatsInfo, "sessionName">;
   getLastAssistantText(): string | undefined;
   setAutoCompactionEnabled(enabled: boolean): void;
@@ -251,8 +256,46 @@ export interface AgentSessionLike {
   clearQueue(): { steering: string[]; followUp: string[] };
   getAllTools(): ToolInfo[];
   getActiveToolNames(): string[];
-  setActiveToolsByName(names: string[]): void;
-  abortCompaction(): void;
+  /** Engines apply the set asynchronously (the CLI child answers a bridge request); in-process engines return void. */
+  setActiveToolsByName(names: string[]): void | Promise<void>;
+  /** Re-query the engine's real tool list/active set (the CLI child's bridge); absent on in-process engines. */
+  refreshTools?(): Promise<void>;
+  /**
+   * Persist the session's tool-selection pin through the engine's single
+   * writer (the CLI child appends the entry itself). Absent on in-process
+   * engines, where the host appends through `sessionManager`.
+   */
+  persistToolSelection?(toolNames: string[] | undefined): Promise<void>;
+  /**
+   * Whether `persistToolSelection` can append the pin while the engine's
+   * runtime is still alive (a CLI child's bridge writes it into the session
+   * file it owns). False/absent means the host may only append it after that
+   * runtime exited. This is a persistence capability, not a switching policy:
+   * a chat-only CLI session answers true while refusing live tool switches.
+   */
+  canPersistToolPinLive?(): boolean;
+  /**
+   * One restricted pi-subagents RPC through this engine's transport (the CLI
+   * child's bridge); absent on engines with no such path.
+   */
+  requestSubagentsRpc?(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: { timeoutMs?: number },
+  ): Promise<{ success?: boolean; data?: unknown; error?: { code: string; message: string } }>;
+  /**
+   * Whether the pi-subagents package is visible to the engine's own metadata
+   * (tool/command `sourceInfo`), by source or path — never by tool name.
+   * `unknown` means there is no evidence either way.
+   */
+  piSubagentsExtensionState?(): "loaded" | "not-loaded" | "unknown";
+  /**
+   * Atomically apply a resolved active set and persist its pin (one child-side
+   * transaction on the CLI engine). Absent on in-process engines, where the
+   * host applies the two steps itself.
+   */
+  applyToolSelection?(names: string[], pin: string[]): Promise<void>;
+  abortCompaction(): void | Promise<void>;
   /** Under a virtual model, the physical model of the latest successful response (pi >= 0.99). */
   readonly routedModel?: { model: ModelLike; thinkingLevel?: string };
   readonly cacheWarmingStatus?: NonNullable<CacheWarmingInfo["status"]>;

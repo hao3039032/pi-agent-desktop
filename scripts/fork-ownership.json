@@ -126,33 +126,12 @@
       "disposition": "accepted",
       "reason": "Fork precedence policy: preferPiSubagentsExtension detects loaded pi-subagents files and removes the built-in host plus resolved conflicts. Preserve package-first precedence and the detection flag when upstream changes extension registration; tool-name matching must not return."
     },
-    "lib/subagent-runtime.ts": {
-      "risk": "medium",
-      "drift": 36,
-      "structuralDrift": 36,
-      "disposition": "accepted",
-      "reason": "Fork start/resume guard combines the process-wide detection flag with global package activation. Upstream lifecycle changes must retain this best-effort gate without blocking existing children from get/steer/notification paths."
-    },
     "lib/subagent-settings.ts": {
       "risk": "medium",
       "drift": 43,
       "structuralDrift": 43,
       "disposition": "accepted",
       "reason": "Fork package-activation reader and shared package identity support both the runtime guard and Agents panel. Preserve npm/versioned/local-path recognition and extensions: [] disable semantics when upstream changes settings persistence."
-    },
-    "components/AgentsConfig.tsx": {
-      "risk": "medium",
-      "drift": 73,
-      "structuralDrift": 66,
-      "disposition": "accepted",
-      "reason": "Fork pi-subagents notice disables the built-in switch and hides builtin profiles from both the sidebar and detail selection. Upstream form or selection changes can silently restore an orphaned builtin pane; retain visibleProfiles and settings-response wiring."
-    },
-    "app/api/subagents/settings/route.ts": {
-      "risk": "low",
-      "drift": 13,
-      "structuralDrift": 13,
-      "disposition": "accepted",
-      "reason": "Fork GET and PUT responses add legacyPackage from global package settings. Preserve both response paths when upstream changes the built-in settings API; the read does not activate extensions."
     },
     "lib/api-types.ts": {
       "risk": "low",
@@ -310,7 +289,7 @@
     "reduce": "Drift that can be removed without losing anything — desktop-only code that belongs in components/desktop/, or fork additions sitting in an upstream file that can move to a fork-owned one. Act on these."
   },
   "decisionLog": [
-"2026-10-21 — MarkdownBody now integrates @lobehub/streamdown through fork-owned StreamingMarkdown and useStreamingMarkdown, retaining Pi's remark/rehype pipeline, widgets, final-text flush and document-scoped fallbacks. Stable block caching and paced word fades replace full-document parsing on every streamed snapshot; no Lobe UI theme is imported. Browser replay measures parse volume against the former 120ms strategy.",
+    "2026-10-21 — MarkdownBody now integrates @lobehub/streamdown through fork-owned StreamingMarkdown and useStreamingMarkdown, retaining Pi's remark/rehype pipeline, widgets, final-text flush and document-scoped fallbacks. Stable block caching and paced word fades replace full-document parsing on every streamed snapshot; no Lobe UI theme is imported. Browser replay measures parse volume against the former 120ms strategy.",
     "2026-07-26 — lib/api-types.ts: fork update types moved to lib/app-update-types.ts; file now matches upstream and left the manifest.",
     "2026-07-26 — components/AppShell.tsx: desktop window chrome moved to components/desktop/ (-53 structural). The remaining 376 lines are the top-bar redesign; accepted.",
     "2026-07-26 — TabBar, FileExplorer, useTheme, FileViewer: assessed as generic improvements with zero desktop coupling. Upstreaming was declined, so accepted rather than reverted — reverting would delete working features to save CI review time.",

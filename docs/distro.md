@@ -24,6 +24,7 @@
 | `scripts/distro-seed.mjs` | 构建时把扩展包装进 `src-tauri/resources/pi-seed/`，并写 `manifest.json`（含 `seedVersion`）和 `bin/npm` shim。git 包去掉 peer 依赖和 `.map`/`.d.ts` 以减小体积 |
 | `scripts/distro-portable-git.mjs` | Windows 构建时下载 PortableGit（版本和 sha256 写死在脚本里），解压、裁剪文档/翻译后放进 `resources/git/`。`post-install.bat` 保留，由运行时执行 |
 | `scripts/distro-build-config.mjs` | 发版时生成 `tauri.distro.conf.json`（改名、identifier、updater 指向本仓库、附加 resources），并把版本号写成 上游X.Y.Z×100+revision |
+| `scripts/pi-cli-release.mjs` | 发版时按 **Rust target triple** 挑上游 pi 发版的归档（darwin/linux 为 `pi-*/{arm64,x64}.tar.gz`，Windows 为 `pi-*.zip`），用该发版自己的 `SHA256SUMS` 校验后解包；包里布局不同（tar 是 `pi/pi`，zip 是扁平的 `pi.exe`），脚本统一落到 `resolvePiExecutable()` 认的文件名并导出 `PI_CLI_SOURCE` |
 | `scripts/distro-reset-revision.mjs` | 合并上游后若版本变化，把 `distro.json` 的 `revision` 重置为 1（revision 按上游版本分别计数，`distro-sync.yml` 自动执行，也并入 merge commit） |
 | `lib/distro/` | 运行时：PATH 注入（npm shim、Git Bash）、首次启动种子（packages 重写、默认值、`pi-plan-vanguard.json`、`WATCHDOG.yml`）、服务配置读写、一次性迁移（`mcp-migration.ts`、`lazy-tool-activation.ts`） |
 | `components/distro/` | 首次启动弹窗 + 设置里的服务配置表单 |
@@ -56,6 +57,10 @@
 3. 全部目标构建成功后 draft 自动转正；部分失败保持 draft，会在 job summary 里报警，不要手工发布。
 
 ## macOS 双架构（Intel 支持）
+
+随包的 pi CLI 与 Node 运行时一样按 **target triple** 选：`scripts/pi-cli-release.mjs` 用 `matrix.target`（`aarch64-apple-darwin` / `x86_64-apple-darwin`）查上游发版归档，而不是 runner 的架构——Intel 包正是跑在 Apple Silicon runner 上。这一步曾经按 `matrix.platform` 写死一个上游从未发布的 `pi-macos-x64.zip`，两个 macOS 目标都在下载处 404，等于近几版没有 mac 安装包；现在下载的名字只来自脚本里的映射表（Map，`constructor`/`__proto__` 不是 triple），`SHA256SUMS` 里查不到该名字就直接失败（上游改名不会被静默当成空归档），并校验整个归档的 sha256 后才解包（自写的 tar.gz/zip 读取器遇到 PAX/GNU 扩展头、越界长度、路径逃逸、symlink 直接拒绝）。
+
+**随包的 pi 是整个发行目录，不只是一个可执行文件**：归档里 darwin/linux 还带 `pi/photon_rs_bg.wasm`、`pi/theme/`（Windows zip 是扁平的 `pi.exe`+`theme/`）。`scripts/pi-cli-release.mjs` 导出 `PI_CLI_SOURCE`（可执行文件）与 `PI_CLI_DISTRIBUTION_DIR`（解包出来的发行目录），`scripts/prepare-desktop.mjs` 通过 `scripts/pi-cli-distribution.mjs` 把整个目录树拷进 `src-tauri/resources/pi/` 并写 `pi-distribution.json` 清单；只给 `PI_CLI_SOURCE`（单可执行文件）仍是明确支持的旧输入，清单里记 `complete: false`（本地开发树用；发版工作流 `PI_DESKTOP_REQUIRE_PI=1` 下直接拒绝，`scripts/verify-packaged-frontend.mjs` 还会断言 `complete: true`）。清单核对不在 `desktop:verify`，在 `scripts/verify-packaged-frontend.mjs`：按清单逐个核对最终 resources，缺一个文件就不放行。可执行文件名与权限按 **target** 而非 host 判断（交叉构建不用 host 平台的 `pi.exe`）。
 
 Rust 直接在 Apple Silicon runner 上交叉编译 `x86_64-apple-darwin`；真正架构相关的只有随包分发的 Node 运行时：`scripts/prepare-desktop.mjs` 默认复制构建机正在运行的 `process.execPath`，交叉构建时由工作流从 nodejs.org 下载同版本 `darwin-x64` Node，并通过两个环境变量交给打包脚本：
 

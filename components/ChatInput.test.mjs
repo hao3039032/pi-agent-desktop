@@ -1020,12 +1020,11 @@ test("chat-only composer keeps shell, file and session mentions out of the input
 
 test("only the chat composer offers saving a default model or reasoning level", () => {
   const chatInputSource = readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8");
-  const agentsConfigSource = readFileSync(new URL("./AgentsConfig.tsx", import.meta.url), "utf8");
+  // AgentsConfig.tsx is gone with the built-in subagent system (M4); the
+  // composer-only rule now stands on the ChatInput assertions alone.
   assert.match(chatInputSource, /<ModelSelector[\s\S]*?defaultValue=\{defaultModel\}[\s\S]*?onSetDefault=\{onSetDefaultModel\}/);
   // "auto" means "use the default", so it never gets a star of its own.
   assert.match(chatInputSource, /star=\{onSetDefaultThinkingLevel && lvl !== "auto"/);
-  // A subagent profile's model is not the default for new chats.
-  assert.doesNotMatch(agentsConfigSource, /onSetDefault/);
 });
 
 test("selector rows expose a plain default star separate from the selected option", async () => {

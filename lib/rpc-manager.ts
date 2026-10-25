@@ -34,7 +34,9 @@ import {
 } from "./session-replacement";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 import { readSubagentRun, readSubagentSessionResources, SUBAGENT_CONTROL_TOOL_NAMES } from "./subagents";
-import type { SubagentEventBus } from "./pi-subagents-rpc";
+import type { SubagentEventBus, SubagentRpcTransport } from "./pi-subagents-rpc";
+import { createBridgeSubagentTransport, createEventBusSubagentTransport } from "./pi-subagents-rpc";
+import { loadResultHasPiSubagentsExtension } from "./subagent-extension";
 import { resolveShellTools } from "./powershell-settings";
 import { contextFilesSystemPrompt } from "./chat-only";
 import type { McpHost } from "./mcp-host";
@@ -139,6 +141,8 @@ type AgentSessionWrapperOptions = {
    */
   noLiveToolSwitch?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
+  /** CLI-only, targets exactly this wrapper's child, never a replacement. */
+  terminateProcess?: () => Promise<void>;
   suppressCompletionNotifications?: boolean;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
   mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
@@ -365,6 +369,9 @@ export class AgentSessionWrapper {
   // wrapper's extension bus must not outlive the session it belongs to
   // (lib/pi-subagents-rpc.ts takes it as its AbortSignal).
   private readonly lifecycleAbort = new AbortController();
+  readonly instanceId = randomUUID();
+  private stopRequested = false;
+  private readonly terminateProcess?: () => Promise<void>;
 
   constructor(
     public readonly inner: AgentSessionLike,
@@ -379,6 +386,7 @@ export class AgentSessionWrapper {
     this.chatFolder = options.chatFolder === true;
     this.noLiveToolSwitch = options.noLiveToolSwitch === true;
     this.onAgentRunComplete = options.onAgentRunComplete;
+    this.terminateProcess = options.terminateProcess;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.mcpHost = options.mcpHost;
     this.composerQueue = new ComposerQueue(inner.sessionId, {
@@ -507,6 +515,35 @@ export class AgentSessionWrapper {
     return this.subagentsEventBus;
   }
 
+  /**
+   * The restricted pi-subagents RPC transport for this session. On the CLI
+   * engine the package's listener lives in the pi child, so the call goes
+   * through that child's bridge; the in-process bus is the fallback for an
+   * engine that owns the bus here. Absent when neither path exists.
+   */
+  getSubagentsRpcTransport(): SubagentRpcTransport | undefined {
+    const inner = this.inner;
+    if (typeof inner.requestSubagentsRpc === "function") {
+      const request = inner.requestSubagentsRpc.bind(inner);
+      return createBridgeSubagentTransport((method, params, options) => request(method, params, options));
+    }
+    if (this.subagentsEventBus) return createEventBusSubagentTransport(this.subagentsEventBus);
+    return undefined;
+  }
+
+  /**
+   * Whether pi-subagents is loaded in this session, by extension source/path
+   * (never by tool name). `unknown` means this engine cannot tell — it must
+   * never be reported as "not installed".
+   */
+  piSubagentsExtensionState(): "loaded" | "not-loaded" | "unknown" {
+    const inner = this.inner;
+    if (typeof inner.piSubagentsExtensionState === "function") return inner.piSubagentsExtensionState();
+    const extensions = inner.resourceLoader?.getExtensions?.().extensions;
+    if (!extensions || !Array.isArray(extensions)) return "unknown";
+    return loadResultHasPiSubagentsExtension(extensions) ? "loaded" : "not-loaded";
+  }
+
   /** Aborts once shutdown() or destroy() starts; scoped subagent RPC uses it as its cancellation signal. */
   getLifecycleAbortSignal(): AbortSignal {
     return this.lifecycleAbort.signal;
@@ -520,6 +557,7 @@ export class AgentSessionWrapper {
   start(): void {
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
       if (event.type === "agent_start") {
+        this.stopRequested = false;
         this.agentRunNeedsCompletion = true;
         // Cross-window liveness: idle → running must reach other windows'
         // sidebars through the running-events stream, not just this one's SSE.
@@ -588,7 +626,7 @@ export class AgentSessionWrapper {
   }
 
   private notifyAgentRunCompleteIfIdle(): void {
-    if (!this.agentRunNeedsCompletion || this.isRunning() || this.composerQueue.snapshot().length) return;
+    if (!this.isAlive() || !this.agentRunNeedsCompletion || this.isRunning() || this.composerQueue.snapshot().length) return;
     this.agentRunNeedsCompletion = false;
     if (this.suppressCompletionNotifications) return;
     try {
@@ -702,14 +740,50 @@ export class AgentSessionWrapper {
   }
 
   /** Apply a coding tool selection; `carry` defaults to the tools active now. */
-  setActiveToolSelection(toolNames: string[], carry: readonly string[] = this.inner.getActiveToolNames()): void {
+  async setActiveToolSelection(toolNames: string[], carry?: readonly string[]): Promise<void> {
     if (this.noLiveToolSwitch) {
       // The child restored the target branch's loadout itself; the pin
       // re-applies at the next respawn (setRpcSessionTools).
       return;
     }
+    if (carry === undefined) {
+      // The carry must reflect the engine's live state: a tool registered
+      // since the last query (a late MCP server) would otherwise be switched
+      // off by the loadout change.
+      await this.inner.refreshTools?.();
+      carry = this.inner.getActiveToolNames();
+    }
     const names = resolveActiveToolNames(this.inner, toolNames, carry);
-    this.inner.setActiveToolsByName(this.chatWorkspace ? restrictToChatTools(this.inner, names, this.chatFolder) : names);
+    await this.inner.setActiveToolsByName(this.chatWorkspace ? restrictToChatTools(this.inner, names, this.chatFolder) : names);
+  }
+
+  /** Persist the session's tool-selection pin (the engine's writer when it has one). */
+  async persistToolSelection(toolNames: string[] | undefined): Promise<void> {
+    if (typeof this.inner.persistToolSelection === "function") {
+      await this.inner.persistToolSelection(toolNames);
+      return;
+    }
+    if (toolNames === undefined) appendClearedSessionToolSelection(this.inner.sessionManager);
+    else appendSessionToolSelection(this.inner.sessionManager, toolNames);
+  }
+
+  /**
+   * The live set_tools path: resolve the selection against the engine's real
+   * state, then persist the pin AND apply the set in one engine transaction
+   * when it has one (the CLI child confirms and appends atomically). The
+   * in-process engine keeps its two steps (pin, then apply).
+   */
+  async applyToolSelectionWithPin(toolNames: string[]): Promise<void> {
+    if (this.noLiveToolSwitch) return;
+    await this.inner.refreshTools?.();
+    const carry = this.inner.getActiveToolNames();
+    const names = resolveActiveToolNames(this.inner, toolNames, carry);
+    if (typeof this.inner.applyToolSelection === "function") {
+      await this.inner.applyToolSelection(names, toolNames);
+      return;
+    }
+    await this.persistToolSelection(toolNames);
+    await this.inner.setActiveToolsByName(names);
   }
 
   /**
@@ -730,7 +804,7 @@ export class AgentSessionWrapper {
     if (this.chatWorkspace) {
       // The target branch's transcript may declare coding tools a chat must not have.
       const activeAfter = this.inner.getActiveToolNames();
-      this.setActiveToolSelection(
+      await this.setActiveToolSelection(
         this.chatFolder ? [...CHAT_FOLDER_TOOL_NAMES] : [CHAT_READ_TOOL_NAME],
         [...activeAfter, ...activeBefore.filter((name) => SESSION_TOOL_NAMES.has(name))],
       );
@@ -740,7 +814,7 @@ export class AgentSessionWrapper {
     const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
     if (!readSubagentSessionResources(entries)) {
       const activeAfter = this.inner.getActiveToolNames();
-      this.setActiveToolSelection(
+      await this.setActiveToolSelection(
         readSessionToolSelection(entries) ?? activeAfter,
         [...activeAfter, ...activeBefore.filter((name) => SESSION_TOOL_NAMES.has(name))],
       );
@@ -886,6 +960,7 @@ export class AgentSessionWrapper {
     if (this.sessionReplacement && !allowedDuringReplacement) {
       throw new Error("Session is being copied to a new session");
     }
+    if (!this.isAlive()) throw new Error("Session process is closed; send a new prompt to restart it");
     if (SESSION_REPLACEMENT_COMMAND_TYPES.has(type) && this.activeMutatingCommands > 0) {
       throw new Error(`Cannot ${type} while another session command is running`);
     }
@@ -897,6 +972,7 @@ export class AgentSessionWrapper {
       // Status reconciliation must not postpone forced cleanup after Stop.
       if (type !== "get_state") this.resetIdleTimer();
       if (this.shouldWaitForExtensions(type)) await this.waitForExtensionsBound();
+      if (!this.isAlive()) throw new Error("Session process is closed");
       if (this.sessionReplacement && !allowedDuringReplacement) {
         throw new Error("Session is being copied to a new session");
       }
@@ -1069,6 +1145,7 @@ export class AgentSessionWrapper {
         return null;
 
       case "abort":
+        this.stopRequested = true;
         this.composerQueue.pause();
         this.forceShutdownOnIdle = true;
         // Arm the forced cleanup now: the reset above ran before this flag,
@@ -1264,7 +1341,10 @@ export class AgentSessionWrapper {
       case "set_session_name": {
         const name = (command.name as string | undefined)?.trim();
         if (!name) throw new Error("Session name cannot be empty");
-        this.inner.setSessionName(name);
+        // The CLI engine answers only after the child wrote the name; awaiting
+        // it keeps the list refresh from republishing the old name and makes a
+        // rejected rename reach the caller instead of looking successful.
+        await this.inner.setSessionName(name);
         invalidateSessionListCache();
         return null;
       }
@@ -1306,6 +1386,9 @@ export class AgentSessionWrapper {
       }
 
       case "get_tools": {
+        // The CLI engine's list comes from the child's real state: refresh
+        // before answering so the picker never shows a stale universe.
+        await this.inner.refreshTools?.();
         // A hidden tool is withdrawn: pi ignores it when setting the active tools. A chat
         // never lists the coding tools it blocks.
         const all: ToolInfo[] = this.inner.getAllTools().filter((t) => (
@@ -1361,7 +1444,7 @@ export class AgentSessionWrapper {
           throw new Error("Chats have no tools. Open a project to change the tool preset.");
         }
         const toolNames = command.toolNames as string[];
-        this.setActiveToolSelection(toolNames);
+        await this.setActiveToolSelection(toolNames);
         return null;
       }
 
@@ -1377,7 +1460,7 @@ export class AgentSessionWrapper {
         await this.inner.reload();
         // pi rebuilds from the tools active before, then extensions adjust them as they start
         // again; carry that result so a tool one switched off during reload stays off.
-        this.setActiveToolSelection(activeToolNames);
+        await this.setActiveToolSelection(activeToolNames);
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
         }
@@ -1386,7 +1469,8 @@ export class AgentSessionWrapper {
       }
 
       case "abort_compaction": {
-        this.inner.abortCompaction();
+        this.stopRequested = true;
+        await this.inner.abortCompaction();
         return null;
       }
 
@@ -1447,9 +1531,11 @@ export class AgentSessionWrapper {
       }
 
       case "abort_bash": {
+        this.stopRequested = true;
+        this.composerQueue.pause();
         this.forceShutdownOnIdle = true;
         this.resetIdleTimer();
-        this.inner.abortBash();
+        await this.inner.abortBash();
         return null;
       }
 
@@ -1476,6 +1562,28 @@ export class AgentSessionWrapper {
     }
   }
 
+  /** Transport failure is terminal, not a successful agent completion. */
+  handleProcessExit(code: number | null, signal?: string | null): void {
+    if (!this.isAlive()) return;
+    this.composerQueue.pause();
+    this.agentRunNeedsCompletion = false;
+    this.emit({ type: "session_process_exit", code, signal: signal ?? null });
+    this.destroy();
+    invalidateSessionListCache();
+    notifyRunningChange();
+  }
+
+  async forceStop(expectedInstanceId: unknown): Promise<void> {
+    if (expectedInstanceId !== this.instanceId || !this.isAlive()) {
+      throw new Error("Session process changed; refusing to terminate a replacement");
+    }
+    if (!this.stopRequested || !this.terminateProcess) {
+      throw new Error("Request Stop before forcing this session process to terminate");
+    }
+    this.composerQueue.pause();
+    await this.terminateProcess();
+  }
+
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
@@ -1486,7 +1594,7 @@ export class AgentSessionWrapper {
     // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
     this.emit({ type: "session_shutdown" });
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    if (this.inner.isBashRunning) this.inner.abortBash();
+    if (this.inner.isBashRunning) void Promise.resolve(this.inner.abortBash()).catch(() => {});
     this.unsubscribe?.();
     for (const pending of this.pendingUiResponses.values()) pending.cancel();
     for (const id of Array.from(this.activeCustomUis.keys())) this.closeCustomUi(id, undefined);
@@ -2424,6 +2532,29 @@ export interface SetRpcSessionToolsResult {
   recreated: boolean;
 }
 
+/** Which writer appends the tool pin for a session that must restart. */
+export type ToolPinRestartPhase =
+  /** The engine's live runtime appends it (a CLI child, single writer). */
+  | "engine-live"
+  /** The host appends it, but only after the engine's child exited. */
+  | "host-after-exit"
+  /** An in-process engine: the host appends through the session manager. */
+  | "host-manager";
+
+/**
+ * The pin's writer for a restart. This asks the engine's PERSISTENCE capability
+ * (`canPersistToolPinLive`), never its switching policy: a chat-only session
+ * refuses live tool switches but its child still appends the pin itself, and a
+ * CLI child whose bridge knows no tool operations can only be written to once
+ * it exited.
+ */
+export function toolPinRestartPhase(
+  engine: Pick<AgentSessionLike, "persistToolSelection" | "canPersistToolPinLive">,
+): ToolPinRestartPhase {
+  if (typeof engine.persistToolSelection !== "function") return "host-manager";
+  return engine.canPersistToolPinLive?.() === true ? "engine-live" : "host-after-exit";
+}
+
 /**
  * Persist a normal session's tool selection and rebuild when resource policy changes.
  * An undefined requestedToolNames returns the session to pi's configured defaults:
@@ -2477,17 +2608,31 @@ export async function setRpcSessionTools(
   const crossesChatOnlyBoundary = toolNames === undefined
     || !hasCurrentResourcePolicy
     || existing.isChatOnly() !== (toolNames.length === 0);
-  // The pi CLI engine has no in-memory tool switch: even a same-boundary pin
-  // change must respawn the child for the new selection to take effect.
+  // The pi CLI engine switches tools live through the bridge when its probe
+  // succeeded; otherwise (old bridge asset, or a protocol failure) a
+  // same-boundary pin change must respawn the child for the new selection.
+  // Chat-only sessions always restart here (their spawn flags differ), even
+  // though their bridge does answer tool operations.
   const needsRestart = crossesChatOnlyBoundary
     || (typeof existing.canLiveSwitchTools === "function" && !existing.canLiveSwitchTools());
-  if (toolNames === undefined) appendClearedSessionToolSelection(existing.inner.sessionManager);
-  else appendSessionToolSelection(existing.inner.sessionManager, toolNames);
-  invalidateSessionListCache();
 
   if (toolNames !== undefined && !needsRestart) {
-    existing.setActiveToolSelection(toolNames);
+    // Live path: one engine transaction (apply + confirm + pin) when present.
+    await existing.applyToolSelectionWithPin(toolNames);
+    invalidateSessionListCache();
     return { session: existing, sessionId, recreated: false };
+  }
+
+  // Which writer owns the pin on the restart path, and when. This is the
+  // engine's PERSISTENCE capability, not its switching policy: a chat-only
+  // session cannot switch live but its child still appends the pin itself.
+  const pinPhase = toolPinRestartPhase(existing.inner);
+
+  if (pinPhase !== "host-after-exit") {
+    // The live child appends the pin itself (single writer) or this is an
+    // in-process engine's own manager: write before the restart.
+    await existing.persistToolSelection(toolNames);
+    invalidateSessionListCache();
   }
 
   const persistedFile = existing.sessionFile && existsSync(existing.sessionFile)
@@ -2497,6 +2642,13 @@ export async function setRpcSessionTools(
   const model = existing.inner.model;
   const currentThinkingLevel = existing.inner.agent.state?.thinkingLevel;
   await existing.shutdown();
+
+  if (pinPhase === "host-after-exit") {
+    // The engine cannot write the pin while its child lives (no tool ops in the
+    // bridge): the host appends it, and only now that the child exited.
+    await existing.persistToolSelection(toolNames);
+    invalidateSessionListCache();
+  }
 
   if (persistedFile) {
     const started = await startRpcSession(sessionId, persistedFile, undefined);

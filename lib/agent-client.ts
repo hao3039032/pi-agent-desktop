@@ -13,6 +13,7 @@ export class AgentCommandError extends Error {
     public readonly status: number,
     public readonly code?: string,
     public readonly accepted?: boolean,
+    public readonly instanceId?: string,
   ) {
     super(message);
     this.name = "AgentCommandError";
@@ -28,11 +29,13 @@ export function isPromptRejectedError(error: unknown): error is AgentCommandErro
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
+  options?: { signal?: AbortSignal },
 ): Promise<T> {
   const res = await fetch(`/api/agent/${encodeURIComponent(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(command),
+    ...(options?.signal ? { signal: options.signal } : {}),
   });
   const body = (await res.json().catch(() => ({}))) as {
     success?: boolean;
@@ -40,6 +43,7 @@ export async function sendAgentCommand<T = unknown>(
     error?: string;
     code?: string;
     accepted?: boolean;
+    instanceId?: string;
   };
   if (!res.ok || body.error) {
     throw new AgentCommandError(
@@ -47,6 +51,7 @@ export async function sendAgentCommand<T = unknown>(
       res.status,
       body.code,
       body.accepted,
+      body.instanceId,
     );
   }
   return body.data as T;
