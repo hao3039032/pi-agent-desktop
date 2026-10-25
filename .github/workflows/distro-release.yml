@@ -9,6 +9,11 @@ name: Publish distro release
 
 on:
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Preview build: keep the release a draft, skip the updater feed and the latest flag"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -206,7 +211,9 @@ jobs:
           tagName: v__VERSION__
           releaseName: Pi Agent LW v__VERSION__
           releaseBody: |
-            Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
+            ${{ inputs.prerelease && format("⚠️ PREVIEW BUILD — architecture switch: every session now runs on the bundled pi CLI child process (the in-process SDK engine is removed). Not an auto-update channel release; install manually alongside or over the previous version.
+
+") || "" }}Pi Agent LW — pi-agent-desktop with the LW extensions, Git Bash (Windows) and npm built in.
 
             - Windows: download `*_x64-setup.exe` and run it.
             - macOS (Apple Silicon and Intel): open the `.dmg`, drag the app to Applications. First launch: System Settings → Privacy & Security → "Open Anyway".
@@ -214,12 +221,16 @@ jobs:
 
             On first launch, enter the service address and API key. Later changes: Settings → General → Service.
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ inputs.prerelease }}
           uploadUpdaterJson: true
           args: ${{ matrix.args }} --config src-tauri/tauri.distro.conf.json
 
   publish:
     needs: build
+    # A preview build stops at the draft: no updater feed rewrite, no
+    # --draft=false --latest, so the stable channel never sees it. Review
+    # the draft and publish it manually (or discard and rebuild) instead.
+    if: ${{ !inputs.prerelease }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
