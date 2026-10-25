@@ -65,6 +65,12 @@ export class FileSessionManagerView {
     return this.open().getEntries();
   }
 
+  // The live session reload (GET /api/sessions/[id]) reads the branch tree
+  // from this view for as long as the wrapper is alive.
+  getTree() {
+    return this.open().getTree();
+  }
+
   getBranch(fromId?: string) {
     // Parameterized: the wrapper's clone path passes a leafId, and a
     // zero-argument forwarding view would silently drop it and read the
