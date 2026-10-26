@@ -29,7 +29,10 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macOS 26 SDK, as the release jobs: AppKit picks the window-control style
+    # from the linked SDK, not the running OS, so an SDK 15 build ships the
+    # legacy traffic lights even on macOS 26+ (see 504c9d1e).
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - name: Check out pi-agent-desktop
@@ -40,6 +43,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      - name: Require the macOS 26 SDK
+        run: |
+          sdk="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK $sdk"
+          test "${sdk%%.*}" -ge 26
 
       - name: Stage an x86_64 Node runtime for the Intel macOS build
         # See distro-release.yml: the ARM runner's Node cannot serve an x86_64
@@ -80,8 +89,33 @@ jobs:
       - name: Write component manifest
         run: npm run release:manifest
 
+      - name: Download the pi CLI for the bundled engine
+        # Mirrors distro-release.yml: sessions run on a bundled `pi` child, so
+        # a test bundle without the distribution is dead on arrival. Same
+        # target-driven archive map, SHA256 verification and env exports.
+        shell: bash
+        run: |
+          node scripts/pi-cli-release.mjs \
+            --target "${{ inputs.target }}" \
+            --download-dir "$RUNNER_TEMP/pi-cli" \
+            --github-env "$GITHUB_ENV"
+
       - name: Prepare packaged Next.js server
         run: npm run desktop:prepare
+        env:
+          PI_DESKTOP_REQUIRE_PI: "1"
+          PI_CLI_SOURCE: ${{ env.PI_CLI_SOURCE }}
+          PI_CLI_DISTRIBUTION_DIR: ${{ env.PI_CLI_DISTRIBUTION_DIR }}
+
+      - name: Verify packaged frontend
+        # The distribution's manifest must be complete, exactly as a release
+        # job requires it.
+        run: node scripts/verify-packaged-frontend.mjs
+        env:
+          PI_DESKTOP_REQUIRE_PI: "1"
+
+      - name: Verify packaged server
+        run: npm run desktop:verify
 
       - name: Pre-install distro pi packages
         run: npm run distro:seed
