@@ -182,10 +182,8 @@ off (and the prompt says so) when `PI_WEB_HOSTNAME` is a non-loopback address
   `FileViewer` exactly as in a project, and `AppShell` shows the folder's file tree
   (`workbenchCwd = visibleProjectCwd ?? chatFolderCwd`) behind the topbar panel toggle.
   `handleOpenFile` only accepts paths inside that folder (`isPathInside`), so a link to
-  anything else does nothing. The panel is reset on every chat switch and when leaving a chat.
-  LW disables the panel's upload button and `FileExplorer` upload handler for chats;
-  viewing generated files must not introduce a new arbitrary-file attachment path.
-  The explorer remounts by chat session id so pending state cannot follow a chat switch.
+  anything else does nothing. The panel is reset on every chat switch and when leaving a chat
+  (upstream behavior; `FileExplorer` resets its own upload/expand state when its `cwd` changes).
   Terminals, project trust, `@` mentions and artifact tabs stay project-only; a legacy chat has
   no folder and gets no panel (`AppShell.chat-workspace.test.mjs`,
   `ChatWindow.chat-folder-files.test.mjs`).

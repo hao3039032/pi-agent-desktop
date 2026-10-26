@@ -62,7 +62,4 @@ test("a chat with a folder shows that folder in the right panel, but never a ter
   // The composer's @ completion is off in chats, so the panel offers no @mention either.
   assert.match(source, /onAtMention=\{isChatWorkspaceActive \? undefined : handleAtMention\}/);
   assert.match(source, /onOpenFile=\{handleOpenLinkedFile\}/);
-  assert.match(source, /uploadsEnabled=\{!isChatWorkspaceActive\}/);
-  assert.match(source, /\{!isChatWorkspaceActive && <button\s+type="button"\s+onClick=\{\(\) => fileExplorerRef\.current\?\.openUploadPicker\(\)\}/);
-  assert.match(source, /key=\{isChatWorkspaceActive \? selectedChatSessionId : workbenchCwd\}/);
 });

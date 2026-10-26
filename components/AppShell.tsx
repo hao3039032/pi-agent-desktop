@@ -3182,7 +3182,7 @@ export function AppShell() {
                     </svg>
                   </button>
                 )}
-                {!isChatWorkspaceActive && <button
+                <button
                   type="button"
                   onClick={() => fileExplorerRef.current?.openUploadPicker()}
                   disabled={explorerUploadBusy}
@@ -3201,13 +3201,11 @@ export function AppShell() {
                     <path d="m17 8-5-5-5 5" />
                     <path d="M12 3v12" />
                   </svg>
-                </button>}
+                </button>
               </div>
               <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden" }}>
                 <FileExplorer
                   ref={fileExplorerRef}
-                  key={isChatWorkspaceActive ? selectedChatSessionId : workbenchCwd}
-                  uploadsEnabled={!isChatWorkspaceActive}
                   cwd={workbenchCwd}
                   onOpenFile={handleOpenFile}
                   refreshKey={explorerRefreshKey}
