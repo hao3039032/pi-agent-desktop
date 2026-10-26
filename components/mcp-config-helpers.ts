@@ -476,16 +476,16 @@ export function mcpEffectiveCodemodePreference(codemode: McpCodemodeInfo): McpCo
 /**
  * Why the tools of a server with `codemode` exposure, which only Code mode
  * scripts call, may not be callable, most decisive first:
- * the sandbox cannot run (the MCP host then offers them through tool search),
- * `-builtin:codemode` registers no codemode tool (the host keeps their
- * exposure, so only an active tool search reaches them), or Automatic with
- * `autoEnableCodemode: false`, under which the MCP extension never turns Code
- * mode on. Automatic is the effective choice, so a project whose settings
- * start its sessions with Code mode on needs no warning, and one that starts
- * them without it does. Undefined when a session turns Code mode on for them.
+ * `-builtin:codemode` registers no codemode tool (so only an active tool
+ * search reaches them), or Automatic with `autoEnableCodemode: false`, under
+ * which the MCP extension never turns Code mode on. Automatic is the
+ * effective choice, so a project whose settings start its sessions with
+ * Code mode on needs no warning, and one that starts them without it does.
+ * Undefined when a session turns Code mode on for them. The sandbox is not
+ * weighed here: it runs in the bundled pi child, which either works or fails
+ * at run time, not something Settings could report.
  */
 export function mcpCodemodeReachNotice(codemode: McpCodemodeInfo, autoEnable: McpAutoEnableCodemode): McpNoticeText | undefined {
-  if (codemode.sandbox.state === "unavailable") return { key: "mcp.exposure.sandboxUnavailable" };
   if (codemode.builtinDisabled) return { key: "mcp.exposure.builtinDisabled" };
   if (!autoEnable.value && mcpEffectiveCodemodePreference(codemode) !== "always") {
     return { key: "mcp.exposure.autoEnableOff", params: { path: autoEnable.path } };
@@ -523,19 +523,16 @@ export function mcpCodemodeAutomaticNotice(codemode: McpCodemodeInfo, autoEnable
 
 /**
  * Why Always on cannot be chosen, shown under the switch: no session can
- * offer Code mode, because its sandbox failed the self-test (checked first,
- * as nothing in Settings fixes it) or the global `extensions` turn it off
+ * offer Code mode because the global `extensions` turn it off
  * (`-builtin:codemode`). Always on writes the global `defaultTools`, which
  * every project's sessions read, so only the global settings count: a trusted
  * project that turns Code mode off for its own sessions leaves Always on
  * working everywhere else (`mcpCodemodeBuiltinNotice()` says so), and one that
  * turns it back on does not make the global choice work elsewhere. Whether
  * the switch is offered never depends on which project Settings was opened
- * from. A sandbox nobody has checked yet leaves it available; the Sandbox
- * line says so.
+ * from.
  */
 export function mcpCodemodeAlwaysUnavailableNotice(codemode: McpCodemodeInfo): McpNoticeText | undefined {
-  if (codemode.sandbox.state === "unavailable") return { key: "mcp.codemode.alwaysUnavailable.sandbox" };
   if (!codemode.globalBuiltinSettingsPath) return undefined;
   return { key: "mcp.codemode.alwaysUnavailable.builtin", params: { path: codemode.globalBuiltinSettingsPath } };
 }
@@ -707,12 +704,12 @@ export function mcpCodemodeInlineBudgetNotices(budget: McpCodemodeInlineBudget):
 export type McpCodemodeRowState = "automatic" | "always" | "unavailable" | "unknown";
 
 /**
- * The Code mode row's state: unavailable when no session can offer it (its
- * sandbox failed the self-test, or `-builtin:codemode` turns it off), unknown
- * when the global settings file cannot be read, else the preference.
+ * The Code mode row's state: unavailable when no session can offer it
+ * (`-builtin:codemode` turns it off), unknown when the global settings file
+ * cannot be read, else the preference.
  */
 export function mcpCodemodeRowState(codemode: McpCodemodeInfo): McpCodemodeRowState {
-  if (codemode.builtinDisabled || codemode.sandbox.state === "unavailable") return "unavailable";
+  if (codemode.builtinDisabled) return "unavailable";
   return codemode.preference ?? "unknown";
 }
 

@@ -1,27 +1,32 @@
 #!/usr/bin/env node
 /**
- * Verifies that Code mode works in the *packaged* server that `npm run
- * desktop:prepare` stages, using the Node runtime bundled with it.
+ * Verifies the *packaged* server that `npm run desktop:prepare` stages, using
+ * the Node runtime bundled with it.
  *
- * Code mode's QuickJS sandbox loads `quickjs-wasi` through runtime
- * `import.meta.resolve`, which Next's file tracer cannot follow, so a packaged
- * install can lose the wasm file while every source-tree test still passes
- * (see the quickjs-wasi copy in prepare-desktop.mjs). This starts the staged
- * server the way the desktop shell does, creates a session (which runs the
- * sandbox self-test in lib/builtin-extensions.ts) and reads the verdict from
- * `GET /api/mcp`, and fails on any "Cannot find module" in the server log.
+ * Since the CLI-engine migration every session runs on a bundled `pi --mode
+ * rpc` child, and Code mode's QuickJS sandbox ships inside that pi
+ * distribution — its completeness is gated by `pi-distribution.json`
+ * (`complete: true` under PI_DESKTOP_REQUIRE_PI=1, verified per file by
+ * scripts/verify-packaged-frontend.mjs). Nothing in this server process
+ * executes the sandbox any more, so this script gates what the staged server
+ * itself must still do:
  *
- * It also imports pi-ai's Amazon Bedrock implementation from the staged tree
- * with the bundled Node. pi-ai reaches it through a variable specifier, so the
- * file tracer drops `@aws-sdk/client-bedrock-runtime` and a packaged
- * amazon-bedrock session would die with ERR_MODULE_NOT_FOUND at the first
- * stream (see stageResolvedClosure in prepare-desktop.mjs).
+ *  - start under the bundled Node and answer /api/home;
+ *  - create a session end to end — spawn the bundled pi child, load the
+ *    bridge extension and reach session start. The child's stderr is relayed
+ *    into the server log, so the module-resolution scan below covers both
+ *    processes: a "Cannot find module" anywhere fails the build;
+ *  - import pi-ai's Amazon Bedrock implementation from the staged tree with
+ *    the bundled Node. pi-ai reaches it through a variable specifier, so the
+ *    file tracer drops `@aws-sdk/client-bedrock-runtime` and a packaged
+ *    amazon-bedrock session would die with ERR_MODULE_NOT_FOUND at the first
+ *    stream (see stageResolvedClosure in prepare-desktop.mjs).
  *
- * Not covered: jiti (user-extension loading). Its lib/jiti.cjs is only reached
- * on the lazy transform path, which a session start without a real extension
- * does not exercise.
+ * Not covered: jiti (nothing in the staged server loads user extensions any
+ * more; the pi child loads its own) and the pi distribution's own internals
+ * (the manifest check owns those).
  *
- *   npm run desktop:prepare && node scripts/verify-packaged-codemode.mjs
+ *   npm run desktop:prepare && node scripts/verify-packaged-server.mjs
  *
  * Runs against a throwaway HOME / PI_CODING_AGENT_DIR, never the user's data.
  */
@@ -48,7 +53,7 @@ const STARTUP_TIMEOUT_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 60_000;
 
 function fail(message) {
-  console.error(`verify-packaged-codemode: ${message}`);
+  console.error(`verify-packaged-server: ${message}`);
   process.exitCode = 1;
 }
 
@@ -61,17 +66,6 @@ function freePort() {
       probe.close(() => resolve(port));
     });
   });
-}
-
-/** The first object under `key` anywhere in a JSON value, depth first. */
-export function findKey(value, key) {
-  if (!value || typeof value !== "object") return undefined;
-  if (Object.hasOwn(value, key)) return value[key];
-  for (const child of Object.values(value)) {
-    const found = findKey(child, key);
-    if (found !== undefined) return found;
-  }
-  return undefined;
 }
 
 async function waitForServer(baseUrl, child) {
@@ -125,7 +119,7 @@ async function main() {
   }
   console.log("bedrock: the staged Amazon Bedrock implementation imports.");
 
-  const scratch = await mkdtemp(join(tmpdir(), "pi-packaged-codemode-"));
+  const scratch = await mkdtemp(join(tmpdir(), "pi-packaged-server-"));
   const agentDir = join(scratch, "agent");
   const workDir = join(scratch, "project");
   await mkdir(agentDir, { recursive: true });
@@ -174,17 +168,12 @@ async function main() {
       fail(`GET /api/mcp failed (HTTP ${overview.status}): ${await overview.text()}`);
       return;
     }
-    const sandbox = findKey(await overview.json(), "sandbox");
-    console.log(`sandbox: ${JSON.stringify(sandbox)}`);
 
     const resolutionErrors = [...new Set(logChunks.join("").match(/(?:Cannot find module|ERR_MODULE_NOT_FOUND)[^\n]*/g) ?? [])];
-    if (sandbox?.state === "available" && resolutionErrors.length === 0) {
-      console.log("OK: the packaged Code mode sandbox ran its self-test; no module resolution errors in the server log.");
-    } else if (sandbox?.state === "available") {
-      fail(`the server log reports missing modules:\n  ${resolutionErrors.join("\n  ")}`);
-      console.error(`--- server log (tail) ---\n${logTail()}`);
+    if (resolutionErrors.length === 0) {
+      console.log("OK: the packaged server created a session over the bundled pi child; no module resolution errors in the log.");
     } else {
-      fail(`the packaged Code mode sandbox is not available: ${JSON.stringify(sandbox)}`);
+      fail(`the server log reports missing modules:\n  ${resolutionErrors.join("\n  ")}`);
       console.error(`--- server log (tail) ---\n${logTail()}`);
     }
   } catch (error) {

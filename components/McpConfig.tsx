@@ -1854,9 +1854,10 @@ function McpConnectionRows({
  * `defaultTools` and read by sessions started afterwards (pi applies
  * `defaultTools` when it creates a session, so nothing reloads); a trusted
  * project whose own `defaultTools` decides it there; the global
- * `codemode.mode` and `codemode.inlineBudget` rows; whether its sandbox can
- * run; and whether a setting turns it off. Always on is disabled, with the
- * reason as text under the switch, while no session could offer Code mode.
+ * `codemode.mode` and `codemode.inlineBudget` rows; and whether a setting
+ * turns it off. Always on is disabled, with the reason as text under the
+ * switch, while no session could offer Code mode. The sandbox is not shown:
+ * it runs inside the bundled pi child, not in this server.
  */
 function McpCodemodeDetail({
   codemode,
@@ -1877,7 +1878,6 @@ function McpCodemodeDetail({
   onInlineBudgetSave: (budget: number | null) => void;
 }) {
   const { t } = useI18n();
-  const sandbox = codemode.sandbox;
   const preference = codemode.preference;
   const waiting = save.saving || serverBusy;
   // A save shows its progress and failure in the row it was made from.
@@ -1964,18 +1964,6 @@ function McpCodemodeDetail({
             </span>
           </ConfigDetailGridRow>
         )}
-        <ConfigDetailGridRow label={t("mcp.codemode.sandbox")} tone="plain">
-          {sandbox.state === "unavailable" ? (
-            <span className="mcp-config-line is-warning">
-              {t("mcp.codemode.sandbox.unavailable")}{" "}
-              <code className="mcp-config-chip">{revealHiddenCharacters(sandbox.error)}</code>
-            </span>
-          ) : (
-            <span className="mcp-config-line">
-              {t(sandbox.state === "available" ? "mcp.codemode.sandbox.available" : "mcp.codemode.sandbox.not-checked")}
-            </span>
-          )}
-        </ConfigDetailGridRow>
         {builtinNotice && (
           <ConfigDetailGridRow label={t("mcp.codemode.builtin")} tone="error">
             {noticeText(builtinNotice, t)}

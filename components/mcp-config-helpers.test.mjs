@@ -342,14 +342,11 @@ test("autoEnableCodemode is merged as the SDK merges it: the project's where rea
 });
 
 test("tools only Code mode scripts call are flagged where no session would reach them", () => {
-  const info = (overrides) => ({ sandbox: { state: "available" }, builtinDisabled: false, preference: "automatic", ...overrides });
+  const info = (overrides) => ({ builtinDisabled: false, preference: "automatic", ...overrides });
   const auto = { value: true };
   const off = { value: false, path: "/home/u/.pi/agent/mcp.json" };
   assert.equal(mcpCodemodeReachNotice(info(), auto), undefined);
-  assert.equal(mcpCodemodeReachNotice(info({ sandbox: { state: "not-checked" } }), auto), undefined);
-  // The host offers them through tool search instead.
-  assert.deepEqual(mcpCodemodeReachNotice(info({ sandbox: { state: "unavailable", error: "x" }, builtinDisabled: true }), off), { key: "mcp.exposure.sandboxUnavailable" });
-  // No codemode tool exists, and the host keeps their exposure.
+  // No codemode tool exists, and the child keeps their exposure.
   assert.deepEqual(mcpCodemodeReachNotice(info({ builtinDisabled: true, preference: "always" }), auto), { key: "mcp.exposure.builtinDisabled" });
   // Automatic never turns Code mode on with autoEnableCodemode false; Always on does not need it.
   assert.deepEqual(mcpCodemodeReachNotice(info(), off), { key: "mcp.exposure.autoEnableOff", params: { path: off.path } });
@@ -359,7 +356,7 @@ test("tools only Code mode scripts call are flagged where no session would reach
   assert.deepEqual(mcpCodemodeAutomaticNotice(info(), off), { key: "mcp.codemode.autoEnableOff", params: { path: off.path } });
   assert.equal(mcpCodemodeAutomaticNotice(info(), auto), undefined);
   assert.equal(mcpCodemodeAutomaticNotice(info({ preference: "always" }), off), undefined);
-  for (const key of ["mcp.exposure.sandboxUnavailable", "mcp.exposure.builtinDisabled", "mcp.exposure.autoEnableOff", "mcp.codemode.autoEnableOff"]) {
+  for (const key of ["mcp.exposure.builtinDisabled", "mcp.exposure.autoEnableOff", "mcp.codemode.autoEnableOff"]) {
     assert.equal(typeof messages[key], "string", key);
   }
   assert.match(messages["mcp.exposure.autoEnableOff"], /\{path\}/);
@@ -367,7 +364,7 @@ test("tools only Code mode scripts call are flagged where no session would reach
 });
 
 test("a project whose own defaultTools decides Code mode is what its sessions get, and says so", () => {
-  const info = (overrides) => ({ sandbox: { state: "available" }, builtinDisabled: false, preference: "automatic", ...overrides });
+  const info = (overrides) => ({ builtinDisabled: false, preference: "automatic", ...overrides });
   const settingsPath = "/repo/.pi/settings.json";
   const off = { value: false, path: "/repo/.pi/mcp.json" };
   assert.equal(mcpEffectiveCodemodePreference(info()), "automatic");
@@ -400,33 +397,19 @@ test("a project whose own defaultTools decides Code mode is what its sessions ge
 });
 
 test("Always on is unavailable while no session could offer Code mode, and says why", () => {
-  const info = (overrides) => ({ sandbox: { state: "available" }, builtinDisabled: false, preference: "automatic", ...overrides });
+  const info = (overrides) => ({ builtinDisabled: false, preference: "automatic", ...overrides });
   const globalPath = "/home/u/.pi/agent/settings.json";
   assert.equal(mcpCodemodeAlwaysUnavailableNotice(info()), undefined);
-  // Nobody has run the self-test yet: Always on stays available, and the Sandbox line says it is unchecked.
-  assert.equal(mcpCodemodeAlwaysUnavailableNotice(info({ sandbox: { state: "not-checked" } })), undefined);
-  // The sandbox first: nothing in Settings fixes it.
-  assert.deepEqual(
-    mcpCodemodeAlwaysUnavailableNotice(info({
-      sandbox: { state: "unavailable", error: "x" },
-      builtinDisabled: true,
-      builtinSettingsPath: globalPath,
-      globalBuiltinSettingsPath: globalPath,
-    })),
-    { key: "mcp.codemode.alwaysUnavailable.sandbox" },
-  );
   assert.deepEqual(
     mcpCodemodeAlwaysUnavailableNotice(info({ builtinDisabled: true, builtinSettingsPath: globalPath, globalBuiltinSettingsPath: globalPath })),
     { key: "mcp.codemode.alwaysUnavailable.builtin", params: { path: globalPath } },
   );
-  for (const key of ["sandbox", "builtin"]) {
-    assert.equal(typeof messages[`mcp.codemode.alwaysUnavailable.${key}`], "string", key);
-  }
+  assert.equal(typeof messages["mcp.codemode.alwaysUnavailable.builtin"], "string");
   assert.match(messages["mcp.codemode.alwaysUnavailable.builtin"], /\{path\}/);
 });
 
 test("Always on is weighed against the global extensions alone, never the project Settings was opened from", () => {
-  const info = (overrides) => ({ sandbox: { state: "available" }, builtinDisabled: false, preference: "automatic", ...overrides });
+  const info = (overrides) => ({ builtinDisabled: false, preference: "automatic", ...overrides });
   const globalPath = "/home/u/.pi/agent/settings.json";
   const projectPath = "/work/app/.pi/settings.json";
   // Only the trusted project turns Code mode off: its sessions lose it, Always on still works everywhere else.
@@ -469,10 +452,9 @@ test("with nothing selected, the detail pane tells an empty listing from one a f
 });
 
 test("the Code mode row says whether a session can offer it, and the preference otherwise", () => {
-  const info = (overrides) => ({ sandbox: { state: "available" }, builtinDisabled: false, preference: "automatic", ...overrides });
+  const info = (overrides) => ({ builtinDisabled: false, preference: "automatic", ...overrides });
   assert.equal(mcpCodemodeRowState(info()), "automatic");
-  assert.equal(mcpCodemodeRowState(info({ preference: "always", sandbox: { state: "not-checked" } })), "always");
-  assert.equal(mcpCodemodeRowState(info({ sandbox: { state: "unavailable", error: "no wasm" } })), "unavailable");
+  assert.equal(mcpCodemodeRowState(info({ preference: "always" })), "always");
   assert.equal(mcpCodemodeRowState(info({ builtinDisabled: true })), "unavailable");
   assert.equal(mcpCodemodeRowState(info({ preference: undefined, preferenceError: "bad json" })), "unknown");
   assert.equal(mcpCodemodeTone("unavailable"), "error");
@@ -500,7 +482,7 @@ function fakeFetch(responses) {
 
 const overview = {
   mcp: { available: true },
-  codemode: { sandbox: { state: "not-checked" }, builtinDisabled: false, preference: "automatic" },
+  codemode: { builtinDisabled: false, preference: "automatic" },
   files: [file("global")],
   servers: [],
 };
@@ -668,9 +650,9 @@ test("a save that never answers ends at the deadline, and the caller's signal re
 });
 
 test("a saved choice replaces the preference and its read error in the loaded overview", () => {
-  const data = { ...overview, codemode: { sandbox: { state: "available" }, builtinDisabled: false, preferenceError: "Unexpected token" } };
+  const data = { ...overview, codemode: { builtinDisabled: false, preferenceError: "Unexpected token" } };
   const next = withMcpCodemodePreference(data, "always");
-  assert.deepEqual(next.codemode, { sandbox: { state: "available" }, builtinDisabled: false, preference: "always" });
+  assert.deepEqual(next.codemode, { builtinDisabled: false, preference: "always" });
   assert.equal(next.servers, data.servers);
   assert.equal(data.codemode.preferenceError, "Unexpected token", "the loaded overview is not changed in place");
 });
@@ -685,7 +667,7 @@ test("the exposure dropdown offers every exposure the SDK accepts, each describe
 });
 
 test("why an exposure's tools may be out of reach depends on the exposure", () => {
-  const codemode = { sandbox: { state: "available" }, builtinDisabled: true, preference: "automatic" };
+  const codemode = { builtinDisabled: true, preference: "automatic" };
   const autoEnable = { value: true };
   const toolSearchDisabled = { settingsPath: "/Users/me/.pi/agent/settings.json" };
   // Code mode's own reasons reach only the exposures Code mode serves.
@@ -718,7 +700,7 @@ test("the mode switch saves another mode, or either one over a value that is not
 });
 
 test("the mode's notes name a value that is not a mode, a project that decides for itself, and Automatic's wait", () => {
-  const info = (mode, extra = {}) => ({ sandbox: { state: "available" }, builtinDisabled: false, preference: "always", mode, ...extra });
+  const info = (mode, extra = {}) => ({ builtinDisabled: false, preference: "always", mode, ...extra });
   assert.deepEqual(mcpCodemodeModeNotices(info(undefined)), []);
   assert.deepEqual(mcpCodemodeModeNotices(info({ settingsPath: globalSettingsPath, value: "only" })), []);
   assert.deepEqual(mcpCodemodeModeNotices(info({

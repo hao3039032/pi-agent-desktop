@@ -170,30 +170,20 @@ async function assembleServer() {
   }
 
   // Next's file tracer drops files that a package loads through runtime
-  // `require` / `import.meta.resolve`, so jiti and quickjs-wasi arrive
-  // incomplete:
-  //  - jiti: only lib/jiti-static.mjs survives, the pi-coding-agent bundle
-  //    reaches lib/jiti.cjs only through a lazy require("jiti"), and extension
-  //    loading fails with "Cannot find module .../jiti/lib/jiti.cjs".
-  //  - quickjs-wasi: the sandbox loads "quickjs-wasi/quickjs.wasm" plus the
-  //    extensions' *.so through `import.meta.resolve`; without them Code mode
-  //    is off for every packaged session.
-  // Ship each complete source package over every staged copy of it. Where that
-  // copy lives depends on npm's layout (pi 1.0.0 nested quickjs-wasi under
-  // pi-coding-agent, pi 1.0.1 hoists it for pi-codemode) and the dedupe pass
-  // below deletes nested copies that match the top level, so see
-  // stage-package.mjs before assuming a path. `npm run desktop:verify`
-  // checks the result by running the packaged Code mode sandbox.
+  // `require` / `import.meta.resolve`, so jiti arrives incomplete: only
+  // lib/jiti-static.mjs survives, while the pi-coding-agent bundle reaches
+  // lib/jiti.cjs through a lazy require("jiti"). Ship the complete source
+  // package over every staged copy of it. (quickjs-wasi used to need the
+  // same treatment for the in-process engine's Code mode sandbox; since the
+  // CLI-engine migration the sandbox runs inside the bundled pi distribution
+  // and nothing in the staged server loads it, so it is no longer staged.
+  // Keep jiti: the SDK's lazy require path is broad, and the cost is one
+  // small package.) See stage-package.mjs before assuming a path; the dedupe
+  // pass below deletes nested copies that match the top level.
   const stagedNodeModulesDir = join(serverResourcesDir, "node_modules");
-  const piCodingAgentModules = join(rootDir, "node_modules", "@earendil-works", "pi-coding-agent", "node_modules");
   await stageCompletePackage({
     name: "jiti",
     sources: [join(rootDir, "node_modules", "jiti")],
-    stagedNodeModulesDir,
-  });
-  await stageCompletePackage({
-    name: "quickjs-wasi",
-    sources: [join(piCodingAgentModules, "quickjs-wasi"), join(rootDir, "node_modules", "quickjs-wasi")],
     stagedNodeModulesDir,
   });
 

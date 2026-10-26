@@ -2,7 +2,6 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readF
 import { join, resolve } from "node:path";
 import { CONFIG_DIR_NAME, type McpServerConfig } from "@earendil-works/pi-coding-agent";
 import type {
-  CodemodeSandboxStatus,
   McpAvailability,
   McpCodemodeInfo,
   McpConfigFieldRef,
@@ -18,7 +17,6 @@ import type {
 import {
   isMcpDisabledByOperator,
   MCP_DISABLE_VARIABLE,
-  peekCodemodeSandbox,
   readBuiltinExtensionSwitches,
   type BuiltinExtensionName,
   type BuiltinExtensionSwitch,
@@ -717,23 +715,18 @@ function mcpAvailability(
 
 /**
  * Code mode as a session would get it: the global preference, mode and inline
- * budget, the sandbox self-test and `-builtin:codemode` (both as the project's
- * sessions see it and as the global settings alone say), and, given
- * `trustedCwd`, the project settings that decide any of them there whatever
- * the global value.
+ * budget, and `-builtin:codemode` (both as the project's sessions see it and
+ * as the global settings alone say), and, given `trustedCwd`, the project
+ * settings that decide any of them there whatever the global value. The
+ * sandbox itself is not reported here: since the CLI-engine migration it runs
+ * inside the bundled pi child, not in this server process.
  */
 async function codemodeInfo(
   agentDir: string,
   codemodeSwitch: BuiltinExtensionSwitch | undefined,
   trustedCwd: string | undefined,
 ): Promise<McpCodemodeInfo> {
-  const peek = await peekCodemodeSandbox();
-  const sandbox: CodemodeSandboxStatus = !peek.checked
-    ? { state: "not-checked" }
-    : peek.available
-      ? { state: "available" }
-      : { state: "unavailable", error: peek.reason, ...(peek.retryInMs === undefined ? {} : { retryInMs: peek.retryInMs / 1000 }) };
-  const info: McpCodemodeInfo = { sandbox, builtinDisabled: codemodeSwitch?.enabled === false };
+  const info: McpCodemodeInfo = { builtinDisabled: codemodeSwitch?.enabled === false };
   if (codemodeSwitch?.settingsPath) info.builtinSettingsPath = codemodeSwitch.settingsPath;
   // What the global `extensions` alone say, which is what Always on, a global setting, depends on.
   const globalSwitch = codemodeSwitch?.global ?? codemodeSwitch;

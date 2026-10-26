@@ -194,11 +194,10 @@ test("-builtin:tool-search is reported with the file that turns tool search off"
   assert.deepEqual((await get()).body.toolSearchDisabled, { settingsPath });
 });
 
-test("Code mode reports the global preference and a self-test nobody has run yet", async (t) => {
+test("Code mode reports the global preference and the file setting that turns it off", async (t) => {
   t.after(() => rm(settingsPath, { force: true }));
   let { body } = await get();
   assert.deepEqual(body.codemode, {
-    sandbox: { state: "not-checked" },
     builtinDisabled: false,
     preference: "automatic",
     mode: { settingsPath, value: "on" },

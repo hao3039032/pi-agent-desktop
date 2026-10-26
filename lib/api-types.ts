@@ -443,18 +443,10 @@ export type McpAvailability =
       settingsPath?: string;
     };
 
-export type CodemodeSandboxStatus =
-  /** No normal session has started since the server did, so the self-test has not run. */
-  | { state: "not-checked" }
-  | { state: "available" }
-  /** `retryInMs`: seconds until the next normal session retries the self-test after this failure. */
-  | { state: "unavailable"; error: string; retryInMs?: number };
-
 export interface McpCodemodeInfo {
   /** Absent when the global settings file cannot be read; see `preferenceError`. */
   preference?: McpCodemodePreference;
   preferenceError?: string;
-  sandbox: CodemodeSandboxStatus;
   /** `-builtin:codemode` (or a pattern matching it) in the global or a trusted project's `extensions`. */
   builtinDisabled: boolean;
   builtinSettingsPath?: string;
