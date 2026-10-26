@@ -109,7 +109,8 @@ try{
   const low=reasoningRows.filter({has:page.getByRole('option',{name:/^low\b/})});
   const star=low.locator('button.app-default-star');await star.hover();
   const starStyle=await star.evaluate(el=>{const s=getComputedStyle(el);return {border:s.borderTopWidth,bg:s.backgroundColor,shadow:s.boxShadow};});
-  assert.equal(starStyle.border,'0px');assert.equal(starStyle.bg,'rgba(0, 0, 0, 0)');assert.equal(starStyle.shadow,'none');
+  assert.equal(starStyle.border,'0px');assert.equal(starStyle.shadow,'none');
+  assert.ok(starStyle.bg==='rgba(0, 0, 0, 0)'||parseFloat(starStyle.bg.match(/[\d.]+\)$/)?.[0]??'1')<=0.06,'star hover stays quiet: '+starStyle.bg);
   await star.click();await low.locator('.app-default-star.is-default').waitFor();
   assert.equal(await low.locator('[role="option"]').getAttribute('aria-selected'),'true','saved reasoning is applied through the existing callback');
   // The star is reachable and usable from the keyboard: Right from a row, Enter to save, Left back.

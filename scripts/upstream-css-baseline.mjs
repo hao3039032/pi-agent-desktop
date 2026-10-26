@@ -20,7 +20,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifestPath = join(rootDir, "scripts", "upstream-css-baseline.json");
@@ -67,7 +67,7 @@ async function update(ref) {
   console.log(`Upstream CSS baseline set to ${manifest.upstreamRef}.`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [command, ref] = process.argv.slice(2);
   if (command !== "update" || !ref) {
     console.error("Usage: node scripts/upstream-css-baseline.mjs update <upstream-git-ref>");

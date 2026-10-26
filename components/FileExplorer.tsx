@@ -47,6 +47,8 @@ interface Props {
   onAtMention?: (relativePath: string, isDir: boolean) => void;
   onAtMentions?: (relativePaths: string[]) => void;
   onUploadBusyChange?: (busy: boolean) => void;
+  /** Chat panels browse generated files; they are not a new attachment import path. */
+  uploadsEnabled?: boolean;
   changesCollapsed: boolean;
   onChangesCountChange?: (count: number) => void;
   fileSearchOpen?: boolean;
@@ -728,6 +730,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   onAtMention,
   onAtMentions,
   onUploadBusyChange,
+  uploadsEnabled = true,
   changesCollapsed,
   onChangesCountChange,
   fileSearchOpen = false,
@@ -900,7 +903,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   }, [applyUploadResult, cwd]);
 
   const prepareUpload = useCallback(async (files: File[]) => {
-    if (files.length === 0 || uploadBusy) return;
+    if (!uploadsEnabled || files.length === 0 || uploadBusy) return;
     setUploadSummary(null);
     setHighlightedPaths(new Set());
     setPendingConflict(null);
@@ -935,7 +938,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     } finally {
       setUploadPhase("idle");
     }
-  }, [cwd, performUpload, uploadBusy]);
+  }, [cwd, performUpload, uploadBusy, uploadsEnabled]);
 
   const handleUploadInput = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
@@ -945,9 +948,9 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
 
   useImperativeHandle(ref, () => ({
     openUploadPicker() {
-      if (!uploadBusy) uploadInputRef.current?.click();
+      if (uploadsEnabled && !uploadBusy) uploadInputRef.current?.click();
     },
-  }), [uploadBusy]);
+  }), [uploadBusy, uploadsEnabled]);
 
   useEffect(() => {
     onUploadBusyChange?.(uploadBusy);

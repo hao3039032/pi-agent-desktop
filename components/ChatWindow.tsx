@@ -104,6 +104,7 @@ interface Props {
   onOpenSession?: (sessionId: string) => void;
   onAskInNewChat?: (prompt: string, sourceSessionId: string, sourceEntryId: string) => Promise<void>;
   quoteSelectionEnabled?: boolean;
+  conversationNavigatorEnabled?: boolean;
   initialPrompt?: string;
   onInitialPromptConsumed?: () => void;
   /** Completion sound state + controls, owned by AppShell so tasks finishing in
@@ -281,7 +282,7 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, defaultExpanded = fa
   );
 }
 
-export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTargetHandled, initialScrollPosition, onScrollPositionChange, sessionRunning, newSessionCwd, newSessionDraftKey, onAgentEnd, onAttentionNeeded, onSessionCreated, onSessionForked, modelsRefreshKey, workspaceUnavailable, onRecheckWorkspace, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onOpenSettings, onOpenModelsConfig, onContextUsageChange, onOpenFile, onOpenSession, onAskInNewChat, onSelectProject, projectOptions, onProjectChange, onProjectFilesImported, quoteSelectionEnabled = true, initialPrompt, onInitialPromptConsumed, soundEnabled = true, playDoneSound = () => {}, unlockAudio }: Props) {
+export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTargetHandled, initialScrollPosition, onScrollPositionChange, sessionRunning, newSessionCwd, newSessionDraftKey, onAgentEnd, onAttentionNeeded, onSessionCreated, onSessionForked, modelsRefreshKey, workspaceUnavailable, onRecheckWorkspace, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onOpenSettings, onOpenModelsConfig, onContextUsageChange, onOpenFile, onOpenSession, onAskInNewChat, onSelectProject, projectOptions, onProjectChange, onProjectFilesImported, quoteSelectionEnabled = true, conversationNavigatorEnabled = true, initialPrompt, onInitialPromptConsumed, soundEnabled = true, playDoneSound = () => {}, unlockAudio }: Props) {
   const { t } = useI18n();
   const isMobile = useIsMobile();
   const chatOnly = workspaceKind === "chat" || session?.workspaceKind === "chat";
@@ -828,7 +829,11 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
   useEffect(() => () => { onContextUsageChange?.(null); }, [onContextUsageChange]);
 
   const cwd = chatOnly ? undefined : session?.cwd ?? newSessionCwd;
-  const openFile = chatOnly ? undefined : onOpenFile;
+  // A chat with its own folder opens what it made in the right panel; a legacy
+  // chat (shared hidden cwd) has no folder to show. The browser takes the folder
+  // from the server-classified session, never from a path it builds itself.
+  const chatFolderCwd = chatOnly && session?.chatFolder ? session.cwd : undefined;
+  const openFile = chatOnly ? (chatFolderCwd ? onOpenFile : undefined) : onOpenFile;
   const dropBusyRef = useRef(false);
   const dropZoneRef = useRef<HTMLDivElement | null>(null);
   const dropGenerationRef = useRef(0);
@@ -1209,7 +1214,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
   }, [isEmptyNew, scrollContainerRef]);
 
   const hasStreamingContent = Boolean(streamState.streamingMessage?.content.length);
-  const messageCwd = chatOnly ? undefined : session?.cwd ?? newSessionCwd ?? undefined;
+  const messageCwd = chatOnly ? chatFolderCwd : session?.cwd ?? newSessionCwd ?? undefined;
   // Keys that do not change when a sent or streamed message gets its entry id
   // on the post-run reload; keying by the id remounted the sent bubble.
   const messageKeyTrackerRef = useRef<{ sessionId: string | null; tracker: ReturnType<typeof createMessageKeyTracker> } | null>(null);
@@ -1820,6 +1825,8 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           <ConversationNavigator
             turns={conversationTurns}
             scrollContainerRef={scrollContainerRef}
+            contentRef={messageContentRef}
+            enabled={conversationNavigatorEnabled}
             onSelect={selectConversationTurn}
           />
         </>

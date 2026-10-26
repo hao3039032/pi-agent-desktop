@@ -13,6 +13,7 @@ import { invalidateModelsCache } from "./models-cache";
 import { cacheSessionPath, getSessionListVersion, invalidateSessionListCache, readLatestSessionEntryId } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { notifySessionComplete } from "./web-push";
+import { isVerboseLogging } from "../bin/pi-web-options.js";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { PRODUCT_NAME } from "./branding";
@@ -687,7 +688,7 @@ export class AgentSessionWrapper {
         this.inner.extensionRunner.setUIContext?.(uiContext, "rpc");
       }
       this.extensionsBound = true;
-      console.log(`[pi-web] session_start dispatched to extensions for session ${this.inner.sessionId}`);
+      if (isVerboseLogging()) console.log("[pi-web] session_start dispatched to extensions");
     })().catch((err) => {
       this.extensionBindingError = err;
       throw err;
@@ -3037,16 +3038,10 @@ async function startRpcSessionLocked(
   const closingWait = closingRpcSessionWait(sessionId);
   if (closingWait) {
     // Concurrent starts share this lock, then the one start that follows it.
-    const waiting: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = (async () => {
-      try {
-        await closingWait;
-      } finally {
-        // Release the start lock on failure too. The child-exit gate remains
-        // responsible for fail-closed safety; a stale rejected start is not.
-        if (locks.get(sessionId) === waiting) locks.delete(sessionId);
-      }
-      return startRpcSessionLocked(sessionId, sessionFile, cwd, options);
-    })();
+    const waiting: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = closingWait.finally(() => {
+      // Deferred promise callback: the lock is installed before cleanup runs.
+      if (locks.get(sessionId) === waiting) locks.delete(sessionId);
+    }).then(() => startRpcSessionLocked(sessionId, sessionFile, cwd, options));
     locks.set(sessionId, waiting);
     return waiting;
   }
@@ -3060,14 +3055,9 @@ async function startRpcSessionLocked(
   // process knows of, and the original synchronous path is kept.
   const childExitGate = getChildExitWaits().get(sessionId);
   if (childExitGate) {
-    const gated: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = (async () => {
-      try {
-        await childExitGate;
-      } finally {
-        if (locks.get(sessionId) === gated) locks.delete(sessionId);
-      }
-      return startRpcSessionLocked(sessionId, sessionFile, cwd, options);
-    })();
+    const gated: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = childExitGate.finally(() => {
+      if (locks.get(sessionId) === gated) locks.delete(sessionId);
+    }).then(() => startRpcSessionLocked(sessionId, sessionFile, cwd, options));
     locks.set(sessionId, gated);
     return gated;
   }

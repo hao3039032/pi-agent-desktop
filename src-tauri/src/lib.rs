@@ -49,15 +49,26 @@ const DEV_SERVER_URL: &str = "http://127.0.0.1:30141";
 /// matters because the webview's localStorage is origin-scoped (`host:port`).
 #[cfg(feature = "custom-protocol")]
 const DESKTOP_SERVER_PORT: u16 = 38471;
+/// How long startup waits for the server to answer. A login launch gets far
+/// longer: the machine is busiest right after sign-in (antivirus scans, disk
+/// and startup apps all compete), the window is hidden anyway, and giving up
+/// early leaves the user with no app at all.
 #[cfg(feature = "custom-protocol")]
-const SERVER_START_TIMEOUT: Duration = Duration::from_secs(30);
-/// Slow-start budget for the retry attempt. Cold caches and real-time
-/// antivirus scanning can push the first module load well past the initial
-/// window (thousands of bundled JS files are read before the server answers);
-/// one respawn with this larger budget recovers machines that merely need
-/// more time, instead of panic-exiting with no window at all.
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(90);
 #[cfg(feature = "custom-protocol")]
-const SERVER_START_TIMEOUT_SLOW: Duration = Duration::from_secs(120);
+const SERVER_START_TIMEOUT_AT_LOGIN: Duration = Duration::from_secs(180);
+/// Per-probe limits while waiting for startup. An abandoned probe still costs
+/// the server the work of answering it, so a cold server gets room to finish.
+#[cfg(feature = "custom-protocol")]
+const STARTUP_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(feature = "custom-protocol")]
+const STARTUP_PROBE_IO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "custom-protocol")]
+const MONITOR_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(feature = "custom-protocol")]
+const MONITOR_PROBE_IO_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(feature = "custom-protocol")]
+const SERVER_START_TIMEOUT_SLOW: Duration = Duration::from_secs(180);
 /// How often startup checks whether the server answers. The probe is a local
 /// socket round trip, so a short interval costs nothing and trims up to this
 /// much off every launch.
@@ -513,29 +524,54 @@ fn response_has_instance_id(response: &[u8], expected_instance_id: &str) -> bool
     })
 }
 
+/// Why a response is not the expected server's identity answer, for the log.
 #[cfg(feature = "custom-protocol")]
-fn server_identity_matches(address: SocketAddr, expected_instance_id: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) else {
-        return false;
-    };
-    let timeout = Some(Duration::from_millis(500));
-    if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
-        return false;
+fn response_mismatch_reason(response: &[u8]) -> String {
+    let text = String::from_utf8_lossy(response);
+    match text
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        Some(status) => format!(
+            "unexpected response: {}",
+            status.chars().take(80).collect::<String>()
+        ),
+        None => "empty response".to_string(),
     }
+}
+
+/// One identity probe. `Err` carries the step that failed and the OS error, so
+/// a startup timeout can say what the server was doing instead of just "no".
+#[cfg(feature = "custom-protocol")]
+fn probe_server(
+    address: SocketAddr,
+    expected_instance_id: &str,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let timeout = Some(io_timeout);
+    stream
+        .set_read_timeout(timeout)
+        .and_then(|()| stream.set_write_timeout(timeout))
+        .map_err(|error| format!("socket setup failed: {error}"))?;
 
     let request = format!(
         "GET /api/desktop/identity HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
     );
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("request write failed: {error}"))?;
 
     let mut response = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 512];
     while response.len() < 8 * 1024 {
-        let Ok(read) = stream.read(&mut chunk) else {
-            return false;
-        };
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("no response within {io_timeout:?}: {error}"))?;
         if read == 0 {
             break;
         }
@@ -545,7 +581,22 @@ fn server_identity_matches(address: SocketAddr, expected_instance_id: &str) -> b
         }
     }
 
-    response_has_instance_id(&response, expected_instance_id)
+    if response_has_instance_id(&response, expected_instance_id) {
+        Ok(())
+    } else {
+        Err(response_mismatch_reason(&response))
+    }
+}
+
+#[cfg(feature = "custom-protocol")]
+fn server_identity_matches(address: SocketAddr, expected_instance_id: &str) -> bool {
+    probe_server(
+        address,
+        expected_instance_id,
+        MONITOR_PROBE_CONNECT_TIMEOUT,
+        MONITOR_PROBE_IO_TIMEOUT,
+    )
+    .is_ok()
 }
 
 /// How often the monitor checks the server, and how many failed probes in a
@@ -625,7 +676,10 @@ fn wait_for_server(
     log_path: &Path,
     timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut attempts = 0_u32;
+    let mut last_failure = String::from("no probe ran");
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
             return Err(io::Error::other(format!(
@@ -633,16 +687,25 @@ fn wait_for_server(
                 log_path.display()
             )));
         }
-        if server_identity_matches(address, expected_instance_id) {
-            // Re-check after the HTTP handshake. A losing child can exit with
-            // EADDRINUSE while another process is answering on the same port.
-            if let Some(status) = child.try_wait()? {
-                return Err(io::Error::other(format!(
-                    "Pi Agent server exited during startup with {status}; see {}",
-                    log_path.display()
-                )));
+        attempts += 1;
+        match probe_server(
+            address,
+            expected_instance_id,
+            STARTUP_PROBE_CONNECT_TIMEOUT,
+            STARTUP_PROBE_IO_TIMEOUT,
+        ) {
+            Ok(()) => {
+                // Re-check after the HTTP handshake. A losing child can exit with
+                // EADDRINUSE while another process is answering on the same port.
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::other(format!(
+                        "Pi Agent server exited during startup with {status}; see {}",
+                        log_path.display()
+                    )));
+                }
+                return Ok(());
             }
-            return Ok(());
+            Err(reason) => last_failure = reason,
         }
         thread::sleep(SERVER_START_POLL_INTERVAL);
     }
@@ -650,47 +713,12 @@ fn wait_for_server(
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
-            "Pi Agent server did not start within {} seconds; see {}",
+            "Pi Agent server did not start within {} seconds ({attempts} probes, last: {last_failure}); see {}",
             timeout.as_secs(),
             log_path.display()
         ),
     ))
 }
-
-/// Last-resort notice when the server never came up. The setup hook runs
-/// before the Tauri event loop starts, so plugin-based dialogs cannot be
-/// shown here; a native Windows MessageBox works without any event loop.
-#[cfg(all(windows, feature = "custom-protocol"))]
-fn show_startup_error_dialog(first_error: &io::Error, retry_error: &io::Error, log_path: &Path) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-    };
-
-    let text = format!(
-        "Pi Agent could not start its local server.\n\n\
-         First attempt: {first_error}\n\
-         Retry attempt: {retry_error}\n\n\
-         Details: {}\n\n\
-         The machine may be busy (antivirus scans, cold caches). Try launching again.",
-        log_path.display()
-    );
-    let title = "Pi Agent failed to start";
-    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that
-    // outlive the call; MessageBoxW returns only after the user clicks OK.
-    unsafe {
-        MessageBoxW(
-            0,
-            wide_text.as_ptr(),
-            wide_title.as_ptr(),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
-        );
-    }
-}
-
-#[cfg(any(not(windows), not(feature = "custom-protocol")))]
-fn show_startup_error_dialog(_first_error: &io::Error, _retry_error: &io::Error, _log_path: &Path) {}
 
 /// pi-subagents background (async) children detach into their own Pi host
 /// process. The extension attributes the host npm package by walking up from
@@ -710,6 +738,28 @@ fn pi_subagents_package_root(server_dir: &Path) -> PathBuf {
         .join("node_modules")
         .join("@earendil-works")
         .join("pi-coding-agent")
+}
+
+/// The end of server.log, so a startup failure in desktop.log says what the
+/// server itself last reported without opening a second file.
+#[cfg(feature = "custom-protocol")]
+fn server_log_tail(log_path: &Path) -> String {
+    const TAIL_BYTES: u64 = 1024;
+    let Ok(mut file) = fs::File::open(log_path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if io::Seek::seek(
+        &mut file,
+        io::SeekFrom::Start(len.saturating_sub(TAIL_BYTES)),
+    )
+    .is_err()
+    {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
 #[cfg(feature = "custom-protocol")]
@@ -796,19 +846,20 @@ fn start_packaged_server(
         Ok((child, address))
     };
 
+    let timeout = if launched_at_login() {
+        SERVER_START_TIMEOUT_AT_LOGIN
+    } else {
+        SERVER_START_TIMEOUT
+    };
     let (mut child, mut address) = spawn_server()?;
-    if let Err(first_error) = wait_for_server(
-        &mut child,
-        address,
-        desktop_instance_id,
-        &log_path,
-        SERVER_START_TIMEOUT,
-    ) {
+    if let Err(first_error) =
+        wait_for_server(&mut child, address, desktop_instance_id, &log_path, timeout)
+    {
         desktop_log(
             app,
             &format!(
                 "server not ready in {}s ({first_error}); respawning once with a {}s budget",
-                SERVER_START_TIMEOUT.as_secs(),
+                timeout.as_secs(),
                 SERVER_START_TIMEOUT_SLOW.as_secs()
             ),
         );
@@ -828,7 +879,15 @@ fn start_packaged_server(
             }
             Err(retry_error) => {
                 DesktopServer::running(retry_child).stop();
-                show_startup_error_dialog(&first_error, &retry_error, &log_path);
+                desktop_log(
+                    app,
+                    &format!(
+                        "server retry failed: {retry_error}\nserver.log tail:\n{}",
+                        server_log_tail(&log_path)
+                    ),
+                );
+                // The setup caller owns the cross-platform dialog and clean
+                // exit; do not show a second Windows-only blocking dialog.
                 return Err(retry_error.into());
             }
         }
@@ -841,7 +900,10 @@ fn start_packaged_server(
 #[cfg(all(test, feature = "custom-protocol"))]
 mod tests {
     use super::shell::popup::PopupMenuEntry;
-    use super::{child_process_compatible_path, response_has_instance_id};
+    use super::{
+        child_process_compatible_path, probe_server, response_has_instance_id,
+        response_mismatch_reason,
+    };
     use super::{logging::format_utc_millis, native_prefs::is_inline_frame_document};
 
     use std::path::{Path, PathBuf};
@@ -856,6 +918,38 @@ mod tests {
             "https://example.com/srcdoc"
         )));
         assert!(!is_inline_frame_document(&parse("data:text/html,x")));
+    }
+
+    #[test]
+    fn mismatched_responses_are_described_for_the_startup_log() {
+        assert_eq!(response_mismatch_reason(b""), "empty response");
+        assert_eq!(
+            response_mismatch_reason(b"HTTP/1.1 503 Service Unavailable\r\nx: y\r\n\r\n"),
+            "unexpected response: HTTP/1.1 503 Service Unavailable"
+        );
+        assert!(!response_has_instance_id(
+            b"HTTP/1.1 503 Service Unavailable\r\n\r\n",
+            "id"
+        ));
+    }
+
+    #[test]
+    fn probe_failures_name_the_step_that_failed() {
+        use std::{net::TcpListener, time::Duration};
+        let wait = Duration::from_millis(150);
+
+        // Accepts the connection but never answers: a server stuck after "Ready".
+        let silent = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let reason = probe_server(silent.local_addr().unwrap(), "id", wait, wait).unwrap_err();
+        assert!(reason.starts_with("no response within"), "{reason}");
+
+        // Nothing listening: the port is closed again by the time we probe.
+        let closed = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let reason = probe_server(closed, "id", wait, wait).unwrap_err();
+        assert!(reason.starts_with("connect failed"), "{reason}");
     }
 
     #[test]
@@ -938,7 +1032,12 @@ mod tests {
         let apps = apps.unwrap();
         for app in apps.as_array().expect("an array of apps") {
             let path = app["path"].as_str().expect("path");
-            for office in ["Microsoft Word.app", "Microsoft Excel.app", "Numbers.app", "Notes.app"] {
+            for office in [
+                "Microsoft Word.app",
+                "Microsoft Excel.app",
+                "Numbers.app",
+                "Notes.app",
+            ] {
                 assert!(!path.ends_with(office), "{path} only claims generic text");
             }
         }
@@ -1029,6 +1128,26 @@ mod tests {
         assert!(!response_has_instance_id(wrong, expected));
         assert!(!response_has_instance_id(body_spoof, expected));
     }
+}
+
+/// The server never came up. Log it and quit cleanly. A manual launch also
+/// tells the user and points at the logs; a login launch stays silent because
+/// nobody is waiting on it, and opening the app again retries.
+fn report_startup_failure(app: &AppHandle, error: &str) {
+    desktop_log(app, &format!("startup failed: {error}"));
+    if launched_at_login() {
+        app.exit(1);
+        return;
+    }
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    let handle = app.clone();
+    app.dialog()
+        .message(format!(
+            "Pi Agent could not start its background service.\n\n{error}\n\nOpening the app again retries."
+        ))
+        .title("Pi Agent")
+        .kind(MessageDialogKind::Error)
+        .show(move |_| handle.exit(1));
 }
 
 #[cfg(not(feature = "custom-protocol"))]
@@ -1314,10 +1433,19 @@ pub fn run() {
             }
 
             #[cfg(feature = "custom-protocol")]
-            let (url, server) =
-                start_packaged_server(app.handle(), &server_api_token, &server_instance_id)?;
+            let started =
+                start_packaged_server(app.handle(), &server_api_token, &server_instance_id);
             #[cfg(not(feature = "custom-protocol"))]
-            let (url, server) = start_development_server(app.handle())?;
+            let started = start_development_server(app.handle());
+            // Returning the error from setup makes Tauri panic, which Windows
+            // reports as a crash. Report it and leave through the normal exit.
+            let (url, server) = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    report_startup_failure(app.handle(), &error.to_string());
+                    return Ok(());
+                }
+            };
 
             desktop_log(app.handle(), &format!("server ready at {url}"));
             desktop_log(

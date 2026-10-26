@@ -88,9 +88,9 @@
     },
     "components/MessageView.tsx": {
       "risk": "high",
-      "drift": 524,
+      "drift": 533,
       "reason": "Message bubble markup adjusted.",
-      "structuralDrift": 327,
+      "structuralDrift": 332,
       "disposition": "accepted"
     },
     "lib/i18n/registry.ts": {
@@ -120,9 +120,9 @@
       "disposition": "accepted"
     },
     "lib/subagent-extension.ts": {
-      "risk": "medium",
-      "drift": 82,
-      "structuralDrift": 82,
+      "risk": "high",
+      "drift": 335,
+      "structuralDrift": 329,
       "disposition": "accepted",
       "reason": "Fork precedence policy: preferPiSubagentsExtension detects loaded pi-subagents files and removes the built-in host plus resolved conflicts. Preserve package-first precedence and the detection flag when upstream changes extension registration; tool-name matching must not return."
     },
@@ -234,6 +234,19 @@
     }
   },
   "forkOwnedPaths": [
+    "components/ConversationNavigator.tsx",
+    "e2e/conversation-navigator.fixture.tsx",
+    "e2e/conversation-navigator.mjs",
+    "lib/installed-fonts.ts",
+    "lib/system-fonts.ts",
+    "lib/installed-fonts.test.mjs",
+    "app/api/desktop/fonts/",
+    "components/FontSettings.tsx",
+    "hooks/useFonts.ts",
+    "lib/font-preferences.ts",
+    "lib/font-preferences.test.mjs",
+    "lib/font-settings.ts",
+    "app/api/appearance/fonts/",
     "components/StreamingMarkdown.tsx",
     "hooks/useStreamingMarkdown.ts",
     "lib/streaming-markdown.ts",
@@ -313,6 +326,7 @@
     "2026-10-20 — Rebased the fork onto desktop upstream v0.7.5 (2909e09a, was 2e0e3e71/v0.7.4): 14 fork commits replayed, no upstream commit rewritten. Upstream now owns the chat tool policy in lib/chat-workspace-policy.ts (chats keep no coding tools, no shell and no file editing of their own, but a trusted MCP server's tools may write or run commands); the fork deleted its second inline policy path and adopted that file, so AGENTS.md's 'chats are tool-less' wording now describes upstream's rule instead of the fork's older stricter one. Also adopted upstream's BUILD_ID-tied route-cache self-heal in desktop/server-launcher.cjs (the fork's unconditional delete kept the fork's own desktop-route-cache test passing only by contradicting upstream's four route-cache-cleanup tests; the fork test now stages a real upgrade with a changed BUILD_ID) and kept the fork's wider installer hook line alongside upstream's narrower one so both suites hold. Components must use AppSelect/AppCombobox, not browser-native select: SubagentFleetPanel's steer-mode picker was converted. Drift numbers refreshed against the unchanged pi-web baseline; scripts/measure-fork-drift.mjs double-parsed the manifest baseline and broke whenever no pi-web-upstream remote existed — now it parses once.",
     "2026-10-20 — Post-rebase review pass on v0.7.5: the CSS baseline provenance label was refreshed with `node scripts/upstream-css-baseline.mjs update upstream/v0.7.5` (upstreamRef c8da553 -> 2909e09a; both hashes already matched, so only the label moved), and the components/ChatWindow.tsx reason now matches the file, which lost the update chip to upstream 4f8f53bc and so no longer carries that empty-state drift. Four reviewer notes were accepted as-is rather than fixed: scripts/desktop-route-cache.test.mjs serves its seeded page through Next's legacy `/$/` FileSystemCache.get fallback (the seed branch is Next's, not the launcher's, so an upgrade that drops it changes the test, not the launcher); next.config.ts stays an unmeasured root-level entry exempt from the structural-drift risk assertion, because a Next config's size says nothing about merge risk; the fork's SettingsEntryMenu removal is now covered by upstream's own openSettingsAtLastSection in components/AppShell.tsx; and the chat policy loosening recorded on 2026-10-20 (a trusted MCP server's tools may write or run commands inside a chat) is upstream's decision, kept deliberately. lib/rpc-manager.ts also stops creating a subagents event bus for a chat workspace, matching the comment and the one resource-loader branch that passes it.",
     "2026-10-22 — Rebased the fork onto desktop upstream v0.7.6 (67340ed4, was 2909e09a/v0.7.5): 17 fork commits replayed, no upstream commit rewritten. Upstream's per-chat policy (6e418d2) replaced the shared hidden chat cwd: a chat owns a server-created folder, file tools are confined to it, MCP tools are limited to those their server marks read-only, and the per-chat unlock (`pi-web:chat-unlock`) is the only way out — AGENTS.md and docs/agents/fork-chat-workspace.md follow upstream's wording again instead of the fork's older stricter sentence. Every conflict was an additive union: lib/session-reader.ts imports (upstream's openSlimSessionManager beside the fork's projectModelImages), lib/rpc-manager.ts (upstream's isChat()/isChatUnlocked() beside the fork's SubagentEventBus/lifecycle accessors), package.json test:e2e (upstream's streaming-markdown replay plus the fork's subagent-fleet), and the decisionLog blocks themselves. Upstream's pi SDK 1.3.0 -> 1.4.0 bump (de1fdb5) and its new lib/session-slim-load.ts (d5603b5, dead tool-result details skipped when a large session file opens) were initially adopted wholesale; the review below repairs the slim loader's missing LW image-metadata protection. app/native-theme.css is now a file upstream also edits (its native-monospace/CJK font-stack fix landed there) while the fork still owns every rule in it, so a future merge must expect conflicts in it. CSS baseline re-pinned to 67340ed with both hashes unchanged — upstream did not touch app/globals.css or app/settings.css; only the provenance label moved.",
-    "2026-10-22 — v0.7.6 review fixes: lib/session-slim-load.ts now falls back for modelImages and verifies that the cut contains exactly one details container, preserving usage, nestedCalls and unknown siblings before the tail anchor. Regression tests cover projection/gallery parity, stats parity, a real large-file open and unchanged disk bytes. GET chat-access now reports effective unlock only for a chat folder on a local server, including persisted sessions and stale live wrappers; the execution policy remains upstream's single path. These are direct-desktop/LW integration seams, not additions to the older pi-web drift list: session-slim-load.ts and tool-result-details.ts do not exist at the recorded 6fcd7d4 baseline."
+    "2026-10-22 — v0.7.6 review fixes: lib/session-slim-load.ts now falls back for modelImages and verifies that the cut contains exactly one details container, preserving usage, nestedCalls and unknown siblings before the tail anchor. Regression tests cover projection/gallery parity, stats parity, a real large-file open and unchanged disk bytes. GET chat-access now reports effective unlock only for a chat folder on a local server, including persisted sessions and stale live wrappers; the execution policy remains upstream's single path. These are direct-desktop/LW integration seams, not additions to the older pi-web drift list: session-slim-load.ts and tool-result-details.ts do not exist at the recorded 6fcd7d4 baseline.",
+    "2026-10-25 — components/MessageView.tsx: backported readable completed write content from agegr/pi-web #1024. Streamed input, empty files and additional arguments, ambiguous paths and paths truncated by the header keep the generic JSON view. No syntax highlighting or styling changes; the implementation converges with pi-web and is retained until the next upstream sync. Drift re-measured against the recorded 6fcd7d4 baseline."
   ]
 }

@@ -138,7 +138,7 @@ test("each pi-subagents policy seam independently requires upstream review", () 
   // settings route were deleted with the built-in engine (M4) and left the
   // manifest: an upstream file we no longer carry cannot drift here.)
   const expectedRisks = {
-    "lib/subagent-extension.ts": "medium",
+    "lib/subagent-extension.ts": "high",
     "lib/subagent-settings.ts": "medium",
     "lib/rpc-manager.ts": "high",
     "lib/i18n/locale-plugins.ts": "high",
