@@ -112,6 +112,22 @@ async function main() {
     return;
   }
 
+  // The child extension assets are resolved at runtime from the server cwd,
+  // so the file tracer cannot be trusted with them; prepare-desktop stages
+  // them explicitly. Both are load-bearing for every session start: the
+  // bridge owns navigate/reload (a missing one fails the factory's post-spawn
+  // check), the artifacts guide owns the prompt section behind Settings ›
+  // General › Chat, and resolveAssetPath throws at session start when either
+  // is absent.
+  for (const asset of ["pi-web-bridge.mjs", "pi-web-artifacts.mjs", "pi-web-chat.mjs"]) {
+    const staged = join(serverDir, "lib", "pi-rpc", "assets", asset);
+    if (!existsSync(staged)) {
+      fail(`the staged server is missing the child extension asset ${asset} (${staged}); prepare-desktop must stage lib/pi-rpc/assets.`);
+      return;
+    }
+  }
+  console.log("assets: the staged child extension assets (bridge, artifacts guide, chat policy) are present.");
+
   const bedrockError = await importStagedBedrock(nodePath);
   if (bedrockError) {
     fail(`the staged Amazon Bedrock implementation cannot be imported: ${bedrockError}`);

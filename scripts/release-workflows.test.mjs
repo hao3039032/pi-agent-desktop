@@ -299,6 +299,22 @@ test("desktop staging ships the Amazon Bedrock SDK the file tracer cannot see", 
   assert.match(prepareSource, /https-proxy-agent/);
 });
 
+test("desktop staging ships the child extension assets and verify gates their presence", async () => {
+  const prepareSource = await readText(new URL("./prepare-desktop.mjs", import.meta.url), "utf8");
+  const verifySource = await readText(new URL("./verify-packaged-server.mjs", import.meta.url), "utf8");
+  // Every session spawns its pi child with --extension pointing at these
+  // files (bridge, artifacts guide, chat policy), resolved at RUNTIME from
+  // the server cwd by resolveAssetPath() — a dynamic path Next's file tracer
+  // cannot follow. A missing asset fails the session start, so staging must
+  // copy the assets dir itself and the packaged-server gate must check it.
+  assert.match(prepareSource, /lib", "pi-rpc", "assets"/);
+  assert.match(prepareSource, /endsWith\("\.mjs"\)/);
+  assert.match(prepareSource, /extensionAssetsDestination, asset\)/);
+  for (const asset of ["pi-web-bridge.mjs", "pi-web-artifacts.mjs", "pi-web-chat.mjs"]) {
+    assert.match(verifySource, new RegExp(asset.replace(/[.]/g, "\\.")), `${asset} is presence-checked`);
+  }
+});
+
 test("desktop staging drops sharp's musl native builds for Linux bundles", async () => {
   const prepareSource = await readFile(new URL("./prepare-desktop.mjs", import.meta.url), "utf8");
   // npm installs sharp's glibc and musl libvips variants on Linux. The musl

@@ -130,6 +130,12 @@ The child raises extension UI while it boots, before the wrapper's relay exists.
 
 `get_state` reports no `autoRetryEnabled` field, so `initialCoreState` leaves it **undefined**: the UI's `automation` keeps `null` and the gear hides the switch until `set_auto_retry` or an `auto_retry_start` event proves the value. Never default it to `true` again — that claimed an enabled retry policy the child never confirmed.
 
+## Honest system-prompt display (pi CLI engine)
+
+`get_state` reads `getActiveEntries()` from the live CLI (entries and leafId in one response), then uses the SDK's `buildSessionProjection` and `getCurrentSystemPrompt` to replay the active branch, including compaction checkpoints. It never guesses a prompt from desktop options or uses the disk tail after navigation. `systemPromptStatus` is `recorded`, `configured` (only the spawn-time custom base, when no record exists), `none` (confirmed absence), or `unknown` (query failed). A recorded composition takes precedence over the configured base, including chat-only sessions; the CLI and extensions can append sections. Recorded text is not proof of provider receipt. Base changes require restarting the session process; other settings follow CLI semantics, not a blanket restart rule. Reading this panel generates no prompt.
+
+Session starts, tool-policy restarts and chat-unlock writes share the per-session `withSessionWriterLock`: ownership spans old-child shutdown, actual exit, host append and replacement start. Other sessions are independent. Exit-wait failure retains the gate (fail-closed); a wrapper-disposal timeout never proves the CLI has exited. Tests in `lib/session-writer-lock.test.mjs` cover delayed append versus replacement, rejection and retry, and production entry-point wiring.
+
 ## CLI stop, process exit, and post-compaction usage
 
 - A CLI exit is a terminal transport event (`session_process_exit`), not successful

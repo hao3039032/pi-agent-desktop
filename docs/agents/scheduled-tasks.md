@@ -25,7 +25,15 @@ Design record: [ADR 0007](../adr/0007-scheduled-tasks.md). Full spec and impleme
   `catch-up.ts`, `claimSlot()`, overlap and concurrency rules, auto-pause after 5 failures in a
   row, `runNow()`. `runner.ts` runs one task: starts a session, tags it, names it, sends the
   prompt and waits for `prompt_done`; a model error in the last reply fails the run, a manual Stop
-  does not count against the task, and a run past its time limit is aborted.
+d  does not count against the task, and a run past its time limit is aborted.
+  The tag is the session's single-writer entry: the bridge op `meta.scheduled-run`
+  (fixed `pi-web:scheduled-run` type, strictly validated payload) makes the CLI
+  child append it through its own `pi.appendEntry` onto the session's real
+  active branch, and the child's confirmed reply — before the prompt is sent —
+  is the only success. A refusal, timeout or child exit fails the run before
+  any prompt (never reported as success), because an untagged session would
+  surface as an ordinary chat. `lib/scheduled-run-marker.ts` holds the shared
+  payload shape; the bridge asset re-validates it in the child.
 - `cron.ts` wraps croner. croner works in whole seconds and leaves out a slot equal to the
   reference time, so `previousCronRun()` looks one second ahead. Only five-field expressions
   are accepted, and runs must be at least 5 minutes apart.

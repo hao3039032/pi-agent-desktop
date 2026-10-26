@@ -9,6 +9,7 @@ import { useNativeAppMenu } from "@/hooks/useNativeAppMenu";
 import { selectProjectDirectoryNative } from "./ProjectPicker";
 import { SessionSidebar } from "./SessionSidebar";
 import { ChatWindow } from "./ChatWindow";
+import type { SystemPromptStatus } from "@/hooks/useAgentSession";
 import { AppNoticeShelf } from "./AppNoticeShelf";
 import { useScheduledRunNotifications } from "@/hooks/useScheduledRunNotifications";
 import type { ChatScrollPosition } from "@/lib/chat-scroll-position";
@@ -446,13 +447,15 @@ export function AppShell() {
   }, []);
 
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
+  const [systemPromptStatus, setSystemPromptStatus] = useState<SystemPromptStatus>("unknown");
   const [systemTools, setSystemTools] = useState<ToolEntry[] | null>(null);
   const [systemInfoLoading, setSystemInfoLoading] = useState(false);
   const systemInfoLoaderRef = useRef<((kind: "system" | "tools") => Promise<void>) | null>(null);
   const systemInfoLoadIdRef = useRef(0);
 
-  const handleSystemPromptChange = useCallback((prompt: string | null) => {
+  const handleSystemPromptChange = useCallback((prompt: string | null, status?: SystemPromptStatus) => {
     setSystemPrompt(prompt);
+    if (status !== undefined) setSystemPromptStatus(status);
     setSystemInfoLoading(false);
   }, []);
 
@@ -1015,6 +1018,7 @@ export function AppShell() {
     setBranchActiveLeafId(null);
     setBranchSwitchLocked(false);
     setSystemPrompt(null);
+    setSystemPromptStatus("unknown");
     setSystemTools(null);
     setSystemInfoLoading(false);
     setActiveTopPanel(null);
@@ -1085,6 +1089,7 @@ export function AppShell() {
     setBranchSwitchLocked(false);
     branchLeafChangeFnRef.current = null;
     setSystemPrompt(null);
+    setSystemPromptStatus("unknown");
     setSessionStats(null);
     setContextUsage(null);
     setActiveTopPanel(null);
@@ -1139,6 +1144,7 @@ export function AppShell() {
 
     setBranchSwitchLocked(false);
     setSystemPrompt(null);
+    setSystemPromptStatus("unknown");
     setSessionStats(null);
     setContextUsage(null);
     setSystemTools(null);
@@ -1515,6 +1521,7 @@ export function AppShell() {
       setBranchActiveLeafId(null);
       setBranchSwitchLocked(false);
       setSystemPrompt(null);
+      setSystemPromptStatus("unknown");
       setSystemTools(null);
       setSystemInfoLoading(false);
       setActiveTopPanel(null);
@@ -2238,7 +2245,17 @@ export function AppShell() {
                   void showNativeMenu([
                     { label: nameLabel, disabled: nameDisabled, onSelect: () => void handleAutoName() },
                     {
-                      label: `${translate("system.prompt")}${systemPrompt === null ? "" : systemPrompt ? "" : ` (${translate("appshell.toolsDisabled")})`}`,
+                      label: `${translate("system.prompt")}${
+                        systemPrompt === null
+                          ? ""
+                          : systemPromptStatus === "unknown"
+                            ? ` (${translate("system.unavailable")})`
+                            : systemPromptStatus === "none"
+                            ? ` (${translate("system.notSentShort")})`
+                            : systemPrompt
+                              ? ""
+                              : ` (${translate("system.empty")})`
+                      }`,
                       checked: activeTopPanel === "system" ? true : undefined,
                       onSelect: () => handleSystemInfoToggle("system"),
                     },
@@ -2369,7 +2386,17 @@ export function AppShell() {
                           </span>
                           <span className="app-topbar-more-copy">
                             <span>{translate("system.prompt")}</span>
-                            <small>{systemPrompt === null ? translate("appshell.systemLoads") : systemPrompt ? translate("appshell.viewInstructions") : translate("appshell.toolsDisabled")}</small>
+                            <small>{
+                              systemPrompt === null
+                                ? translate("appshell.systemLoads")
+                                : systemPromptStatus === "unknown"
+                                  ? translate("system.unavailable")
+                                  : systemPromptStatus === "none"
+                                  ? translate("system.notSentShort")
+                                  : systemPrompt
+                                    ? translate("appshell.viewInstructions")
+                                    : translate("system.empty")
+                            }</small>
                           </span>
                         </button>
                         <button
@@ -2487,6 +2514,7 @@ export function AppShell() {
                 <SystemPromptPanel
                   loading={systemInfoLoading}
                   prompt={systemPrompt}
+                  status={systemPromptStatus}
                   translate={translate}
                 />
               )}

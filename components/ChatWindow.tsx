@@ -22,7 +22,7 @@ import { AnsiText } from "./AnsiText";
 import { useI18n } from "@/hooks/useI18n";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { phaseLabel } from "@/lib/chat-phase-label";
-import { useAgentSession, type NoticeItem } from "@/hooks/useAgentSession";
+import { useAgentSession, type NoticeItem, type SystemPromptStatus } from "@/hooks/useAgentSession";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useDesktopDragDrop } from "@/hooks/useDesktopDragDrop";
 import { useScrollbarVisibility } from "@/hooks/useScrollbarVisibility";
@@ -83,7 +83,7 @@ interface Props {
   onRecheckWorkspace?: () => void;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null, options?: LeafChangeOptions) => void, locked: boolean) => void;
-  onSystemPromptChange?: (prompt: string | null) => void;
+  onSystemPromptChange?: (prompt: string | null, status?: SystemPromptStatus) => void;
   onSystemToolsChange?: (tools: ToolEntry[] | null) => void;
   onSystemInfoLoaderChange?: (
     loader: ((kind: "system" | "tools" | "mcp") => Promise<void>) | null,

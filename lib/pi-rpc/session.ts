@@ -550,6 +550,62 @@ export class RpcAgentSession {
     throw new PiRpcUnsupportedError("navigateTree()", "M2/M3: get_tree + get_entries; summarize needs upstream");
   }
 
+  // --- CLI-authoritative active snapshot (get_entries + get_tree) ---------
+
+  /**
+   * One consistent active-session snapshot straight from the child:
+   * `entries` (append order) and `leafId` come from ONE `get_entries`
+   * response, and `tree` from `get_tree` (labels, orphan roots and child
+   * ordering are computed by the CLI itself, never re-derived here).
+   *
+   * Why this exists: `navigateTree` moves the leaf IN MEMORY
+   * (`sessionManager.branch()`); the file's bytes are unchanged, so any
+   * disk re-open computes leafId = the file's last entry (the abandoned
+   * branch's tail). The desktop must not re-implement that pointer — the
+   * child's own answer is the only authoritative active branch.
+   *
+   * The two responses are separate commands, so a navigation or append
+   * between them can make `tree` slightly newer than `entries`; that is
+   * harmless (the tree always contains every entry, its shape only changes
+   * on append). `leafId` is taken from the entries response so the leaf and
+   * the entries the caller slices it from can never disagree.
+   *
+   * A failure is THROWN and never answered from disk: a live session's
+   * active branch read must fail explicitly rather than show the file tail
+   * as if it were live.
+   */
+  async getActiveSnapshot(options: { timeoutMs?: number } = {}): Promise<{
+    entries: unknown[];
+    tree: unknown[];
+    leafId: string | null;
+  }> {
+    const timeoutMs = options.timeoutMs ?? 60_000;
+    const [entriesResult, treeResult] = await Promise.all([
+      this.getActiveEntries({ timeoutMs }),
+      this.client.command<{ tree?: unknown; leafId?: unknown }>("get_tree", {}, timeoutMs),
+    ]);
+    if (!Array.isArray(treeResult?.tree)) {
+      throw new Error("pi RPC 'get_tree' did not return a tree array");
+    }
+    return { ...entriesResult, tree: treeResult.tree };
+  }
+
+  /** Lightweight active projection input; polling need not transfer the tree twice. */
+  async getActiveEntries(options: { timeoutMs?: number } = {}): Promise<{ entries: unknown[]; leafId: string | null }> {
+    const entriesResult = await this.client.command<{ entries?: unknown; leafId?: unknown }>("get_entries", {}, options.timeoutMs ?? 60_000);
+    if (!Array.isArray(entriesResult?.entries)) {
+      throw new Error("pi RPC 'get_entries' did not return an entries array");
+    }
+    const leafId = entriesResult.leafId;
+    if (leafId !== null && typeof leafId !== "string") {
+      throw new Error("pi RPC 'get_entries' did not return a leafId string or null");
+    }
+    if (leafId !== null && !entriesResult.entries.some(entry => entry && typeof entry === "object" && entry.id === leafId)) {
+      throw new Error("pi RPC 'get_entries' returned a leaf missing from its entries");
+    }
+    return { entries: entriesResult.entries, leafId };
+  }
+
   getAllTools(): ToolInfo[] {
     return this.toolsCache;
   }

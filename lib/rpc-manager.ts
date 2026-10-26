@@ -6,6 +6,8 @@ import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
 import { resolvePiExecutable, startCliRpcSessionFromManager } from "./pi-rpc/factory";
+import { extractActiveSystemPrompt } from "./system-prompt-snapshot";
+import { withSessionWriterLock } from "./session-writer-lock";
 import { createProjectCommandBashOperations } from "./project-command-env";
 import { invalidateModelsCache } from "./models-cache";
 import { cacheSessionPath, getSessionListVersion, invalidateSessionListCache, readLatestSessionEntryId } from "./session-reader";
@@ -56,6 +58,7 @@ import {
   isChatWorkspacePath,
 } from "./chat-workspace";
 import { appendChatUnlock, readChatUnlocked } from "./chat-unlock";
+import type { ScheduledRunMarkerData } from "./scheduled-run-marker";
 import { saveAttachedFilesToFolder } from "./chat-attachment-files";
 import { deriveSessionPolicy, type SessionPolicy } from "./session-policy";
 import { readChatSettings } from "./chat-settings";
@@ -768,6 +771,19 @@ export class AgentSessionWrapper {
   }
 
   /**
+   * Tag this session as a scheduled run's output through the engine's single
+   * writer. The tag must be confirmed before the run's prompt is sent, so a
+   * failure rejects and the runner fails the run instead of proceeding with an
+   * untagged session. The host never appends this entry beside a live child.
+   */
+  async markScheduledRun(data: ScheduledRunMarkerData): Promise<void> {
+    if (typeof this.inner.appendScheduledRunMarker !== "function") {
+      throw new Error("this engine cannot tag a scheduled run before its prompt starts");
+    }
+    await this.inner.appendScheduledRunMarker(data);
+  }
+
+  /**
    * The live set_tools path: resolve the selection against the engine's real
    * state, then persist the pin AND apply the set in one engine transaction
    * when it has one (the CLI child confirms and appends atomically). The
@@ -1169,6 +1185,9 @@ export class AgentSessionWrapper {
       case "get_state": {
         const model = this.inner.model;
         const contextUsage = this.inner.getContextUsage();
+        // Replay the CLI's active projection, not the disk tail. A failed
+        // query means unknown, never "no record" or a different branch.
+        const promptSnapshot = await this.readSystemPromptSnapshot();
         return {
           sessionId: this.inner.sessionId,
           sessionFile: this.inner.sessionFile ?? "",
@@ -1193,14 +1212,10 @@ export class AgentSessionWrapper {
           contextUsage: contextUsage
             ? { percent: contextUsage.percent, contextWindow: contextUsage.contextWindow, tokens: contextUsage.tokens }
             : null,
-          // An exact prompt is projected onto each run by the inline extension. Every other
-          // session reports `agent.state.systemPrompt`, which replays the transcript: that is
-          // what the model actually saw, including sections a `before_agent_start` handler
-          // changed for the run. It stays empty until the first run persists a system message,
-          // so a session that has not sent anything yet falls back to the session getter, which
-          // renders the prompt from the current options. The getter alone would drop those
-          // per-run changes again once the run ends.
-          systemPrompt: this.exactSystemPrompt?.() ?? (this.inner.agent.state?.systemPrompt || this.inner.systemPrompt || ""),
+          // Recorded CLI composition, configured base only, confirmed absence,
+          // or unknown on a failed read. A transcript is not provider receipt.
+          systemPrompt: promptSnapshot.text,
+          systemPromptStatus: promptSnapshot.status,
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
@@ -1277,7 +1292,9 @@ export class AgentSessionWrapper {
         }
         const sessionManager = this.inner.sessionManager;
         const currentSessionFile = this.inner.sessionFile;
-        const leafId = typeof command.leafId === "string" ? command.leafId : sessionManager.getLeafId();
+        const leafId = typeof command.leafId === "string" ? command.leafId
+          : this.inner.getActiveEntries ? (await this.inner.getActiveEntries()).leafId
+          : sessionManager.getLeafId();
         const branchHasAssistant = leafId && sessionManager.getBranch(leafId).some(
           (entry) => entry.type === "message" && entry.message.role === "assistant",
         );
@@ -1816,6 +1833,22 @@ export class AgentSessionWrapper {
       id: routed.model.id,
       ...(routed.thinkingLevel ? { thinkingLevel: routed.thinkingLevel } : {}),
     };
+  }
+
+  private async readSystemPromptSnapshot(): Promise<{ status: "recorded" | "configured" | "none" | "unknown"; text: string }> {
+    try {
+      const snapshot = this.inner.getActiveEntries
+        ? await this.inner.getActiveEntries({ timeoutMs: 10_000 })
+        : { entries: this.inner.sessionManager.getEntries(), leafId: this.inner.sessionManager.getLeafId() };
+      const replayed = extractActiveSystemPrompt(snapshot.entries as Parameters<typeof extractActiveSystemPrompt>[0], snapshot.leafId);
+      // Recorded CLI composition takes precedence, even for custom bases.
+      if (replayed.recorded) return { status: "recorded", text: replayed.text };
+      if (this.exactSystemPrompt) return { status: "configured", text: this.exactSystemPrompt() };
+      return { status: "none", text: "" };
+    } catch {
+      // Liveness polling must still work if prompt inspection is unavailable.
+      return { status: "unknown", text: "" };
+    }
   }
 
   private getCacheWarming(): CacheWarmingInfo | undefined {
@@ -2399,6 +2432,7 @@ declare global {
   var __piSessions: Map<string, AgentSessionWrapper> | undefined;
   var __piStartLocks: Map<string, Promise<{ session: AgentSessionWrapper; realSessionId: string }>> | undefined;
   var __piStartingSessionCwds: Map<string, number> | undefined;
+  var __piChildExitWaits: Map<string, Promise<void>> | undefined;
 }
 
 function getRegistry(): Map<string, AgentSessionWrapper> {
@@ -2432,6 +2466,9 @@ function registerRpcWrapper(wrapper: AgentSessionWrapper): void {
     // switch, fork/clone replacement); push the new set so sidebars clear
     // its spinner instead of waiting for the next broadcast.
     notifyRunningChange();
+    // Its child may still be in its exit grace; later host appends and
+    // replacement starts for this id wait for the real exit.
+    recordChildExitWait(sessionId, wrapper);
   });
   // A wrapper registered before a hot reload still unregisters by id alone.
   const previous = registry.get(sessionId);
@@ -2477,7 +2514,7 @@ const closingSessionWaits = new WeakMap<AgentSessionWrapper, { done: boolean; pr
  * session id, which the replacement shares. The wait is bounded so a shutdown stuck in
  * extension binding cannot keep the session from starting again. One wait per closing
  * wrapper: its bound runs from the first caller and later callers share it, so a
- * shutdown still binding extensions can be overtaken.
+ * shutdown still binding extensions can be overtaken only after its CLI exits.
  */
 function closingRpcSessionWait(sessionId: string): Promise<void> | null {
   const closing = getRegistry().get(sessionId);
@@ -2487,14 +2524,82 @@ function closingRpcSessionWait(sessionId: string): Promise<void> | null {
   if (!wait) {
     const entry = { done: false, promise: Promise.resolve() };
     entry.promise = closing.waitUntilDisposed(SESSION_SHUTDOWN_DEADLINE_MS + CLOSING_SESSION_WAIT_MARGIN_MS)
-      .then((disposed) => {
-        if (!disposed) console.warn(`[pi-web] session ${sessionId} is still shutting down; starting it again anyway`);
-      })
-      .finally(() => { entry.done = true; });
+      .then(async (disposed) => {
+        // Even if wrapper disposal times out, a live CLI is still a writer.
+        // Never overtake it. An exit timeout rejects and remains fail-closed.
+        await closing.inner.waitForChildExit?.();
+        if (!disposed) console.warn(`[pi-web] session ${sessionId} is still disposing; its child has exited`);
+        entry.done = true;
+      });
     closingSessionWaits.set(closing, entry);
     wait = entry;
   }
   return wait.done ? null : wait.promise;
+}
+
+/** Live child-exit waits for wrappers already destroyed (globalThis: survives hot reload). */
+function getChildExitWaits(): Map<string, Promise<void>> {
+  globalThis.__piChildExitWaits ??= new Map();
+  return globalThis.__piChildExitWaits;
+}
+
+/**
+ * Remember a destroyed wrapper's child exit under its session id. A disposed
+ * wrapper is not an exited process — dispose fire-and-forgets the child's
+ * close (its grace kill can take seconds) — so any host-side append or
+ * replacement spawn for that id must first await the real exit this records.
+ */
+function recordChildExitWait(sessionId: string, wrapper: AgentSessionWrapper): void {
+  const waitForChildExit = wrapper.inner.waitForChildExit;
+  if (typeof waitForChildExit !== "function") return;
+  let wait: Promise<void>;
+  try {
+    wait = waitForChildExit.call(wrapper.inner);
+  } catch (error) {
+    wait = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+  // The recorded wait is awaited by callers that must not proceed beside a
+  // live writer; nobody else observes it, so it must not surface as an
+  // unhandled rejection when no caller is waiting.
+  void wait.catch(() => undefined);
+  const exits = getChildExitWaits();
+  exits.set(sessionId, wait);
+  void wait.then(
+    () => { if (exits.get(sessionId) === wait) exits.delete(sessionId); },
+    () => { /* Fail closed: a timeout does not prove the writer exited. */ },
+  );
+}
+
+/**
+ * Wait for a destroyed wrapper's child to really be gone, so the host is the
+ * session file's only writer. No record means no child this process knows of
+ * (a cold open, or one that already exited and was cleaned up). A child that
+ * outlives the engine's own wait rejects here, which callers surface instead
+ * of appending beside it.
+ */
+function waitForRecentChildExit(sessionId: string): Promise<void> {
+  return getChildExitWaits().get(sessionId) ?? Promise.resolve();
+}
+
+/**
+ * Append the chat unlock/lock entry through the engine's after-exit writer.
+ * The guards that authorize the change (local-only, chat folder, not running,
+ * file persisted) have already run in setRpcChatUnlock; the entry lands only
+ * once the engine's child process really exited, never beside a live writer
+ * and never through a bridge op that could bypass those guards.
+ */
+async function appendChatUnlockAfterChildExit(
+  existing: AgentSessionWrapper,
+  unlocked: boolean,
+): Promise<void> {
+  const inner = existing.inner;
+  if (typeof inner.appendChatUnlockAfterExit === "function") {
+    await inner.appendChatUnlockAfterExit(unlocked);
+    return;
+  }
+  // Capability absence alone does not prove there is no child.
+  await inner.waitForChildExit?.();
+  appendChatUnlock(inner.sessionManager, unlocked);
 }
 
 function normalizeRpcCwd(cwd: string): string {
@@ -2561,7 +2666,15 @@ export function toolPinRestartPhase(
  * the pin is retracted and the session is rebuilt, because the loadout that
  * settings.json defaultTools resolves to is only known once pi builds the session.
  */
-export async function setRpcSessionTools(
+export function setRpcSessionTools(
+  sessionId: string,
+  sessionFile: string | undefined,
+  requestedToolNames: unknown,
+): Promise<SetRpcSessionToolsResult> {
+  return withSessionWriterLock(sessionId, () => setRpcSessionToolsLocked(sessionId, sessionFile, requestedToolNames));
+}
+
+async function setRpcSessionToolsLocked(
   sessionId: string,
   sessionFile: string | undefined,
   requestedToolNames: unknown,
@@ -2578,9 +2691,12 @@ export async function setRpcSessionTools(
     // come up without the selection while this call reported success.
     const pending = closingRpcSessionWait(sessionId) ?? getLocks().get(sessionId);
     if (pending) {
-      await pending.catch(() => undefined);
-      return setRpcSessionTools(sessionId, sessionFile, requestedToolNames);
+      await pending;
+      return setRpcSessionToolsLocked(sessionId, sessionFile, requestedToolNames);
     }
+    // A just-destroyed wrapper's child may still be exiting; the pin is only
+    // the host's to write once that process is really gone.
+    await waitForRecentChildExit(sessionId);
     const manager = SessionManager.open(sessionFile, undefined);
     if (isChatWorkspacePath(manager.getCwd())) {
       throw new Error("Chats have no tools. Open a project to change the tool preset.");
@@ -2591,7 +2707,7 @@ export async function setRpcSessionTools(
     if (toolNames === undefined) appendClearedSessionToolSelection(manager);
     else appendSessionToolSelection(manager, toolNames);
     invalidateSessionListCache();
-    const started = await startRpcSession(sessionId, sessionFile, undefined);
+    const started = await startRpcSessionLocked(sessionId, sessionFile, undefined);
     return { session: started.session, sessionId: started.realSessionId, recreated: false };
   }
 
@@ -2651,11 +2767,11 @@ export async function setRpcSessionTools(
   }
 
   if (persistedFile) {
-    const started = await startRpcSession(sessionId, persistedFile, undefined);
+    const started = await startRpcSessionLocked(sessionId, persistedFile, undefined);
     return { session: started.session, sessionId: started.realSessionId, recreated: true };
   }
 
-  const started = await startRpcSession(`__recreate__${randomUUID()}`, "", sessionCwd, {
+  const started = await startRpcSessionLocked(`__recreate__${randomUUID()}`, "", sessionCwd, {
     ...(toolNames !== undefined ? { toolNames } : {}),
     ...(model ? { initialModel: { provider: model.provider, modelId: model.id } } : {}),
     allowInitialModelFallback: true,
@@ -2672,7 +2788,15 @@ export async function setRpcSessionTools(
  * Only a chat with a folder that has been saved can be unlocked, and never on a server other
  * machines can reach.
  */
-export async function setRpcChatUnlock(
+export function setRpcChatUnlock(
+  sessionId: string,
+  sessionFile: string | undefined,
+  unlocked: boolean,
+): Promise<SetRpcSessionToolsResult> {
+  return withSessionWriterLock(sessionId, () => setRpcChatUnlockLocked(sessionId, sessionFile, unlocked));
+}
+
+async function setRpcChatUnlockLocked(
   sessionId: string,
   sessionFile: string | undefined,
   unlocked: boolean,
@@ -2686,14 +2810,18 @@ export async function setRpcChatUnlock(
     if (!sessionFile) throw new Error("Session not found");
     const pending = closingRpcSessionWait(sessionId) ?? getLocks().get(sessionId);
     if (pending) {
-      await pending.catch(() => undefined);
-      return setRpcChatUnlock(sessionId, sessionFile, unlocked);
+      await pending;
+      return setRpcChatUnlockLocked(sessionId, sessionFile, unlocked);
     }
+    // No wrapper is alive, but a just-destroyed one may still have a child in
+    // its exit grace: the host may only append once that process is really
+    // gone (a disposed wrapper is not an exited child).
+    await waitForRecentChildExit(sessionId);
     const manager = SessionManager.open(sessionFile, undefined);
     if (!isChatFolderPath(manager.getCwd())) throw new Error("Only a chat with its own folder can use the computer.");
     appendChatUnlock(manager, unlocked);
     invalidateSessionListCache();
-    const started = await startRpcSession(sessionId, sessionFile, undefined);
+    const started = await startRpcSessionLocked(sessionId, sessionFile, undefined);
     return { session: started.session, sessionId: started.realSessionId, recreated: false };
   }
 
@@ -2706,10 +2834,13 @@ export async function setRpcChatUnlock(
   // pi writes a session out only once it has an assistant message; an entry added before
   // that would be lost with the restart.
   if (!persistedFile) throw new Error("Send a message first, then this chat can use the computer.");
-  appendChatUnlock(existing.inner.sessionManager, unlocked);
-  invalidateSessionListCache();
+  // The entry is host-written, and only after the child the shutdown just
+  // stopped has really exited: while it lives, the child is the file's writer
+  // (its exit can flush for seconds after the wrapper is disposed).
   await existing.shutdown();
-  const started = await startRpcSession(sessionId, persistedFile, undefined);
+  await appendChatUnlockAfterChildExit(existing, unlocked);
+  invalidateSessionListCache();
+  const started = await startRpcSessionLocked(sessionId, persistedFile, undefined);
   return { session: started.session, sessionId: started.realSessionId, recreated: true };
 }
 
@@ -2874,7 +3005,16 @@ export function getCompletionNotificationSuppressedRpcSessionIds(): string[] {
  * thinking pin, and SDK scopedModels share one settings snapshot.
  * Pass options.toolNames to pre-configure active tools (empty = all disabled).
  */
-export async function startRpcSession(
+export function startRpcSession(
+  sessionId: string,
+  sessionFile: string,
+  cwd: string | undefined,
+  options: RpcSessionStartOptions = {},
+): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
+  return withSessionWriterLock(sessionId, () => startRpcSessionLocked(sessionId, sessionFile, cwd, options));
+}
+
+async function startRpcSessionLocked(
   sessionId: string,
   sessionFile: string,
   cwd: string | undefined,
@@ -2897,12 +3037,39 @@ export async function startRpcSession(
   const closingWait = closingRpcSessionWait(sessionId);
   if (closingWait) {
     // Concurrent starts share this lock, then the one start that follows it.
-    const waiting: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = closingWait.then(() => {
-      if (locks.get(sessionId) === waiting) locks.delete(sessionId);
-      return startRpcSession(sessionId, sessionFile, cwd, options);
-    });
+    const waiting: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = (async () => {
+      try {
+        await closingWait;
+      } finally {
+        // Release the start lock on failure too. The child-exit gate remains
+        // responsible for fail-closed safety; a stale rejected start is not.
+        if (locks.get(sessionId) === waiting) locks.delete(sessionId);
+      }
+      return startRpcSessionLocked(sessionId, sessionFile, cwd, options);
+    })();
     locks.set(sessionId, waiting);
     return waiting;
+  }
+
+  // A wrapper destroyed a moment ago (idle eviction, restart) leaves a child
+  // in its exit grace; opening or appending to the file before that process is
+  // really gone would race its final flush (and a replacement spawn would
+  // overlap two children on one file). The wait holds the start lock (the
+  // closingWait shape above): a start that arrives while the child is dying
+  // shares this one instead of racing beside it. No record means no child this
+  // process knows of, and the original synchronous path is kept.
+  const childExitGate = getChildExitWaits().get(sessionId);
+  if (childExitGate) {
+    const gated: Promise<{ session: AgentSessionWrapper; realSessionId: string }> = (async () => {
+      try {
+        await childExitGate;
+      } finally {
+        if (locks.get(sessionId) === gated) locks.delete(sessionId);
+      }
+      return startRpcSessionLocked(sessionId, sessionFile, cwd, options);
+    })();
+    locks.set(sessionId, gated);
+    return gated;
   }
 
   let sessionManager: SessionManager;

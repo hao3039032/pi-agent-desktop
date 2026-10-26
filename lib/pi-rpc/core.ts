@@ -35,6 +35,8 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { NavigateTreeOptions, NavigateTreeResult, PiAgentMessage, SlashCommandInfo, ToolInfo } from "../pi-types";
 import { appendClearedSessionToolSelection, appendSessionToolSelection } from "../session-tool-selection";
+import { appendChatUnlock } from "../chat-unlock";
+import { validateScheduledRunMarkerData, type ScheduledRunMarkerData } from "../scheduled-run-marker";
 import { PI_SUBAGENTS_PACKAGE_NAME } from "../subagent-settings";
 import { PiRpcClient, type PiRpcRecord } from "./client";
 import { PiRpcUnsupportedError, RpcAgentSession, type RpcAgentSessionOptions, type RpcAgentSessionState } from "./session";
@@ -113,8 +115,28 @@ export class FileSessionManagerView {
     return this.open().getSessionName();
   }
 
-  appendCustomEntry(type: string, data: unknown): void {
-    this.open().appendCustomEntry(type, data);
+  // --- host-side appends (enumerated, never a caller-chosen type) --------
+  //
+  // The child is the session file's writer while it lives; conversation
+  // entries and live metadata (the tool pin, the scheduled-run marker) go
+  // through the child. These members exist for the two entries the host owns,
+  // and every caller must first prove the child is gone (waitForChildExit):
+  // appending beside a live writer is exactly what these members replaced.
+  // There is deliberately no appendCustomEntry(type, data) here anymore.
+
+  /** The tool-selection pin, host-written only after the child exited. */
+  appendToolSelectionEntry(tools: readonly string[]): void {
+    appendSessionToolSelection(this.open(), tools);
+  }
+
+  /** The pin's retraction, host-written only after the child exited. */
+  appendClearedToolSelectionEntry(): void {
+    appendClearedSessionToolSelection(this.open());
+  }
+
+  /** The chat unlock/lock choice, host-written only after the child exited. */
+  appendChatUnlockEntry(unlocked: boolean): void {
+    appendChatUnlock(this.open(), unlocked);
   }
 }
 
@@ -893,8 +915,39 @@ export class CliAgentSessionCore extends RpcAgentSession {
       return;
     }
     await this.waitForChildExit();
-    if (toolNames === undefined) appendClearedSessionToolSelection(this.view as unknown as SessionManager);
-    else appendSessionToolSelection(this.view as unknown as SessionManager, toolNames);
+    if (toolNames === undefined) this.view.appendClearedToolSelectionEntry();
+    else this.view.appendToolSelectionEntry(toolNames);
+  }
+
+  /**
+   * Tag this session as a scheduled run's output through the child's own
+   * writer: the bridge's `meta.scheduled-run` op appends the fixed entry type
+   * with a strictly validated payload via `pi.appendEntry`, on the session's
+   * real active branch, before the run's first prompt. The child's confirmed
+   * reply is the only success; any refusal, timeout or child exit rejects, so
+   * the caller fails the run instead of sending an untagged prompt.
+   */
+  async appendScheduledRunMarker(data: ScheduledRunMarkerData): Promise<void> {
+    validateScheduledRunMarkerData(data);
+    const result = await this.bridgeRequest<{ entry?: unknown }>(
+      "meta.scheduled-run",
+      data as unknown as Record<string, unknown>,
+    );
+    if (typeof result !== "object" || result === null || (result as { entry?: unknown }).entry !== "scheduled-run") {
+      throw new Error("pi-web bridge 'meta.scheduled-run' did not confirm the entry");
+    }
+  }
+
+  /**
+   * Append the chat unlock/lock choice as the host, and only once the child
+   * process really exited (wrapper disposed is not process exited: dispose
+   * fire-and-forgets the child's close, whose grace kill can take seconds).
+   * The unlock's authorization (local-only, chat folder, not running) stays in
+   * setRpcChatUnlock; there is deliberately no bridge op for this entry.
+   */
+  async appendChatUnlockAfterExit(unlocked: boolean): Promise<void> {
+    await this.waitForChildExit();
+    this.view.appendChatUnlockEntry(unlocked);
   }
 
   /**

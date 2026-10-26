@@ -232,6 +232,21 @@ export interface AgentSessionLike {
   readonly isBashRunning: boolean;
   setModel(model: ModelLike): Promise<void>;
   navigateTree(targetId: string, options?: NavigateTreeOptions): Promise<NavigateTreeResult>;
+  /**
+   * The engine's authoritative ACTIVE-branch snapshot: `entries` and `leafId`
+   * come from one consistent answer, and `tree` is the engine's own tree
+   * projection. Present on the CLI engine, where `navigateTree` moves the
+   * leaf in memory and a file re-open would answer with the abandoned
+   * branch's tail instead of the live leaf. Absent on engines whose
+   * `sessionManager` already is the live view. A live query failure must be
+   * reported to the caller, never answered from disk.
+   */
+  getActiveEntries?(options?: { timeoutMs?: number }): Promise<{ entries: unknown[]; leafId: string | null }>;
+  getActiveSnapshot?(options?: { timeoutMs?: number }): Promise<{
+    entries: unknown[];
+    tree: unknown[];
+    leafId: string | null;
+  }>;
   /** Command-capable context bound to this session, handed to an extension's `withSession()` callback. */
   createReplacedSessionContext?(): unknown;
   /** Rebuild the agent's context from the session manager after entries were appended outside a run. */
@@ -295,6 +310,26 @@ export interface AgentSessionLike {
    * host applies the two steps itself.
    */
   applyToolSelection?(names: string[], pin: string[]): Promise<void>;
+  /**
+   * Tag this session as a scheduled run's output through the engine's single
+   * writer (the CLI child appends the entry itself, before the run's first
+   * prompt). Absent on engines that cannot; callers must fail the run rather
+   * than send an untagged prompt.
+   */
+  appendScheduledRunMarker?(data: import("./scheduled-run-marker").ScheduledRunMarkerData): Promise<void>;
+  /**
+   * Wait until the engine's runtime process is really gone (the CLI child's
+   * OS exit, not the wrapper being disposed), so the host may append to the
+   * session file as its only writer. Absent on in-process engines.
+   */
+  waitForChildExit?(): Promise<void>;
+  /**
+   * Append the chat unlock/lock entry through the engine's after-exit writer
+   * (the CLI core waits for the child's real exit first). The authorization
+   * guards live in setRpcChatUnlock; engines without a child process are
+   * absent here and the host appends through their own manager.
+   */
+  appendChatUnlockAfterExit?(unlocked: boolean): Promise<void>;
   abortCompaction(): void | Promise<void>;
   /** Under a virtual model, the physical model of the latest successful response (pi >= 0.99). */
   readonly routedModel?: { model: ModelLike; thinkingLevel?: string };

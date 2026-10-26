@@ -142,8 +142,15 @@ session with an empty tool allow-list (exact context-file prompt, nothing loaded
 
 `lib/chat-unlock.ts` records the choice as a session entry (`pi-web:chat-unlock`, newest
 wins), so it outlives the process and is per chat. `POST /api/sessions/[id]/chat-access
-{ unlocked }` (`setRpcChatUnlock`) appends it, shuts the wrapper down and starts it again;
-the client then re-attaches like after a tool-preset change (`handleChatAccessRebuilt`).
+{ unlocked }` (`setRpcChatUnlock`) shuts the wrapper down and then appends the entry —
+the host writes it only after the child process REALLY exited (`waitForChildExit`; a
+disposed wrapper still leaves the child a few seconds of exit grace), never beside a
+live writer, and there is deliberately no bridge op for it: the unlock's authorization
+(local-only, chat folder, not running, file persisted) lives in `setRpcChatUnlock` alone
+and cannot be bypassed by a raw bridge request. A just-destroyed wrapper's still-dying
+child is covered too (`recordChildExitWait`/`waitForRecentChildExit` in `rpc-manager.ts`:
+host appends and replacement spawns for that session id wait for the tracked real exit).
+The client then re-attaches like after a tool-preset change (`handleChatAccessRebuilt`).
 
 - An unlocked chat (`chat-unlocked` policy) keeps the chat prompt, `date`/`instructions`
   sections, its folder as cwd and `noContextFiles`, but the workspace extension registers no

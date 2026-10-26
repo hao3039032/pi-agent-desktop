@@ -114,6 +114,11 @@ export function resolveBridgeExtensionPath(): string {
   return resolveAssetPath("pi-web-bridge.mjs");
 }
 
+/** The artifacts guide extension (assets/pi-web-artifacts.mjs), same layout rules as the bridge. */
+export function resolveArtifactsExtensionPath(): string {
+  return resolveAssetPath("pi-web-artifacts.mjs");
+}
+
 /** A shipped extension asset next to the server code (bridge, chat policy). */
 function resolveAssetPath(file: string): string {
   if (process.env.PI_WEB_BRIDGE_EXTENSION && file === "pi-web-bridge.mjs") {
@@ -290,7 +295,9 @@ export async function startCliRpcSessionFromManager(
     // The chat-only pin mirrors CHAT_ONLY_RESOURCE_LOADER_OPTIONS: no tools,
     // no discoverable resources, and the exact prompt (built from the
     // session's context files) replaces pi's own — so context files must not
-    // be added a second time. The bridge stays: navigate/reload remain live.
+    // be added a second time. The bridge and the artifacts guide stay
+    // loaded: navigate/reload remain live and the artifacts switch keeps its
+    // per-run semantics (an explicit --extension loads under --no-extensions).
     const promptFile = createExactPromptFile(options.chatOnlyExactPrompt);
     promptCleanups.push(promptFile.cleanup);
     args.push(
@@ -324,6 +331,13 @@ export async function startCliRpcSessionFromManager(
   // The bridge owns tree navigation and reload inside the child; without it
   // the wrapper's navigate_tree would send literal command text to the model.
   args.push("--extension", resolveBridgeExtensionPath());
+  // The artifacts guide is its own asset, loaded exactly where the bridge
+  // used to carry it — every session kind that loads the bridge (normal,
+  // chat-only pin, chat workspace) keeps the same artifacts switch behavior:
+  // per-run, default-on, off, driven by Pi Web's own settings file. A
+  // chat-only pin passes --no-extensions, but an explicit --extension loads
+  // anyway, which is how the bridge itself stays live there.
+  args.push("--extension", resolveArtifactsExtensionPath());
   // The shell mapping reads the same settings.json the in-process engine
   // reads (resolveActiveToolNames), so a pinned `bash` follows the powershell
   // switch instead of enabling both shells.

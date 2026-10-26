@@ -362,11 +362,13 @@ const FORK_FEATURES = [
     markers: ['kind?: "terminal" | "artifact"', 'tab.kind === "artifact"'],
   },
   {
-    name: "artifacts: normal sessions get the prompt section",
-    // Moved with the CLI engine: the guide now ships inside the bridge
-    // extension every `pi --mode rpc` child loads (M3 port).
-    file: "lib/pi-rpc/assets/pi-web-bridge.mjs",
-    markers: ["ARTIFACT_GUIDE_SECTION"],
+    name: "artifacts: every session kind gets the prompt section",
+    // The guide is its own asset (the bridge is protocol/security only),
+    // loaded by the factory next to the bridge for every session kind —
+    // normal, chat-only pin and chat workspace — with per-run, default-on
+    // switching driven by Pi Web's settings file.
+    file: "lib/pi-rpc/assets/pi-web-artifacts.mjs",
+    markers: ["ARTIFACT_GUIDE_SECTION", "before_agent_start"],
   },
   {
     name: "artifacts: General settings has the artifacts switch",

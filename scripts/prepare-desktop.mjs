@@ -239,6 +239,21 @@ async function assembleServer() {
     join(serverResourcesDir, "desktop-server.cjs"),
   );
 
+  // The child extension assets (bridge, chat policy, artifacts guide) are
+  // resolved at RUNTIME by resolveAssetPath() through process.cwd() and a
+  // dynamic file name, which Next's file tracer cannot follow into the
+  // standalone server. Stage the whole assets dir explicitly — every
+  // session spawns its child with --extension <these files>, so a missing
+  // one fails the session start, not just a feature.
+  const extensionAssetsSource = join(rootDir, "lib", "pi-rpc", "assets");
+  const extensionAssetsDestination = join(serverResourcesDir, "lib", "pi-rpc", "assets");
+  const extensionAssets = await readdir(extensionAssetsSource);
+  await mkdir(extensionAssetsDestination, { recursive: true });
+  for (const asset of extensionAssets) {
+    if (!asset.endsWith(".mjs")) continue;
+    await copyFile(join(extensionAssetsSource, asset), join(extensionAssetsDestination, asset));
+  }
+
   const staticSource = join(desktopBuildDir, "static");
   const staticDestination = join(serverResourcesDir, ".next-desktop", "static");
   await mkdir(dirname(staticDestination), { recursive: true });

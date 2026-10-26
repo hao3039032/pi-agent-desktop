@@ -58,15 +58,46 @@ export async function GET(
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
 
-    const sm = liveRpc?.inner.sessionManager ?? openSessionManager(resolvedPath!);
-    perf?.span("open");
-    const filePath = liveRpc?.sessionFile || sm.getSessionFile() || resolvedPath || "";
-    const entries = sm.getEntries();
-    const leafId = sm.getLeafId();
+    // The active branch is CLI-authoritative on a live wrapper: navigateTree
+    // moves the child's leaf in memory while the file keeps the abandoned
+    // branch's tail, so a disk read would answer with the wrong branch. The
+    // snapshot (entries + leafId from one get_entries response, plus the
+    // child's own tree) is the only live truth; a failed query is an explicit
+    // error — never a disk tail passed off as real-time. Engines without the
+    // method (a non-CLI engine whose sessionManager IS live) keep the sync view.
+    let entries: SessionEntry[];
+    let leafId: string | null;
+    let rawTree: unknown[];
+    let sm: ReturnType<typeof openSessionManager> | undefined;
+    if (liveRpc?.inner.getActiveSnapshot) {
+      let snapshot: { entries: unknown[]; tree: unknown[]; leafId: string | null };
+      try {
+        snapshot = await liveRpc.inner.getActiveSnapshot();
+      } catch (error) {
+        throw new Error(
+          "the live session's active branch could not be read from the CLI process: "
+            + (error instanceof Error ? error.message : String(error)),
+        );
+      }
+      perf?.span("snapshot");
+      entries = snapshot.entries as never;
+      leafId = snapshot.leafId;
+      rawTree = snapshot.tree;
+      // The file view (header/name/file-path only; never the active leaf —
+      // see the snapshot above) so no disk manager is opened on this path.
+      sm = liveRpc.inner.sessionManager;
+    } else {
+      sm = liveRpc?.inner.sessionManager ?? openSessionManager(resolvedPath!);
+      perf?.span("open");
+      entries = sm.getEntries() as never;
+      leafId = sm.getLeafId();
+      rawTree = sm.getTree() as unknown[];
+    }
+    const filePath = liveRpc?.sessionFile || sm?.getSessionFile() || resolvedPath || "";
     const summaryTree = searchParams.get("tree") === "summary";
     const tree = summaryTree
-      ? toSummaryTree(projectTreeForResponse(sm.getTree()))
-      : projectTreeForResponse(sm.getTree());
+      ? toSummaryTree(projectTreeForResponse(rawTree as never))
+      : projectTreeForResponse(rawTree as never);
     perf?.span("tree");
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
@@ -99,11 +130,11 @@ export async function GET(
       latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
       leafId: leafId ?? null,
     });
-    const sessionName = sm.getSessionName();
+    const sessionName = sm?.getSessionName();
     const firstUserEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
     const firstUserMessage = firstUserEntry?.type === "message" ? firstUserEntry.message : undefined;
 
-    const header = sm.getHeader();
+    const header = sm?.getHeader();
     let modified = header?.timestamp ?? new Date().toISOString();
     try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
     const parentSessionId = header?.parentSession

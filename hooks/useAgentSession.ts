@@ -107,6 +107,8 @@ type AgentStateResponse = {
   model?: { provider: string; id: string };
   contextUsage?: { percent: number | null; contextWindow: number; tokens: number | null } | null;
   systemPrompt?: string;
+  /** Which truth `systemPrompt` is: a replay of the recorded system messages, an exact prompt fixed at spawn, or no record yet. */
+  systemPromptStatus?: "recorded" | "configured" | "none" | "unknown";
   thinkingLevel?: string;
   isStreaming?: boolean;
   isPromptRunning?: boolean;
@@ -126,6 +128,9 @@ type AgentStateResponse = {
 };
 
 export type { SessionAutomation } from "@/hooks/useSessionAutomation";
+
+/** Which truth a reported system prompt is (see lib/system-prompt-snapshot.ts). */
+export type SystemPromptStatus = "recorded" | "configured" | "none" | "unknown";
 
 export interface QueuedMessages {
   steering: string[];
@@ -202,7 +207,7 @@ export interface UseAgentSessionOptions {
   modelsRefreshKey?: number;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null, options?: LeafChangeOptions) => void, locked: boolean) => void;
-  onSystemPromptChange?: (prompt: string | null) => void;
+  onSystemPromptChange?: (prompt: string | null, status?: SystemPromptStatus) => void;
   onSystemToolsChange?: (tools: ToolEntry[] | null) => void;
   /** Registers an action that lazily starts the session and loads its prompt and tools. */
   onSystemInfoLoaderChange?: (
@@ -389,6 +394,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [retryInfo, setRetryInfo] = useState<{ attempt: number; maxAttempts: number; errorMessage?: string } | null>(null);
   const [contextUsage, setContextUsage] = useState<{ percent: number | null; contextWindow: number; tokens: number | null } | null>(null);
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
+  // Which truth `systemPrompt` is; "unknown" until a get_state answered.
+  const [systemPromptStatus, setSystemPromptStatus] = useState<SystemPromptStatus>("unknown");
   const [forkingEntryId, setForkingEntryId] = useState<string | null>(null);
   const [currentModelOverride, setCurrentModelOverride] = useState<{ provider: string; modelId: string } | null>(null);
   const [liveModel, setLiveModel] = useState<{ provider: string; modelId: string } | null>(null);
@@ -617,6 +624,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setAgentPhase(null);
     setContextUsage(null);
     setSystemPrompt(null);
+    setSystemPromptStatus("unknown");
     setExtensionStatuses([]);
     setExtensionWidgets([]);
     setQueuedMessages({ steering: [], followUp: [] });
@@ -879,6 +887,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (liveState) {
           if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
           if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt ?? null);
+          if (liveState.systemPromptStatus !== undefined) setSystemPromptStatus(liveState.systemPromptStatus);
           if (liveState.extensionStatuses !== undefined) setExtensionStatuses(liveState.extensionStatuses ?? []);
           if (liveState.extensionWidgets !== undefined) setExtensionWidgets(liveState.extensionWidgets ?? []);
           if (liveState.queuedMessages !== undefined) setQueuedMessages(previous => mergeQueuedMessages(previous, liveState.queuedMessages));
@@ -1082,6 +1091,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!sessionHookMountedRef.current || sessionIdRef.current !== sid) return;
     syncLiveModel(state);
     setSystemPrompt(state.systemPrompt ?? "");
+    setSystemPromptStatus(state.systemPromptStatus ?? "none");
   }, [ensureNewSession, loadTools, syncLiveModel]);
 
   const loadSystemInfoFor = useCallback(async (kind: "system" | "tools" | "mcp") => {
@@ -1528,6 +1538,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!agentRunningRef.current) return;
       if (state) {
         if (state.systemPrompt !== undefined) setSystemPrompt(state.systemPrompt ?? null);
+        if (state.systemPromptStatus !== undefined) setSystemPromptStatus(state.systemPromptStatus);
         if (state.extensionStatuses !== undefined) setExtensionStatuses(state.extensionStatuses ?? []);
         if (state.extensionWidgets !== undefined) setExtensionWidgets(state.extensionWidgets ?? []);
       }
@@ -1625,6 +1636,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               syncLiveModel(d.state);
               if (d.state?.contextUsage !== undefined) setContextUsage(d.state.contextUsage ?? null);
               if (d.state?.systemPrompt !== undefined) setSystemPrompt(d.state.systemPrompt ?? null);
+              if (d.state?.systemPromptStatus !== undefined) setSystemPromptStatus(d.state.systemPromptStatus);
               if (d.state?.extensionStatuses !== undefined) setExtensionStatuses(d.state.extensionStatuses ?? []);
               if (d.state?.extensionWidgets !== undefined) setExtensionWidgets(d.state.extensionWidgets ?? []);
               // Aborted turns can leave messages queued in pi (delivered with the
@@ -2703,6 +2715,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ]);
       if (sessionHookMountedRef.current && sessionIdRef.current === activeSessionId) {
         setSystemPrompt(state.systemPrompt ?? "");
+        setSystemPromptStatus(state.systemPromptStatus ?? "none");
         syncLiveModel(state);
       }
     } catch (e) {
@@ -2730,6 +2743,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ]);
       if (sessionHookMountedRef.current && sessionIdRef.current === sid) {
         setSystemPrompt(state.systemPrompt ?? "");
+        setSystemPromptStatus(state.systemPromptStatus ?? "none");
         syncLiveModel(state);
       }
     } catch (e) {
@@ -2868,6 +2882,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
           if (agentState.state.contextUsage !== undefined) setContextUsage(agentState.state.contextUsage ?? null);
           if (agentState.state.systemPrompt !== undefined) setSystemPrompt(agentState.state.systemPrompt ?? null);
+          if (agentState.state.systemPromptStatus !== undefined) setSystemPromptStatus(agentState.state.systemPromptStatus);
           if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
           if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
           if (agentState.state.queuedMessages !== undefined) setQueuedMessages(previous => mergeQueuedMessages(previous, agentState.state?.queuedMessages));
@@ -2927,8 +2942,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [sessionIdentity]);
 
   useEffect(() => {
-    onSystemPromptChange?.(systemPrompt);
-  }, [systemPrompt, onSystemPromptChange]);
+    onSystemPromptChange?.(systemPrompt, systemPromptStatus);
+  }, [systemPrompt, systemPromptStatus, onSystemPromptChange]);
 
   useEffect(() => {
     onSystemInfoLoaderChange?.(loadSystemInfoFor);

@@ -1,16 +1,24 @@
 import { getToolNamesForPreset } from "../tool-presets";
 import { isBlockingExtensionUiRequest } from "../browser-notifications";
 import type { ExtensionUiRequest } from "../types";
+import {
+  SCHEDULED_RUN_ENTRY_TYPE,
+  type ScheduledRunMarkerData,
+} from "../scheduled-run-marker";
 import type { MessageParams, RunErrorCode, RunStatus, RunTrigger, ScheduledTask } from "./types";
 
-/** Custom session entry that marks a session as the output of a scheduled run. */
-export const SCHEDULED_RUN_ENTRY_TYPE = "pi-web:scheduled-run";
+export { SCHEDULED_RUN_ENTRY_TYPE };
 
 /** What the runner needs from an AgentSessionWrapper; tests substitute a stub. */
 export interface RunnerSession {
   send(command: Record<string, unknown>): Promise<unknown>;
   onEvent(listener: (event: Record<string, unknown>) => void): () => void;
-  inner: { sessionManager: { appendCustomEntry(customType: string, data: unknown): unknown } };
+  /**
+   * Tag the session as this run's output through the engine's single writer
+   * (the CLI child appends the entry itself, before the prompt). The host
+   * never appends this entry beside a live child.
+   */
+  markScheduledRun(data: ScheduledRunMarkerData): Promise<void>;
 }
 
 export interface RunnerDeps {
@@ -84,14 +92,28 @@ export async function executeRun(
     const { session } = started;
     sessionId = started.sessionId;
 
-    session.inner.sessionManager.appendCustomEntry(SCHEDULED_RUN_ENTRY_TYPE, {
-      version: 1,
-      taskId: task.id,
-      runId: info.runId,
-      taskName: task.name,
-      trigger: info.trigger,
-      ...(info.scheduledFor ? { scheduledFor: info.scheduledFor } : {}),
-    });
+    // The tag is the session's single-writer entry: the engine's child appends
+    // it to its own active leaf and must confirm it BEFORE the run's prompt
+    // starts. Without the confirmation the session would land in the project
+    // tree as an ordinary chat, so a failure here fails the run instead of
+    // sending an untagged prompt (the error is never reported as success).
+    try {
+      await session.markScheduledRun({
+        version: 1,
+        taskId: task.id,
+        runId: info.runId,
+        taskName: task.name,
+        trigger: info.trigger,
+        ...(info.scheduledFor ? { scheduledFor: info.scheduledFor } : {}),
+      });
+    } catch (error) {
+      return {
+        status: "failed",
+        error: `tagging the session as a scheduled run failed: ${errorText(error)}`,
+        sessionId,
+        countsAsFailure: true,
+      };
+    }
     // A missing title only costs a less readable sidebar row.
     await session.send({ type: "set_session_name", name: runSessionName(task, deps.now()) }).catch(() => undefined);
     onSessionReady?.(sessionId);
