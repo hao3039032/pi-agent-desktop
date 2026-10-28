@@ -920,6 +920,19 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
   const fileIndexFetchingRef = useRef<string | null>(null);
   const draftKeyRef = useRef(draftKey);
+  const composerScopeRef = useRef({ key: draftKey, generation: 0 });
+  if (composerScopeRef.current.key !== draftKey) {
+    composerScopeRef.current = { key: draftKey, generation: composerScopeRef.current.generation + 1 };
+  }
+  const composerGeneration = composerScopeRef.current.generation;
+  const composerMountedRef = useRef(true);
+  useLayoutEffect(() => {
+    composerMountedRef.current = true;
+    return () => { composerMountedRef.current = false; };
+  }, []);
+  const isCurrentComposer = useCallback(() => (
+    composerMountedRef.current && composerScopeRef.current.generation === composerGeneration
+  ), [composerGeneration]);
   const valueRef = useRef(value);
   const attachedImagesRef = useRef(attachedImages);
   const pendingImageCountRef = useRef(0);
@@ -1026,6 +1039,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           && image.mimeType === currentDraft.images[index]?.mimeType
         ));
       draftKeyRef.current = nextKey;
+      // Promotion is the same composer; pending reference resolution survives it.
+      composerScopeRef.current.key = nextKey;
       if (unchanged) return;
 
       const movedImages = draftImagesToAttachedImages(moved.images);
@@ -1239,6 +1254,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   const clearInput = useCallback(() => {
+    if (!isCurrentComposer()) return;
     valueRef.current = "";
     setValue("");
     setAtQuery(null);
@@ -1251,7 +1267,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [clearAttachedFiles, clearImages, draftKey, setHashQuery]);
+  }, [clearAttachedFiles, clearImages, draftKey, setHashQuery, isCurrentComposer]);
 
   useEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;
@@ -1262,7 +1278,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, [attachedFiles, attachedImages, draftKey, value]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const previousDraftKey = draftKeyRef.current;
     if (previousDraftKey === draftKey) return;
 
@@ -1342,12 +1358,14 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   const runBuiltinCommand = useCallback(async (msg: string): Promise<boolean> => {
+    if (!isCurrentComposer()) return true;
     if (attachedImages.length || attachedFilesRef.current.length || !msg.startsWith("/") || !onBuiltinCommand) return false;
     if (builtinCommandPendingRef.current) return true;
     builtinCommandPendingRef.current = true;
     setBuiltinCommandPending(true);
     try {
       const result = await onBuiltinCommand(msg);
+      if (!isCurrentComposer()) return true;
       if (!result.handled) return false;
       if (!result.error && canClearBuiltinCommandInput(valueRef.current, attachedImagesRef.current.length, msg)) clearInput();
       return true;
@@ -1355,24 +1373,29 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       builtinCommandPendingRef.current = false;
       setBuiltinCommandPending(false);
     }
-  }, [attachedImages.length, clearInput, onBuiltinCommand]);
+  }, [attachedImages.length, clearInput, onBuiltinCommand, isCurrentComposer]);
 
   const handleSend = useCallback(async () => {
+    if (!isCurrentComposer()) return;
+    const files = attachedFilesRef.current;
     const msg = value.trim();
     if (!msg && !attachedImages.length && !attachedFilesRef.current.length) return;
     onAudioUnlock?.();
     const builtinAllowed = !isStreaming || offersBuiltinSlashCommandWhileStreaming(msg);
     if (builtinAllowed && await runBuiltinCommand(msg)) return;
-    if (isStreaming) return;
+    if (!isCurrentComposer() || isStreaming) return;
     // A run cannot start in a cwd that is gone; keep the draft until it is back or another project is picked.
     if (workspaceUnavailable) return;
     const resolvedMessage = composeMessageWithAttachedFiles(
       await resolveSessionReferences(msg, sessionMentionTargetsRef.current),
-      attachedFilesRef.current,
+      files,
     );
-    onSend(resolvedMessage, attachedImages.length ? attachedImages : undefined);
+    // Resolution can outlive a switch (including A -> B -> A), or edits made
+    // while waiting. Leave that draft intact rather than submitting stale text.
+    if (!isCurrentComposer() || valueRef.current !== value || attachedImagesRef.current !== attachedImages || attachedFilesRef.current !== files) return;
     clearInput();
-  }, [value, attachedImages, workspaceUnavailable, isStreaming, runBuiltinCommand, onSend, clearInput, onAudioUnlock, sessionMentionTargetsRef]);
+    onSend(resolvedMessage, attachedImages.length ? attachedImages : undefined);
+  }, [value, attachedImages, workspaceUnavailable, isStreaming, runBuiltinCommand, onSend, clearInput, onAudioUnlock, sessionMentionTargetsRef, isCurrentComposer]);
 
   const slashQuery = !compact && value.startsWith("/") && !/\s/.test(value.slice(1))
     ? value.slice(1).toLowerCase()
@@ -1606,15 +1629,19 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   const sendQueued = useCallback(async (mode: "steer" | "followup") => {
+    if (!isCurrentComposer()) return;
+    const files = attachedFilesRef.current;
     const msg = value.trim();
     if (!msg && !attachedImages.length && !attachedFilesRef.current.length) return;
     onAudioUnlock?.();
     const images = attachedImages.length ? attachedImages : undefined;
     const queue = async () => {
+      if (!isCurrentComposer()) return;
       const resolvedMessage = composeMessageWithAttachedFiles(
         await resolveSessionReferences(msg, sessionMentionTargetsRef.current),
-        attachedFilesRef.current,
+        files,
       );
+      if (!isCurrentComposer() || valueRef.current !== value || attachedImagesRef.current !== attachedImages || attachedFilesRef.current !== files) return;
       const streamingBehavior = mode === "steer" ? "steer" : "followUp";
       if (mode === "steer" && msg.startsWith("/") && !attachedFilesRef.current.length && onPromptWithStreamingBehavior) {
         clearInput();
@@ -1641,7 +1668,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       return;
     }
     void queue();
-  }, [value, attachedImages, onBuiltinCommand, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, runBuiltinCommand, sessionMentionTargetsRef]);
+  }, [value, attachedImages, onBuiltinCommand, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, runBuiltinCommand, sessionMentionTargetsRef, isCurrentComposer]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
     const lastIndex = displayedSlashCommands.length - 1;

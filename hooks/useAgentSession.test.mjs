@@ -245,7 +245,8 @@ test("history edits move the branch only when sent, so cancel or reload keeps it
   assert.match(source, /opts\.chatInputRef\?\.current\?\.replaceMessage\(message\);\s*setEdit\(entryId\)/);
   assert.match(messageViewSource, /onClick=\{onCancelEdit\}/);
   assert.match(source, /const cancelEdit = useCallback\(\(\) => setEdit\(null\)/);
-  assert.match(sendSource, /setEdit\(null\);\s*if \(!\(await handleNavigateRef\.current\?\.\(entryId\)\)\) \{\s*setEdit\(entryId\);\s*restoreSubmission\(/);
+  assert.match(sendSource, /setEdit\(null\);\s*const navigated = await handleNavigateRef\.current\?\.\(entryId\)/);
+  assert.match(sendSource, /if \(!navigated\) \{\s*setEdit\(entryId\);\s*restoreSubmission\(/);
 });
 
 test("an empty persisted session displays the model it will use on first send", () => {

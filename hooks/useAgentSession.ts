@@ -568,6 +568,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const previousIdentity = appliedIdentity;
     setAppliedIdentity(sessionIdentity);
     sessionGenerationRef.current += 1;
+    ensuringNewSessionRef.current = null;
+    newSessionPromotedRef.current = false;
+    promotedIdentityRef.current = null;
+    promotedLoadRef.current = false;
+    sdkAgentActiveRef.current = false;
+    rpcPromptPendingRef.current = false;
+    promptRunIdRef.current += 1;
     stopRequestRef.current = null;
     setStopPending(false);
     setForceStopTarget(null);
@@ -633,6 +640,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setCacheWarming(null);
     setLiveThinkingLevel(null);
   }
+
+  // Capture at render, not invocation: a retained callback from A must stay
+  // invalid after A -> B -> A. Draft promotion does not advance this generation.
+  const submissionGeneration = sessionGenerationRef.current;
+  const isCurrentSubmission = useCallback(() => (
+    sessionHookMountedRef.current
+    && sessionGenerationRef.current === submissionGeneration
+  ), [submissionGeneration]);
 
   const currentModel = currentModelOverride ?? liveModel ?? data?.context.model ?? pendingModel ?? null;
   const displayModel = isNew
@@ -992,7 +1007,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const promoteNewSession = useCallback((messageCount = 0, firstMessage = "(no messages)") => {
     const sid = sessionIdRef.current;
-    if (!isNew || !newSessionCwd || !sid || newSessionPromotedRef.current) return;
+    if (!isCurrentSubmission() || !isNew || !newSessionCwd || !sid || newSessionPromotedRef.current) return;
     newSessionPromotedRef.current = true;
     const provisionalDraftKey = newSessionDraftKey;
     if (!provisionalDraftKey) return;
@@ -1015,9 +1030,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       transient: true,
       workspaceKind: chatWorkspace ? "chat" : "project",
     }, provisionalDraftKey);
-  }, [chatWorkspace, isNew, newSessionCwd, newSessionDraftKey, onSessionCreated, opts.chatInputRef]);
+  }, [chatWorkspace, isNew, isCurrentSubmission, newSessionCwd, newSessionDraftKey, onSessionCreated, opts.chatInputRef]);
 
   const ensureNewSession = useCallback(async () => {
+    if (!isCurrentSubmission()) return null;
     if (sessionIdRef.current) return sessionIdRef.current;
     if (!isNew || !newSessionCwd) return sessionIdRef.current;
     if (ensuringNewSessionRef.current) return ensuringNewSessionRef.current;
@@ -1052,6 +1068,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         thinkingLevel?: ThinkingLevelOption;
       };
       const realId = result.sessionId;
+      if (!isCurrentSubmission()) return null;
       sessionIdRef.current = realId;
       if (result.model && newSessionModelOverrideRef.current === selectedModel) {
         setPendingModel(result.model);
@@ -1073,9 +1090,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       return await promise;
     } finally {
-      ensuringNewSessionRef.current = null;
+      if (ensuringNewSessionRef.current === promise) ensuringNewSessionRef.current = null;
     }
-  }, [chatWorkspace, isNew, newSessionCwd, toolPreset]);
+  }, [chatWorkspace, isNew, isCurrentSubmission, newSessionCwd, toolPreset]);
 
   // Opening the System or Tools panel may initialize an otherwise dormant
   // session. This is deliberately a non-prompt command: it creates no message
@@ -1911,6 +1928,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
     const trimmedMessage = message.trim();
     if (!trimmedMessage && !images?.length) return;
+    // ChatWindow is intentionally kept mounted while AppShell swaps sessions.
+    // A queued textarea callback from the departing window can therefore resume
+    // after the user has already opened a new chat. Never let that callback
+    // submit (or steer) against the old session.
+    if (!isCurrentSubmission()) {
+      restoreSubmission(message, images, composerDraftKey);
+      return;
+    }
     if (agentRunningRef.current || bashRunningRef.current || branchSummaryHolds(branchSummarySessionIdRef.current, sessionIdRef.current)) {
       restoreSubmission(message, images, composerDraftKey);
       return;
@@ -1920,7 +1945,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // keeps the new leaf until the server can apply both atomically.
       const entryId = editEntryId;
       setEdit(null);
-      if (!(await handleNavigateRef.current?.(entryId))) {
+      const navigated = await handleNavigateRef.current?.(entryId);
+      if (!isCurrentSubmission()) {
+        restoreSubmission(message, images, composerDraftKey);
+        return;
+      }
+      if (!navigated) {
         setEdit(entryId);
         restoreSubmission(message, images, composerDraftKey);
         return;
@@ -1975,9 +2005,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (isNew && newSessionCwd) {
         const selectedModel = newSessionModel;
         const existingSid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
+        if (!isCurrentSubmission()) {
+          restoreSubmission(message, images, composerDraftKey);
+          return;
+        }
         const sid = existingSid ?? await ensureNewSession();
 
         if (!sid) throw new Error("Unable to create a session for the prompt");
+        if (!isCurrentSubmission()) {
+          restoreSubmission(message, images, composerDraftKey);
+          return;
+        }
         sentSessionId = sid;
         if (selectedModel) {
           setPendingModel(selectedModel);
@@ -1985,17 +2023,33 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
           }
         }
+        if (!isCurrentSubmission()) {
+          restoreSubmission(message, images, composerDraftKey);
+          return;
+        }
         await ensureEventsConnected(sid);
+        if (!isCurrentSubmission()) {
+          restoreSubmission(message, images, composerDraftKey);
+          return;
+        }
         promptRequestStarted = true;
         await sendAgentCommand(sid, {
           type: "prompt",
           message,
           ...(piImages?.length ? { images: piImages } : {}),
         });
-        promoteNewSession(1, message);
+        if (isCurrentSubmission()) promoteNewSession(1, message);
       } else if (session) {
         sentSessionId = session.id;
+        if (!isCurrentSubmission()) {
+          restoreSubmission(message, images, composerDraftKey);
+          return;
+        }
         await ensureEventsConnected(session.id);
+        if (!isCurrentSubmission()) {
+          restoreSubmission(message, images, composerDraftKey);
+          return;
+        }
         promptRequestStarted = true;
         await sendAgentCommand(session.id, {
           type: "prompt",
@@ -2005,12 +2059,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       } else {
         throw new Error("No active session for the prompt");
       }
-      if (isSlashCommandPrompt && sentSessionId) {
+      if (isCurrentSubmission() && isSlashCommandPrompt && sentSessionId) {
         void waitForPromptSettlement(sentSessionId, promptRunId);
       }
     } catch (e) {
-      console.error("Failed to send message:", e);
       const definitivelyRejected = !promptRequestStarted || isPromptRejectedError(e);
+      if (!isCurrentSubmission()) {
+        // Recovery belongs to the source draft, not the currently visible UI.
+        // Ambiguous transport errors must not invite duplicate submissions.
+        if (definitivelyRejected) restoreSubmission(message, images, composerDraftKey);
+        return;
+      }
+      console.error("Failed to send message:", e);
       // A transport/proxy failure after dispatch is ambiguous: the server may
       // have accepted the prompt before the response was lost. Keep SSE alive
       // until server state confirms the run is idle.
@@ -2041,11 +2101,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, chatWorkspace, closeEvents, composerDraftKey, reconcileAgentState, restoreSubmission, editEntryId, setEdit, branchSummarySessionIdRef, t]);
+  }, [isNew, newSessionCwd, newSessionModel, session, isCurrentSubmission, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, chatWorkspace, closeEvents, composerDraftKey, reconcileAgentState, restoreSubmission, editEntryId, setEdit, branchSummarySessionIdRef, t]);
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
-    if (agentRunningRef.current || bashRunningRef.current) return;
     const inputText = `${excludeFromContext ? "!!" : "!"}${command}`;
+    if (!isCurrentSubmission()) {
+      restoreSubmission(inputText, undefined, composerDraftKey);
+      return;
+    }
+    if (agentRunningRef.current || bashRunningRef.current) return;
     if (chatWorkspace) {
       addNotice({ type: "error", message: t("chat.chatOnlyNoShell") });
       restoreSubmission(inputText, undefined, composerDraftKey);
@@ -2057,27 +2121,38 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       const sid = sessionIdRef.current ?? session?.id ?? await ensureNewSession();
       if (!sid) throw new Error("Unable to create a session for the shell command");
+      if (!isCurrentSubmission()) {
+        restoreSubmission(inputText, undefined, composerDraftKey);
+        return;
+      }
       // Connect SSE before dispatching: `bash_execution_update` chunks stream
       // through the per-session event stream, without which a long `!command`
       // shows nothing until it finishes.
       await ensureEventsConnected(sid);
+      if (!isCurrentSubmission()) {
+        restoreSubmission(inputText, undefined, composerDraftKey);
+        return;
+      }
       await sendAgentCommand(sid, {
         type: "bash",
         command,
         excludeFromContext,
       });
+      if (!isCurrentSubmission()) return;
       await loadSession(sid);
-      promoteNewSession(1, inputText);
+      if (isCurrentSubmission()) promoteNewSession(1, inputText);
     } catch (e) {
       console.error("Failed to execute shell command:", e);
-      addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+      if (isCurrentSubmission()) addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
       restoreSubmission(inputText, undefined, composerDraftKey);
     } finally {
-      bashRunningRef.current = false;
-      setPendingBash(null);
-      setBashRunning(false);
+      if (isCurrentSubmission()) {
+        bashRunningRef.current = false;
+        setPendingBash(null);
+        setBashRunning(false);
+      }
     }
-  }, [addNotice, chatWorkspace, composerDraftKey, ensureEventsConnected, ensureNewSession, loadSession, promoteNewSession, restoreSubmission, session, t]);
+  }, [addNotice, chatWorkspace, composerDraftKey, ensureEventsConnected, ensureNewSession, isCurrentSubmission, loadSession, promoteNewSession, restoreSubmission, session, t]);
   executeBashRef.current = executeBash;
 
   const handleAbort = useCallback(async () => {
@@ -2522,6 +2597,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   ) => {
     const sid = sessionIdRef.current;
     const restore = () => restoreSubmission(message, images, composerDraftKey);
+    if (!isCurrentSubmission()) {
+      restore();
+      return;
+    }
     // A pending history edit must branch when sent, never join the current run.
     if (editEntryId) {
       restore();
@@ -2546,12 +2625,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // accepted the queued prompt before the response was lost. Restoring in
       // that case would invite a duplicate turn.
       if (isPromptRejectedError(e)) restore();
+      if (!isCurrentSubmission()) return;
       addNotice({
         type: "error",
         message: e instanceof Error ? e.message : String(e),
       });
     }
-  }, [addNotice, composerDraftKey, editEntryId, restoreSubmission]);
+  }, [addNotice, composerDraftKey, editEntryId, restoreSubmission, isCurrentSubmission]);
 
   const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
     await sendStreamingPrompt(message, "steer", images);
@@ -2568,7 +2648,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
     const sid = sessionIdRef.current;
     const generation = sessionGenerationRef.current;
-    if (!sid || editEntryId) {
+    if (!sid || editEntryId || !isCurrentSubmission()) {
       restoreSubmission(message, images, composerDraftKey);
       return;
     }
@@ -2580,9 +2660,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } catch (error) {
       // Only explicit server rejection proves the outbox did not accept it.
       if (error instanceof Error && "status" in error) restoreSubmission(message, images, composerDraftKey);
-      if (sessionGenerationRef.current === generation) addNotice({ type: "error", message: String(error) });
+      if (isCurrentSubmission() && sessionGenerationRef.current === generation) addNotice({ type: "error", message: String(error) });
     }
-  }, [addNotice, composerDraftKey, editEntryId, restoreSubmission]);
+  }, [addNotice, composerDraftKey, editEntryId, restoreSubmission, isCurrentSubmission]);
 
   const handleQueuedMessageAction = useCallback(async (id: string, action: "send" | "edit" | "delete") => {
     const sid = sessionIdRef.current;

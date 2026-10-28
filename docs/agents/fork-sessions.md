@@ -96,6 +96,32 @@ The prompt-anchor spacer must subtract the floating composer's separate trailing
 
 `ChatInput.handleSend` routes slash commands through `runBuiltinCommand` (the pending-guard wrapper) and sends exactly one `onSend` with the `#session`-mention-resolved text. A merge once left a second raw `onSend(msg, …)` behind it: the first send flips `agentRunningRef`, the second hits the running guard and *restores the just-sent text back into the composer* — every message appeared to "stick". `components/ChatInput.test.mjs` runs the extracted handler in a VM to pin one-send semantics.
 
+### Submission isolation across switches
+
+Explicit New remounts `ChatWindow`; ordinary session selection reuses it. Do not
+infer a shared runtime from a transient running flag. `useAgentSession` captures
+its submission generation at render (not callback invocation), checks it after
+creation/model/SSE waits and before dispatch, and drops stale runtime-creation
+responses. A draft promoted to its real session id is the same generation.
+Explicit rejection restores the source session draft even after selection moves;
+ambiguous transport failures never restore a potentially accepted submission.
+An abandoned, unpromoted New composer retains the existing discard policy.
+
+`ChatInput` also owns a composer generation, invalidated by switches/unmounts but
+not imperative draft promotion. Reference resolution and built-in command replies
+cannot submit or clear a different composer, including A→B→A. Text/attachment
+changes during reference resolution leave the edited draft untouched. Clear the
+submitted input before invoking the hook so synchronous recovery cannot be erased.
+Shell submissions obey the same post-readiness guard without clearing another
+session's busy state. Keep shell-only running controls distinct from agent steer.
+
+Behavioral coverage: `hooks/useAgentSession.submission-isolation.test.mjs` executes
+actual callbacks with controlled delayed replies; `node e2e/session-submission.mjs`
+mounts the real hook and composer under React StrictMode in an isolated browser
+with fake HTTP/SSE (no Next build, model requests or user sessions). It checks
+running A → New → first prompt, subsequent outbox routing and delayed references
+across ordinary selection and A→B→A.
+
 ## `!command` output renders live, then collapses
 The pending bash bubble accumulates `bash_execution_update` deltas into `pendingBash.output` and renders them through `BashExecutionView` as a synthesized partial result, default-expanded while running (`ToolCallBlock defaultExpanded`). When the run finishes the persisted message mounts collapsed like any other tool call — live-watched, then folded, is intentional.
 

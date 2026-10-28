@@ -576,6 +576,7 @@ test("locks built-in command submission until it settles", async () => {
   const callback = new Script(ts.transpileModule(findCallback(source).getText(source), {
     compilerOptions: { target: ts.ScriptTarget.ES2020 },
   }).outputText).runInNewContext({
+    isCurrentComposer: () => true,
     attachedImages: [],
     attachedFilesRef: { current: [] }, composeMessageWithAttachedFiles,
     attachedImagesRef: { current: [] },
@@ -649,7 +650,12 @@ function chatInputCallback(name, context) {
   }
   return new Script(ts.transpileModule(findCallback(source).getText(source), {
     compilerOptions: { target: ts.ScriptTarget.ES2020 },
-  }).outputText).runInNewContext(context);
+  }).outputText).runInNewContext({
+    isCurrentComposer: () => true,
+    valueRef: { current: context.value },
+    attachedImagesRef: { current: context.attachedImages },
+    ...context,
+  });
 }
 
 test("while a run streams, a bare /mcp opens Settings or is queued as before", async () => {
@@ -939,6 +945,7 @@ test("handleSend sends exactly once and routes builtin commands through the pend
     let builtinCalls = 0;
     const handler = script.runInNewContext({
       value, attachedImages, isStreaming: false, workspaceUnavailable,
+      isCurrentComposer: () => true, valueRef: { current: value }, attachedImagesRef: { current: attachedImages },
       attachedFilesRef: { current: [] }, composeMessageWithAttachedFiles,
       onAudioUnlock() {},
       runBuiltinCommand: async () => {

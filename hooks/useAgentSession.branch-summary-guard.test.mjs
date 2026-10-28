@@ -76,7 +76,7 @@ test("a summary running for the current session still locks its branch switches"
 test("send, branch switch and the lock banner all scope the summary to the current session", () => {
   const sendSource = sourceText.slice(
     sourceText.indexOf("  const handleSend = useCallback"),
-    sourceText.indexOf("  const handleSend = useCallback") + 600,
+    sourceText.indexOf("  const executeBash = useCallback"),
   );
   assert.match(sendSource, /if \(agentRunningRef\.current \|\| bashRunningRef\.current \|\| branchSummaryHolds\(branchSummarySessionIdRef\.current, sessionIdRef\.current\)\) \{/);
   assert.match(branchSummaryText, /const branchSummaryPending = branchSummaryHolds\(branchSummarySessionId, sessionId\);/);
