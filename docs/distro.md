@@ -56,13 +56,34 @@
 2. 手动触发 `distro-release.yml`，或等 `distro-sync.yml` 在上游发新 release 后自动触发；
 3. 全部目标构建成功后 draft 自动转正；部分失败保持 draft，会在 job summary 里报警，不要手工发布。
 
+## macOS Runner 选择与容量不足
+
+`distro-release.yml` 的手动触发界面提供两个独立的 choice 参数；省略参数的自动触发仍使用 `macos-26`：
+
+| 参数 | 默认 | 可选 Runner |
+|---|---|---|
+| `macos_arm64_runner`（Apple Silicon 包） | `macos-26` | `macos-26`、`macos-15` |
+| `macos_x64_runner`（Intel 包） | `macos-26` | `macos-26`、`macos-15`、`macos-26-intel`、`macos-15-intel` |
+
+`macos-15` 和 `macos-15-intel` 都显式选择预装的 `/Applications/Xcode_26.3.app`；不存在就失败，不回退到旧 Xcode。所有 Mac 构建仍要求 **macOS SDK ≥ 26**，不因 Runner 系统版本或 CPU 架构降低门槛，以保留新版 AppKit 窗口控件。此选择不改变安装包的最低运行系统版本。
+
+Intel 包在 ARM Runner 上继续交叉编译并换入 x64 Node；选择 `*-intel` 时原生编译，直接使用构建机的 x64 Node，不执行 Rosetta/跨架构 Node 下载。两条路径都保留随包运行时架构校验、`desktop:verify`、签名及全部平台成功才发布的门槛。新增 Runner 的实际可用性须由对应 CI 构建验证，本地工作流测试不等同于 Mac 打包通过。
+
+遇到 `The job was not acquired by Runner of type hosted` 时，可新建一次运行选择备用镜像，例如：
+
+```bash
+gh workflow run distro-release.yml --ref main -f macos_arm64_runner=macos-15 -f macos_x64_runner=macos-15-intel
+```
+
+工作流修改须先推送到所选分支。旧运行的 **Re-run** 沿用旧提交和输入，不能切换 Runner；需要新的 workflow dispatch。若旧运行仍排队，先确认是否取消它，否则发布工作流的 concurrency 队列会让新运行继续等待。候选列表不是自动抢占/故障转移；不同 ARM 镜像仍可能同时缺资源。保持 `max-parallel: 1`，避免各目标覆盖同一个 `latest.json`；不完整的 draft 不得手动转正。
+
 ## macOS 双架构（Intel 支持）
 
 随包的 pi CLI 与 Node 运行时一样按 **target triple** 选：`scripts/pi-cli-release.mjs` 用 `matrix.target`（`aarch64-apple-darwin` / `x86_64-apple-darwin`）查上游发版归档，而不是 runner 的架构——Intel 包正是跑在 Apple Silicon runner 上。这一步曾经按 `matrix.platform` 写死一个上游从未发布的 `pi-macos-x64.zip`，两个 macOS 目标都在下载处 404，等于近几版没有 mac 安装包；现在下载的名字只来自脚本里的映射表（Map，`constructor`/`__proto__` 不是 triple），`SHA256SUMS` 里查不到该名字就直接失败（上游改名不会被静默当成空归档），并校验整个归档的 sha256 后才解包（自写的 tar.gz/zip 读取器遇到 PAX/GNU 扩展头、越界长度、路径逃逸、symlink 直接拒绝）。
 
 **随包的 pi 是整个发行目录，不只是一个可执行文件**：归档里 darwin/linux 还带 `pi/photon_rs_bg.wasm`、`pi/theme/`（Windows zip 是扁平的 `pi.exe`+`theme/`）。`scripts/pi-cli-release.mjs` 导出 `PI_CLI_SOURCE`（可执行文件）与 `PI_CLI_DISTRIBUTION_DIR`（解包出来的发行目录），`scripts/prepare-desktop.mjs` 通过 `scripts/pi-cli-distribution.mjs` 把整个目录树拷进 `src-tauri/resources/pi/` 并写 `pi-distribution.json` 清单；只给 `PI_CLI_SOURCE`（单可执行文件）仍是明确支持的旧输入，清单里记 `complete: false`（本地开发树用；发版工作流 `PI_DESKTOP_REQUIRE_PI=1` 下直接拒绝，`scripts/verify-packaged-frontend.mjs` 还会断言 `complete: true`）。清单核对不在 `desktop:verify`，在 `scripts/verify-packaged-frontend.mjs`：按清单逐个核对最终 resources，缺一个文件就不放行。可执行文件名与权限按 **target** 而非 host 判断（交叉构建不用 host 平台的 `pi.exe`）。
 
-Rust 直接在 Apple Silicon runner 上交叉编译 `x86_64-apple-darwin`；真正架构相关的只有随包分发的 Node 运行时：`scripts/prepare-desktop.mjs` 默认复制构建机正在运行的 `process.execPath`，交叉构建时由工作流从 nodejs.org 下载同版本 `darwin-x64` Node，并通过两个环境变量交给打包脚本：
+默认在 Apple Silicon runner 上用 Rust 交叉编译 `x86_64-apple-darwin`（也可选择 Intel runner 原生构建）；交叉构建还需要处理随包分发的 Node 运行时：`scripts/prepare-desktop.mjs` 默认复制构建机正在运行的 `process.execPath`，交叉构建时由工作流从 nodejs.org 下载同版本 `darwin-x64` Node，并通过两个环境变量交给打包脚本：
 
 - `PI_DESKTOP_TARGET_TRIPLE`：本次构建的目标（如 `x86_64-apple-darwin`），不设则取构建机自身的平台/架构；
 - `PI_DESKTOP_NODE_BINARY`：要打包的 Node 二进制路径，替代 `process.execPath`。

@@ -195,12 +195,45 @@ test("the distro release workflow builds on the macOS 26 SDK", async () => {
     "utf8",
   ).then((text) => text.replaceAll("\r\n", "\n"));
 
-  // The distro release signs and publishes the same AppKit window controls;
-  // the same SDK gate as release.yml applies (0.7.1 shipped legacy traffic
-  // lights from a macOS 15 runner).
-  assert.match(workflow, /runner: macos-26/);
-  assert.doesNotMatch(workflow, /macos-15/);
+  // Runner OS and link SDK are independent. Both macos-15 images must select
+  // Xcode 26.3 BEFORE the unconditional macOS SDK gate (legacy traffic lights
+  // shipped when an older SDK was used). Missing Xcode must fail closed.
+  const selectIndex = workflow.indexOf("      - name: Select Xcode 26.3 on macos-15");
+  const gateIndex = workflow.indexOf("      - name: Require the macOS 26 SDK");
+  assert.ok(selectIndex >= 0 && gateIndex > selectIndex);
+  const selection = workflow.slice(selectIndex, gateIndex);
+  assert.match(selection, /if: runner\.os == 'macOS' && \(matrix\.runner == 'macos-15' \|\| matrix\.runner == 'macos-15-intel'\)/);
+  assert.match(selection, /test -d \/Applications\/Xcode_26\.3\.app\/Contents\/Developer/);
+  assert.match(selection, /sudo xcode-select --switch \/Applications\/Xcode_26\.3\.app\/Contents\/Developer/);
+  assert.doesNotMatch(selection, /continue-on-error|\|\| true/);
+  assert.match(workflow.slice(gateIndex), /Require the macOS 26 SDK\n\s+if: runner\.os == 'macOS'/);
   assert.match(workflow, /--show-sdk-version\)"\n\s+echo "macOS SDK \$sdk"\n\s+test "\$\{sdk%%\.\*\}" -ge 26/);
+});
+
+test("distro macOS runner choices keep architecture targets and release gates intact", async () => {
+  const workflow = await readText(join(root, ".github", "workflows", "distro-release.yml"), "utf8");
+  for (const [input, target, choices] of [
+    ["macos_arm64_runner", "aarch64-apple-darwin", ["macos-26", "macos-15"]],
+    ["macos_x64_runner", "x86_64-apple-darwin", ["macos-26", "macos-15", "macos-26-intel", "macos-15-intel"]],
+  ]) {
+    const block = workflow.match(new RegExp(`^      ${input}:\\n([\\s\\S]*?)(?=^      \\w+:|^\\S)`, "m"))?.[1];
+    assert.ok(block, `${input} is a workflow_dispatch input`);
+    assert.match(block, /type: choice/);
+    assert.match(block, /default: macos-26/);
+    assert.deepEqual([...block.matchAll(/^          - (.+)$/gm)].map((match) => match[1]), choices);
+    assert.ok(workflow.includes(
+      `          - runner: \${{ inputs.${input} || 'macos-26' }}\n            platform: macos\n            target: ${target}`,
+    ), `${input} selects only its own target and defaults for dispatches omitting the input`);
+  }
+  assert.match(workflow, /runs-on: \$\{\{ matrix\.runner \}\}/);
+  assert.match(workflow, /runner: windows-latest\n\s+platform: windows\n\s+target: x86_64-pc-windows-msvc/);
+  assert.match(workflow, /if: matrix\.target == 'x86_64-apple-darwin' && runner\.arch == 'ARM64'/);
+  assert.match(workflow, /PI_DESKTOP_TARGET_TRIPLE=x86_64-apple-darwin/);
+  assert.match(workflow, /PI_DESKTOP_NODE_BINARY=\$dir\/bin\/node/);
+  assert.match(workflow, /Verify packaged server\n[\s\S]*?if: runner\.os != 'Windows'\n\s+run: npm run desktop:verify/);
+  assert.match(workflow, /max-parallel: 1/);
+  assert.match(workflow, /releaseDraft: true/);
+  assert.match(workflow, /publish:\n\s+needs: build/);
 });
 
 test("the distro release stages the pi CLI by target triple through the shared script", async () => {

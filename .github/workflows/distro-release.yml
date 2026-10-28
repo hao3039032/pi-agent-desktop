@@ -10,6 +10,22 @@ name: Publish distro release
 on:
   workflow_dispatch:
     inputs:
+      macos_arm64_runner:
+        description: "Apple Silicon runner (macos-15 selects Xcode 26.3)"
+        type: choice
+        default: macos-26
+        options:
+          - macos-26
+          - macos-15
+      macos_x64_runner:
+        description: "Intel build runner (ARM cross-build or native Intel; macos-15 variants select Xcode 26.3)"
+        type: choice
+        default: macos-26
+        options:
+          - macos-26
+          - macos-15
+          - macos-26-intel
+          - macos-15-intel
       prerelease:
         description: "Preview build: keep the release a draft, skip the updater feed and the latest flag"
         type: boolean
@@ -36,15 +52,14 @@ jobs:
             target: x86_64-pc-windows-msvc
             args: --target x86_64-pc-windows-msvc --bundles nsis
             apple_signing_identity: ""
-          - runner: macos-26
+          - runner: ${{ inputs.macos_arm64_runner || 'macos-26' }}
             platform: macos
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
             apple_signing_identity: "-"
-          # Cross-compiled on the Apple Silicon runner (macOS 12 dropped the
-          # last Intel images): Rust targets x86_64-apple-darwin natively, and
-          # the bundled Node runtime is swapped below for a darwin-x64 build.
-          - runner: macos-26
+          # Default: cross-compile on Apple Silicon and swap in darwin-x64
+          # Node below. The optional *-intel runners build/run x64 natively.
+          - runner: ${{ inputs.macos_x64_runner || 'macos-26' }}
             platform: macos
             target: x86_64-apple-darwin
             args: --target x86_64-apple-darwin
@@ -87,6 +102,16 @@ jobs:
         with:
           node-version: 22
           cache: npm
+
+      # Both macos-15 images default to an older Xcode; select preinstalled
+      # Xcode 26.3 explicitly. Missing Xcode fails, never falls back silently.
+      - name: Select Xcode 26.3 on macos-15
+        if: runner.os == 'macOS' && (matrix.runner == 'macos-15' || matrix.runner == 'macos-15-intel')
+        shell: bash
+        run: |
+          test -d /Applications/Xcode_26.3.app/Contents/Developer
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+          xcodebuild -version
 
       # The window controls are drawn by the AppKit the binary links, not the
       # one it runs on: an SDK 15 build shows the legacy traffic lights even on
