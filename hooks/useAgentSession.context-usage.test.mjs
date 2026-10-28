@@ -26,6 +26,7 @@ function compileHandler(name) {
 
 const reconcileScript = compileHandler("reconcileAgentState");
 const sessionCommandScript = compileHandler("handleBuiltinSlashCommand");
+const finishScript = compileHandler("finishPromptWithoutStream");
 const oldUsage = { tokens: 50_000, contextWindow: 1_000_000, percent: 5 };
 const newUsage = { tokens: 120_000, contextWindow: 1_000_000, percent: 12 };
 
@@ -36,6 +37,7 @@ function harness({ response, stats, pending } = {}) {
     sessionGenerationRef: { current: 1 },
     promptRunIdRef: { current: 1 },
     agentRunningRef: { current: true },
+    promptPreparingRef: { current: null },
     sdkAgentActiveRef: { current: false },
     rpcPromptPendingRef: { current: false },
   };
@@ -64,6 +66,50 @@ function harness({ response, stats, pending } = {}) {
     reconcile: reconcileScript.runInNewContext(globals),
     sessionCommand: sessionCommandScript.runInNewContext(globals),
   };
+}
+
+test("idle reconciliation cannot finish a prompt still awaiting session readiness or admission", async () => {
+  const h = harness({ response: { running: false } });
+  h.promptPreparingRef.current = 1;
+  await h.reconcile("session-a");
+  assert.equal(h.state.finished, 0);
+  h.promptPreparingRef.current = null;
+  await h.reconcile("session-a");
+  assert.equal(h.state.finished, 1);
+});
+
+test("an idle poll started before preparation cannot settle the newly preparing prompt", async () => {
+  let resolve;
+  const pending = new Promise((done) => { resolve = done; });
+  const h = harness({ pending });
+  const poll = h.reconcile("session-a");
+  h.promptPreparingRef.current = 2;
+  resolve({ running: false });
+  await poll;
+  assert.equal(h.state.finished, 0);
+});
+
+for (const preparingAt of ['entry', 'after history', 'never']) {
+  test(`finishPromptWithoutStream directly preserves preparation at ${preparingAt}`, async () => {
+    const history = deferred();
+    const refs = {
+      sessionIdRef: {current:'A'}, promptRunIdRef: {current:1}, promptPreparingRef: {current:preparingAt === 'entry' ? 1 : null},
+      rpcPromptPendingRef: {current:true}, sdkAgentActiveRef: {current:false}, optimisticUserMessageKeyRef: {current:'message'},
+    };
+    let loads = 0, settled = 0, notifications = 0;
+    const finish = finishScript.runInNewContext({
+      ...refs, loadSession: () => { loads++; return history.promise; },
+      settleUiStage: () => { settled++; return true; }, notifyPromptStage: () => { notifications++; },
+      onAgentEnd() {}, scheduleEventStreamClose() {},
+    });
+    const pending = finish('A',1);
+    if (preparingAt === 'after history') refs.promptPreparingRef.current = 1;
+    history.resolve(); await pending;
+    assert.equal(loads, preparingAt === 'entry' ? 0 : 1);
+    assert.equal(settled, preparingAt === 'never' ? 1 : 0);
+    assert.equal(notifications, preparingAt === 'never' ? 1 : 0);
+    assert.equal(refs.rpcPromptPendingRef.current, preparingAt !== 'never');
+  });
 }
 
 for (const busyFlag of ["isStreaming", "isPromptRunning", "isCompacting"]) {

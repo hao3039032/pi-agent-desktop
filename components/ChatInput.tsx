@@ -76,6 +76,8 @@ interface Props {
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
   isStreaming: boolean;
+  /** The first prompt is waiting for session readiness or server admission. */
+  promptPreparing?: boolean;
   /** Text-only composer without the session controls or outer spacing. */
   compact?: boolean;
   model?: { provider: string; modelId: string } | null;
@@ -798,7 +800,7 @@ export function ModelScopeWarningBanner({
 }
 
 export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onSend, onAttachFiles, onAbort, stopPending = false, onSteer, onFollowUp, isStreaming, model, isAutoModelSelection, modelNames, modelList, modelError, workspaceUnavailable, onRecheckWorkspace, modelScopeWarnings, onDismissModelScopeWarnings, onOpenModelsConfig, onModelChange, modelSwitching,
+  onSend, onAttachFiles, onAbort, stopPending = false, onSteer, onFollowUp, isStreaming, promptPreparing = false, model, isAutoModelSelection, modelNames, modelList, modelError, workspaceUnavailable, onRecheckWorkspace, modelScopeWarnings, onDismissModelScopeWarnings, onOpenModelsConfig, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, compactNotice, compactResult, summarizationRetry, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
@@ -1431,8 +1433,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     : t(slashQuery ? "chat.matches" : "chat.commands", { count: filteredSlashCommands.length });
   const hasInputText = Boolean(value.trim());
   const canQueueStreamingMessage = hasInputText || attachedImages.length > 0 || attachedFiles.length > 0;
-  const canSend = canQueueStreamingMessage && !workspaceUnavailable;
-  const showStop = isStreaming && !canQueueStreamingMessage;
+  const canSend = canQueueStreamingMessage && !workspaceUnavailable && !promptPreparing;
+  const showStop = isStreaming && (promptPreparing || !canQueueStreamingMessage);
   // Warn when images are attached but the selected model is known not to accept
   // image input (#584), including a resolved default. Unknown models stay silent.
   const showImageUnsupportedWarning = (
@@ -1629,7 +1631,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   }, []);
 
   const sendQueued = useCallback(async (mode: "steer" | "followup") => {
-    if (!isCurrentComposer()) return;
+    if (!isCurrentComposer() || promptPreparing) return;
     const files = attachedFilesRef.current;
     const msg = value.trim();
     if (!msg && !attachedImages.length && !attachedFilesRef.current.length) return;
@@ -1668,7 +1670,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       return;
     }
     void queue();
-  }, [value, attachedImages, onBuiltinCommand, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, runBuiltinCommand, sessionMentionTargetsRef, isCurrentComposer]);
+  }, [value, attachedImages, onBuiltinCommand, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock, runBuiltinCommand, sessionMentionTargetsRef, isCurrentComposer, promptPreparing]);
 
   const getNextSlashIndex = useCallback((direction: "up" | "down" | "left" | "right") => {
     const lastIndex = displayedSlashCommands.length - 1;

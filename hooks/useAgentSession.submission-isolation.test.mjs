@@ -21,7 +21,10 @@ function deferred() { let resolve, reject; const promise = new Promise((a,b) => 
 function harness() {
   const sent = [], restored = [], notices = [];
   const env = {
-    console: { error() {} },
+    console: { error() {} }, promptPreparingRef: ref(null), setPromptPreparing() {}, pendingPromptSubmissionRef: ref(null),
+    AbortSignal, DOMException, PROMPT_ADMISSION_TIMEOUT_MS: 130_000, t: key => key, stopRequestRef: ref(null),
+    setStopPending() {}, setForceStopTarget() {}, settleUiStage() { env.agentRunningRef.current = false; },
+    waitForPromptSettlement() {},
     sessionHookMountedRef: ref(true), sessionGenerationRef: ref(1), submissionGeneration: 1, sessionIdRef: ref('A'),
     agentRunningRef: ref(false), bashRunningRef: ref(false), branchSummarySessionIdRef: ref(null), branchSummaryHolds: () => false,
     composerDraftKey: 'A', editEntryId: null, chatWorkspace: false,
@@ -33,6 +36,7 @@ function harness() {
     isPromptRejectedError: e => e.code === 'prompt_rejected', reconcileAgentState() {}, closeEvents() {},
   };
   env.isCurrentSubmission = callback(hook, 'isCurrentSubmission', env);
+  env.abortSessionRuntime = callback(hook, 'abortSessionRuntime', env);
   return { env, sent, restored, notices };
 }
 function switchTo(env, sid) { env.sessionGenerationRef.current++; env.sessionIdRef.current = sid; }
@@ -70,11 +74,171 @@ for (const action of ['handleSend', 'sendStreamingPrompt']) {
     });
   }
 }
+for (const stage of ['SSE', 'creation', 'model']) {
+  test(`Stop before ${stage} completes restores once and prevents the late prompt`, async () => {
+    const h = harness(), ready = deferred(); let closes = 0;
+    h.env.closeEvents = () => { closes++; };
+    if (stage === 'SSE') h.env.ensureEventsConnected = () => ready.promise;
+    if (stage === 'creation') Object.assign(h.env, {
+      isNew: true, newSessionCwd: '/sandbox', sessionIdRef: ref(null), ensuringNewSessionRef: ref(null),
+      ensureNewSession: () => ready.promise,
+    });
+    if (stage === 'model') Object.assign(h.env, {
+      isNew: true, newSessionCwd: '/sandbox', newSessionModel: { provider:'test', modelId:'test' }, setPendingModel() {},
+      sendAgentCommand: async (sid,body) => { h.sent.push({sid,body}); if (body.type === 'set_model') await ready.promise; },
+    });
+    const send = callback(hook, 'handleSend', h.env);
+    const pending = send('cancel me'); await tick();
+    await callback(hook, 'handleAbort', h.env)();
+    assert.equal(h.env.promptPreparingRef.current, null);
+    assert.equal(h.env.agentRunningRef.current, false);
+    assert.equal(h.restored.length, 1); assert.equal(h.restored[0][0], 'cancel me');
+    ready.resolve('new-A'); await pending;
+    assert.equal(h.sent.filter(c => c.body.type === 'prompt' || c.body.type === 'abort').length, 0);
+    assert.equal(h.restored.length, 1); assert.equal(closes, 0, 'warm connection is not closed');
+  });
+}
+test('a cancelled first send cannot clear or dispatch a second send sharing readiness', async () => {
+  const h = harness(), ready = deferred(); h.env.ensureEventsConnected = () => ready.promise;
+  const send = callback(hook, 'handleSend', h.env);
+  const first = send('first'); await callback(hook, 'handleAbort', h.env)();
+  const second = send('second'); const secondRunId = h.env.promptPreparingRef.current;
+  assert.notEqual(secondRunId, null);
+  ready.resolve(); await Promise.all([first, second]);
+  assert.deepEqual(h.sent.map(c => c.body.message), ['second']);
+  assert.equal(h.restored.length, 1);
+});
+test('Stop after dispatch goes to the server and does not restore an uncertain message', async () => {
+  const h = harness(), reply = deferred();
+  h.env.sendAgentCommand = async (sid,body) => { h.sent.push({sid,body}); if (body.type === 'prompt') return reply.promise; };
+  const pending = callback(hook, 'handleSend', h.env)('submitted'); await tick();
+  await callback(hook, 'handleAbort', h.env)();
+  assert.deepEqual(h.sent.map(c => c.body.type), ['prompt','abort']); assert.equal(h.restored.length, 0);
+  reply.resolve(); await pending;
+});
+for (const newSession of [false, true]) {
+  test(`admission deadline releases preparation without resending/restoring (${newSession ? 'new' : 'existing'})`, async () => {
+    const h = harness(), deadline = new AbortController(); let timeoutMs, settlements = 0;
+    h.env.AbortSignal = { timeout(ms) { timeoutMs = ms; return deadline.signal; } };
+    h.env.waitForPromptSettlement = () => { settlements++; };
+    h.env.sendAgentCommand = (sid,body,options) => {
+      h.sent.push({sid,body});
+      return new Promise((resolve,reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), {once:true}));
+    };
+    if (newSession) Object.assign(h.env, { isNew:true, newSessionCwd:'/sandbox', promoteNewSession() {} });
+    const pending = callback(hook,'handleSend',h.env)('only once'); await tick();
+    h.env.sdkAgentActiveRef = ref(true); // server may already be streaming while HTTP is lost
+    deadline.abort(new DOMException('deadline', 'TimeoutError')); await pending;
+    assert.equal(timeoutMs,130_000); assert.equal(h.env.promptPreparingRef.current,null);
+    assert.equal(h.sent.length,1); assert.equal(h.restored.length,0); assert.equal(settlements,1);
+    assert.equal(h.notices[0].message,'chat.promptAdmissionTimeout');
+  });
+}
+for (const newSession of [false, true]) {
+  for (const hasReason of [false, true]) {
+    for (const aborted of [false, true]) {
+      test(`legacy WebView admission: ${newSession ? 'new' : 'existing'}, ${aborted ? 'expired' : 'success'}, ${hasReason ? 'reason' : 'no reason'}`, async () => {
+        const h = harness(), deadline = new AbortController(); let promotions = 0, settlements = 0;
+        const reason = new DOMException('deadline', 'TimeoutError');
+        const signal = deadline.signal;
+        Object.defineProperty(signal, 'throwIfAborted', { value: undefined });
+        if (!hasReason) Object.defineProperty(signal, 'reason', { value: undefined });
+        h.env.AbortSignal = { timeout: ms => { assert.equal(ms, 130_000); return signal; } };
+        h.env.waitForPromptSettlement = () => { settlements++; };
+        h.env.sendAgentCommand = async (sid,body,options) => {
+          h.sent.push({sid,body});
+          assert.equal(options.signal, signal);
+          // Simulate expiry while reading a successfully delivered response;
+          // the post-await check must reject it even if fetch resolved normally.
+          if (aborted) deadline.abort(reason);
+        };
+        if (newSession) Object.assign(h.env, {
+          isNew: true, newSessionCwd: '/sandbox', promoteNewSession() { promotions++; },
+        });
+        await callback(hook, 'handleSend', h.env)('only once');
+        assert.equal(h.sent.length, 1);
+        assert.equal(h.restored.length, 0);
+        assert.equal(h.env.promptPreparingRef.current, null);
+        assert.equal(promotions, newSession && !aborted ? 1 : 0);
+        assert.equal(settlements, aborted ? 1 : 0);
+        assert.equal(h.notices.length, aborted ? 1 : 0);
+        if (aborted) assert.equal(h.notices[0].message, 'chat.promptAdmissionTimeout');
+      });
+    }
+  }
+}
+// Unlike the legacy instance-method cases above, this models an engine with
+// no static timeout API at all. Drive the actual fallback timer deterministically.
+for (const newSession of [false, true]) {
+  for (const outcome of ['success', 'rejected', 'timeout', 'expired-response', 'switched-timeout']) {
+    test(`missing AbortSignal.timeout fallback: ${newSession ? 'new' : 'existing'} ${outcome}`, async () => {
+      const h = harness(), reply = deferred(), timers = new Map();
+      let timerCallback, timeoutMs, signal, promotions = 0, settlements = 0, cleared = 0;
+      Object.assign(h.env, {
+        AbortSignal: {},
+        AbortController: class extends AbortController {
+          constructor() {
+            super();
+            Object.defineProperty(this.signal, 'throwIfAborted', { value: undefined });
+            Object.defineProperty(this.signal, 'reason', { value: undefined });
+          }
+        },
+        setTimeout(fn, ms) { timerCallback = fn; timeoutMs = ms; timers.set(1, fn); return 1; },
+        clearTimeout(id) { assert.equal(id, 1); timers.delete(id); cleared++; },
+        waitForPromptSettlement() { settlements++; },
+        sendAgentCommand(sid, body, options) {
+          h.sent.push({ sid, body }); signal = options.signal;
+          if (outcome !== 'expired-response') {
+            signal.addEventListener('abort', () => reply.reject(new DOMException('aborted', 'AbortError')), { once: true });
+          }
+          return reply.promise;
+        },
+      });
+      if (newSession) Object.assign(h.env, { isNew: true, newSessionCwd: '/sandbox', promoteNewSession() { promotions++; } });
+      const pending = callback(hook, 'handleSend', h.env)('only once'); await tick();
+      assert.equal(h.sent.length, 1, 'missing static API must not reject before dispatch');
+      assert.equal(timeoutMs, 130_000); assert.equal(timers.size, 1);
+      assert.equal(signal.aborted, false);
+      assert.equal(signal.throwIfAborted, undefined);
+      if (outcome === 'success') reply.resolve();
+      else if (outcome === 'rejected') reply.reject(Object.assign(new Error('explicit rejection'), { code: 'prompt_rejected', accepted: false }));
+      else {
+        if (outcome === 'switched-timeout') {
+          switchTo(h.env, 'B');
+          h.env.promptPreparingRef.current = 99;
+        }
+        timerCallback();
+        assert.equal(signal.aborted, true);
+        if (outcome === 'expired-response') reply.resolve();
+      }
+      await pending;
+      assert.equal(timers.size, 0); assert.equal(cleared, 1, 'all completion paths dispose their timer');
+      assert.equal(h.sent.length, 1, 'never resend');
+      assert.equal(h.restored.length, outcome === 'rejected' ? 1 : 0);
+      assert.equal(promotions, newSession && outcome === 'success' ? 1 : 0);
+      assert.equal(settlements, ['timeout', 'expired-response'].includes(outcome) ? 1 : 0);
+      assert.equal(h.env.promptPreparingRef.current, outcome === 'switched-timeout' ? 99 : null);
+      if (['timeout', 'expired-response'].includes(outcome)) assert.equal(h.notices[0].message, 'chat.promptAdmissionTimeout');
+      if (['success', 'switched-timeout'].includes(outcome)) assert.equal(h.notices.length, 0);
+    });
+  }
+}
+
+test('an old admission deadline cannot clear another prompt preparation', async () => {
+  const h = harness(), deadline = new AbortController();
+  h.env.AbortSignal = { timeout: () => deadline.signal };
+  h.env.sendAgentCommand = (sid,body,options) => new Promise((resolve,reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), {once:true}));
+  const pending = callback(hook,'handleSend',h.env)('old'); await tick();
+  h.env.promptRunIdRef.current++; h.env.promptPreparingRef.current = h.env.promptRunIdRef.current;
+  deadline.abort(new DOMException('deadline','TimeoutError')); await pending;
+  assert.equal(h.env.promptPreparingRef.current,h.env.promptRunIdRef.current); assert.equal(h.notices.length,0); assert.equal(h.restored.length,0);
+});
+
 function composer() {
   const gate = deferred(), sent = [], drafts = new Map([['A','hello'], ['B','new unsent draft']]);
   const env = {
     value: 'hello', valueRef: ref('hello'), attachedImages: [], attachedImagesRef: ref(null), attachedFilesRef: ref([]),
-    isStreaming: false, workspaceUnavailable: null, onAudioUnlock() {}, runBuiltinCommand: async () => false,
+    isStreaming: false, promptPreparing: false, workspaceUnavailable: null, onAudioUnlock() {}, runBuiltinCommand: async () => false,
     resolveSessionReferences: () => gate.promise, sessionMentionTargetsRef: ref(new Map()), composeMessageWithAttachedFiles: t => t,
     onSend: (...args) => sent.push(args), onSteer: (...args) => sent.push(args), onFollowUp: (...args) => sent.push(args), onBuiltinCommand: undefined,
     composerMountedRef: ref(true), composerScopeRef: ref({ key:'A', generation:0 }), composerGeneration: 0,

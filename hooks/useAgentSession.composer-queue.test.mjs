@@ -15,7 +15,7 @@ function callback(name, overrides = {}) {
   };
   find(source); assert.ok(node);
   const env = {
-    Error, TypeError, mergeComposerQueueSnapshot, isCurrentSubmission: () => true,
+    Error, TypeError, mergeComposerQueueSnapshot, isCurrentSubmission: () => true, promptPreparingRef: { current: null },
     sessionIdRef: { current: 'session-a' }, sessionGenerationRef: { current: 1 },
     editEntryId: null, composerDraftKey: 'session-a', addNotice() {}, restoreSubmission() {}, setQueuedMessages() {},
     ...overrides,

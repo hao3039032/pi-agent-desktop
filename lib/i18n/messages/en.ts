@@ -360,6 +360,8 @@ export const enLocale: LocalePlugin = {
     "chat.runningNamedTool": "Running {name}...",
     "chat.runningTools": "Running {names}...",
     "chat.runningToolsMore": "Running {names} (+{count})...",
+    "chat.preparingSession": "Preparing session...",
+    "chat.promptAdmissionTimeout": "Timed out waiting for the server to acknowledge this message. It may already be running; checking its state. The message has not been resent.",
     "chat.waitingModel": "Waiting for model...",
     "chat.runningCommand": "Running command...",
     "chat.thinking": "Thinking...",

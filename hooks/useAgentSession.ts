@@ -165,6 +165,7 @@ type NoticeAction =
   | { type: "remove"; id: string };
 
 export type AgentPhase =
+  | { kind: "preparing_session" }
   | { kind: "waiting_model" }
   | { kind: "running_command" }
   | { kind: "running_tools"; tools: { id: string; name: string; progress?: string }[] }
@@ -233,6 +234,9 @@ function asConcreteThinkingLevel(value?: string | null): ConcreteThinkingLevel |
 // pending edit lives here as long as that session's in-memory draft does.
 const pendingHistoryEdits = new Map<string, string>();
 
+// The CLI admission RPC has a 120s deadline. Bound the HTTP wait as well:
+// a lost response must not retain the preparing lock forever.
+const PROMPT_ADMISSION_TIMEOUT_MS = 130_000;
 const PROMPT_SETTLE_INITIAL_DELAY_MS = 800;
 const PROMPT_SETTLE_POLL_MS = 600;
 const PROMPT_SETTLE_MAX_MS = 20_000;
@@ -367,6 +371,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [hasEarlierMessages, setHasEarlierMessages] = useState(false);
   const [streamState, dispatch] = useReducer(streamReducer, INITIAL_STREAMING_STATE);
   const [agentRunning, setAgentRunning] = useState(false);
+  const [promptPreparing, setPromptPreparing] = useState(false);
+  const promptPreparingRef = useRef<number | null>(null);
+  const pendingPromptSubmissionRef = useRef<{ dispatched: boolean; cancel: () => void } | null>(null);
   const [bashRunning, setBashRunning] = useState(false);
   const [pendingBash, setPendingBash] = useState<PendingBash | null>(null);
   const { automation, setAutomation, syncAutomation } = useSessionAutomation();
@@ -574,6 +581,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     promotedLoadRef.current = false;
     sdkAgentActiveRef.current = false;
     rpcPromptPendingRef.current = false;
+    promptPreparingRef.current = null;
+    pendingPromptSubmissionRef.current = null;
+    setPromptPreparing(false);
     promptRunIdRef.current += 1;
     stopRequestRef.current = null;
     setStopPending(false);
@@ -766,12 +776,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
     // Single-flight: concurrent reads for the same session (mount + SSE settle +
     // reconcile) share one request unless the caller forces a fresh read.
-    const flightKey = options?.force ? `force:${sid}` : sid;
+    const flightKey = `${options?.force ? "force:" : ""}${sid}:${sessionGenerationRef.current}:${promptRunIdRef.current}`;
     const inflight = options?.force ? undefined : loadFlightsRef.current.get(flightKey);
     if (inflight) return await inflight;
   const flight = (async (): Promise<unknown> => {
     let messagesLoaded = false;
     const sessionGeneration = sessionGenerationRef.current;
+    const requestPromptRunId = promptRunIdRef.current;
     const isCurrent = () => (
       sessionIdRef.current === sid
       && sessionGenerationRef.current === sessionGeneration
@@ -803,6 +814,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
       if (!isCurrent()) return null;
+      // Any history request (including an idle/background refresh) may have
+      // captured the transcript before submission. Keep the optimistic message.
+      if (promptRunIdRef.current !== requestPromptRunId) {
+        if (showLoading) setLoading(false);
+        return null;
+      }
       // Freshness check: when the disk snapshot is unchanged (same opaque
       // revision), keep any history the user already paged in instead of
       // collapsing back to the fresh 50-entry window. The state hooks then
@@ -895,7 +912,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (!isCurrent()) return null;
+        if (!isCurrent() || promptRunIdRef.current !== requestPromptRunId) return null;
 
         const liveState = agentState.state;
         syncLiveModel(liveState);
@@ -1440,11 +1457,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const finishPromptWithoutStream = useCallback(async (sid: string | null = sessionIdRef.current, runId = promptRunIdRef.current) => {
     // Bail out before loadSession too: a stale finish for a previous run
     // must not overwrite the messages of the run currently streaming.
-    if (promptRunIdRef.current !== runId) return;
+    if (promptRunIdRef.current !== runId || promptPreparingRef.current !== null) return;
     try {
       if (sid) await loadSession(sid);
     } finally {
-      if (promptRunIdRef.current !== runId) return;
+      if (promptRunIdRef.current !== runId || promptPreparingRef.current !== null) return;
       const promptWasPending = rpcPromptPendingRef.current;
       const agentWasActive = sdkAgentActiveRef.current;
       rpcPromptPendingRef.current = false;
@@ -1465,11 +1482,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const startedAt = Date.now();
 
     while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
-      if (runId !== undefined && promptRunIdRef.current !== runId) return;
+      if (promptPreparingRef.current !== null || (runId !== undefined && promptRunIdRef.current !== runId)) return;
       try {
         const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
         if (res.ok) {
           const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+          if (promptPreparingRef.current !== null || (runId !== undefined && promptRunIdRef.current !== runId) || sessionIdRef.current !== sid) return;
           const state = data.state;
           syncLiveModel(state);
           if (!data.running || !state || (!state.isStreaming && !state.isPromptRunning)) {
@@ -1519,7 +1537,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // If the server reports idle while we still think it's running, finish
   // through the same settlement path used by non-streaming prompts.
   const reconcileAgentState = useCallback(async (sid: string) => {
-    if (!agentRunningRef.current || sessionIdRef.current !== sid) return;
+    if (!agentRunningRef.current || sessionIdRef.current !== sid || promptPreparingRef.current !== null) return;
     const sessionGeneration = sessionGenerationRef.current;
     const runId = promptRunIdRef.current;
     try {
@@ -1533,6 +1551,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         sessionIdRef.current !== sid
         || sessionGenerationRef.current !== sessionGeneration
         || promptRunIdRef.current !== runId
+        || promptPreparingRef.current !== null
       ) return;
       const state = data.state;
       syncLiveModel(state);
@@ -1680,6 +1699,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       case "prompt_done":
         {
+          promptPreparingRef.current = null;
+          setPromptPreparing(false);
           const runId = promptRunIdRef.current;
           const promptWasPending = rpcPromptPendingRef.current;
           rpcPromptPendingRef.current = false;
@@ -1702,6 +1723,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setContextUsage((event.contextUsage as AgentStateResponse["contextUsage"]) ?? null);
         break;
       case "session_process_exit": {
+        promptPreparingRef.current = null;
+        setPromptPreparing(false);
         // Do not let EventSource immediately respawn a failed CLI (and its
         // background-work recovery) on the server's ensuing stream close.
         closeEvents();
@@ -1976,6 +1999,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
 
     const promptRunId = promptRunIdRef.current + 1;
+    promptPreparingRef.current = promptRunId;
+    setPromptPreparing(true);
     cancelEventStreamGrace();
     rpcPromptPendingRef.current = true;
 
@@ -1992,7 +2017,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     promptRunIdRef.current = promptRunId;
     agentRunningRef.current = true;
     setAgentRunning(true);
-    setAgentPhase(isSlashCommandPrompt ? { kind: "running_command" } : { kind: "waiting_model" });
+    setAgentPhase({ kind: "preparing_session" });
     dispatch({ type: "start" });
     pendingScrollToUserRef.current = true;
     setPromptAnchorActive(true);
@@ -2000,16 +2025,51 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
     let sentSessionId: string | null = null;
     let promptRequestStarted = false;
+    let admissionSignal: AbortSignal | undefined;
+    let admissionTimer: ReturnType<typeof setTimeout> | undefined;
+    const startAdmissionDeadline = (): AbortSignal => {
+      if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+        return AbortSignal.timeout(PROMPT_ADMISSION_TIMEOUT_MS);
+      }
+      // Older WebViews lack the static timeout API as well as throwIfAborted.
+      // Own the fallback timer so success and rejection both release it.
+      const controller = new AbortController();
+      admissionTimer = setTimeout(() => controller.abort(), PROMPT_ADMISSION_TIMEOUT_MS);
+      return controller.signal;
+    };
+    let cancelled = false;
+    const pendingSubmission = {
+      dispatched: false,
+      cancel: () => {
+        if (cancelled || pendingSubmission.dispatched || !isCurrentSubmission()) return;
+        cancelled = true;
+        pendingPromptSubmissionRef.current = null;
+        promptPreparingRef.current = null;
+        setPromptPreparing(false);
+        // Invalidate settlement/history work for the cancelled optimistic run.
+        promptRunIdRef.current += 1;
+        rpcPromptPendingRef.current = false;
+        optimisticUserMessageKeyRef.current = null;
+        setMessages((previous) => previous.filter((item) => item !== userMsg));
+        restoreSubmission(message, images, composerDraftKey);
+        settleUiStage();
+        // Keep the selected session's warm SSE alive. Its eventual readiness
+        // may finish starting the runtime, but cancelled continuations never POST.
+      },
+    };
+    pendingPromptSubmissionRef.current = pendingSubmission;
 
     try {
       if (isNew && newSessionCwd) {
         const selectedModel = newSessionModel;
         const existingSid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
+        if (cancelled) return;
         if (!isCurrentSubmission()) {
           restoreSubmission(message, images, composerDraftKey);
           return;
         }
         const sid = existingSid ?? await ensureNewSession();
+        if (cancelled) return;
 
         if (!sid) throw new Error("Unable to create a session for the prompt");
         if (!isCurrentSubmission()) {
@@ -2023,21 +2083,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             await sendAgentCommand(sid, { type: "set_model", provider: selectedModel.provider, modelId: selectedModel.modelId });
           }
         }
+        if (cancelled) return;
         if (!isCurrentSubmission()) {
           restoreSubmission(message, images, composerDraftKey);
           return;
         }
         await ensureEventsConnected(sid);
+        if (cancelled) return;
         if (!isCurrentSubmission()) {
           restoreSubmission(message, images, composerDraftKey);
           return;
         }
+        admissionSignal = startAdmissionDeadline();
         promptRequestStarted = true;
+        pendingSubmission.dispatched = true;
         await sendAgentCommand(sid, {
           type: "prompt",
           message,
           ...(piImages?.length ? { images: piImages } : {}),
-        });
+        }, { signal: admissionSignal });
+        // Older macOS WebViews lack throwIfAborted (and may lack reason).
+        if (admissionSignal.aborted) throw admissionSignal.reason ?? new DOMException("Prompt admission timed out.", "TimeoutError");
         if (isCurrentSubmission()) promoteNewSession(1, message);
       } else if (session) {
         sentSessionId = session.id;
@@ -2046,35 +2112,52 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           return;
         }
         await ensureEventsConnected(session.id);
+        if (cancelled) return;
         if (!isCurrentSubmission()) {
           restoreSubmission(message, images, composerDraftKey);
           return;
         }
+        admissionSignal = startAdmissionDeadline();
         promptRequestStarted = true;
+        pendingSubmission.dispatched = true;
         await sendAgentCommand(session.id, {
           type: "prompt",
           message,
           ...(piImages?.length ? { images: piImages } : {}),
-        });
+        }, { signal: admissionSignal });
+        if (admissionSignal.aborted) throw admissionSignal.reason ?? new DOMException("Prompt admission timed out.", "TimeoutError");
       } else {
         throw new Error("No active session for the prompt");
+      }
+      if (isCurrentSubmission() && promptPreparingRef.current === promptRunId) {
+        promptPreparingRef.current = null;
+        setPromptPreparing(false);
+        setAgentPhase(isSlashCommandPrompt ? { kind: "running_command" } : { kind: "waiting_model" });
       }
       if (isCurrentSubmission() && isSlashCommandPrompt && sentSessionId) {
         void waitForPromptSettlement(sentSessionId, promptRunId);
       }
     } catch (e) {
+      if (cancelled) return;
       const definitivelyRejected = !promptRequestStarted || isPromptRejectedError(e);
-      if (!isCurrentSubmission()) {
+      if (!isCurrentSubmission() || promptRunIdRef.current !== promptRunId) {
         // Recovery belongs to the source draft, not the currently visible UI.
         // Ambiguous transport errors must not invite duplicate submissions.
         if (definitivelyRejected) restoreSubmission(message, images, composerDraftKey);
         return;
       }
       console.error("Failed to send message:", e);
+      if (promptPreparingRef.current === promptRunId) {
+        promptPreparingRef.current = null;
+        setPromptPreparing(false);
+      }
       // A transport/proxy failure after dispatch is ambiguous: the server may
       // have accepted the prompt before the response was lost. Keep SSE alive
       // until server state confirms the run is idle.
       if (!definitivelyRejected && sentSessionId) {
+        if (admissionSignal?.aborted) {
+          addNotice({ type: "warning", message: t("chat.promptAdmissionTimeout") });
+        }
         void waitForPromptSettlement(sentSessionId, promptRunId);
         return;
       }
@@ -2100,8 +2183,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentRunning(false);
       setAgentPhase(null);
       dispatch({ type: "end" });
+    } finally {
+      if (admissionTimer !== undefined) clearTimeout(admissionTimer);
+      if (pendingPromptSubmissionRef.current === pendingSubmission) pendingPromptSubmissionRef.current = null;
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, isCurrentSubmission, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, chatWorkspace, closeEvents, composerDraftKey, reconcileAgentState, restoreSubmission, editEntryId, setEdit, branchSummarySessionIdRef, t]);
+  }, [isNew, newSessionCwd, newSessionModel, session, isCurrentSubmission, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, cancelEventStreamGrace, chatWorkspace, closeEvents, composerDraftKey, reconcileAgentState, restoreSubmission, editEntryId, setEdit, branchSummarySessionIdRef, settleUiStage, t]);
 
   const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
     const inputText = `${excludeFromContext ? "!!" : "!"}${command}`;
@@ -2155,7 +2241,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [addNotice, chatWorkspace, composerDraftKey, ensureEventsConnected, ensureNewSession, isCurrentSubmission, loadSession, promoteNewSession, restoreSubmission, session, t]);
   executeBashRef.current = executeBash;
 
-  const handleAbort = useCallback(async () => {
+  const abortSessionRuntime = useCallback(async (type: "abort" | "abort_bash") => {
     const sid = sessionIdRef.current;
     if (!sid || stopRequestRef.current) return;
     const generation = sessionGenerationRef.current;
@@ -2164,7 +2250,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setStopPending(true);
     const current = () => sessionIdRef.current === sid && sessionGenerationRef.current === generation && stopRequestRef.current === request;
     try {
-      await sendAgentCommand(sid, { type: bashRunningRef.current ? "abort_bash" : "abort" }, { signal: AbortSignal.timeout(35_000) });
+      await sendAgentCommand(sid, { type }, { signal: AbortSignal.timeout(35_000) });
       if (current()) void reconcileAgentState(sid);
     } catch (e) {
       if (!current()) return;
@@ -2177,6 +2263,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
     }
   }, [addNotice, reconcileAgentState, t]);
+
+  const handleAbort = useCallback(async () => {
+    const pendingSubmission = pendingPromptSubmissionRef.current;
+    if (pendingSubmission && !pendingSubmission.dispatched) {
+      pendingSubmission.cancel();
+      return;
+    }
+    await abortSessionRuntime(bashRunningRef.current ? "abort_bash" : "abort");
+  }, [abortSessionRuntime]);
 
   const handleForceStop = useCallback(async () => {
     const target = forceStopTarget;
@@ -2597,7 +2692,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   ) => {
     const sid = sessionIdRef.current;
     const restore = () => restoreSubmission(message, images, composerDraftKey);
-    if (!isCurrentSubmission()) {
+    if (!isCurrentSubmission() || promptPreparingRef.current !== null) {
       restore();
       return;
     }
@@ -2648,7 +2743,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
     const sid = sessionIdRef.current;
     const generation = sessionGenerationRef.current;
-    if (!sid || editEntryId || !isCurrentSubmission()) {
+    if (!sid || editEntryId || !isCurrentSubmission() || promptPreparingRef.current !== null) {
       restoreSubmission(message, images, composerDraftKey);
       return;
     }
@@ -2690,8 +2785,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [addNotice, composerDraftKey, restoreSubmission]);
 
-  // CLI abort cancels compaction too; share visible failures and force-stop fallback.
-  const handleAbortCompaction = handleAbort;
+  // CLI abort cancels compaction too; share failures/force-stop without taking
+  // the composer's pre-dispatch cancellation path instead of stopping compaction.
+  const handleAbortCompaction = useCallback(() => abortSessionRuntime("abort"), [abortSessionRuntime]);
 
   const handleRecallQueue = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -3175,7 +3271,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
-    agentRunning, modelNames, modelList, modelError, modelScopeWarnings: visibleModelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
+    agentRunning, promptPreparing, modelNames, modelList, modelError, modelScopeWarnings: visibleModelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId, retryLoad, dismissModelScopeWarnings,
     isCompacting, compactError, compactNotice, compactResult, currentModel, displayModel, modelSwitching, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,

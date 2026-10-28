@@ -107,6 +107,36 @@ Explicit rejection restores the source session draft even after selection moves;
 ambiguous transport failures never restore a potentially accepted submission.
 An abandoned, unpromoted New composer retains the existing discard policy.
 
+Cold reopen: a first prompt marks `promptPreparingRef` until the server admits
+it (or emits `prompt_done`/exits). SSE readiness alone is not admission: an
+idle poll during child startup or POST preflight must not settle the optimistic
+run. The composer displays “preparing session” and keeps a second submission in
+its draft until admission, rather than starting the outbox before the first
+prompt. Before the prompt POST is dispatched, Stop cancels that local submission,
+removes its optimistic bubble and restores its source draft exactly once, even
+before a new runtime has an id. Late creation/model/SSE completions cannot send
+it, and the selected session's warm event stream is left open. Stop remains
+visible during preparation even with newly typed draft text. Once dispatched,
+Stop uses the existing server abort; it does not restore a possibly accepted
+message. The separate Stop compaction action always targets the runtime, not
+this local submission, while sharing the pending/error/force-stop safeguards.
+
+The admission HTTP wait has a 130-second deadline (the CLI RPC allows 120s).
+When `AbortSignal.timeout` is unavailable, it uses `AbortController` plus an
+owned timer, cleared in `finally` on success, rejection or timeout (including
+stale responses after switching sessions). Its response check uses `aborted`
+and an optional `reason`, not `throwIfAborted`, which older macOS WebViews do
+not implement either.
+A lost/expired HTTP response releases preparation, warns that acceptance is
+uncertain and resumes normal settlement/reconciliation. It never restores or
+resends that message automatically. Late failures cannot clear a newer run's
+preparation. Both initial and background history snapshots begun before a new
+submission are discarded; history single-flights are scoped to session generation
+and prompt run so a current refresh cannot inherit an obsolete request.
+The browser fixture delays handshake, admission and background history, triggers
+`online` reconciliation, tests pre-dispatch Stop with/without a runtime id, and
+expires an HTTP reply after SSE reports a running agent without duplicating it.
+
 `ChatInput` also owns a composer generation, invalidated by switches/unmounts but
 not imperative draft promotion. Reference resolution and built-in command replies
 cannot submit or clear a different composer, including A→B→A. Text/attachment

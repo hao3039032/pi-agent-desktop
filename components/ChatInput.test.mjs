@@ -651,7 +651,7 @@ function chatInputCallback(name, context) {
   return new Script(ts.transpileModule(findCallback(source).getText(source), {
     compilerOptions: { target: ts.ScriptTarget.ES2020 },
   }).outputText).runInNewContext({
-    isCurrentComposer: () => true,
+    isCurrentComposer: () => true, promptPreparing: false,
     valueRef: { current: context.value },
     attachedImagesRef: { current: context.attachedImages },
     ...context,
@@ -991,7 +991,7 @@ test("handleSend sends exactly once and routes builtin commands through the pend
 test("a missing workspace replaces the model error and disables Send", () => {
   const source = readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8");
   assert.match(source, /workspaceUnavailable\s*\?\s*<WorkspaceUnavailableBanner[\s\S]*?:\s*<ModelErrorBanner error=\{modelError\} \/>/);
-  assert.match(source, /const canSend = canQueueStreamingMessage && !workspaceUnavailable;/);
+  assert.match(source, /const canSend = canQueueStreamingMessage && !workspaceUnavailable && !promptPreparing;/);
   assert.match(source, /disabled=\{!showStop && \(!canSend/);
 });
 
