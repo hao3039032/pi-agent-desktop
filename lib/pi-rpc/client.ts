@@ -21,6 +21,16 @@
  * declares an explicit, bounded hold: requests keep their original id and are
  * replayed in arrival order once their handler registers (or cancelled — never
  * approved — when the window ends).
+ *
+ * One channel opts out of that queue: a handler registered with
+ * `bypassQueueWhen` receives its matching records IMMEDIATELY, even while
+ * older requests are still held. This exists for the bridge result envelope
+ * (see core.ts): the host's own state requests (refreshTools) are answered
+ * over notify, so holding those envelopes behind UI whose handler only
+ * registers after the requests answered would deadlock the session start for
+ * the bridge timeout. It is safe precisely because pi never blocks on a notify
+ * — delivering one answers, cancels and reorders nothing user-visible — and
+ * everything else (dialogs, plain notifies, status) keeps the ordered replay.
  */
 
 import { type ChildProcessByStdio, spawn, type SpawnOptions } from "node:child_process";
@@ -66,6 +76,18 @@ interface Pending {
 /** Dialog methods pi blocks on; every other extension-UI method is fire-and-forget. */
 const DIALOG_METHODS = new Set(["select", "confirm", "input", "editor"]);
 
+/** One subscribed extension-UI method. */
+interface UiRegistration {
+  handler: (params: PiRpcRecord) => unknown;
+  /**
+   * Deliver a matching record immediately, bypassing the pre-attach window's
+   * queue, even while older requests are still held. Only for host-internal,
+   * non-blocking channels whose records pi never blocks on (the bridge result
+   * envelope): everything user-visible must keep the arrival-order replay.
+   */
+  bypassQueueWhen?: (record: PiRpcRecord) => boolean;
+}
+
 /** Default bound on requests held by a pre-attach window. */
 const UI_ATTACH_MAX_ENTRIES = 64;
 
@@ -93,7 +115,7 @@ export class PiRpcClient {
   private child: ChildProcessByStdio<Writable, Readable, Readable>;
   private pending = new Map<string, Pending>();
   private listeners = new Set<(record: PiRpcRecord) => void>();
-  private uiHandlers = new Map<string, (params: PiRpcRecord) => unknown>();
+  private uiHandlers = new Map<string, UiRegistration>();
   /** The open pre-attach window; absent means unregistered dialogs cancel at once. */
   private uiWindow: { deadline: number; maxEntries: number; timer: NodeJS.Timeout } | undefined;
   private uiBuffer: BufferedUiRequest[] = [];
@@ -180,9 +202,21 @@ export class PiRpcClient {
     return () => this.listeners.delete(listener);
   }
 
-  /** Subscribe to one extension-UI method; the handler's return value is sent back. */
-  onUi(method: string, handler: (params: PiRpcRecord) => unknown): () => void {
-    this.uiHandlers.set(method, handler);
+  /**
+   * Subscribe to one extension-UI method; the handler's return value is sent
+   * back. `bypassQueueWhen` (optional) claims immediate delivery for matching
+   * records even while the pre-attach window still holds older ones — for the
+   * host-internal bridge result channel only; user-visible UI must not use it.
+   */
+  onUi(
+    method: string,
+    handler: (params: PiRpcRecord) => unknown,
+    options?: { bypassQueueWhen?: (record: PiRpcRecord) => boolean },
+  ): () => void {
+    this.uiHandlers.set(method, {
+      handler,
+      ...(options?.bypassQueueWhen ? { bypassQueueWhen: options.bypassQueueWhen } : {}),
+    });
     this.flushBufferedUi();
     return () => this.uiHandlers.delete(method);
   }
@@ -380,7 +414,17 @@ export class PiRpcClient {
       const id = typeof record.id === "string" ? record.id : undefined;
       const method = typeof record.method === "string" ? record.method : undefined;
       if (id && method) {
-        const handler = this.uiHandlers.get(method);
+        const registration = this.uiHandlers.get(method);
+        if (registration && this.bypassesQueue(registration, record)) {
+          // A host-internal channel (the bridge result envelope): deliver at
+          // once even while older UI is held, or the startup window would
+          // stall host requests behind UI whose handler only registers after
+          // those very requests answered. pi never blocks on a notify, so this
+          // answers, cancels and reorders nothing the ordered replay protects.
+          this.deliverUiRequest(record, id, registration.handler);
+          return;
+        }
+        const handler = registration?.handler;
         // Arrival order is absolute: while anything is held, a new request
         // joins the queue even if its handler is already registered, or a
         // later dialog would jump ahead of an earlier one still waiting.
@@ -458,7 +502,7 @@ export class PiRpcClient {
           this.cancelBufferedUi(entry);
           continue;
         }
-        const handler = this.uiHandlers.get(entry.method);
+        const handler = this.uiHandlers.get(entry.method)?.handler;
         if (!handler) return;
         this.uiBuffer.shift();
         this.deliverUiRequest(entry.record, entry.id, handler);
@@ -471,6 +515,18 @@ export class PiRpcClient {
   /** A held entry is dead once its own dialog timeout elapsed. */
   private bufferedEntryExpired(entry: BufferedUiRequest): boolean {
     return entry.timeoutMs !== undefined && Date.now() >= entry.timeoutMs;
+  }
+
+  /** Whether this registration claims immediate delivery for the record. */
+  private bypassesQueue(registration: UiRegistration, record: PiRpcRecord): boolean {
+    if (!registration.bypassQueueWhen) return false;
+    try {
+      return registration.bypassQueueWhen(record) === true;
+    } catch {
+      // A throwing predicate must never break the dispatch loop; the record
+      // falls back to the ordinary ordered path.
+      return false;
+    }
   }
 
   private cancelBufferedUi(entry: BufferedUiRequest): void {

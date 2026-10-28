@@ -302,8 +302,23 @@ export class CliAgentSessionCore extends RpcAgentSession {
     this.bridgeNote = options.onLog ?? ((line) => console.log(`[pi-rpc] ${line}`));
     // The bridge result channel owns "notify": it is registered for the core's
     // whole lifetime (refreshTools runs before attachUiRelay wires the relay)
-    // and forwards every non-bridge notify to the relay unchanged.
-    this.offBridgeNotify = this.rpc.onUi("notify", (record) => this.onNotifyRecord(record));
+    // and forwards every non-bridge notify to the relay unchanged. Bridge
+    // result envelopes BYPASS the startup window's queue (bypassQueueWhen):
+    // they are host-internal — rid-correlated, nonce/session-verified in
+    // onNotifyRecord — and pi never blocks on a notify, so delivering one
+    // answers, cancels and reorders nothing user-visible. Without the bypass a
+    // startup setStatus/dialog held ahead of the envelope stalls refreshTools
+    // behind UI whose handler only registers after the bridge answered (the
+    // 30s boot deadlock). A PLAIN notify never matches the predicate and keeps
+    // the ordinary ordered replay.
+    this.offBridgeNotify = this.rpc.onUi(
+      "notify",
+      (record) => this.onNotifyRecord(record),
+      {
+        bypassQueueWhen: (record) =>
+          typeof record.message === "string" && record.message.startsWith(BRIDGE_RESULT_PREFIX),
+      },
+    );
   }
 
   /** Wire the wrapper in after it exists; registers the child-UI subprotocol handlers. */
