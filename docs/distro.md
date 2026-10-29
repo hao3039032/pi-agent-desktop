@@ -63,16 +63,16 @@
 | 参数 | 默认 | 可选 Runner |
 |---|---|---|
 | `macos_arm64_runner`（Apple Silicon 包） | `macos-26` | `macos-26`、`macos-15` |
-| `macos_x64_runner`（Intel 包） | `macos-26` | `macos-26`、`macos-15`、`macos-26-intel`、`macos-15-intel` |
+| `macos_x64_runner`（Intel 包） | `macos-26` | `macos-26`、`macos-15` |
 
-`macos-15` 和 `macos-15-intel` 都显式选择预装的 `/Applications/Xcode_26.3.app`；不存在就失败，不回退到旧 Xcode。所有 Mac 构建仍要求 **macOS SDK ≥ 26**，不因 Runner 系统版本或 CPU 架构降低门槛，以保留新版 AppKit 窗口控件。此选择不改变安装包的最低运行系统版本。
+`macos-15` 显式选择预装的 `/Applications/Xcode_26.3.app`；不存在就失败，不回退到旧 Xcode。所有 Mac 构建仍要求 **macOS SDK ≥ 26**，不因 Runner 系统版本或 CPU 架构降低门槛，以保留新版 AppKit 窗口控件。此选择不改变安装包的最低运行系统版本。
 
-Intel 包在 ARM Runner 上继续交叉编译并换入 x64 Node；选择 `*-intel` 时原生编译，直接使用构建机的 x64 Node，不执行 Rosetta/跨架构 Node 下载。两条路径都保留随包运行时架构校验、`desktop:verify`、签名及全部平台成功才发布的门槛。新增 Runner 的实际可用性须由对应 CI 构建验证，本地工作流测试不等同于 Mac 打包通过。
+Intel 包一律在 ARM Runner 上交叉编译并换入 x64 Node（原生 `*-intel` Runner 选项已移除：hdiutil/bundle_dmg 在 Intel 跑机上挂死，且镜像正被淘汰；v0.7.705 的 Intel 包即由 macos-26 交叉编译产出）。该路径保留随包运行时架构校验、`desktop:verify`、签名及全部平台成功才发布的门槛。新增 Runner 的实际可用性须由对应 CI 构建验证，本地工作流测试不等同于 Mac 打包通过。
 
 遇到 `The job was not acquired by Runner of type hosted` 时，可新建一次运行选择备用镜像，例如：
 
 ```bash
-gh workflow run distro-release.yml --ref main -f macos_arm64_runner=macos-15 -f macos_x64_runner=macos-15-intel
+gh workflow run distro-release.yml --ref main -f macos_arm64_runner=macos-15 -f macos_x64_runner=macos-15
 ```
 
 工作流修改须先推送到所选分支。旧运行的 **Re-run** 沿用旧提交和输入，不能切换 Runner；需要新的 workflow dispatch。若旧运行仍排队，先确认是否取消它，否则发布工作流的 concurrency 队列会让新运行继续等待。候选列表不是自动抢占/故障转移；不同 ARM 镜像仍可能同时缺资源。保持 `max-parallel: 1`，避免各目标覆盖同一个 `latest.json`；不完整的 draft 不得手动转正。

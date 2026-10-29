@@ -202,7 +202,7 @@ test("the distro release workflow builds on the macOS 26 SDK", async () => {
   const gateIndex = workflow.indexOf("      - name: Require the macOS 26 SDK");
   assert.ok(selectIndex >= 0 && gateIndex > selectIndex);
   const selection = workflow.slice(selectIndex, gateIndex);
-  assert.match(selection, /if: runner\.os == 'macOS' && \(matrix\.runner == 'macos-15' \|\| matrix\.runner == 'macos-15-intel'\)/);
+  assert.match(selection, /if: runner\.os == 'macOS' && matrix\.runner == 'macos-15'/);
   assert.match(selection, /test -d \/Applications\/Xcode_26\.3\.app\/Contents\/Developer/);
   assert.match(selection, /sudo xcode-select --switch \/Applications\/Xcode_26\.3\.app\/Contents\/Developer/);
   assert.doesNotMatch(selection, /continue-on-error|\|\| true/);
@@ -214,7 +214,7 @@ test("distro macOS runner choices keep architecture targets and release gates in
   const workflow = await readText(join(root, ".github", "workflows", "distro-release.yml"), "utf8");
   for (const [input, target, choices] of [
     ["macos_arm64_runner", "aarch64-apple-darwin", ["macos-26", "macos-15"]],
-    ["macos_x64_runner", "x86_64-apple-darwin", ["macos-26", "macos-15", "macos-26-intel", "macos-15-intel"]],
+    ["macos_x64_runner", "x86_64-apple-darwin", ["macos-26", "macos-15"]],
   ]) {
     const block = workflow.match(new RegExp(`^      ${input}:\\n([\\s\\S]*?)(?=^      \\w+:|^\\S)`, "m"))?.[1];
     assert.ok(block, `${input} is a workflow_dispatch input`);

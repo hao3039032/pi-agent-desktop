@@ -18,14 +18,12 @@ on:
           - macos-26
           - macos-15
       macos_x64_runner:
-        description: "Intel build runner (ARM cross-build or native Intel; macos-15 variants select Xcode 26.3)"
+        description: "Intel build runner (ARM cross-build; macos-15 selects Xcode 26.3)"
         type: choice
         default: macos-26
         options:
           - macos-26
           - macos-15
-          - macos-26-intel
-          - macos-15-intel
       prerelease:
         description: "Preview build: keep the release a draft, skip the updater feed and the latest flag"
         type: boolean
@@ -58,7 +56,8 @@ jobs:
             args: --target aarch64-apple-darwin
             apple_signing_identity: "-"
           # Default: cross-compile on Apple Silicon and swap in darwin-x64
-          # Node below. The optional *-intel runners build/run x64 natively.
+          # Node below (native Intel runners were removed: hdiutil/bundle_dmg
+          # hangs there and GitHub is retiring the images).
           - runner: ${{ inputs.macos_x64_runner || 'macos-26' }}
             platform: macos
             target: x86_64-apple-darwin
@@ -106,7 +105,7 @@ jobs:
       # Both macos-15 images default to an older Xcode; select preinstalled
       # Xcode 26.3 explicitly. Missing Xcode fails, never falls back silently.
       - name: Select Xcode 26.3 on macos-15
-        if: runner.os == 'macOS' && (matrix.runner == 'macos-15' || matrix.runner == 'macos-15-intel')
+        if: runner.os == 'macOS' && matrix.runner == 'macos-15'
         shell: bash
         run: |
           test -d /Applications/Xcode_26.3.app/Contents/Developer
