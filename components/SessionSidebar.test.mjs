@@ -349,7 +349,7 @@ test("unsent drafts show as rows in the project tree and stay out of Chats", () 
   // Parked drafts (and the active new-session composer) are projected by the
   // pure helper; the sidebar only wires its live state into it.
   assert.match(source, /import \{ clearDraft, listParkedNewSessionDrafts, subscribeParkedDrafts \} from "@\/lib\/draft-store";/);
-  assert.match(source, /import \{\s*deriveSidebarDraftRows,\s*EMPTY_SIDEBAR_DRAFTS,\s*mergeDraftSyntheticGroups,\s*type SidebarDraftRowModel,\s*\} from "@\/lib\/sidebar-draft-rows";/);
+  assert.match(source, /import \{\s*deriveSidebarDraftRows,\s*draftRowProjectRootFor,\s*EMPTY_SIDEBAR_DRAFTS,\s*mergeDraftSyntheticGroups,\s*type SidebarDraftRowModel,\s*\} from "@\/lib\/sidebar-draft-rows";/);
   // Re-renders come from the parked-draft subscription (also cross-window).
   assert.match(source, /subscribeParkedDrafts\(\(\) => bumpParkedDrafts\(\)\)/);
   // Parked rows wait for the first successful session list load: without the
@@ -362,7 +362,7 @@ test("unsent drafts show as rows in the project tree and stay out of Chats", () 
   // where its archived project's sessions hide (grouped and timeline alike).
   assert.match(
     source,
-    /deriveSidebarDraftRows\(\{\s*parked: parkedNewSessionDrafts,\s*groups: allProjects,\s*selectedCwd,\s*selectedSessionId,\s*projectRootFor,\s*isChatCwd,\s*archivedRoots: archivedProjectRoots,\s*\}\)/,
+    /deriveSidebarDraftRows\(\{\s*parked: parkedNewSessionDrafts,\s*groups: allProjects,\s*selectedCwd,\s*selectedSessionId,\s*projectRootFor: draftProjectRootFor,\s*isChatCwd,\s*archivedRoots: archivedProjectRoots,\s*\}\)/,
   );
   // Synthetic draft groups join the project list (and thus the composer's
   // project list through onProjectsChange).
@@ -400,6 +400,51 @@ test("the chronological view lists draft rows first with project subtitles", () 
   assert.match(timeline, /sidebarDrafts\.rows\.map\(\(row\) => \([\s\S]*?<SidebarDraftRowItem/);
   assert.match(timeline, /subtitle=\{projectDisplayNames\.get\(row\.projectRoot\)/);
   assert.match(timeline, /getProjectDisplayName\(row\.projectRoot, activeProjectRoots\)\}/);
+});
+
+test("a parked draft keeps the project root the server reported for its cwd", () => {
+  // A worktree without sessions has no session row, and its project's worktree
+  // listing is replaced the moment the user switches projects. The row resolver
+  // therefore falls back to the roots the server reported for this browser
+  // (lib/cwd-project-roots.ts); without it the row became a synthetic project
+  // of its own and the archived-project hiding no longer applied.
+  assert.match(source, /import \{ rememberCwdProjectRoots, subscribeCwdProjectRoots \} from "@\/lib\/cwd-project-roots";/);
+  assert.match(source, /draftRowProjectRootFor,\s*EMPTY_SIDEBAR_DRAFTS,/);
+  // Every server answer is recorded (incomplete rows are skipped, never stored
+  // as "its own project") together with the selected project's worktree
+  // listing.
+  assert.match(
+    source,
+    /rememberCwdProjectRoots\(\s*allSessions\s*\.filter\(\(session\) => session\.workspaceKind !== "chat"\)\s*\.map\(\(session\) => \[session\.cwd, session\.projectRoot\] as const\),\s*\);/,
+  );
+  assert.match(
+    source,
+    /rememberCwdProjectRoots\(\[\s*\[worktreeState\.forCwd, worktreeState\.projectRoot\] as const,\s*\.\.\.worktreeState\.worktrees\.map\(\(worktree\) => \[worktree\.path, worktreeState\.projectRoot\] as const\),\s*\]\);/,
+  );
+  // Draft rows resolve through the remembered root…
+  assert.match(
+    source,
+    /const draftProjectRootFor = useCallback\(\(cwd: string \| null\): string \| null => \{\s*if \(!cwd\) return null;\s*if \(isChatCwd\(cwd\)\) return null;\s*return draftRowProjectRootFor\(serverProjectRootFor\(cwd\), cwd\);/,
+  );
+  assert.match(source, /projectRootFor: draftProjectRootFor,/);
+  // Another window can learn an identity this one never saw; the sidebar has to
+  // re-render its parked rows when that arrives, or the row keeps the grouping
+  // of its stale map.
+  assert.match(source, /useEffect\(\(\) => subscribeCwdProjectRoots\(\(\) => bumpParkedDrafts\(\)\), \[\]\);/);
+  // …while project selection keeps its own fallback: an unresolved cwd is
+  // still its own workspace, and chat cwds never resolve to a project.
+  assert.match(source, /return serverProjectRootFor\(cwd\) \?\? cwd;/);
+});
+
+test("an incomplete session row answers no root instead of the cwd", () => {
+  // `projectRoot` is optional on SessionInfo, and a partial row must not claim
+  // its cwd is a known root: that would stop a draft row from falling back to
+  // the identity the server reported earlier, and the row would become a
+  // synthetic project of its own (escaping archived-project hiding).
+  assert.match(
+    source,
+    /const match = allSessions\.find\(\(s\) => s\.cwd === cwd\);\s*return match\?\.projectRoot \?\? null;/,
+  );
 });
 
 test("the shell-known chat cwd classifies the active row before the list loads", async () => {

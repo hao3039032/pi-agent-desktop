@@ -99,6 +99,87 @@ orphaned it (see below). Drafts now have a sidebar presence:
   so a chat cwd never synthesizes a project group even before the list
   loads, while a project cwd still appears immediately. Archived project
   roots hide their draft rows in every view, like their sessions.
+- A draft row's project root comes from `serverProjectRootFor()` (the selected
+  project's worktree listing, then session rows), then from
+  `lib/cwd-project-roots.ts`: the cwd → project root pairs the server reported
+  for this browser, persisted in localStorage. That store exists because a git
+  worktree without sessions is identified *only* by its project's worktree
+  listing — once the user switched to another project the listing was replaced
+  and the row fell back to its own path, became a synthetic project named after
+  the worktree, and escaped the archived-root hiding (keyed by the real root).
+  Re-asking the server is not an option: it is one request per parked draft,
+  and after a restart a session-less worktree path is not in the file-access
+  allow-list, so `/api/worktrees?cwd=` is denied. `SessionSidebar` records only
+  server answers and never a client-side guess (an incomplete row without a
+  resolved `projectRoot` is skipped, not stored as "its own project" — the real
+  session list fills that field, so this only guards a partial shape); the map
+  is capped at 200 entries, written only when the bounded result differs from
+  the stored snapshot (a changed value, or an eviction — a batch that answers a
+  brand-new identity and then re-confirms it so the trim removes it again
+  writes nothing), and grants no access — reads and agent starts still pass the
+  server's own authorization.
+  `projectRootFor()` (project selection) deliberately keeps its plain
+  cwd fallback; only draft rows use the remembered identity.
+- The identity map is shared between windows because the parked drafts are.
+  The stored snapshot is the committed authority, and an answer only overrides
+  it when the answer is a value the snapshot does not carry. The store keeps
+  that apart as two things:
+  - `pending` — answers whose value the snapshot lacks (a correction, a new
+    identity). Only these may override the snapshot, and a failed write keeps
+    them so the next real change retries instead of dropping the correction.
+    An answer that matches the committed value *after re-reading the snapshot*
+    is never pending: it is a re-confirmation, or a revert of an unsaved value
+    back to what is committed. That distinction is why a failed-then-reverted
+    value cannot later resurrect a project another window already corrected.
+  - `observedOrder` — this window's answers in arrival order, pending values
+    and re-confirmations in one list, because that list is the eviction order
+    ("least recently remembered first"). One list also keeps a mixed batch
+    honest: `[newIdentity, ...200 re-confirmed]` answers the new identity
+    first, so the new one is evicted first rather than a key that was just
+    re-confirmed. An order that predates a newer write is dropped (compare the
+    order-sensitive map this window last read with the current one): a poll that
+    ran before another window's write must not reorder that write's keys, and
+    must not resurrect a value it replaced. Pending answers the fresh snapshot
+    already carries are dropped *before* that sweep, so a correction another
+    window has committed cannot keep the position it was queued at and evict
+    that window's newer identity. A repeated confirmation writes
+    nothing, so polling cannot age out an identity that is still being
+    confirmed; the refreshed order reaches disk with the next real change.
+  - Every batch of server answers is classified only *after* re-reading the
+    snapshot. Otherwise an answer that agrees with this window's stale memory
+    would be dismissed as a poll even though the snapshot now says something
+    else — the answer would be silently dropped.
+  - A `storage` event ignores its own payload and re-reads the stored snapshot,
+    because a queued event can predate a correction this window already applied
+    and wrote. Nothing is written back from the listener, so windows cannot
+    ping-pong; subscribers re-render instead — a mapping that arrives after the
+    draft's own `storage` event still fixes the row (the projection runs on
+    every render, not behind a cache version).
+  - Local answers notify subscribers too, whenever they change a grouping (a new
+    or corrected identity, an adopted snapshot, an eviction). The sidebar
+    projects draft rows during render and records answers in a passive effect,
+    so without that notify an already-rendered row could keep the grouping the
+    cache just replaced. A pure re-confirmation does not notify (nothing is
+    re-rendered, nothing is written), so polling cannot loop.
+  - A corrupt stored value (absent, unparsable, an array, a key removal) is
+    ignored when reading — the last good map stays — and is replaced on the next
+    write; there is nothing in it worth preserving, and refusing to write would
+    block corrections forever.
+  - The read-modify-write of the *whole* snapshot is not atomic. Two windows
+    writing at the same instant resolve last-writer-wins for the entire
+    snapshot, so concurrent updates to different keys can be lost, and no
+    per-key merge is guaranteed. The bounded claim this store does make: it
+    never resurrects or reorders an entry merely copied from an older snapshot,
+    and the updates it protects are the ones already visible on disk when it
+    reads before writing.
+- The composer's draft-key layout effect in `ChatInput` writes the outgoing
+  text back to the previous key only while the store still holds that key.
+  `AppShell`'s park paths clear it (the draft now lives under
+  `parked-new:<cwd>`), and the effect runs again when the new draft key arrives
+  — without the guard it recreated `new:<oldId>:<cwd>` with the same text: an
+  orphan copy nothing can display, which the 40-entry persistence window then
+  pushed real parked drafts out for. Per-session drafts have no other owner, so
+  their write-back is unchanged.
 - Deliberately out of scope: draft rows in the Chats section, salvaging
   historical orphan `new:*` keys, and multiple drafts per cwd.
 

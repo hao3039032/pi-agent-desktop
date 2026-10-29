@@ -1284,7 +1284,14 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const previousDraftKey = draftKeyRef.current;
     if (previousDraftKey === draftKey) return;
 
-    if (previousDraftKey) {
+    // Hand the outgoing composer's text to its own key — but only while the
+    // store still owns that key. AppShell's park paths move the active draft to
+    // `parked-new:<cwd>` and clear the old key; writing the text back here
+    // would resurrect an orphan `new:<id>:<cwd>` copy nothing can display and
+    // which would push real parked drafts out of the 40-entry persistence
+    // window. A key the store still holds is the ordinary case (per-session
+    // drafts have no other owner) and keeps the freshest keystrokes.
+    if (previousDraftKey && getDraft(previousDraftKey)) {
       setDraft(previousDraftKey, {
         value: valueRef.current,
         images: attachedImagesRef.current.map(imageToDraftImage),

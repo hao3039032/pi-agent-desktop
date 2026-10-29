@@ -123,6 +123,7 @@ lib/
   desktop-connection.ts useDesktopConnection() — local server health probe for the reconnect banner
   desktop-native.ts    native dialogs, open/reveal path, external links, save/import, window lifecycle
   desktop-notify.ts    native completion notifications (skipped while the window is focused)
+  cwd-project-roots.ts cwd → project root identities the server reported (parked draft rows)
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
@@ -198,7 +199,7 @@ Read the doc for the area you touch before changing it. Upstream docs (no prefix
 - [client-platform.md](docs/agents/client-platform.md): mobile software keyboard and viewport height, completion sound. Files: `hooks/useViewportHeight.ts`, `hooks/useAudio.ts`, the keyboard-open CSS.
 
 Fork notes:
-- [fork-sessions.md](docs/agents/fork-sessions.md): branch summaries, the not-yet-flushed new session, unsent-draft sidebar rows (`parked-new:` keys, `pagehide` parking), the SDK → wire → client event pipeline, the incremental session scanner, `useAgentSession` guards (request ids, load deadline, streaming seed, render-phase scroll save), compaction / retry / 0.86 events, `isRunning()` and `isIdle`, running-state propagation and reconciliation, session automation, the single-shot composer send, `!command` output, stats, transcript system messages, extension command session actions. Files: `lib/draft-store.ts`, `lib/sidebar-draft-rows.ts`, the draft parking in `components/AppShell.tsx`, the draft rows in `components/SessionSidebar.tsx`.
+- [fork-sessions.md](docs/agents/fork-sessions.md): branch summaries, the not-yet-flushed new session, unsent-draft sidebar rows (`parked-new:` keys, `pagehide` parking), the SDK → wire → client event pipeline, the incremental session scanner, `useAgentSession` guards (request ids, load deadline, streaming seed, render-phase scroll save), compaction / retry / 0.86 events, `isRunning()` and `isIdle`, running-state propagation and reconciliation, session automation, the single-shot composer send, `!command` output, stats, transcript system messages, extension command session actions. Files: `lib/draft-store.ts`, `lib/sidebar-draft-rows.ts`, `lib/cwd-project-roots.ts`, the draft parking in `components/AppShell.tsx`, the draft rows in `components/SessionSidebar.tsx`.
 - [fork-models.md](docs/agents/fork-models.md): routed model, cost by model and cache warming, classifier and image models, the four thinking-level states, model defaults, remote provider catalogs (refresh only on request), `enabledModels` minimal edits and `resync`, auth and credential deletion.
 - [fork-tools-subagents.md](docs/agents/fork-tools-subagents.md): new-session tool presets and Chat only, exact system prompts through `before_agent_start`, built-in subagents (setting, disabled built-ins, profile files, notifications).
 - [fork-files-security.md](docs/agents/fork-files-security.md): security posture (web password, OAuth tokens, preview sandboxes), worktrees and branch switching, the file access allow-list, web password throttling.

@@ -1,4 +1,5 @@
 import { parkedNewSessionDraftKey, type ChatDraft } from "./draft-store";
+import { recallCwdProjectRoot } from "./cwd-project-roots";
 import { basenameOf, type ProjectGroup } from "./project-group";
 
 /**
@@ -67,6 +68,25 @@ export const EMPTY_SIDEBAR_DRAFTS: SidebarDraftsModel = {
   rowsByProjectRoot: new Map(),
   syntheticGroups: [],
 };
+
+/**
+ * Project root a draft row belongs to.
+ *
+ * `serverProjectRoot` is what the sidebar's loaded data (the selected project's
+ * worktree listing, session rows) attributes to the cwd. A parked draft
+ * outlives that data: a worktree without sessions is only identified by its
+ * project's worktree listing, so switching projects used to leave the row with
+ * its own path as "project root" — a synthetic group named after the worktree
+ * that also escaped the archived-project hiding (which is keyed by the real
+ * root). `lib/cwd-project-roots.ts` keeps the roots the server reported for
+ * this browser; anything still unknown falls back to the cwd itself.
+ */
+export function draftRowProjectRootFor(
+  serverProjectRoot: string | null | undefined,
+  cwd: string,
+): string {
+  return serverProjectRoot ?? recallCwdProjectRoot(cwd) ?? cwd;
+}
 
 function previewOf(draft: ChatDraft): string | null {
   const firstLine = draft.value.split(/\r?\n/, 1)[0]?.trim() ?? "";

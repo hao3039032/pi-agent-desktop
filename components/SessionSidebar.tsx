@@ -26,8 +26,10 @@ import { getRecentProjects } from "./path-ui";
 import { APP_PREF_KEYS, getPref, getPrefJson, removePref, setPref, setPrefJson } from "@/lib/app-prefs";
 import { groupByProject } from "@/lib/project-group";
 import { clearDraft, listParkedNewSessionDrafts, subscribeParkedDrafts } from "@/lib/draft-store";
+import { rememberCwdProjectRoots, subscribeCwdProjectRoots } from "@/lib/cwd-project-roots";
 import {
   deriveSidebarDraftRows,
+  draftRowProjectRootFor,
   EMPTY_SIDEBAR_DRAFTS,
   mergeDraftSyntheticGroups,
   type SidebarDraftRowModel,
@@ -358,17 +360,36 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   }, [allSessions, chatWorkspaceCwd, knownChatCwd]);
   const selectedCwdIsChat = selectedCwd ? isChatCwd(selectedCwd) : false;
 
-  /** Resolve the project root for a cwd from the freshest data available */
-  const projectRootFor = useCallback((cwd: string | null): string | null => {
-    if (!cwd) return null;
-    if (isChatCwd(cwd)) return null;
+  /** The project root the loaded data attributes to a cwd, or null when this
+   *  selection's data does not identify it (a worktree without sessions is
+   *  only identified by its own project's worktree listing). An incomplete
+   *  session row must answer null, not the cwd: `allSessions` can carry a
+   *  partial shape, and reporting the cwd as a known root would stop a draft
+   *  row from falling back to the identity the server reported earlier. */
+  const serverProjectRootFor = useCallback((cwd: string): string | null => {
     if (worktreeState && worktreeState.forCwd === cwd) return worktreeState.projectRoot;
     // Any path in the loaded worktree list belongs to that project — covers
     // worktrees without sessions, so switching to them keeps the row mounted.
     if (worktreeState?.worktrees.some((w) => w.path === cwd)) return worktreeState.projectRoot;
     const match = allSessions.find((s) => s.cwd === cwd);
-    return match?.projectRoot ?? cwd;
-  }, [allSessions, isChatCwd, worktreeState]);
+    return match?.projectRoot ?? null;
+  }, [allSessions, worktreeState]);
+
+  /** Resolve the project root for a cwd from the freshest data available */
+  const projectRootFor = useCallback((cwd: string | null): string | null => {
+    if (!cwd) return null;
+    if (isChatCwd(cwd)) return null;
+    return serverProjectRootFor(cwd) ?? cwd;
+  }, [isChatCwd, serverProjectRootFor]);
+
+  /** Project root for a draft row: the loaded server identity, else the root
+   *  the server reported for this cwd earlier (a parked draft outlives the
+   *  selection that carried its identity), else the cwd itself. */
+  const draftProjectRootFor = useCallback((cwd: string | null): string | null => {
+    if (!cwd) return null;
+    if (isChatCwd(cwd)) return null;
+    return draftRowProjectRootFor(serverProjectRootFor(cwd), cwd);
+  }, [isChatCwd, serverProjectRootFor]);
   // Branch currently being checked out (name shown dimmed with a spinner)
   const [wtSwitchingBranch, setWtSwitchingBranch] = useState<string | null>(null);
   // Ticked by the poll/focus effect below so the worktree row reflects
@@ -486,6 +507,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   useEffect(() => (
     subscribeParkedDrafts(() => bumpParkedDrafts())
   ), []);
+  // A parked row's project comes from the remembered server identity, which
+  // another window can extend (it opened a worktree this window never saw).
+  // Re-render on that change, or the row keeps the grouping of a stale map.
+  useEffect(() => subscribeCwdProjectRoots(() => bumpParkedDrafts()), []);
   const parkedNewSessionDrafts = sessionsLoaded ? listParkedNewSessionDrafts() : [];
   const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
   const previousSuppressedCompletionSessionIdsRef = useRef<Set<string>>(new Set());
@@ -958,6 +983,27 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     return () => { cancelled = true; };
   }, [selectedCwd, selectedCwdIsChat, wtRefreshKey, refreshKey, wtPollTick]);
 
+  // Remember every cwd → project root the server reports (session rows and
+  // worktree listings). A parked draft's cwd has to keep its project identity
+  // once its listing is gone — after a project switch and after a reload. An
+  // incomplete row is skipped rather than remembered as "its own project", and
+  // chat cwds stay out (they are classified by `isChatCwd`, never by a project
+  // root).
+  useEffect(() => {
+    rememberCwdProjectRoots(
+      allSessions
+        .filter((session) => session.workspaceKind !== "chat")
+        .map((session) => [session.cwd, session.projectRoot] as const),
+    );
+  }, [allSessions]);
+  useEffect(() => {
+    if (!worktreeState) return;
+    rememberCwdProjectRoots([
+      [worktreeState.forCwd, worktreeState.projectRoot] as const,
+      ...worktreeState.worktrees.map((worktree) => [worktree.path, worktreeState.projectRoot] as const),
+    ]);
+  }, [worktreeState]);
+
   // Keep the worktree/branch display honest when branches are switched outside
   // pi (terminal, IDE, another client): poll while the tab is visible and
   // refresh on window focus. `git worktree list` is a cheap local op.
@@ -1338,7 +1384,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       groups: allProjects,
       selectedCwd,
       selectedSessionId,
-      projectRootFor,
+      projectRootFor: draftProjectRootFor,
       isChatCwd,
       archivedRoots: archivedProjectRoots,
     });
