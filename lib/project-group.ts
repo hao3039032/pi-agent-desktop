@@ -22,7 +22,7 @@ export interface ProjectGroup {
   branches: string[];
 }
 
-function basenameOf(path: string): string {
+export function basenameOf(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   const trimmed = normalized.replace(/\/+$/, "");
   if (!trimmed) return path;

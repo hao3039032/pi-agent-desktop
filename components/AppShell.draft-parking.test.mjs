@@ -35,7 +35,7 @@ const fireWindowEvent = (type) => {
 };
 
 const jiti = createJiti(import.meta.url, { tsconfigPaths: true });
-const draftStore = await jiti.import("../lib/draft-store.ts");
+const draftStore = await jiti.import("@/lib/draft-store");
 
 test.after(() => {
   delete globalThis.window;

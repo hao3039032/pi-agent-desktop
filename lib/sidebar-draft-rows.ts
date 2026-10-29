@@ -1,5 +1,5 @@
 import { parkedNewSessionDraftKey, type ChatDraft } from "./draft-store";
-import type { ProjectGroup } from "./project-group";
+import { basenameOf, type ProjectGroup } from "./project-group";
 
 /**
  * Pure projection of parked (and active) new-session drafts into sidebar rows.
@@ -75,14 +75,6 @@ function previewOf(draft: ChatDraft): string | null {
   return chars.length > DRAFT_ROW_PREVIEW_MAX_CHARS
     ? `${chars.slice(0, DRAFT_ROW_PREVIEW_MAX_CHARS).join("")}…`
     : firstLine;
-}
-
-function basenameOf(path: string): string {
-  const normalized = path.replace(/\\/g, "/");
-  const trimmed = normalized.replace(/\/+$/, "");
-  if (!trimmed) return path;
-  const idx = trimmed.lastIndexOf("/");
-  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
 }
 
 export function deriveSidebarDraftRows(input: {
