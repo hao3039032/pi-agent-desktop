@@ -13,7 +13,7 @@ import type { SystemPromptStatus } from "@/hooks/useAgentSession";
 import { AppNoticeShelf } from "./AppNoticeShelf";
 import { useScheduledRunNotifications } from "@/hooks/useScheduledRunNotifications";
 import type { ChatScrollPosition } from "@/lib/chat-scroll-position";
-import { clearDraft, flushDrafts, parkedNewSessionDraftKey, rekeyDraft } from "@/lib/draft-store";
+import { clearDraft, flushDrafts, parkedNewSessionDraftKey, parkDraftForPageHide, rekeyDraft, unparkDraftAfterPageRestore, type PageHideDraftPark } from "@/lib/draft-store";
 import { TabBar, type Tab } from "./TabBar";
 
 // Heavy, rarely-used surfaces are code-split out of the main bundle. The
@@ -1720,18 +1720,20 @@ export function AppShell() {
   // composer: park the active draft under its cwd and force the debounced
   // localStorage write to run synchronously. `pagehide` also covers the
   // Tauri shell's window close, where beforeunload is unreliable. A bfcache
-  // restore (`pageshow`) moves the parked snapshot back into the same active
-  // key — the composer never unmounted, its key is empty after the park, and
-  // the next switch-away is then a clean move instead of a merge that
-  // duplicates the text with its own copy.
+  // restore (`pageshow`) moves that same snapshot back into the active key and
+  // shows it in the composer — the next switch-away is then a clean move
+  // instead of a merge that duplicates the text with its own copy. A blank
+  // composer parks nothing, and a draft another window parked while this page
+  // was frozen stays in its own row (see `parkDraftForPageHide`).
   useEffect(() => {
-    let parkedOnHide: { key: string; cwd: string } | null = null;
+    let parkedOnHide: PageHideDraftPark | null = null;
     const parkActiveDraftOnHide = () => {
       const activeDraftKey = activeNewSessionDraftKeyRef.current;
       const activeDraftCwd = activeNewSessionCwdRef.current;
       if (activeDraftKey && activeDraftCwd) {
-        rekeyDraft(activeDraftKey, parkedNewSessionDraftKey(activeDraftCwd));
-        parkedOnHide = { key: activeDraftKey, cwd: activeDraftCwd };
+        // A second hide without a restore parks nothing (the key is already
+        // empty); keep the first park so the pending restore still runs.
+        parkedOnHide = parkDraftForPageHide(activeDraftKey, activeDraftCwd) ?? parkedOnHide;
       }
       flushDrafts();
     };
@@ -1739,10 +1741,13 @@ export function AppShell() {
       const parked = parkedOnHide;
       parkedOnHide = null;
       if (!parked) return;
-      // The frozen page cannot have navigated, but guard anyway: only take
-      // back the snapshot for the exact key it was parked from.
-      if (activeNewSessionDraftKeyRef.current !== parked.key) return;
-      rekeyDraft(parkedNewSessionDraftKey(parked.cwd), parked.key);
+      // Nothing to show the draft in: leave it parked. The sidebar row and the
+      // reload path still own it, while an active-key draft no composer
+      // displays would be overwritten by the next keystroke.
+      const composer = chatInputRef.current;
+      if (!composer) return;
+      const restored = unparkDraftAfterPageRestore(parked, activeNewSessionDraftKeyRef.current);
+      if (restored) composer.adoptStoredDraft(parked.activeKey);
     };
     window.addEventListener("pagehide", parkActiveDraftOnHide);
     window.addEventListener("pageshow", unparkAfterPageRestore);

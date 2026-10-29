@@ -183,6 +183,9 @@ export interface ChatInputHandle {
   addTextFiles: (files: File[]) => Promise<ChatAttachmentRejection[]>;
   focus: () => void;
   rekeyDraft: (previousKey: string, nextKey: string) => void;
+  /** Show exactly what the store holds under the composer's own draft key, for
+   *  the page-lifecycle restore (no merge, no re-key, no focus). */
+  adoptStoredDraft: (expectedDraftKey: string) => void;
   restoreSubmission: (text: string, images?: ChatDraftImage[], targetDraftKey?: string) => void;
 }
 
@@ -1057,6 +1060,30 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       });
       setAtQuery(null);
       setHistoryMenuOpen(false);
+    },
+    adoptStoredDraft(expectedDraftKey: string) {
+      // Page-lifecycle restore only: the store just moved a parked draft under
+      // this composer's own key, so the composer has to show it — a draft in
+      // the active key that nothing displays is overwritten by the next
+      // keystroke. Declined rather than cleared when the composer already moved
+      // to another key, or when nothing is stored for this one.
+      if (draftKeyRef.current !== expectedDraftKey || draftKey !== expectedDraftKey) return;
+      const draft = getDraft(expectedDraftKey);
+      if (!draft) return;
+      const images = draftImagesToAttachedImages(draft.images);
+      const files = draft.files ?? [];
+      valueRef.current = draft.value;
+      attachedImagesRef.current = images;
+      attachedFilesRef.current = files;
+      setAttachedFiles(files);
+      setValue(draft.value);
+      setAtQuery(null);
+      setHashQuery(null);
+      setHistoryMenuOpen(false);
+      setAttachedImages((current) => {
+        current.forEach(revokeImagePreview);
+        return images;
+      });
     },
     restoreSubmission(text: string, images?: ChatDraftImage[], targetDraftKey?: string) {
       // A queued or rejected message carries its files as markup; they return as attachments.

@@ -99,7 +99,7 @@ function mountComposer({ draftKey }) {
 test("AppShell parks the active draft with the store move this test replays", () => {
   // The park paths write parked-new:<cwd> and clear the active key through
   // lib/draft-store's rekeyDraft — the exact call the harness performs below.
-  assert.match(appShellSource, /import \{ clearDraft, flushDrafts, parkedNewSessionDraftKey, rekeyDraft \} from "@\/lib\/draft-store";/);
+  assert.match(appShellSource, /import \{[^}]*\bparkedNewSessionDraftKey\b[^}]*\brekeyDraft\b[^}]*\} from "@\/lib\/draft-store";/);
   assert.match(appShellSource, /rekeyDraft\(activeDraftKey, parkedNewSessionDraftKey\(activeDraftCwd\)\)/);
   assert.match(appShellSource, /rekeyDraft\(previousDraftKey, parkedNewSessionDraftKey\(previousDraftCwd\)\)/);
 });
@@ -255,4 +255,97 @@ test("the real handleCwdChange park leaves no orphan for the in-place composer",
   composer.switchTo(nextKey);
   assert.equal(draftStore.getDraft(activeKey), null, "no orphan new:* copy is written back");
   assert.equal(draftStore.getDraft(parkedKey)?.value, "unsent worktree draft");
+});
+
+/** The real `adoptStoredDraft()` body, run against the real store with the
+ *  component's refs and state setters replaced by observable stand-ins. Like
+ *  the harness above it is not a React render. */
+function adoptDraftSource() {
+  const start = source.indexOf("    adoptStoredDraft(expectedDraftKey: string) {");
+  assert.notEqual(start, -1, "adoptStoredDraft moved or was renamed");
+  const end = source.indexOf("\n    insertText(text: string) {", start);
+  assert.notEqual(end, -1, "adoptStoredDraft lost its following method");
+  return source.slice(start, end).replace(/,$/, "");
+}
+
+function runAdoptStoredDraft({ draftKey, nextStored }) {
+  const renders = { value: [], images: [], files: [] };
+  const context = vm.createContext({
+    ...draftStore,
+    draftKey,
+    draftKeyRef: { current: draftKey },
+    valueRef: { current: "shown before the restore" },
+    attachedImagesRef: { current: [] },
+    attachedFilesRef: { current: [] },
+    draftImagesToAttachedImages: (list) => (list ?? []).map((image) => ({ ...image })),
+    revokeImagePreview: () => {},
+    setAttachedFiles: (next) => {
+      context.attachedFilesRef.current = next;
+      renders.files.push(next);
+    },
+    setValue: (next) => {
+      context.valueRef.current = next;
+      renders.value.push(next);
+    },
+    setAtQuery: () => {},
+    setHashQuery: () => {},
+    setHistoryMenuOpen: () => {},
+    setAttachedImages: (update) => {
+      const next = update(context.attachedImagesRef.current);
+      context.attachedImagesRef.current = next;
+      renders.images.push(next);
+      return next;
+    },
+  });
+  vm.runInContext(stripTypeScriptTypes(`const handle = { ${adoptDraftSource()} }; handle`), context);
+  const handle = vm.runInContext("handle", context);
+  return { handle, context, renders, nextStored };
+}
+
+test("adoptStoredDraft shows exactly what the store holds for the composer's key", () => {
+  const activeKey = "new:adopt:/repo/wt-adopt";
+  draftStore.setDraft(activeKey, {
+    value: "merged text from the restore",
+    images: [{ data: "aW1n", mimeType: "image/png" }],
+    files: [{ id: "f1", name: "notes.txt", size: 2, text: "hi" }],
+  });
+  const { handle, context, renders } = runAdoptStoredDraft({ draftKey: activeKey });
+
+  handle.adoptStoredDraft(activeKey);
+
+  // The next keystroke persists these refs, so they must match the store or the
+  // restored text would be overwritten.
+  assert.equal(context.valueRef.current, "merged text from the restore");
+  assert.deepEqual(renders.value, ["merged text from the restore"]);
+  assert.deepEqual(context.attachedImagesRef.current, [{ data: "aW1n", mimeType: "image/png" }]);
+  assert.deepEqual(context.attachedFilesRef.current, [{ id: "f1", name: "notes.txt", size: 2, text: "hi" }]);
+  // No re-key, no focus, no session: the draft key is untouched.
+  assert.equal(context.draftKeyRef.current, activeKey);
+  draftStore.clearDraft(activeKey);
+});
+
+test("adoptStoredDraft declines a key the composer already left, and never clears the input", () => {
+  const activeKey = "new:adopt-moved:/repo/wt-moved";
+  draftStore.setDraft(activeKey, { value: "belongs to another key now", images: [] });
+  const { handle, context, renders } = runAdoptStoredDraft({ draftKey: "new:adopt-current:/repo/wt-cur" });
+
+  handle.adoptStoredDraft(activeKey);
+
+  assert.equal(context.valueRef.current, "shown before the restore", "the input is untouched");
+  assert.deepEqual(renders.value, [], "no state update");
+
+  // A key with nothing stored for it is declined too, not cleared.
+  const empty = runAdoptStoredDraft({ draftKey: "new:adopt-nothing:/repo/wt-none" });
+  empty.handle.adoptStoredDraft("new:adopt-nothing:/repo/wt-none");
+  assert.equal(empty.context.valueRef.current, "shown before the restore");
+  assert.deepEqual(empty.renders.value, []);
+  draftStore.clearDraft(activeKey);
+});
+
+test("AppShell's restore hands the moved draft to the composer's adopt path", () => {
+  // The store move alone is not the fix: a draft under the active key that no
+  // composer displays is overwritten by the next keystroke. Pinned so a future
+  // edit cannot drop the display half.
+  assert.match(appShellSource, /unparkDraftAfterPageRestore\(parked, activeNewSessionDraftKeyRef\.current\)/);
+  assert.match(appShellSource, /composer\.adoptStoredDraft\(parked\.activeKey\)/);
 });

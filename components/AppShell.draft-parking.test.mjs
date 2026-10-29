@@ -50,7 +50,12 @@ const handlerBody = (name, endMarker) => {
 };
 
 test("the parked-new key spelling lives in the draft store, not in AppShell", () => {
-  assert.match(source, /import \{ clearDraft, flushDrafts, parkedNewSessionDraftKey, rekeyDraft \} from "@\/lib\/draft-store";/);
+  // Every park/unpark path — the page-lifecycle pair included — goes through
+  // the store's key spelling and store-owned park token.
+  assert.match(
+    source,
+    /import \{[^}]*\bparkedNewSessionDraftKey\b[^}]*\bparkDraftForPageHide\b[^}]*\bunparkDraftAfterPageRestore\b[^}]*\} from "@\/lib\/draft-store";/,
+  );
   // A local redefinition is exactly the spelling drift this extraction kills.
   assert.doesNotMatch(source, /function parkedNewSessionDraftKey/);
 });
@@ -127,10 +132,30 @@ test("the initial ?cwd adoption runs against the real store and consumes the par
   draftStore.clearDraft(activeKey);
 });
 
+const DRAFTS_STORAGE_KEY = "pi-chat-drafts-v1";
+// The store's cross-window path is the `storage` listener it installs with its
+// first subscriber; a parked draft another window wrote reaches this page
+// exactly that way (not through setDraft, which marks the key as this page's).
+draftStore.subscribeParkedDrafts(() => {});
+const writeParkedDraftFromOtherWindow = (key, value) => {
+  const snapshot = JSON.parse(storage.get(DRAFTS_STORAGE_KEY) ?? "{}");
+  snapshot[key] = { value, images: [] };
+  const newValue = JSON.stringify(snapshot);
+  storage.set(DRAFTS_STORAGE_KEY, newValue);
+  for (const handler of [...(listeners.get("storage") ?? [])]) {
+    handler({ key: DRAFTS_STORAGE_KEY, storageArea: globalThis.window.localStorage, newValue });
+  }
+};
+
 /** Behavioral harness: run the real pagehide/pageshow handler bodies against
  *  the real lib/draft-store, with addEventListener captured so the tests can
- *  fire the exact browser events the component registers. */
-function runPageLifecycleEffect() {
+ *  fire the exact browser events the component registers. A test represents
+ *  one mounted AppShell, so the previous test's handlers are unregistered.
+ *  `composer` stands in for `chatInputRef.current`; it records the
+ *  `adoptStoredDraft()` calls the effect makes. */
+function runPageLifecycleEffect({ composer = null } = {}) {
+  listeners.delete("pagehide");
+  listeners.delete("pageshow");
   const effectStart = source.indexOf("// Closing the window (or tab, or reloading) must not lose an unsent");
   const effectEnd = source.indexOf("const showChat = selectedSession", effectStart);
   assert.notEqual(effectStart, -1, "pagehide effect comment not found");
@@ -142,13 +167,21 @@ function runPageLifecycleEffect() {
     useEffect: (body) => body(),
     activeNewSessionDraftKeyRef: { current: null },
     activeNewSessionCwdRef: { current: null },
+    chatInputRef: { current: composer },
   });
   vm.runInContext(stripTypeScriptTypes(source.slice(effectStart, effectEnd)), context);
-  return vm.runInContext("({ key: activeNewSessionDraftKeyRef, cwd: activeNewSessionCwdRef })", context);
+  const refs = vm.runInContext("({ key: activeNewSessionDraftKeyRef, cwd: activeNewSessionCwdRef })", context);
+  return { ...refs, composer };
+}
+
+/** A mounted composer stand-in: it records which key it was asked to adopt. */
+function mountedComposer() {
+  return { adopted: [], adoptStoredDraft(key) { this.adopted.push(key); } };
 }
 
 test("pagehide→pageshow moves the draft back without duplicating or losing it", () => {
-  const refs = runPageLifecycleEffect();
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
   const activeKey = "new:initial:/proj/a";
   const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/a");
 
@@ -166,6 +199,7 @@ test("pagehide→pageshow moves the draft back without duplicating or losing it"
   fireWindowEvent("pageshow");
   assert.equal(draftStore.getDraft(parkedKey), null, "no parked copy survives the restore");
   assert.equal(draftStore.getDraft(activeKey)?.value, "unsent text", "the active key holds the text again");
+  assert.deepEqual(composer.adopted, [activeKey], "the composer shows the restored text");
 
   // Switch away without editing: a clean move, no self-merge duplication.
   draftStore.rekeyDraft(activeKey, parkedKey);
@@ -175,7 +209,8 @@ test("pagehide→pageshow moves the draft back without duplicating or losing it"
 });
 
 test("pagehide→pageshow→edit→switch away does not duplicate the draft", () => {
-  const refs = runPageLifecycleEffect();
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
   const activeKey = "new:id-1:/proj/b";
   const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/b");
 
@@ -208,13 +243,19 @@ test("pageshow without a matching hide, or after the key moved on, restores noth
 
   // And a pageshow whose active key moved on (navigation between hide and
   // show) takes back nothing: the guard compares the recorded key.
+  const otherParkedKey = draftStore.parkedNewSessionDraftKey("/proj/z");
   refs.key.current = "new:other:/proj/z";
   refs.cwd.current = "/proj/z";
+  draftStore.setDraft("new:other:/proj/z", { value: "typed before the move", images: [] });
   fireWindowEvent("pagehide");
+  assert.equal(draftStore.getDraft(otherParkedKey)?.value, "typed before the move");
   refs.key.current = "new:moved:/proj/z";
   fireWindowEvent("pageshow");
-  assert.equal(draftStore.getDraft(parkedKey)?.value, "survivor", "moved-on key is left parked");
+  assert.equal(draftStore.getDraft(otherParkedKey)?.value, "typed before the move", "moved-on key is left parked");
+  assert.equal(draftStore.getDraft("new:moved:/proj/z"), null, "the new key claims nothing");
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "survivor");
   draftStore.clearDraft(parkedKey);
+  draftStore.clearDraft(otherParkedKey);
 });
 
 test("the active draft's cwd is tracked beside its key at every assignment", () => {
@@ -315,4 +356,291 @@ test("handleSessionDeleted runs against the real store and restores the parked d
   assert.equal(draftStore.getDraft(activeKey)?.value, "parked before delete");
   assert.equal(context.activeNewSessionCwdRef.current, "/proj/deleted");
   draftStore.clearDraft(activeKey);
+});
+
+test("an empty composer's pagehide does not hand another window's parked draft to the active key", () => {
+  // Repro: this page's composer is blank for /proj/shared while another window
+  // parks a draft for the same cwd. The blank composer parks nothing, so a
+  // bfcache restore must not move that draft into this page's active key — no
+  // composer reads it there, and the next keystroke would overwrite it.
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:empty:/proj/shared";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/shared");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/shared";
+
+  writeParkedDraftFromOtherWindow(parkedKey, "another window's draft");
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "another window's draft");
+
+  fireWindowEvent("pagehide");
+  fireWindowEvent("pageshow");
+
+  assert.equal(draftStore.getDraft(activeKey), null, "the blank composer's key stays empty");
+  assert.equal(
+    draftStore.getDraft(parkedKey)?.value,
+    "another window's draft",
+    "the other window's parked draft is left where the sidebar shows it",
+  );
+  assert.deepEqual(composer.adopted, [], "a blank composer adopts nothing");
+  draftStore.clearDraft(parkedKey);
+});
+
+test("a pagehide with text already parked elsewhere keeps both texts reloadable", () => {
+  // The occupied-slot case: the park keeps the merge `rekeyDraft()` performs,
+  // so a reload finds the whole text under parked-new:<cwd>.
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:mine:/proj/occupied";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/occupied");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/occupied";
+
+  draftStore.setDraft(activeKey, { value: "this page's text", images: [] });
+  writeParkedDraftFromOtherWindow(parkedKey, "the other window's text");
+
+  fireWindowEvent("pagehide");
+  const parked = draftStore.getDraft(parkedKey)?.value ?? "";
+  assert.ok(parked.includes("the other window's text"), "the other window's text survives the park");
+  assert.ok(parked.includes("this page's text"), "this page's text is parked too, so a reload restores it");
+  assert.equal(draftStore.getDraft(activeKey), null);
+
+  // The reload path reads exactly this key.
+  assert.equal(
+    draftStore.getDraft(draftStore.parkedNewSessionDraftKey("/proj/occupied"))?.value,
+    parked,
+    "a reload restores the parked text",
+  );
+
+  fireWindowEvent("pageshow");
+  assert.equal(draftStore.getDraft(parkedKey), null, "one copy: the parked slot is emptied");
+  assert.equal(draftStore.getDraft(activeKey)?.value, parked, "the merged text comes back under the active key");
+  assert.deepEqual(composer.adopted, [activeKey], "the composer is told to show what the store now holds");
+  draftStore.clearDraft(activeKey);
+});
+
+test("a restored merged draft is shown, and editing it keeps the other window's text", () => {
+  // The restore must leave the composer and the store agreeing, or the next
+  // keystroke overwrites the text the composer never displayed.
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:visible:/proj/visible";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/visible");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/visible";
+
+  draftStore.setDraft(activeKey, { value: "mine", images: [] });
+  writeParkedDraftFromOtherWindow(parkedKey, "theirs");
+  fireWindowEvent("pagehide");
+  fireWindowEvent("pageshow");
+
+  // The composer adopts the stored draft (asserted through the real imperative
+  // method below); the following edit persists over the same content, so the
+  // merged text stays intact and is not duplicated.
+  const adopted = draftStore.getDraft(activeKey).value;
+  draftStore.setDraft(activeKey, { value: `${adopted} edited`, images: [] });
+  draftStore.rekeyDraft(activeKey, parkedKey);
+  const afterEdit = draftStore.getDraft(parkedKey).value;
+  assert.ok(afterEdit.includes("theirs") && afterEdit.includes("mine"));
+  assert.equal(afterEdit.match(/theirs/g).length, 1, "the other window's text is not duplicated");
+  assert.equal(afterEdit.match(/mine/g).length, 1);
+  draftStore.clearDraft(parkedKey);
+});
+
+test("a parked draft another window rewrote while the page was frozen keeps both sides", () => {
+  // The slot belongs to the other window now, so this page re-states its own
+  // text under its active key instead of consuming it.
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:frozen:/proj/frozen";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/frozen");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/frozen";
+
+  draftStore.setDraft(activeKey, { value: "parked before the freeze", images: [] });
+  fireWindowEvent("pagehide");
+  assert.equal(draftStore.getDraft(activeKey), null);
+
+  writeParkedDraftFromOtherWindow(parkedKey, "rewritten while frozen");
+  fireWindowEvent("pageshow");
+
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "rewritten while frozen", "their draft stays parked");
+  assert.equal(
+    draftStore.getDraft(activeKey)?.value,
+    "parked before the freeze",
+    "this page's text comes back under its own key, so nothing is lost on reload",
+  );
+  assert.deepEqual(composer.adopted, [activeKey], "the composer shows what the store holds");
+  draftStore.clearDraft(parkedKey);
+  draftStore.clearDraft(activeKey);
+});
+
+test("a parked draft deleted while the page was frozen still restores this page's text", () => {
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:deleted:/proj/deleted";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/deleted");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/deleted";
+
+  draftStore.setDraft(activeKey, { value: "keep me", images: [] });
+  fireWindowEvent("pagehide");
+  draftStore.clearDraft(parkedKey);
+  fireWindowEvent("pageshow");
+
+  assert.equal(draftStore.getDraft(activeKey)?.value, "keep me", "the text is recoverable again");
+  assert.equal(draftStore.getDraft(parkedKey), null, "nothing is resurrected under the parked key");
+  draftStore.clearDraft(activeKey);
+});
+
+test("a bfcache round trip keeps attached files and images through the park", () => {
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:memory:/proj/memory";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/memory");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/memory";
+
+  const draft = {
+    value: "text with attachments",
+    images: [{ data: "aGk=", mimeType: "image/png" }],
+    files: [{ id: "f1", name: "notes.txt", size: 2, text: "hi" }],
+  };
+  draftStore.setDraft(activeKey, draft);
+
+  fireWindowEvent("pagehide");
+  assert.equal(draftStore.getDraft(parkedKey)?.files?.[0]?.text, "hi", "files survive the park");
+  fireWindowEvent("pageshow");
+
+  const restored = draftStore.getDraft(activeKey);
+  assert.equal(restored?.value, "text with attachments");
+  assert.deepEqual(restored?.images, [{ data: "aGk=", mimeType: "image/png" }]);
+  assert.deepEqual(restored?.files, [{ id: "f1", name: "notes.txt", size: 2, text: "hi" }]);
+  assert.equal(draftStore.getDraft(parkedKey), null, "nothing is left behind under the parked key");
+  assert.deepEqual(composer.adopted, [activeKey], "the restored attachments are shown");
+  draftStore.clearDraft(activeKey);
+});
+
+test("consecutive pagehide/pageshow cycles keep one copy of the draft", () => {
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:twice:/proj/twice";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/twice");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/twice";
+  draftStore.setDraft(activeKey, { value: "once", images: [] });
+
+  for (const expected of ["once", "once"]) {
+    fireWindowEvent("pagehide");
+    fireWindowEvent("pageshow");
+    assert.equal(draftStore.getDraft(activeKey)?.value, expected);
+    assert.equal(draftStore.getDraft(parkedKey), null, "no parked residue between cycles");
+  }
+  draftStore.rekeyDraft(activeKey, parkedKey);
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "once", "switching away afterwards parks one copy");
+  assert.deepEqual(composer.adopted, [activeKey, activeKey], "each restore showed the draft it moved back");
+  draftStore.clearDraft(parkedKey);
+});
+
+test("a restore with no mounted composer leaves the draft parked and recoverable", () => {
+  // Without a composer the restored text would sit in a key nothing displays:
+  // the sidebar row and the reload path keep owning it instead.
+  const refs = runPageLifecycleEffect();
+  const activeKey = "new:unmounted:/proj/unmounted";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/unmounted");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/unmounted";
+
+  draftStore.setDraft(activeKey, { value: "no composer to show it", images: [] });
+  fireWindowEvent("pagehide");
+  fireWindowEvent("pageshow");
+
+  assert.equal(draftStore.getDraft(activeKey), null, "no invisible active-key draft is created");
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "no composer to show it", "it stays parked and reloadable");
+  draftStore.clearDraft(parkedKey);
+});
+
+test("a restored draft's edit, send and switch-away leave another window's draft alone", () => {
+  const composer = mountedComposer();
+  const refs = runPageLifecycleEffect({ composer });
+  const activeKey = "new:legit:/proj/legit";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/legit");
+  const otherParkedKey = draftStore.parkedNewSessionDraftKey("/proj/elsewhere");
+  refs.key.current = activeKey;
+  refs.cwd.current = "/proj/legit";
+
+  writeParkedDraftFromOtherWindow(otherParkedKey, "other project's draft");
+  draftStore.setDraft(activeKey, { value: "mine", images: [] });
+  fireWindowEvent("pagehide");
+  fireWindowEvent("pageshow");
+  assert.equal(draftStore.getDraft(activeKey)?.value, "mine");
+
+  // The user keeps typing, then switches away: a clean single-copy park.
+  draftStore.setDraft(activeKey, { value: "mine, edited", images: [] });
+  draftStore.rekeyDraft(activeKey, parkedKey);
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "mine, edited");
+  assert.equal(draftStore.getDraft(otherParkedKey)?.value, "other project's draft");
+  draftStore.clearDraft(parkedKey);
+
+  // Sending clears the restored draft without resurrecting a parked copy.
+  fireWindowEvent("pagehide");
+  fireWindowEvent("pageshow");
+  draftStore.clearDraft(activeKey);
+  assert.equal(draftStore.getDraft(parkedKey), null, "a sent draft leaves no parked residue");
+  assert.equal(draftStore.getDraft(otherParkedKey)?.value, "other project's draft");
+  draftStore.clearDraft(otherParkedKey);
+});
+
+test("the page lifecycle park owns exactly the snapshot it left", () => {
+  // Store-level: the token is only honoured while the composer is still on its
+  // key and the parked slot still holds what the park left; a slot another
+  // window rewrote keeps that window's draft and returns this page's own text.
+  const activeKey = "new:token:/proj/token";
+  const parkedKey = draftStore.parkedNewSessionDraftKey("/proj/token");
+  assert.equal(draftStore.parkDraftForPageHide(activeKey, "/proj/token"), null, "an empty composer parks nothing");
+
+  draftStore.setDraft(activeKey, { value: "token text", images: [] });
+  const park = draftStore.parkDraftForPageHide(activeKey, "/proj/token");
+  assert.ok(park, "a non-empty composer parks");
+  assert.equal(park.own.value, "token text", "the token records what the composer displayed");
+  assert.equal(draftStore.getDraft(activeKey), null);
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "token text");
+
+  const occupied = draftStore.parkDraftForPageHide(activeKey, "/proj/token");
+  assert.equal(occupied, null, "an empty active key parks nothing on a second hide");
+
+  assert.equal(draftStore.unparkDraftAfterPageRestore(park, "new:other:/proj/token"), null, "moved-on key");
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "token text");
+  assert.equal(draftStore.unparkDraftAfterPageRestore(park, activeKey)?.value, "token text");
+  assert.equal(draftStore.getDraft(activeKey)?.value, "token text");
+  assert.equal(draftStore.getDraft(parkedKey), null);
+
+  // A rewrite while the page was frozen: the other window keeps its row, this
+  // page's own text returns under its own key.
+  const second = draftStore.parkDraftForPageHide(activeKey, "/proj/token");
+  assert.ok(second);
+  draftStore.setDraft(parkedKey, { value: "someone else's text", images: [] });
+  assert.equal(draftStore.unparkDraftAfterPageRestore(second, activeKey)?.value, "token text");
+  assert.equal(draftStore.getDraft(activeKey)?.value, "token text");
+  assert.equal(draftStore.getDraft(parkedKey)?.value, "someone else's text", "their draft is untouched");
+  draftStore.clearDraft(parkedKey);
+
+  // A deletion while frozen is the same case: nothing is resurrected under the
+  // parked key, this page's text comes back.
+  const third = draftStore.parkDraftForPageHide(activeKey, "/proj/token");
+  assert.ok(third);
+  draftStore.clearDraft(parkedKey);
+  assert.equal(draftStore.unparkDraftAfterPageRestore(third, activeKey)?.value, "token text");
+  assert.equal(draftStore.getDraft(activeKey)?.value, "token text");
+  assert.equal(draftStore.getDraft(parkedKey), null);
+
+  // The active key holding a draft this page did not leave is not replaced.
+  draftStore.setDraft(activeKey, { value: "token text", images: [] });
+  const fourth = draftStore.parkDraftForPageHide(activeKey, "/proj/token");
+  assert.ok(fourth);
+  draftStore.setDraft(activeKey, { value: "a different draft took this key", images: [] });
+  assert.equal(draftStore.unparkDraftAfterPageRestore(fourth, activeKey), null);
+  assert.equal(draftStore.getDraft(activeKey)?.value, "a different draft took this key");
+  draftStore.clearDraft(activeKey);
+  draftStore.clearDraft(parkedKey);
 });

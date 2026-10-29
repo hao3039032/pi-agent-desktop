@@ -76,6 +76,33 @@ orphaned it (see below). Drafts now have a sidebar presence:
   next switch-away cannot merge the draft with its own copy. A reload
   (no bfcache) instead consumes `parked-new:<cwd>` through the initial
   `?cwd` validation path, so the composer comes back with its text.
+  Both halves are one store-owned park token
+  (`parkDraftForPageHide()` → `PageHideDraftPark` → `unparkDraftAfterPageRestore()`
+  in `lib/draft-store.ts`), because a restored draft must land where the
+  composer actually shows it: a draft written to the active key while no
+  composer displays it is overwritten by the next keystroke.
+  - `parkDraftForPageHide()` parks a **non-empty** composer with the same
+    `rekeyDraft()` move every other park path uses, including its merge into an
+    already-parked draft — so a reload still finds the whole text under
+    `parked-new:<cwd>`. A **blank** composer parks nothing: a blank composer's
+    `pagehide` used to record a park anyway, and the restore then pulled that
+    cwd's parked draft (possibly another window's) into an empty composer's
+    active key.
+  - The token records what the park left (`parked`) and what the composer
+    displayed (`own`). `unparkDraftAfterPageRestore()` moves the parked slot
+    back to the active key — as one draft, never merged twice — while the
+    composer is still on that key and the slot still holds that content, then
+    returns it so `AppShell` shows it through the composer's
+    `adoptStoredDraft()` (same text, images and files the store holds; no
+    re-key, no focus, no session). Attached files and images travel through the
+    move (`draftsEqual` compares them).
+  - A slot another window rewrote or deleted while this page was frozen is left
+    in that window's row, and this page's own text goes back under its active
+    key instead: nothing is fused twice and neither side loses text. When the
+    composer is not mounted (or already moved to another key) the restore
+    declines and the draft stays parked, where the sidebar row and the reload
+    path still own it. A second `pagehide` without a restore keeps the first
+    token.
 - Cross-window sync is parked-key-only and conflict-scoped: the `storage`
   listener adopts remote adds/updates and mirrors remote deletes for parked
   keys whose local copy is committed (persisted); keys with unsaved local

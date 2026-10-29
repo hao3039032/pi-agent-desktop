@@ -366,6 +366,80 @@ export function restoreDraftSubmission(
   return restored;
 }
 
+/** True when two drafts carry identical content: the text, the images in
+ *  order and the page-lifetime files. Used to tell this page's own parked
+ *  snapshot from one another window wrote or changed. */
+function draftsEqual(a: ChatDraft, b: ChatDraft): boolean {
+  if (a.value !== b.value || a.images.length !== b.images.length) return false;
+  const imagesEqual = a.images.every((image, index) =>
+    image.data === b.images[index].data && image.mimeType === b.images[index].mimeType);
+  if (!imagesEqual) return false;
+  const aFiles = a.files ?? [];
+  const bFiles = b.files ?? [];
+  if (aFiles.length !== bFiles.length) return false;
+  return aFiles.every((file, index) => {
+    const other = bFiles[index];
+    return file.id === other.id && file.name === other.name
+      && file.size === other.size && file.text === other.text;
+  });
+}
+
+/** What one `pagehide` moved out of the mounted composer, for the bfcache
+ *  round trip `unparkDraftAfterPageRestore()` undoes — and for nothing else. */
+export interface PageHideDraftPark {
+  activeKey: string;
+  parkedKey: string;
+  /** What this page's composer displays. */
+  own: ChatDraft;
+  /** What the parked slot held right after the park: `own` merged into any
+   *  draft another window had left there. */
+  parked: ChatDraft;
+}
+
+/** Park the mounted composer's draft under its cwd for a close, reload or
+ *  bfcache round trip, and describe that park. A blank composer parks nothing,
+ *  so a draft another window left in that cwd is never attributed to this page.
+ *  An occupied slot keeps the merge `rekeyDraft()` already performs: the whole
+ *  text has to sit under `parked-new:<cwd>`, which is what a reload reads. */
+export function parkDraftForPageHide(activeKey: string, cwd: string): PageHideDraftPark | null {
+  const own = getDraft(activeKey);
+  if (!own) return null;
+  const parkedKey = parkedNewSessionDraftKey(cwd);
+  rekeyDraft(activeKey, parkedKey);
+  const parked = getDraft(parkedKey);
+  return parked ? { activeKey, parkedKey, own, parked } : null;
+}
+
+/** Undo a `parkDraftForPageHide()` after a bfcache restore. Returns the draft
+ *  that now sits under the active key — the caller has to show it in the
+ *  composer, because a draft no composer displays is overwritten by the next
+ *  keystroke — or null when nothing moved.
+ *
+ *  A parked slot still holding exactly what the park left belongs to this page:
+ *  it moves back as one draft (`own` plus whatever the slot already had), the
+ *  same single copy a reload restores. A slot another window rewrote or deleted
+ *  while this page was frozen belongs to that window now, so it is left where
+ *  its sidebar row shows it and this page's own text goes back under its active
+ *  key instead — the composer keeps what it displays, nothing is fused twice,
+ *  and neither side loses text. */
+export function unparkDraftAfterPageRestore(
+  park: PageHideDraftPark,
+  currentActiveKey: string | null,
+): ChatDraft | null {
+  if (currentActiveKey !== park.activeKey) return null;
+  const active = getDraft(park.activeKey);
+  // The key holds a draft this page did not leave there: not ours to replace.
+  if (active && !draftsEqual(active, park.own)) return null;
+  const parked = getDraft(park.parkedKey);
+  if (parked && draftsEqual(parked, park.parked)) {
+    clearDraft(park.parkedKey);
+    setDraft(park.activeKey, parked);
+    return parked;
+  }
+  if (!active) setDraft(park.activeKey, park.own);
+  return park.own;
+}
+
 export function rekeyDraft(
   previousKey: string,
   nextKey: string,
