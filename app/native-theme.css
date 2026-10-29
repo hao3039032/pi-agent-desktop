@@ -2541,6 +2541,114 @@ html.dark .sidebar-view-switcher-thumb {
   color: var(--text);
 }
 
+/* Unsent-draft rows (parked drafts and the active new-session composer).
+   Same geometry and tokens as the session rows beside them: 28px tall,
+   10px inset, rounded, hover reuses --bg-hover. The active row uses
+   --sidebar-selected — the fill the selected session row actually renders
+   (its rule overrides the inline --bg-selected) — background only, no
+   accent stripe (`.session-item.is-selected` pins `box-shadow: none`). */
+.sidebar-draft-row {
+  display: flex;
+  align-items: center;
+  width: calc(100% - 20px);
+  height: 28px;
+  margin: 2px 10px;
+  padding: 0 7px 0 11px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  gap: 6px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.sidebar-draft-row:hover {
+  background: var(--bg-hover);
+}
+
+.sidebar-draft-row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.sidebar-draft-row.is-active {
+  background: var(--sidebar-selected);
+  box-shadow: none;
+}
+
+.sidebar-draft-row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.sidebar-draft-row-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 12%, transparent);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* The badge yields its trailing slot to the discard "×" while the row is
+   hovered or focused, so the title never reflows. */
+.sidebar-draft-row .sidebar-draft-row-discard {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.sidebar-draft-row .sidebar-draft-row-discard:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.sidebar-draft-row .sidebar-draft-row-discard:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.sidebar-draft-row:hover .sidebar-draft-row-discard,
+.sidebar-draft-row:focus-within .sidebar-draft-row-discard {
+  display: inline-flex;
+}
+
+.sidebar-draft-row:hover .sidebar-draft-row-badge,
+.sidebar-draft-row:focus-within .sidebar-draft-row-badge {
+  display: none;
+}
+
+@media (hover: none) {
+  .sidebar-draft-row .sidebar-draft-row-badge {
+    display: none;
+  }
+  .sidebar-draft-row .sidebar-draft-row-discard {
+    display: inline-flex;
+  }
+}
+
 /* Keep project and session rows aligned; their folder/chat icons provide the
    visual distinction instead of a large tree indent. */
 .sidebar-project-tree-children .session-item {

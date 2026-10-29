@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useLayoutEffect, useState, useCallback, useRef, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useState, useCallback, useRef, useReducer, type ReactNode } from "react";
 import type { SessionInfo, SessionWorkspaceKind } from "@/lib/types";
 import { listSessionFamilies } from "@/lib/session-family";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
@@ -25,6 +25,13 @@ import { useProjectWorktreeActions } from "@/hooks/useProjectWorktreeActions";
 import { getRecentProjects } from "./path-ui";
 import { APP_PREF_KEYS, getPref, getPrefJson, removePref, setPref, setPrefJson } from "@/lib/app-prefs";
 import { groupByProject } from "@/lib/project-group";
+import { clearDraft, listParkedNewSessionDrafts, subscribeParkedDrafts } from "@/lib/draft-store";
+import {
+  deriveSidebarDraftRows,
+  EMPTY_SIDEBAR_DRAFTS,
+  mergeDraftSyntheticGroups,
+  type SidebarDraftRowModel,
+} from "@/lib/sidebar-draft-rows";
 import { getProjectDisplayName, getProjectDisplayNames } from "@/lib/project-display";
 import { notifyDesktop } from "@/lib/desktop-notify";
 import { revealItemInDirNative } from "@/lib/desktop-native";
@@ -71,6 +78,11 @@ interface Props {
     workspaceKind?: SessionWorkspaceKind,
   ) => void;
   onChatWorkspaceCwdChange?: (cwd: string | null) => void;
+  /** A cwd the shell's own server round-trips (URL `?cwd` validation, the
+   *  chat-workspace probe) have explicitly classified as a chat workspace.
+   *  Exact-match only: it never labels a different cwd. Lets the sidebar
+   *  classify the active new-session row before the session list loads. */
+  knownChatCwd?: string | null;
   onOpenTerminal?: (cwd: string) => void;
   /** Fired when a session that is not currently selected finishes running.
    *  Lets the app play a cross-workspace completion tone. */
@@ -81,6 +93,8 @@ interface Props {
   headerControls?: ReactNode;
   /** Opens the Scheduled page; the row under New Session is absent without it. */
   onOpenScheduled?: () => void;
+  /** Focus the active composer; the active new-session draft row's click. */
+  onFocusComposer?: () => void;
   scheduledOpen?: boolean;
 }
 
@@ -265,7 +279,7 @@ function readIdSetPref(key: Parameters<typeof getPrefJson>[0]): Set<string> {
     : new Set();
 }
 
-export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onChatWorkspaceCwdChange, onProjectsChange, onBackgroundTaskDone, onRunningSessionIdsChange, onSessionsChange, headerControls, onOpenTerminal, onOpenScheduled, scheduledOpen = false }: Props) {
+export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onChatWorkspaceCwdChange, knownChatCwd, onProjectsChange, onBackgroundTaskDone, onRunningSessionIdsChange, onSessionsChange, headerControls, onOpenTerminal, onOpenScheduled, onFocusComposer, scheduledOpen = false }: Props) {
   const { t } = useI18n();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
   const [chatWorkspaceCwd, setChatWorkspaceCwd] = useState<string | null>(null);
@@ -289,6 +303,13 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const sessionLoadIdRef = useRef(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // True once any /api/sessions load has succeeded. Parked-draft rows need the
+  // server's chat identity (the chat root / chat session list) before their
+  // cwds can be classified — a parked chat draft rendered before that would
+  // surface as a bogus project group. The active new-session row is instead
+  // classified through `knownChatCwd` (the shell's own validation answers), so
+  // a project cwd stays visible immediately even while the list is slow.
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [selectedCwd, setSelectedCwd] = useState<string | null>(null);
   const [homeDir, setHomeDir] = useState<string>("");
   // On macOS the native traffic lights float over this header. The mac-inset
@@ -325,12 +346,16 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const currentWorktreePath = currentWorktree?.path ?? null;
 
   /** Chat detection always comes from server-provided identity or the exact
-   *  chat cwd the server returned. The browser never derives the hidden path. */
+   *  chat cwd the server returned. The browser never derives the hidden path.
+   *  The shell-known cwd (`knownChatCwd`) covers the gap between the initial
+   *  `?cwd` validation resolving and this sidebar's own list load: without it
+   *  a chat cwd would briefly synthesize a project group for its active row. */
   const isChatCwd = useCallback((cwd: string | null): boolean => {
     if (!cwd) return false;
+    if (knownChatCwd && cwd === knownChatCwd) return true;
     if (chatWorkspaceCwd && cwd === chatWorkspaceCwd) return true;
     return allSessions.some((session) => session.workspaceKind === "chat" && session.cwd === cwd);
-  }, [allSessions, chatWorkspaceCwd]);
+  }, [allSessions, chatWorkspaceCwd, knownChatCwd]);
   const selectedCwdIsChat = selectedCwd ? isChatCwd(selectedCwd) : false;
 
   /** Resolve the project root for a cwd from the freshest data available */
@@ -450,6 +475,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [continueChat, setContinueChat] = useState<SessionInfo | null>(null);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
+  // Parked new-session drafts ("parked-new:<cwd>" keys) are re-read from the
+  // draft store's in-memory map on each render; this bump is what triggers
+  // those re-renders when one is parked, restored, cleared — or written by
+  // another window of the same app. Gated on the first successful session
+  // list load (see `sessionsLoaded`) so unclassified chat cwds never render as
+  // project rows; this also keeps the server and client first paint identical
+  // (both start with no rows).
+  const [, bumpParkedDrafts] = useReducer((tick: number) => tick + 1, 0);
+  useEffect(() => (
+    subscribeParkedDrafts(() => bumpParkedDrafts())
+  ), []);
+  const parkedNewSessionDrafts = sessionsLoaded ? listParkedNewSessionDrafts() : [];
   const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
   const previousSuppressedCompletionSessionIdsRef = useRef<Set<string>>(new Set());
   // Once polling has delivered a snapshot it is the source of truth for
@@ -490,6 +527,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       };
       if (loadId !== sessionLoadIdRef.current) return;
       sessionListVersionRef.current = data.sessionListVersion;
+      setSessionsLoaded(true);
       setAllSessions(data.sessions);
       setChatWorkspaceCwd(data.chatWorkspaceCwd ?? null);
       // Treat the fetched running set as an initial fallback only. Once the
@@ -1287,7 +1325,27 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     : orderedChatFamilies.filter((family) => archivedChats.has(family.root.id));
   const sessionFamilies = listSessionFamilies(projectSessions);
   const allProjects = groupByProject(projectSessions, { runningIds: runningSessionIds, unreadIds: unreadSessionIds });
-  const activeProjects = allProjects.filter((group) => !archivedProjectRoots.has(group.projectRoot));
+  // Unsent-draft rows: parked drafts (and the active new-session composer)
+  // become rows inside their project group, or a synthetic group when the
+  // cwd has no sessions yet — a brand-new project must be visible and
+  // reachable immediately. A search lists matches only, so drafts hide.
+  // Matching runs against ALL groups (archived included): a parked draft in
+  // an archived project must not resurrect the project as a synthetic group.
+  const sidebarDrafts = trimmedSessionQuery
+    ? EMPTY_SIDEBAR_DRAFTS
+    : deriveSidebarDraftRows({
+      parked: parkedNewSessionDrafts,
+      groups: allProjects,
+      selectedCwd,
+      selectedSessionId,
+      projectRootFor,
+      isChatCwd,
+      archivedRoots: archivedProjectRoots,
+    });
+  const activeProjects = mergeDraftSyntheticGroups(
+    allProjects.filter((group) => !archivedProjectRoots.has(group.projectRoot)),
+    sidebarDrafts,
+  );
   const activeProjectRoots = activeProjects.map((group) => group.projectRoot);
   const projectDisplayNames = getProjectDisplayNames(activeProjectRoots);
   const canCollapseAllProjects = activeProjects.some((group) => !collapsedProjects.has(group.projectRoot));
@@ -1363,6 +1421,21 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         }}
       />
     );
+  };
+
+  /** Clicking the active new-session row only focuses the composer; a parked
+   *  row re-enters its cwd through the same path as the group's "+", which
+   *  un-archives the project and restores the parked draft. */
+  const activateDraftRow = (row: SidebarDraftRowModel) => {
+    if (row.isActive) {
+      onFocusComposer?.();
+      return;
+    }
+    handleNewSession(row.cwd, "project");
+  };
+
+  const discardDraftRow = (row: SidebarDraftRowModel) => {
+    if (row.parkedKey) clearDraft(row.parkedKey);
   };
 
   const renderProjectGroup = (group: ReturnType<typeof groupByProject>[number]) => {
@@ -1508,6 +1581,14 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         </div>
         {!isCollapsed && (
           <div className="sidebar-project-tree-children">
+            {(sidebarDrafts.rowsByProjectRoot.get(group.projectRoot) ?? []).map((row) => (
+              <SidebarDraftRowItem
+                key={`draft-${row.cwd}`}
+                row={row}
+                onActivate={() => activateDraftRow(row)}
+                onDiscard={() => discardDraftRow(row)}
+              />
+            ))}
             {visibleGroupTree.map((node) => {
               const nodeFamily = sessionFamilies.find(
                 (family) => family.root.id === node.session.id,
@@ -1551,6 +1632,19 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
 
   const renderTimeline = () => (
     <div className="sidebar-project-timeline">
+      {/* Unsent drafts first: they are the newest thing the user touched in
+          their project, and the chronological list has no groups to pin them
+          to, so each row carries its project name like every other row. */}
+      {sidebarDrafts.rows.map((row) => (
+        <SidebarDraftRowItem
+          key={`draft-${row.cwd}`}
+          row={row}
+          subtitle={projectDisplayNames.get(row.projectRoot)
+            ?? getProjectDisplayName(row.projectRoot, activeProjectRoots)}
+          onActivate={() => activateDraftRow(row)}
+          onDiscard={() => discardDraftRow(row)}
+        />
+      ))}
       {timelineFamilies.map((family) => {
         const node = timelineRootNodes.get(family.root.id);
         if (!node) return null;
@@ -1969,7 +2063,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             </button>
           </div>
         </div>
-        {allProjects.length === 0 ? (
+        {allProjects.length === 0 && activeProjects.length === 0 ? (
           <div className="sidebar-project-tree-empty">
             {loading
               ? t("sidebar.loading")
@@ -2119,6 +2213,73 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             />
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+/** One unsent-draft row in the project tree: a parked draft or the active
+ *  new-session composer. Reuses the session row's geometry and tokens; a
+ *  parked row carries a badge that yields its slot to a discard "×" while
+ *  hovered, and the active row stays selected-styled with no discard. */
+function SidebarDraftRowItem({
+  row,
+  subtitle,
+  onActivate,
+  onDiscard,
+}: {
+  row: SidebarDraftRowModel;
+  /** Project name; shown only in the chronological view, like session rows. */
+  subtitle?: string;
+  onActivate: () => void;
+  onDiscard: () => void;
+}) {
+  const { t } = useI18n();
+  const title = row.previewText
+    ?? (row.imageCount > 0 ? t("sidebar.draftImageCount", { count: row.imageCount }) : t("sidebar.newSessionRow"));
+  const tooltip = row.previewText
+    ? `${row.isActive ? t("sidebar.newSessionRow") : t("sidebar.draftRowTitle")} · ${row.previewText}`
+    : row.isActive ? t("sidebar.newSessionRow") : t("sidebar.draftRowTitle");
+  return (
+    <div
+      className={`sidebar-draft-row${row.isActive ? " is-active" : ""}`}
+      data-sidebar-tree-row
+      tabIndex={0}
+      role="treeitem"
+      aria-selected={row.isActive}
+      title={tooltip}
+      onClick={onActivate}
+      onKeyDown={(e) => handleSidebarTreeKeyDown(e, { activate: onActivate })}
+    >
+      <svg className="sidebar-draft-row-glyph" aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-dim)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+        <path d="M12 20h9" />
+        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+      </svg>
+      <span className="sidebar-draft-row-title">{title}</span>
+      {subtitle && (
+        <span className="session-item-project" title={subtitle}>
+          {subtitle}
+        </span>
+      )}
+      {!row.isActive && (
+        <>
+          <span className="sidebar-draft-row-badge">{t("sidebar.draftRowTitle")}</span>
+          <button
+            type="button"
+            className="sidebar-draft-row-discard"
+            title={t("sidebar.discardDraft")}
+            aria-label={t("sidebar.discardDraft")}
+            onClick={(e) => {
+              e.stopPropagation();
+              onDiscard();
+            }}
+          >
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" aria-hidden="true">
+              <line x1="2" y1="2" x2="8" y2="8" />
+              <line x1="8" y1="2" x2="2" y2="8" />
+            </svg>
+          </button>
+        </>
       )}
     </div>
   );

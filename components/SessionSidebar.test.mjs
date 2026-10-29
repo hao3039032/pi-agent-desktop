@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
+import { stripTypeScriptTypes } from "node:module";
 
 const source = (await readFile(new URL("./SessionSidebar.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const sessionItemSource = source.slice(source.indexOf("function SessionItem("));
@@ -153,10 +155,11 @@ test("Chats show five families at a time even when there are no projects", () =>
   assert.match(source, /!loading && !error && chatFamilies\.length === 0/);
   assert.match(source, /sidebar-chats-empty/);
   // The Chats section renders before the Projects empty state, so it remains
-  // available when `activeProjects` is empty.
+  // available when `activeProjects` is empty. Synthetic draft groups (a
+  // project whose only content is an unsent draft) replace the empty state.
   assert.match(
     source,
-    /sidebar-chats-header[\s\S]*?\{allProjects\.length === 0 \? \(/,
+    /sidebar-chats-header[\s\S]*?\{allProjects\.length === 0 && activeProjects\.length === 0 \? \(/,
   );
 });
 
@@ -340,4 +343,101 @@ test("the row menu shows the compaction count only when the session was compacte
     sessionItemSource,
     /\{\(session\.compactionCount \?\? 0\) > 0 && \(\s*<div>\{t\("sidebar\.compactionCount", \{ count: session\.compactionCount \?\? 0 \}\)\}<\/div>/,
   );
+});
+
+test("unsent drafts show as rows in the project tree and stay out of Chats", () => {
+  // Parked drafts (and the active new-session composer) are projected by the
+  // pure helper; the sidebar only wires its live state into it.
+  assert.match(source, /import \{ clearDraft, listParkedNewSessionDrafts, subscribeParkedDrafts \} from "@\/lib\/draft-store";/);
+  assert.match(source, /import \{\s*deriveSidebarDraftRows,\s*EMPTY_SIDEBAR_DRAFTS,\s*mergeDraftSyntheticGroups,\s*type SidebarDraftRowModel,\s*\} from "@\/lib\/sidebar-draft-rows";/);
+  // Re-renders come from the parked-draft subscription (also cross-window).
+  assert.match(source, /subscribeParkedDrafts\(\(\) => bumpParkedDrafts\(\)\)/);
+  // Parked rows wait for the first successful session list load: without the
+  // server's chat identity a parked chat draft would render as a project
+  // group. This also keeps the SSR and client first paint identical.
+  assert.match(source, /const parkedNewSessionDrafts = sessionsLoaded \? listParkedNewSessionDrafts\(\) : \[\];/);
+  assert.match(source, /setSessionsLoaded\(true\)/);
+  // The helper receives the chat filter, so chat cwds never produce rows or
+  // synthetic groups, and the archived roots so a parked draft hides exactly
+  // where its archived project's sessions hide (grouped and timeline alike).
+  assert.match(
+    source,
+    /deriveSidebarDraftRows\(\{\s*parked: parkedNewSessionDrafts,\s*groups: allProjects,\s*selectedCwd,\s*selectedSessionId,\s*projectRootFor,\s*isChatCwd,\s*archivedRoots: archivedProjectRoots,\s*\}\)/,
+  );
+  // Synthetic draft groups join the project list (and thus the composer's
+  // project list through onProjectsChange).
+  assert.match(source, /const activeProjects = mergeDraftSyntheticGroups\(/);
+  // A search lists matches only, so the draft rows hide while one runs.
+  assert.match(source, /const sidebarDrafts = trimmedSessionQuery\s*\?\s*EMPTY_SIDEBAR_DRAFTS\s*:/);
+});
+
+test("draft rows sit above the session window and ignore the preview cap", () => {
+  // The rows render before the windowed session tree inside the group's
+  // children, so they never count toward MAX_VISIBLE_PROJECT_SESSIONS.
+  const grouped = source.slice(
+    source.indexOf("const renderProjectGroup = "),
+    source.indexOf("const renderTimeline = "),
+  );
+  assert.match(
+    grouped,
+    /sidebarDrafts\.rowsByProjectRoot\.get\(group\.projectRoot\)[\s\S]*?<SidebarDraftRowItem[\s\S]*?\{visibleGroupTree\.map/,
+  );
+});
+
+test("draft row clicks dispatch by activity and parked rows can be discarded", () => {
+  // The active row only focuses the composer; a parked row re-enters its cwd
+  // through the same path as the group's "+", which restores the draft.
+  assert.match(
+    source,
+    /const activateDraftRow = \(row: SidebarDraftRowModel\) => \{\s*if \(row\.isActive\) \{\s*onFocusComposer\?\.\(\);\s*return;\s*\}\s*handleNewSession\(row\.cwd, "project"\);\s*\};/,
+  );
+  assert.match(source, /if \(row\.parkedKey\) clearDraft\(row\.parkedKey\);/);
+  assert.match(source, /onFocusComposer\?: \(\) => void;/);
+});
+
+test("the chronological view lists draft rows first with project subtitles", () => {
+  const timeline = source.slice(source.indexOf("const renderTimeline = "));
+  assert.match(timeline, /sidebarDrafts\.rows\.map\(\(row\) => \([\s\S]*?<SidebarDraftRowItem/);
+  assert.match(timeline, /subtitle=\{projectDisplayNames\.get\(row\.projectRoot\)/);
+  assert.match(timeline, /getProjectDisplayName\(row\.projectRoot, activeProjectRoots\)\}/);
+});
+
+test("the shell-known chat cwd classifies the active row before the list loads", async () => {
+  // Wiring: AppShell passes its server-resolved chat cwd down, and
+  // isChatCwd consults it first — the gap between `?cwd` validation
+  // resolving and this sidebar's own /api/sessions response would otherwise
+  // synthesize a "chats" project group for the active composer row.
+  const shellSource = (await readFile(new URL("./AppShell.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
+  assert.match(shellSource, /knownChatCwd=\{chatWorkspaceCwd\}/);
+  assert.match(source, /knownChatCwd\?: string \| null;/);
+  assert.match(
+    source,
+    /if \(knownChatCwd && cwd === knownChatCwd\) return true;\s*if \(chatWorkspaceCwd && cwd === chatWorkspaceCwd\) return true;/,
+  );
+  // The parked half stays gated on the list load; the active half does not
+  // wait for it (a project cwd appears immediately).
+  assert.match(source, /const parkedNewSessionDrafts = sessionsLoaded \? listParkedNewSessionDrafts\(\) : \[\];/);
+
+  // Behavioral: run the actual isChatCwd body with an empty session list
+  // (the slow/failed list case) — only the shell-known cwd classifies.
+  const start = source.indexOf("const isChatCwd = useCallback");
+  const end = source.indexOf("const selectedCwdIsChat", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const runWith = (knownChatCwd, chatWorkspaceCwd) => {
+    const context = vm.createContext({
+      knownChatCwd,
+      chatWorkspaceCwd,
+      allSessions: [],
+      useCallback: (fn) => fn,
+    });
+    vm.runInContext(stripTypeScriptTypes(source.slice(start, end)), context);
+    return vm.runInContext("isChatCwd", context);
+  };
+  const classify = runWith("/srv/chats/root", null);
+  assert.equal(classify("/srv/chats/root"), true, "the shell-known chat cwd is chat");
+  assert.equal(classify("/srv/chats/root/sub"), false, "children of the chat root are not guessed");
+  assert.equal(classify("/work/project"), false, "a project cwd stays project");
+  const withoutShell = runWith(null, null);
+  assert.equal(withoutShell("/srv/chats/root"), false, "no identity yet → no guess");
 });

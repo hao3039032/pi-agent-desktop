@@ -13,7 +13,7 @@ import type { SystemPromptStatus } from "@/hooks/useAgentSession";
 import { AppNoticeShelf } from "./AppNoticeShelf";
 import { useScheduledRunNotifications } from "@/hooks/useScheduledRunNotifications";
 import type { ChatScrollPosition } from "@/lib/chat-scroll-position";
-import { clearDraft } from "@/lib/draft-store";
+import { clearDraft, flushDrafts, parkedNewSessionDraftKey, rekeyDraft } from "@/lib/draft-store";
 import { TabBar, type Tab } from "./TabBar";
 
 // Heavy, rarely-used surfaces are code-split out of the main bundle. The
@@ -75,7 +75,6 @@ import { setupPushSubscription } from "@/lib/push-client";
 import { withTabOpen } from "@/lib/initial-navigation";
 import { clearTabOpenSession, getTabOpen, setTabOpenNewSession, setTabOpenSession } from "@/lib/tab-session";
 import { mergeCatalogRow } from "./session-catalog-helpers";
-import { rekeyDraft } from "@/lib/draft-store";
 import {
   clearLastOpen,
   getLastOpenSession,
@@ -122,10 +121,6 @@ const FILE_TREE_PREVIEW_MIN_WIDTH = 240;
 // shown: the viewer's toolbar (path, mode switch, actions) needs ~320px, and a
 // 220px tree beside it left the preview clipped.
 const FILE_TREE_AUTO_COLLAPSE_WIDTH = FILE_TREE_MIN_WIDTH + 320;
-
-function parkedNewSessionDraftKey(cwd: string): string {
-  return `parked-new:${cwd}`;
-}
 
 export function AppShell() {
   const router = useRouter();
@@ -254,6 +249,10 @@ export function AppShell() {
   const [newSessionCwd, setNewSessionCwd] = useState<string | null>(null);
   const [newSessionDraftId, setNewSessionDraftId] = useState("initial");
   const activeNewSessionDraftKeyRef = useRef<string | null>(null);
+  // The cwd embedded in the active draft key. The key itself cannot be parsed
+  // for it (paths contain colons), and the pagehide handler runs without a
+  // render in between, so every key-ref assignment keeps this ref in sync.
+  const activeNewSessionCwdRef = useRef<string | null>(null);
   const [initialCwdStatus, setInitialCwdStatus] = useState<"idle" | "validating" | "ready" | "error">(
     () => initialNavigation.requestedCwd ? "validating" : "idle",
   );
@@ -875,11 +874,18 @@ export function AppShell() {
       signal: controller.signal,
     })
       .then(async (response) => {
+        // A StrictMode remount aborts the first request; a late resolution
+        // must not adopt a cwd the user has already navigated away from.
+        if (controller.signal.aborted) return;
         const data = await response.json().catch(() => ({})) as {
           cwd?: string;
           error?: string;
           workspaceKind?: SessionWorkspaceKind;
         };
+        // The body read can straddle a StrictMode cleanup: the signal flips
+        // before the cleanup returns, and an already-buffered body would still
+        // resolve. Re-check before adopting the cwd.
+        if (controller.signal.aborted) return;
         if (!response.ok || !data.cwd) {
           throw new Error(data.error ?? `HTTP ${response.status}`);
         }
@@ -888,8 +894,14 @@ export function AppShell() {
         // the just-created empty chat during that initial synchronization.
         suppressCwdBumpRef.current = true;
         const draftId = `initial:${requestedCwd}`;
+        const draftKey = `new:${draftId}:${data.cwd}`;
+        // A reload after this composer's draft was parked (pagehide on tab
+        // close) must come back: consume the parked copy into the active key
+        // before the composer mounts and reads it. No parked draft → no-op.
+        rekeyDraft(parkedNewSessionDraftKey(data.cwd), draftKey);
         setNewSessionDraftId(draftId);
-        activeNewSessionDraftKeyRef.current = `new:${draftId}:${data.cwd}`;
+        activeNewSessionDraftKeyRef.current = draftKey;
+        activeNewSessionCwdRef.current = data.cwd;
         setNewSessionCwd(data.cwd);
         if (data.workspaceKind === "chat") {
           setChatWorkspaceCwd(data.cwd);
@@ -939,6 +951,7 @@ export function AppShell() {
         rekeyDraft(activeDraftKey, parkedNewSessionDraftKey(cwd));
       }
       activeNewSessionDraftKeyRef.current = null;
+      activeNewSessionCwdRef.current = null;
       // Selecting the session must remount the chat with the session
       // present: useAgentSession loads content in a mount-only effect, so
       // the null-session welcome mount from the switch would never load
@@ -1016,8 +1029,9 @@ export function AppShell() {
     // Close any session that belongs to a different project — it no longer
     // matches the selected project directory.
     const previousDraftKey = activeNewSessionDraftKeyRef.current;
-    if (previousDraftKey && currentFreshCwd) {
-      rekeyDraft(previousDraftKey, parkedNewSessionDraftKey(currentFreshCwd));
+    const previousDraftCwd = activeNewSessionCwdRef.current ?? currentFreshCwd;
+    if (previousDraftKey && previousDraftCwd) {
+      rekeyDraft(previousDraftKey, parkedNewSessionDraftKey(previousDraftCwd));
     }
     const draftId = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -1026,6 +1040,7 @@ export function AppShell() {
     rekeyDraft(parkedNewSessionDraftKey(cwd), draftKey);
     setNewSessionDraftId(draftId);
     activeNewSessionDraftKeyRef.current = draftKey;
+    activeNewSessionCwdRef.current = cwd;
     setSelectedSession(null);
     setNewSessionCwd((prev) => {
       if (prev && prev !== cwd) return null;
@@ -1069,11 +1084,12 @@ export function AppShell() {
     setSearchTarget(entryId ? { sessionId: session.id, entryId, blockIndex } : null);
     invalidateWorkspaceRestore();
     const activeDraftKey = activeNewSessionDraftKeyRef.current;
-    const activeDraftCwd = newSessionCwd ?? (selectedSession === null ? activeCwd : null);
+    const activeDraftCwd = activeNewSessionCwdRef.current;
     if (activeDraftKey && activeDraftCwd) {
       rekeyDraft(activeDraftKey, parkedNewSessionDraftKey(activeDraftCwd));
     }
     activeNewSessionDraftKeyRef.current = null;
+    activeNewSessionCwdRef.current = null;
     // Adopt an explicitly selected session before the sidebar reports its cwd.
     const projectKey = workspaceKeyOf(session);
     if (activeProjectKeyRef.current !== projectKey) {
@@ -1130,7 +1146,7 @@ export function AppShell() {
     } else if (!isRestore || new URLSearchParams(window.location.search).get("session") !== session.id) {
       router.replace(`?session=${encodeURIComponent(session.id)}`, { scroll: false });
     }
-  }, [activeCwd, activeFileTabId, chatWorkspaceCwd, invalidateWorkspaceRestore, router, isMobile, newSessionCwd, selectedSession]);
+  }, [activeFileTabId, chatWorkspaceCwd, invalidateWorkspaceRestore, router, isMobile, selectedSession]);
 
   const handleNewSession = useCallback((
     sessionId: string,
@@ -1146,9 +1162,23 @@ export function AppShell() {
     // otherwise be reloaded immediately when the composer remounts (legacy
     // key scheme kept for drafts written by older builds).
     clearDraft(`new:${cwd}`);
+    // Park the outgoing composer's draft BEFORE the target cwd's parked draft
+    // is restored below. Without this, a cross-project new-session click (the
+    // "+" on another project's header) orphans the draft under a
+    // `new:<id>:<old cwd>` key nothing can display again. A second click in
+    // the same cwd intentionally discards instead — that is the documented
+    // blank-composer reset, and parking here would defeat it.
+    const activeDraftKey = activeNewSessionDraftKeyRef.current;
+    const activeDraftCwd = activeNewSessionCwdRef.current;
+    if (activeDraftKey && activeDraftCwd && activeDraftCwd !== cwd) {
+      rekeyDraft(activeDraftKey, parkedNewSessionDraftKey(activeDraftCwd));
+      activeNewSessionDraftKeyRef.current = null;
+      activeNewSessionCwdRef.current = null;
+    }
     const draftKey = `new:${sessionId}:${cwd}`;
     rekeyDraft(parkedNewSessionDraftKey(cwd), draftKey);
     activeNewSessionDraftKeyRef.current = draftKey;
+    activeNewSessionCwdRef.current = cwd;
     setNewSessionDraftId(sessionId);
     setSelectedSession(null);
     setNewSessionCwd(cwd);
@@ -1350,6 +1380,7 @@ export function AppShell() {
     if (activeNewSessionDraftKeyRef.current !== sourceDraftKey) return;
     invalidateWorkspaceRestore();
     activeNewSessionDraftKeyRef.current = null;
+    activeNewSessionCwdRef.current = null;
     setNewSessionCwd(null);
     setSelectedSession(session);
     hydrateSelectedSession(session.id);
@@ -1483,6 +1514,7 @@ export function AppShell() {
   const handleSessionForked = useCallback((newSessionId: string) => {
     invalidateWorkspaceRestore();
     activeNewSessionDraftKeyRef.current = null;
+    activeNewSessionCwdRef.current = null;
     setRefreshKey((k) => k + 1);
     setNewSessionCwd(null);
     setSelectedSession((prev) => ({
@@ -1523,7 +1555,14 @@ export function AppShell() {
         ? crypto.randomUUID()
         : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
       setNewSessionDraftId(draftId);
-      activeNewSessionDraftKeyRef.current = cwd ? `new:${draftId}:${cwd}` : null;
+      // Deleting the session lands the user in a fresh composer for the same
+      // cwd — the cwd's parked draft (if any) must come back with it, exactly
+      // like the other composer creation points. Otherwise the sidebar shows
+      // a parked preview whose row click focuses an empty input.
+      const draftKey = cwd ? `new:${draftId}:${cwd}` : null;
+      if (draftKey) rekeyDraft(parkedNewSessionDraftKey(cwd), draftKey);
+      activeNewSessionDraftKeyRef.current = draftKey;
+      activeNewSessionCwdRef.current = cwd ?? null;
       setSelectedSession(null);
       setNewSessionCwd(cwd ?? null);
       if (wasChat) {
@@ -1674,7 +1713,44 @@ export function AppShell() {
     : null;
   useLayoutEffect(() => {
     activeNewSessionDraftKeyRef.current = newSessionDraftKey;
-  }, [newSessionDraftKey]);
+    activeNewSessionCwdRef.current = newSessionDraftKey ? effectiveNewSessionCwd : null;
+  }, [newSessionDraftKey, effectiveNewSessionCwd]);
+
+  // Closing the window (or tab, or reloading) must not lose an unsent
+  // composer: park the active draft under its cwd and force the debounced
+  // localStorage write to run synchronously. `pagehide` also covers the
+  // Tauri shell's window close, where beforeunload is unreliable. A bfcache
+  // restore (`pageshow`) moves the parked snapshot back into the same active
+  // key — the composer never unmounted, its key is empty after the park, and
+  // the next switch-away is then a clean move instead of a merge that
+  // duplicates the text with its own copy.
+  useEffect(() => {
+    let parkedOnHide: { key: string; cwd: string } | null = null;
+    const parkActiveDraftOnHide = () => {
+      const activeDraftKey = activeNewSessionDraftKeyRef.current;
+      const activeDraftCwd = activeNewSessionCwdRef.current;
+      if (activeDraftKey && activeDraftCwd) {
+        rekeyDraft(activeDraftKey, parkedNewSessionDraftKey(activeDraftCwd));
+        parkedOnHide = { key: activeDraftKey, cwd: activeDraftCwd };
+      }
+      flushDrafts();
+    };
+    const unparkAfterPageRestore = () => {
+      const parked = parkedOnHide;
+      parkedOnHide = null;
+      if (!parked) return;
+      // The frozen page cannot have navigated, but guard anyway: only take
+      // back the snapshot for the exact key it was parked from.
+      if (activeNewSessionDraftKeyRef.current !== parked.key) return;
+      rekeyDraft(parkedNewSessionDraftKey(parked.cwd), parked.key);
+    };
+    window.addEventListener("pagehide", parkActiveDraftOnHide);
+    window.addEventListener("pageshow", unparkAfterPageRestore);
+    return () => {
+      window.removeEventListener("pagehide", parkActiveDraftOnHide);
+      window.removeEventListener("pageshow", unparkAfterPageRestore);
+    };
+  }, []);
   const showChat = selectedSession !== null || effectiveNewSessionCwd !== null;
   const projectTrustCwd = isChatWorkspaceActive
     ? null
@@ -1865,6 +1941,11 @@ export function AppShell() {
         onOpenScheduled={handleOpenScheduled}
         scheduledOpen={scheduledOpen}
         onChatWorkspaceCwdChange={setChatWorkspaceCwd}
+        knownChatCwd={chatWorkspaceCwd}
+        onFocusComposer={() => {
+          if (isMobile) setSidebarOpen(false);
+          chatInputRef.current?.focus();
+        }}
       />
     </>
   );

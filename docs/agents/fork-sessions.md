@@ -37,6 +37,71 @@ Pi delays the first flush of a new session until an assistant message exists, so
 - `GET /api/sessions` returns a `sessionListVersion` counter; the sidebar's SSE handler refetches the list (reusing the invalidated server cache, no forced scan) whenever the version moves — that is how edits from another window/process appear.
 - The sidebar refetches the list once per running id it has no row for, because a session can start running between list fetches.
 
+## Unsent drafts stay visible in the sidebar (Codex-style rows)
+A new session has no file until the first message is sent, and a project with
+no sessions has no group at all — an unsent draft used to be invisible the
+moment the user switched away, and a cross-project new-session click even
+orphaned it (see below). Drafts now have a sidebar presence:
+
+- Draft keys: the active composer writes `new:<draftId>:<cwd>`; switching away
+  rekeys it to `parked-new:<cwd>` (`parkedNewSessionDraftKey()` in
+  `lib/draft-store.ts` — the single spelling every surface shares).
+- `lib/sidebar-draft-rows.ts` projects parked drafts plus the active
+  new-session cwd into rows: a row whose project root matches an existing
+  group renders as that group's top row (never counted toward the 5-session
+  preview window); a cwd without a group gets a synthetic group (basename
+  name, no sessions) — the active empty project sorts first, parked synthetic
+  groups after all real groups. Chat cwds never produce rows (their parked
+  data is kept but invisible).
+- `SessionSidebar` re-renders through `subscribeParkedDrafts()` (microtask
+  debounced; `parked-new:*` keys only; a `storage` listener reads back parked
+  keys written by another window). Parked rows show a first-line preview
+  (60-char cap) or the image count; hover offers a discard "×". Clicking a
+  parked row goes through the sidebar's own `handleNewSession(cwd, "project")`
+  (un-archives, restores the parked draft); the active row only focuses the
+  composer (`onFocusComposer`).
+- `handleNewSession` in `AppShell` parks the outgoing draft *before* restoring
+  the target cwd's parked draft when the cwds differ. The same-cwd second
+  click keeps its documented blank-composer reset (no parking). Every fresh
+  composer creation point consumes the cwd's parked draft the same way: the
+  initial `?cwd` validation, `handleCwdChange`, `handleNewSession`, and
+  `handleSessionDeleted` (deleting the open session lands in a fresh composer
+  for the same cwd, which must come back with its parked draft).
+- The active draft's cwd is tracked in `activeNewSessionCwdRef` beside
+  `activeNewSessionDraftKeyRef` (the key cannot be parsed for it — paths
+  contain colons). `pagehide` parks the active draft and `flushDrafts()`
+  writes localStorage synchronously; `pageshow` (bfcache restore) moves the
+  parked snapshot back into the same active key — the composer never
+  unmounted and its key is empty after the park, so the move is clean and the
+  next switch-away cannot merge the draft with its own copy. A reload
+  (no bfcache) instead consumes `parked-new:<cwd>` through the initial
+  `?cwd` validation path, so the composer comes back with its text.
+- Cross-window sync is parked-key-only and conflict-scoped: the `storage`
+  listener adopts remote adds/updates and mirrors remote deletes for parked
+  keys whose local copy is committed (persisted); keys with unsaved local
+  edits — or memory-only data storage cannot represent (attached files,
+  oversized images), whose in-memory copy is the only copy — always win, and
+  keep winning until the key is deleted locally or becomes fully
+  persistable. A persist that fails (quota / private mode) keeps those
+  protections: only keys actually included in the written 40-entry snapshot
+  (or tombstones whose deletion was written) lose their dirty flag. Snapshot
+  comparison uses the persisted projection (text + persistable image
+  data/mime in order); arrays and primitives never parse as an empty map.
+  The listener never writes storage back, so windows cannot ping-pong.
+  Concurrent edits to the same parked draft in two windows are
+  last-write-wins on persist — there is no merge, and memory-only keys are
+  exempt from sync entirely while they hold such data (not real-time
+  consistent across windows).
+- Parked rows wait for the first successful `/api/sessions` load before they
+  render (the server's chat identity is what classifies chat cwds). The
+  active new-session row is classified through `knownChatCwd` — the chat cwd
+  the shell's own `?cwd` validation / chat-workspace probe already resolved —
+  so a chat cwd never synthesizes a project group even before the list
+  loads, while a project cwd still appears immediately. Archived project
+  roots hide their draft rows in every view, like their sessions.
+- Deliberately out of scope: draft rows in the Chats section, salvaging
+  historical orphan `new:*` keys, and multiple drafts per cwd.
+
 ## Asynchronous notification turns and streaming order
 Both the package's `subagent-notify` and historical `pi-web:subagent-notification`
 start a displayed turn, even with `display: false`. `isSubagentNotificationType`

@@ -62,7 +62,8 @@ test("New restores the draft after session navigation and workspace auto-restore
     callbackBody("handleSelectSession", "handleNewSession"),
     callbackBody("handleNewSession", "hydrateSelectedSession"),
   ].join("\n");
-  const parkedKeyHelper = source.slice(source.indexOf("function parkedNewSessionDraftKey"), source.indexOf("export function AppShell"));
+  // parkedNewSessionDraftKey is imported from lib/draft-store now; the
+  // `...draftStore` context spread below already provides it to the callbacks.
   const hookSource = await readFile(new URL("../hooks/useAgentSession.ts", import.meta.url), "utf8");
   const cleanupStart = hookSource.indexOf("    return () => {", hookSource.indexOf("  // Load session on mount"));
   const cleanupEnd = hookSource.indexOf("    // eslint-disable-next-line", cleanupStart);
@@ -93,6 +94,7 @@ test("New restores the draft after session navigation and workspace auto-restore
         rightPanelOpen: false,
         shortcutHelpOpen: false,
         activeNewSessionDraftKeyRef: { current: `new:initial:${cwd}` },
+        activeNewSessionCwdRef: { current: cwd },
         scheduledOpenRef: { current: false },
         activeProjectKeyRef: { current: cwd },
         workspaceRestoreTokenRef: { current: 0 },
@@ -125,7 +127,7 @@ test("New restores the draft after session navigation and workspace auto-restore
           context[state] = typeof value === "function" ? value(context[state]) : value;
         };
       }
-      vm.runInContext(stripTypeScriptTypes(`${parkedKeyHelper}\n${callbacks}
+      vm.runInContext(stripTypeScriptTypes(`${callbacks}
         globalThis.navigate = { handleCwdChange, handleSelectSession, handleNewSession };
       `), context);
       // Run the actual hook cleanup with the outgoing mount's captured draft key.
@@ -153,6 +155,8 @@ test("New restores the draft after session navigation and workspace auto-restore
           const activeCwd = context.newSessionCwd ?? context.activeCwd;
           const key = context.selectedSession ? null : `new:${context.newSessionDraftId}:${activeCwd}`;
           context.activeNewSessionDraftKeyRef.current = key;
+          // The AppShell layout effect keeps the cwd ref beside the key ref.
+          context.activeNewSessionCwdRef.current = key ? activeCwd : null;
           cleanup = makeCleanup(!context.selectedSession, key);
         }
         await new Promise((resolve) => setImmediate(resolve));
