@@ -44,7 +44,10 @@ M4 项：
 |---|---|---|
 | 调度器核心 | ✅ 落地 | `crates/task-scheduler`：slot 决策（2 分钟准时宽限/7 天补跑一次/更旧丢弃带跳过计数）、overlap 跳过、2 并发上限（手动运行绕过上限不绕过 overlap）、连续 5 失败自动暂停（保留致停错误）、成功重置、90 秒租约心跳/过期/显式接管、超时清理、磁盘任务形状解析。8 测试 |
 | CronOracle（cron 计算经管理扩展的固定版 croner） | ✅ 桥接落地 | `ManagementCronOracle`：previous_run 一次 cron.previousRuns 调用；真实 pi + vendored croner 实测（UTC 表达式、独立核算的 epoch） |
-| 调度器接线（pi_ipc + 任务存储 + 30s tick 循环） | ⬜ | 核心与 oracle 已就位 |
+| 任务存储（磁盘格式兼容） | ✅ 落地 | `crates/task-scheduler/src/store.rs`：scheduled-tasks.json 原子写 + 未知字段保留、lastScheduledFor↔since_ms 映射、JSONL 运行账本容忍截断尾行（历史不重写）、缺文件=空、损坏=错误
+| tick 引擎 | ✅ 落地 | `crates/task-scheduler/src/engine.rs`：slot 决策 + 租约 + overlap 消耗槽位并记 skipped、并发满则不推进水位（下 tick 重试）、spawn 失败计入 5 连败自动暂停（致停错误持久化）、finish_run 释放租约并落盘暂停。17 测试
+| tasks.list IPC | ✅ 落地 | pi_ipc 读面：原样返回任务形状（未知字段透传）、损坏存储报 io 错（绝不空成功诱导覆盖保存）。tick 循环属宿主 30s 定时器，不在请求路径
+| 30s 定时器接线（宿主启动即跑、UI 关闭不停止） | ⬜ 随 M4 宿主整合 | 引擎/存储/预览均已就位 |
 
 M3 项：
 
