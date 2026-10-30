@@ -22,6 +22,7 @@ pi-host = { path = "../crates/pi-host" }
 pty-host = { path = "../crates/pty-host" }
 management-host = { path = "../crates/management-host" }
 task-scheduler = { path = "../crates/task-scheduler" }
+resource-protocol = { path = "../crates/resource-protocol" }
 session-host = { path = "../crates/session-host" }
 base64 = "0.22"
 dunce = "1"

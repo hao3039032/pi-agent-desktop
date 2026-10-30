@@ -2882,6 +2882,7 @@ dependencies = [
  "objc2-foundation",
  "pi-host",
  "pty-host",
+ "resource-protocol",
  "serde",
  "serde_json",
  "session-host",
@@ -3292,6 +3293,10 @@ dependencies = [
  "wasm-streams",
  "web-sys",
 ]
+
+[[package]]
+name = "resource-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "rfd"

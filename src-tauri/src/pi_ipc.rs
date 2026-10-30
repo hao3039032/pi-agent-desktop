@@ -7,6 +7,7 @@
 //! operations answer `unknown_op` without touching any session child.
 
 use base64::Engine;
+use resource_protocol::{ResourceRegistry, ResourceResponse};
 use task_scheduler::TaskStore;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +46,8 @@ pub struct IpcHostState {
     pub management_config: std::sync::Mutex<Option<ManagementSpawnConfig>>,
     /// The scheduled-task store root (the agent dir the host runs against).
     pub task_agent_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The preview resource registry (capability-less handles).
+    pub resources: ResourceRegistry,
 }
 
 impl IpcHostState {
@@ -57,6 +60,7 @@ impl IpcHostState {
             management: ManagementHost::new(),
             management_config: std::sync::Mutex::new(None),
             task_agent_dir: std::sync::Mutex::new(None),
+            resources: ResourceRegistry::new(),
         }
     }
 }
@@ -215,6 +219,18 @@ fn default_agent_dir() -> std::path::PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     std::path::PathBuf::from(home).join(".pi/agent")
+}
+
+/// Map deny reasons to protocol codes.
+fn denied_code(reason: resource_protocol::DenyReason) -> &'static str {
+    match reason {
+        resource_protocol::DenyReason::UnknownHandle => "not_found",
+        resource_protocol::DenyReason::Expired => "not_found",
+        resource_protocol::DenyReason::OutOfScope => "unauthorized_scope",
+        resource_protocol::DenyReason::InvalidPath => "invalid_args",
+        resource_protocol::DenyReason::NotFound => "not_found",
+        resource_protocol::DenyReason::IoError => "io",
+    }
 }
 
 fn session_run_state_json(session: &Arc<session_host::Session>) -> Value {
@@ -398,6 +414,49 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, "io", &error),
             }
         }
+        // Preview resources (crates/resource-protocol): grants are HOST-side
+        // decisions (a dialog result, an artifact location); the frontend
+        // only ever sees opaque handles.
+        "resources.grantFile" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            if path.is_empty() {
+                return protocol_error(&id, "invalid_args", "path is required");
+            }
+            // NOTE (M3 scope): grants from the frontend are restricted to
+            // files the host itself reported (sessions.list files, artifact
+            // locations). The full allow-list lands with the files domain.
+            match state.resources.grant_file(std::path::Path::new(path), Duration::from_secs(600)) {
+                Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
+                Err(reason) => protocol_error(&id, "unauthorized_scope", &format!("{reason:?}")),
+            }
+        }
+        "resources.read" => {
+            let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
+            let subpath = args.get("subpath").and_then(Value::as_str).unwrap_or_default();
+            let range = match (args.get("start").and_then(Value::as_u64), args.get("end").and_then(Value::as_u64)) {
+                (Some(start), Some(end)) => Some((start, end)),
+                _ => None,
+            };
+            match state.resources.read(handle, subpath, range) {
+                ResourceResponse::Ok { mime, bytes, total_len, range_applied } => protocol_ok(
+                    &id,
+                    json!({
+                        "mime": mime,
+                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        "totalLen": total_len,
+                        "rangeApplied": range_applied,
+                    }),
+                ),
+                ResourceResponse::Denied(reason) => {
+                    protocol_error(&id, denied_code(reason), &format!("{reason:?}"))
+                }
+            }
+        }
+        "resources.revoke" => {
+            let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
+            let revoked = state.resources.revoke(handle);
+            protocol_ok(&id, json!({ "revoked": revoked }))
+        }
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
     }
 }
@@ -489,6 +548,62 @@ mod tests {
         std::fs::write(dir.path().join("scheduled-tasks.json"), "{ broken").expect("write");
         let response = send(&state, json!({ "v": 1, "id": "k3", "op": "tasks.list" }));
         assert_eq!(response["error"]["code"], "io");
+    }
+
+    #[test]
+    fn preview_resources_grant_read_revoke_roundtrip() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, vec![1u8; 300]).expect("write");
+
+        // Grant by host-side path decision; the handle is opaque.
+        let grant = send(
+            &state,
+            json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
+        );
+        assert_eq!(grant["ok"], true, "{grant}");
+        let handle = grant["data"]["handle"].as_str().expect("handle").to_string();
+        assert_eq!(handle.len(), 32);
+
+        // Read whole and ranged; MIME by extension.
+        let read = send(
+            &state,
+            json!({ "v": 1, "id": "g2", "op": "resources.read", "args": { "handle": handle } }),
+        );
+        assert_eq!(read["data"]["mime"], "image/png");
+        assert_eq!(read["data"]["totalLen"], 300);
+        let ranged = send(
+            &state,
+            json!({ "v": 1, "id": "g3", "op": "resources.read", "args": { "handle": handle, "start": 10, "end": 19 } }),
+        );
+        assert_eq!(ranged["data"]["rangeApplied"], true);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(ranged["data"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded.len(), 10);
+
+        // A file grant refuses subpaths; ghosts and revoked handles fail.
+        let subpath = send(
+            &state,
+            json!({ "v": 1, "id": "g4", "op": "resources.read", "args": { "handle": handle, "subpath": "x" } }),
+        );
+        assert_eq!(subpath["error"]["code"], "invalid_args");
+        let missing = send(
+            &state,
+            json!({ "v": 1, "id": "g5", "op": "resources.grantFile", "args": { "path": dir.path().join("nope.png").display().to_string() } }),
+        );
+        assert_eq!(missing["error"]["code"], "unauthorized_scope");
+        let revoke = send(
+            &state,
+            json!({ "v": 1, "id": "g6", "op": "resources.revoke", "args": { "handle": handle } }),
+        );
+        assert_eq!(revoke["data"]["revoked"], true);
+        let after = send(
+            &state,
+            json!({ "v": 1, "id": "g7", "op": "resources.read", "args": { "handle": handle } }),
+        );
+        assert_eq!(after["error"]["code"], "not_found");
     }
 
     #[test]
