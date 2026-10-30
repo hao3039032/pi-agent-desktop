@@ -14,6 +14,7 @@ use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::State;
 
+use management_host::{ManagementHost, ManagementSpawnConfig};
 use session_host::{SessionRegistry, SessionSpawnConfig};
 
 /// Terminal output frames carry base64 inside JSON Channels today; the
@@ -35,6 +36,12 @@ pub struct IpcHostState {
     subscription_counter: AtomicU64,
     /// The terminal registry (portable-pty; crates/pty-host).
     pub terminals: pty_host::PtyHost,
+    /// The management instances (crates/management-host). The spawn config
+    /// (packaged pi executable + the vendored management extension) is
+    /// resolved by the M3 wiring; until then the models ops answer
+    /// management_unavailable rather than pretending.
+    pub management: ManagementHost,
+    pub management_config: std::sync::Mutex<Option<ManagementSpawnConfig>>,
 }
 
 impl IpcHostState {
@@ -44,6 +51,8 @@ impl IpcHostState {
             spawn_config: std::sync::Mutex::new(None),
             subscription_counter: AtomicU64::new(0),
             terminals: pty_host::PtyHost::new(),
+            management: ManagementHost::new(),
+            management_config: std::sync::Mutex::new(None),
         }
     }
 }
@@ -339,6 +348,23 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"))
             }
         }
+        // The models domain runs through a management instance
+        // (crates/management-host). Without the packaged spawn config the
+        // answer is management_unavailable — never a fallback, never a lie.
+        "models.list" => {
+            let config = state.management_config.lock().unwrap().clone();
+            let Some(config) = config else {
+                return protocol_error(&id, "management_unavailable", "the management instance is not configured yet (M3 wiring)");
+            };
+            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("global");
+            match state.management.instance(scope, &config) {
+                Ok(instance) => match instance.available_models() {
+                    Ok(models) => protocol_ok(&id, models),
+                    Err(error) => protocol_error(&id, "io", &error.to_string()),
+                },
+                Err(error) => protocol_error(&id, "management_unavailable", &error),
+            }
+        }
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
     }
 }
@@ -399,6 +425,15 @@ mod tests {
         );
         assert_eq!(response["ok"], false);
         assert_eq!(response["error"]["code"], "unknown_op");
+    }
+
+    #[test]
+    fn models_ops_answer_management_unavailable_until_configured() {
+        let state = state();
+        let response = send(&state, json!({ "v": 1, "id": "m1", "op": "models.list" }));
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["error"]["code"], "management_unavailable");
+        assert_eq!(response["error"]["retryable"], false);
     }
 
     #[test]

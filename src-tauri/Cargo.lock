@@ -2224,6 +2224,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "management-host"
+version = "0.1.0"
+dependencies = [
+ "pi-host",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2867,6 +2876,7 @@ dependencies = [
  "getrandom 0.3.4",
  "ksni",
  "libc",
+ "management-host",
  "objc2",
  "objc2-foundation",
  "pi-host",

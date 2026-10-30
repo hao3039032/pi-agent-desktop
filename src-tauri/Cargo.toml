@@ -20,6 +20,7 @@ tauri-build = { version = "2.5.5", features = [] }
 # command dispatches into.
 pi-host = { path = "../crates/pi-host" }
 pty-host = { path = "../crates/pty-host" }
+management-host = { path = "../crates/management-host" }
 session-host = { path = "../crates/session-host" }
 base64 = "0.22"
 dunce = "1"
