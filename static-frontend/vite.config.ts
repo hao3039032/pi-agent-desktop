@@ -37,6 +37,10 @@ export default defineConfig({
         find: /^@\/lib\/agent-client$/,
         replacement: resolve(import.meta.dirname, "src/data/agent-client.ts"),
       },
+      {
+        find: /^@\/lib\/session-event-source$/,
+        replacement: resolve(import.meta.dirname, "src/data/session-event-source.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

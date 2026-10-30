@@ -36,6 +36,9 @@
       ],
       "@/lib/agent-client": [
         "./static-frontend/src/data/agent-client.ts"
+      ],
+      "@/lib/session-event-source": [
+        "./static-frontend/src/data/session-event-source.ts"
       ]
     }
   },
