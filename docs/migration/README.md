@@ -10,9 +10,9 @@
 | IPC 协议规范（信封/错误码/流/资源通道） | ✅ 冻结初版 | `ipc-protocol.md` |
 | Rust→pi 握手/桥接/退出（最高风险项） | ✅ PoC 验证通过 | `crates/pi-host`：20 个确定性协议测试 + 3 个真实 pi 集成测试（`PI_CLI_BIN` 门控，隔离 `PI_CODING_AGENT_DIR` 沙箱） |
 | 管理依赖加载（隔离固定版本模块树，绝对路径导入） | ✅ 机制验证通过（本机 pi 1.4.0 托管安装 = release 目录布局，linux-x64） | `scripts/migration/management-deps-loading.test.mjs`：vendored croner 10.x 在子进程内解析、执行、回报 URL；空 NODE_PATH + 临时 cwd。已随 `PI_CLI_BIN=… npm test` 全量回归（3629/3629，0 跳过）。⚠️ 其余三个发行目标的打包布局（desktop:prepare 产物）验证仍待做 |
-| 扩展 provider 枚举 | ⬜ 未开始 | 依赖管理实例设计（pi.registerProvider 已确认存在；扩展上下文无 getAvailable，需管理扩展自带枚举路径） |
+| 扩展 provider 枚举 | ✅ 验证通过 | `crates/pi-host/tests/real_pi.rs::real_pi_management_instance_enumerates_extension_providers`：管理形态 child（`--mode rpc --no-session`）加载 pi.registerProvider fixture 后，标准 `get_available_models` RPC 枚举出该 provider 的模型；`--no-session` 不写会话文件 |
 | 模拟 OAuth 取消/回调 | ⬜ 未开始 | |
-| PTY（portable-pty） | ⬜ 未开始 | M4 主项，M0 仅需可行性确认 |
+| PTY（portable-pty） | ✅ 可行性验证通过 | `crates/pty-host`：幂等创建（同 id 返回同一实例）、输入/resize 串行、128 Ki UTF-16 历史窗口 + 游标后缀读 + 过旧游标 reset/有界重放、退出码传播（exit 7 实测）、Unicode 分块、关闭后输入显式失败。120 秒租约与 Tauri 接线是 M4 |
 | 无权限资源预览（自定义资源协议） | ⬜ 未开始 | |
 
 ## 如何跑真实 pi 测试

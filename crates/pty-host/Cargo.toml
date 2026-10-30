@@ -1,0 +1,25 @@
+[package]
+name = "pty-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "Rust PTY host for the desktop terminals (M0 PoC: portable-pty replaces node-pty)"
+publish = false
+
+# M0 scope: prove the plan's PTY semantics on portable-pty — idempotent
+# creation (same id/cwd returns the existing PTY), serialized input/resize,
+# a bounded UTF-16-unit history with a cursor (older cursors trigger a reset
+# + bounded replay), exit codes and cleanup. The 120-second connection lease
+# and the Tauri wiring are M4; the semantics frozen here are what M4 builds
+# on (docs/terminal.md is the behavioral reference).
+
+[dependencies]
+portable-pty = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "pty_host"
+path = "src/lib.rs"
