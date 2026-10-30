@@ -82,3 +82,8 @@ commands.allow = ["install_available_update"]
 identifier = "allow-pi-ipc"
 description = "Allows the app WebView to call the typed IPC bridge (protocol v1): one closed operation table (docs/migration/ipc-protocol.md), no generic execution surface. Unknown operations are refused by the host."
 commands.allow = ["pi_ipc"]
+
+[[permission]]
+identifier = "allow-pi-ipc-subscribe-events"
+description = "Allows the app WebView to subscribe a session's event stream over a Tauri Channel (snapshot-then-events, monotonic seq, host epoch)."
+commands.allow = ["pi_ipc_subscribe_events"]

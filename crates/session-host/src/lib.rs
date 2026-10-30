@@ -24,6 +24,9 @@
 //! tool events, fleet monitoring) layers on top in later M2 steps; this
 //! crate freezes the process-level backbone with real-pi tests.
 
+pub mod machine;
+pub use machine::{FollowUp, SessionMachine, SessionRunState, StreamingMessage};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +55,10 @@ pub struct Session {
     state: Mutex<SessionState>,
     /// Epoch for event subscribers (bumped if the session is ever reset).
     epoch: AtomicU64,
+    /// The message-level state machine (fed before fan-out).
+    machine: Mutex<crate::machine::SessionMachine>,
+    /// Notified when a run settles (prompt waits) or the child exits.
+    settle_cv: std::sync::Condvar,
 }
 
 struct SessionState {
@@ -131,14 +138,155 @@ impl Session {
         self.epoch.load(Ordering::SeqCst)
     }
 
+    /// The run epoch the machine last saw settled.
+    pub fn machine_settled_epoch(&self) -> u64 {
+        self.machine.lock().unwrap().settled_epoch()
+    }
+
     /// When the session started (diagnostics).
     pub fn started_at(&self) -> Instant {
         self.state.lock().unwrap().started_at
     }
 
-    fn fan_out(&self, record: Value) {
-        let mut state = self.state.lock().unwrap();
-        state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+    fn fan_out(self: &Arc<Self>, record: Value) {
+        // 1. The state machine eats first (it may request follow-ups).
+        let follow_up = {
+            let mut machine = self.machine.lock().unwrap();
+            let follow_up = machine.apply_event(&record);
+            if matches!(follow_up, crate::machine::FollowUp::RefreshAfterSettle { .. }) {
+                self.settle_cv.notify_all();
+            }
+            follow_up
+        };
+        // 2. Subscribers see the raw record in arrival order.
+        {
+            let mut state = self.state.lock().unwrap();
+            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+        }
+        // 3. Follow-ups run off the dispatch path (a slow get_state must not
+        //    stall the event thread): a settle refresh is epoch-guarded when
+        //    it lands (apply_snapshot), stats are advisory.
+        match follow_up {
+            crate::machine::FollowUp::RefreshAfterSettle { epoch } => {
+                let client = Arc::clone(&self.client);
+                let session = Arc::clone(self);
+                std::thread::Builder::new()
+                    .name("settle-refresh".into())
+                    .spawn(move || {
+                        if let Ok(snapshot) =
+                            client.command("get_state", json!({}), Some(Duration::from_secs(30)))
+                        {
+                            session.apply_snapshot(snapshot, epoch);
+                        }
+                        let _ =
+                            client.command("get_session_stats", json!({}), Some(Duration::from_secs(30)));
+                    })
+                    .ok();
+            }
+            crate::machine::FollowUp::RefreshStats => {
+                let client = Arc::clone(&self.client);
+                std::thread::Builder::new()
+                    .name("stats-refresh".into())
+                    .spawn(move || {
+                        let _ =
+                            client.command("get_session_stats", json!({}), Some(Duration::from_secs(30)));
+                    })
+                    .ok();
+            }
+            crate::machine::FollowUp::None => {}
+        }
+    }
+
+    /// Merge one get_state snapshot into the machine (epoch-guarded for the
+    /// volatile run flags).
+    pub fn apply_snapshot(&self, snapshot: Value, captured_epoch: u64) {
+        self.machine.lock().unwrap().apply_state_snapshot(&snapshot, captured_epoch);
+    }
+
+    /// Pull one get_state NOW and merge it at the current epoch (stable
+    /// fields always apply; a run in flight keeps its live flags).
+    pub fn refresh_state_now(&self) -> Result<(), pi_host::PiRpcError> {
+        let epoch = self.machine.lock().unwrap().epoch();
+        let snapshot = self.command("get_state", json!({}), Some(Duration::from_secs(30)))?;
+        self.apply_snapshot(snapshot, epoch);
+        Ok(())
+    }
+
+    /// The projected run state (a cheap copy for IPC responses).
+    pub fn run_state(&self) -> crate::machine::SessionRunState {
+        self.machine.lock().unwrap().state.clone()
+    }
+
+    /// Wait until the run of `min_epoch` (or later) settled, the child
+    /// exited, or `limit` passed. The TS prompt contract: the promise
+    /// resolves only once the run is fully idle.
+    pub fn wait_for_settle(&self, min_epoch: u64, limit: Duration) -> SettleOutcome {
+        let deadline = Instant::now() + limit;
+        let mut machine = self.machine.lock().unwrap();
+        loop {
+            if machine.settled_epoch() >= min_epoch && !machine.state.is_streaming {
+                return SettleOutcome::Settled;
+            }
+            if self.client.has_exited() {
+                return SettleOutcome::ChildExited;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return SettleOutcome::Timeout;
+            }
+            let (guard, _) = self.settle_cv.wait_timeout(machine, deadline - now).unwrap();
+            machine = guard;
+        }
+    }
+
+    /// Send a prompt and wait for its run to settle (the SDK contract).
+    pub fn prompt(&self, message: &str) -> Result<crate::machine::SessionRunState, SessionHostError> {
+        let epoch_at_send = self.machine.lock().unwrap().epoch();
+        let response = self
+            .command(
+                "prompt",
+                json!({ "message": message }),
+                Some(Duration::from_secs(120)),
+            )
+            .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
+        let disposition = match response.get("disposition").and_then(Value::as_str) {
+            Some("queued") => "queued",
+            Some("handled") => "handled",
+            _ => "started",
+        };
+        match disposition {
+            // A started run waits for the NEXT epoch; a queued one for the
+            // current; "handled" starts no run.
+            "started" => {
+                match self.wait_for_settle(epoch_at_send + 1, Duration::from_secs(600)) {
+                    SettleOutcome::Settled => {}
+                    SettleOutcome::ChildExited => {
+                        return Err(SessionHostError::Spawn("pi process exited during the run".into()))
+                    }
+                    SettleOutcome::Timeout => {
+                        return Err(SessionHostError::Spawn("the run did not settle in time".into()))
+                    }
+                }
+            }
+            "queued" => {
+                match self.wait_for_settle(epoch_at_send, Duration::from_secs(600)) {
+                    SettleOutcome::Settled => {}
+                    SettleOutcome::ChildExited => {
+                        return Err(SessionHostError::Spawn("pi process exited during the run".into()))
+                    }
+                    SettleOutcome::Timeout => {
+                        return Err(SessionHostError::Spawn("the run did not settle in time".into()))
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(self.run_state())
+    }
+
+    /// The current projected state after any events so far.
+    pub fn state(&self) -> crate::machine::SessionRunState {
+        self.run_state()
     }
 
     /// Orderly shutdown: stdin EOF then grace kill (pi-host close).
@@ -290,6 +438,14 @@ impl SessionRegistry {
     }
 }
 
+/// How a settle wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleOutcome {
+    Settled,
+    ChildExited,
+    Timeout,
+}
+
 /// Session-host-level errors.
 #[derive(Debug)]
 pub enum SessionHostError {
@@ -362,6 +518,8 @@ fn spawn_session(
             subscribers: Vec::new(),
         }),
         epoch: AtomicU64::new(1),
+        machine: Mutex::new(crate::machine::SessionMachine::new(session_file_id)),
+        settle_cv: std::sync::Condvar::new(),
     });
     {
         let fan = Arc::clone(&state);
@@ -431,12 +589,51 @@ pub fn dispatch_session_op(
         "agent.setSessionName" => {
             let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
             let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
-            session
+            let result = session
                 .command("set_session_name", json!({ "name": name }), Some(Duration::from_secs(30)))
-                .map_err(DispatchError::Transport)
+                .map_err(DispatchError::Transport)?;
+            // No event follows a rename (the child is its file's writer):
+            // pull the snapshot now so the projected state is current.
+            let _ = session.refresh_state_now();
+            Ok(result)
+        }
+        // The projected run state (the message-level machine's view).
+        "agent.runState" => {
+            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            Ok(run_state_json(&session.run_state()))
+        }
+        // A snapshot of the stream subscription (the Channel bridge in
+        // src-tauri layers incremental events on top of this snapshot).
+        "agent.eventsSnapshot" => {
+            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            Ok(json!({
+                "epoch": session.epoch(),
+                "settledEpoch": session.machine_settled_epoch(),
+                "state": run_state_json(&session.run_state()),
+            }))
         }
         _ => Err(DispatchError::unknown_op(op)),
     }
+}
+
+/// Serialize the projected run state for IPC responses.
+fn run_state_json(state: &crate::machine::SessionRunState) -> Value {
+    json!({
+        "sessionId": state.session_id,
+        "sessionName": state.session_name,
+        "isStreaming": state.is_streaming,
+        "isIdle": state.is_idle,
+        "isCompacting": state.is_compacting,
+        "autoRetryEnabled": state.auto_retry_enabled,
+        "retryAttempt": state.retry_attempt,
+        "messageCount": state.message_count,
+        "pendingMessageCount": state.pending_message_count,
+        "steeringQueue": state.steering_queue,
+        "followUpQueue": state.follow_up_queue,
+        "model": state.model,
+        "thinkingLevel": state.thinking_level,
+        "running": state.is_running(),
+    })
 }
 
 /// IPC-level dispatch errors (mirrors the protocol doc's codes).

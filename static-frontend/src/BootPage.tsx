@@ -43,7 +43,33 @@ function detectTransport(): { transport: IpcTransport; label: string } {
             request,
             timeoutMs,
           ),
-        subscribe: () => () => {},
+        subscribe: (op, args, onMessage) => {
+          if (op !== "agent.subscribeEvents") {
+            return () => {};
+          }
+          // The host exposes the stream as its own command returning a
+          // Channel; wire it through the protocol frame type.
+          const channel = new (window as unknown as {
+            __TAURI_INTERNALS__: {
+              Channel: new () => {
+                onmessage: (message: unknown) => void;
+              };
+            };
+          }).__TAURI_INTERNALS__.Channel();
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const anyChannel = channel as any;
+          anyChannel.onmessage = (message: unknown) => {
+            onMessage(message as import("./ipc/protocol.ts").IpcStreamMessage);
+          };
+          void (internals.invoke as (cmd: string, payload: unknown) => Promise<unknown>)(
+            "pi_ipc_subscribe_events",
+            { session: args?.session, onEvent: channel },
+          );
+          return () => {
+            // Dropping the reference detaches host-side on the next send.
+            anyChannel.onmessage = () => {};
+          };
+        },
       },
     };
   }

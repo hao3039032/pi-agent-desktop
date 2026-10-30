@@ -7,6 +7,9 @@
 //! operations answer `unknown_op` without touching any session child.
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tauri::ipc::Channel;
 use tauri::State;
 
 use session_host::{SessionRegistry, SessionSpawnConfig};
@@ -24,6 +27,7 @@ pub struct IpcHostState {
     /// the operation set that spawns children.
     #[allow(dead_code)]
     pub spawn_config: std::sync::Mutex<Option<SessionSpawnConfig>>,
+    subscription_counter: AtomicU64,
 }
 
 impl IpcHostState {
@@ -31,8 +35,93 @@ impl IpcHostState {
         Self {
             registry: SessionRegistry::new(),
             spawn_config: std::sync::Mutex::new(None),
+            subscription_counter: AtomicU64::new(0),
         }
     }
+}
+
+/// One stream frame (docs/migration/ipc-protocol.md §3).
+fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &str, payload: Value) -> Value {
+    json!({
+        "subscriptionId": subscription_id,
+        "epoch": epoch,
+        "seq": seq,
+        "kind": kind,
+        "payload": payload,
+    })
+}
+
+/// Subscribe to a session's event stream on a Tauri Channel. The first
+/// frame is the atomic snapshot (epoch + projected state), then raw child
+/// events follow in arrival order with monotonic seq. The subscription
+/// ends when the receiver drops the channel (page reload, window close) or
+/// the session leaves the registry; the relay thread then detaches.
+#[tauri::command]
+pub fn pi_ipc_subscribe_events(
+    state: State<'_, IpcHostState>,
+    session: String,
+    on_event: Channel<Value>,
+) -> Value {
+    let Some(session_handle) = state.registry.get(&session) else {
+        return protocol_error("?", "not_found", &format!("no running session {session}"));
+    };
+    let subscription_id = format!(
+        "sub-{}",
+        state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    let subscription_id_for_relay = subscription_id.clone();
+    let epoch = session_handle.epoch();
+    let events = session_handle.subscribe();
+
+    // The relay: snapshot first, then every record in order. A closed
+    // channel (send error) ends the loop and detaches.
+    std::thread::Builder::new()
+        .name(format!("ipc-events-{subscription_id}"))
+        .spawn(move || {
+            let subscription_id = subscription_id_for_relay;
+            let mut seq: u64 = 0;
+            let snapshot = json!({
+                "epoch": session_handle.epoch(),
+                "settledEpoch": session_handle.machine_settled_epoch(),
+                "state": session_run_state_json(&session_handle),
+            });
+            seq += 1;
+            if on_event.send(stream_frame(&subscription_id, epoch, seq, "snapshot", snapshot)).is_err() {
+                return;
+            }
+            while let Ok(record) = events.recv() {
+                seq += 1;
+                if on_event
+                    .send(stream_frame(&subscription_id, epoch, seq, "event", record))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .ok();
+
+    json!({ "subscriptionId": subscription_id, "epoch": epoch })
+}
+
+fn session_run_state_json(session: &Arc<session_host::Session>) -> Value {
+    let state = session.run_state();
+    json!({
+        "sessionId": state.session_id,
+        "sessionName": state.session_name,
+        "isStreaming": state.is_streaming,
+        "isIdle": state.is_idle,
+        "isCompacting": state.is_compacting,
+        "autoRetryEnabled": state.auto_retry_enabled,
+        "retryAttempt": state.retry_attempt,
+        "messageCount": state.message_count,
+        "pendingMessageCount": state.pending_message_count,
+        "steeringQueue": state.steering_queue,
+        "followUpQueue": state.follow_up_queue,
+        "model": state.model,
+        "thinkingLevel": state.thinking_level,
+        "running": state.is_running(),
+    })
 }
 
 impl Default for IpcHostState {
@@ -89,7 +178,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }),
         ),
         // Session operations route through the closed table in session-host.
-        "sessions.runState" | "agent.interrupt" | "agent.setSessionName" => {
+        "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
+        | "agent.eventsSnapshot" => {
             match session_host::dispatch_session_op(&state.registry, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err(error) => protocol_error(&id, error.code(), &error.to_string()),

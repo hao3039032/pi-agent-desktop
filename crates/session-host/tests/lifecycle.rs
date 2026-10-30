@@ -138,3 +138,73 @@ fn real_pi_session_lifecycle() {
     assert!(registry.remove("url-id-1", Duration::from_secs(5)).is_none());
     let _ = IDLE_TIMEOUT;
 }
+
+#[test]
+fn real_pi_machine_and_handled_prompt() {
+    let Some(executable) = pi_bin() else {
+        eprintln!("skipping: PI_CLI_BIN not set");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&agent_dir).expect("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, file_id) = create_session_file(&sessions, &cwd).expect("session file");
+
+    let registry = SessionRegistry::new();
+    let session = registry
+        .start("url-id-2", &file, &file_id, &cwd, &config(&executable, &agent_dir))
+        .expect("session starts");
+
+    // A subscriber sees the raw event records.
+    let events = session.subscribe();
+
+    // A handled prompt (a bridge command) starts NO run: the prompt method
+    // returns at once with the projected state still idle.
+    let state = session
+        .prompt("/pi-web:bridge does-not-matter invalid-token")
+        .expect("handled prompt resolves");
+    assert!(!state.is_running(), "an extension command starts no run: {state:?}");
+
+    // The projected state flows through the IPC dispatch table too.
+    let snapshot = dispatch_session_op(
+        &registry,
+        "agent.eventsSnapshot",
+        &json!({ "session": "url-id-2" }),
+    )
+    .expect("events snapshot");
+    assert_eq!(snapshot["state"]["sessionId"], file_id);
+    assert_eq!(snapshot["state"]["running"], false);
+
+    // set_session_name reaches the child (its own writer) and the projected
+    // state picks the name up from the follow-up get_state refresh.
+    dispatch_session_op(
+        &registry,
+        "agent.setSessionName",
+        &json!({ "session": "url-id-2", "name": "rust-mgmt-name" }),
+    )
+    .expect("set name");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snapshot = dispatch_session_op(
+            &registry,
+            "agent.eventsSnapshot",
+            &json!({ "session": "url-id-2" }),
+        )
+        .expect("snapshot");
+        if snapshot["state"]["sessionName"] == "rust-mgmt-name" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "name never projected");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // No agent_start happened: no run events on the wire beyond whatever
+    // the child emitted at boot; the machine never went streaming.
+    assert!(!session.state().is_streaming);
+    drop(events);
+    registry.remove("url-id-2", Duration::from_secs(10));
+}
