@@ -52,6 +52,9 @@ pub struct ManagementInstance {
     pub scope: String,
     client: Arc<PiRpcClient>,
     state: Mutex<InstanceState>,
+    /// The management protocol nonce this child was spawned with
+    /// (PI_WEB_MGMT_NONCE in the child env).
+    nonce: String,
 }
 
 struct InstanceState {
@@ -60,6 +63,81 @@ struct InstanceState {
 }
 
 impl ManagementInstance {
+    /// Call one management op through the extension protocol and wait for
+    /// its nonce-bound envelope (the synchronous bridge the scheduler and
+    /// config ops use; UI progress flows get the async variant later).
+    pub fn management_call_sync(&self, op: &str, args: Value) -> Result<Value, String> {
+        self.management_call(op, args, Duration::from_secs(60))
+    }
+
+    /// The general form: send `/pi-web:mgmt <rid> <b64url>` and await the
+    /// PI_WEB_MGMT_V1 envelope with matching rid and the spawning nonce.
+    pub fn management_call(&self, op: &str, args: Value, timeout: Duration) -> Result<Value, String> {
+        use std::sync::mpsc;
+        let nonce = self.nonce.clone();
+        let request_id = format!("call-{}", uuid::Uuid::new_v4());
+        let payload = json!({ "op": op, "args": args, "nonce": nonce });
+        let token = base64_url_no_pad(&payload.to_string());
+
+        // pi-host's on_ui delivers through a channel: a per-call consumer
+        // thread correlates the envelope by rid (drops everything else).
+        let (notify_tx, notify_rx) = mpsc::channel::<pi_host::client::UiRequest>();
+        let subscription = self.client.on_ui("notify", notify_tx, None);
+        let (envelope_tx, envelope_rx) = mpsc::channel::<Value>();
+        let rid_for_router = request_id.clone();
+        let router = std::thread::Builder::new()
+            .name("mgmt-envelope-wait".into())
+            .spawn(move || {
+                while let Ok(request) = notify_rx.recv() {
+                    let Some(message) = request.record.get("message").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(body) = message.strip_prefix("PI_WEB_MGMT_V1 ") else {
+                        continue;
+                    };
+                    let Ok(envelope) = serde_json::from_str::<Value>(body) else {
+                        continue;
+                    };
+                    if envelope.get("rid").and_then(Value::as_str) == Some(rid_for_router.as_str()) {
+                        let _ = envelope_tx.send(envelope);
+                        return;
+                    }
+                }
+            })
+            .map_err(|error| format!("envelope router failed: {error}"))?;
+
+        let result = (|| -> Result<Value, String> {
+            let ack = self
+                .client
+                .command("prompt", json!({ "message": format!("/pi-web:mgmt {request_id} {token}") }), Some(timeout + Duration::from_secs(10)))
+                .map_err(|error| format!("management prompt failed: {error}"))?;
+            if ack.get("disposition").and_then(Value::as_str) != Some("handled") {
+                return Err("the management command was not handled (extension missing?)".to_string());
+            }
+            match envelope_rx.recv_timeout(timeout) {
+                Ok(envelope) => {
+                    if envelope.get("nonce").and_then(Value::as_str) != Some(nonce.as_str()) {
+                        return Err("the management envelope carried the wrong nonce".to_string());
+                    }
+                    if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+                        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+                    } else {
+                        let code = envelope.get("code").and_then(Value::as_str).unwrap_or("op_failed");
+                        let error = envelope.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+                        Err(format!("[{code}] {error}"))
+                    }
+                }
+                Err(_) => Err(format!("management op {op} timed out")),
+            }
+        })();
+        drop(subscription);
+        // Dropping the notify sender ends the router thread on its next
+        // recv (or it already returned with the envelope).
+        let _ = router.join();
+        self.touch();
+        result
+    }
+
     /// Take the lease (a login/install/test is running).
     pub fn lease(&self) {
         let mut state = self.state.lock().unwrap();
@@ -189,6 +267,25 @@ impl ManagementHost {
     }
 }
 
+/// base64url without padding (RFC 4648 §5).
+fn base64_url_no_pad(data: &str) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = data.as_bytes();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+        out.push(ALPHABET[(b[0] >> 2) as usize] as char);
+        out.push(ALPHABET[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b[2] & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
 fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
@@ -219,8 +316,15 @@ fn spawn_management(
         SpawnOptions { args, cwd: None, env, ..SpawnOptions::default() },
     )
     .map_err(|error| format!("management instance failed to start: {error}"))?;
+    let nonce = config
+        .env
+        .iter()
+        .find(|(key, _)| key == "PI_WEB_MGMT_NONCE")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
     Ok(Arc::new(ManagementInstance {
         scope: scope.to_string(),
+        nonce,
         client,
         state: Mutex::new(InstanceState {
             lease_until: Instant::now() + IDLE_RECYCLE,
@@ -247,9 +351,107 @@ impl ManagementHost {
     }
 }
 
+/// A CronOracle backed by the management extension's vendored croner
+/// (plan §三: cron math stays with the fixed-version croner inside the
+/// management instance; the Rust scheduler only consumes slots).
+///
+/// Each query is one management-protocol call: `/pi-web:mgmt` with
+/// cron.previousRuns (bounded) — the most recent slot is computed from the
+/// run history rather than a second, drifting implementation.
+pub struct ManagementCronOracle<'a> {
+    instance: &'a ManagementInstance,
+}
+
+impl<'a> ManagementCronOracle<'a> {
+    pub fn new(instance: &'a ManagementInstance) -> Self {
+        Self { instance }
+    }
+
+    fn call(&self, op: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        // The result arrives as a nonce-bound PI_WEB_MGMT_V1 envelope
+        // (management_call correlates the rid and checks the nonce).
+        self.instance.management_call_sync(op, args)
+    }
+}
+
+impl task_scheduler::CronOracle for ManagementCronOracle<'_> {
+    fn previous_run(&self, expr: &str, timezone: &str, now_ms: i64) -> Option<i64> {
+        let args = serde_json::json!({
+            "expr": expr,
+            "timezone": timezone,
+            "fromISO": iso_from_ms(now_ms),
+            "count": 1,
+        });
+        let result = self.call("cron.previousRuns", args).ok()?;
+        let runs = result.get("runs").and_then(|runs| runs.as_array())?;
+        let first = runs.first()?.as_str()?;
+        iso_to_ms(first)
+    }
+
+    fn count_slots_between(&self, _expr: &str, _timezone: &str, _since_ms: i64, _until_ms: i64) -> u32 {
+        // Slot counting stays approximate until the extension exposes a
+        // dedicated op; the scheduler only uses it for the skipped count.
+        0
+    }
+}
+
+fn iso_from_ms(ms: i64) -> String {
+    // Only minute precision is needed for cron boundaries.
+    let seconds = ms.div_euclid(1000);
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        y, m, d,
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+fn iso_to_ms(iso: &str) -> Option<i64> {
+    let bytes = iso.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let y: i64 = iso.get(0..4)?.parse().ok()?;
+    let m: i64 = iso.get(5..7)?.parse().ok()?;
+    let d: i64 = iso.get(8..10)?.parse().ok()?;
+    let hh: i64 = iso.get(11..13)?.parse().ok()?;
+    let mm: i64 = iso.get(14..16)?.parse().ok()?;
+    let ss: i64 = iso.get(17..19)?.parse().ok()?;
+    let days = civil_days_from(y, m, d);
+    Some((days * 86_400 + hh * 3_600 + mm * 60 + ss) * 1000)
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn civil_days_from(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use task_scheduler::CronOracle as _;
 
     fn pi_bin() -> Option<String> {
         match std::env::var("PI_CLI_BIN") {
@@ -338,6 +540,74 @@ export default function managementFixture(pi) {
         let recycled = host.recycle_expired();
         assert_eq!(recycled, vec!["/tmp/some-project".to_string()]);
         assert_eq!(host.scopes(), vec!["global".to_string()]);
+        host.recycle_expired_all_for_tests();
+    }
+
+    #[test]
+    fn real_pi_management_calls_and_cron_oracle_over_the_extension() {
+        let Some(executable) = pi_bin() else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent");
+
+        // The vendored tree: croner only (the cron ops need no SDK graph).
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&managed).expect("managed");
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).expect("target dir");
+            for entry in std::fs::read_dir(from).expect("read dir").flatten() {
+                let target = to.join(entry.file_name());
+                let meta = entry.metadata().expect("metadata");
+                if meta.is_dir() {
+                    std::fs::create_dir_all(&target).expect("mkdir");
+                    copy_tree(&entry.path(), &target);
+                } else if meta.is_file() {
+                    std::fs::copy(entry.path(), &target).expect("copy");
+                }
+                // Symlinks and specials are skipped: the croner tree has
+                // none, and a vendored tree must be plain files.
+            }
+        }
+        copy_tree(&repo_root.join("node_modules/croner"), &managed.join("croner"));
+
+        let config = ManagementSpawnConfig {
+            executable,
+            agent_dir: Some(agent_dir),
+            extensions: vec![
+                repo_root.join("lib/pi-rpc/assets/pi-web-management.mjs"),
+            ],
+            env: vec![
+                ("PI_WEB_MANAGED_MODULES".to_string(), managed.to_string_lossy().into_owned()),
+                ("PI_WEB_MGMT_NONCE".to_string(), "rust-mgmt-nonce".to_string()),
+            ],
+        };
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).expect("instance");
+
+        // The capability table through the typed bridge.
+        let capabilities = instance
+            .management_call_sync("sys.capabilities", serde_json::json!({}))
+            .expect("capabilities");
+        assert_eq!(capabilities["version"], 1);
+        assert!(capabilities["ops"].as_array().unwrap().iter().any(|op| op == "cron.preview"));
+
+        // The CronOracle bridge: previous_run on a fixed UTC expression.
+        let oracle = crate::ManagementCronOracle::new(&instance);
+        // 2026-03-01T12:30:45Z with "17 5 * * *" → the 05:17 slot that day.
+        let now_ms = 1_772_368_245_000;
+        let previous = oracle.previous_run("17 5 * * *", "UTC", now_ms).expect("slot");
+        assert_eq!(previous, 1_772_342_220_000, "2026-03-01T05:17:00Z");
+
+        // A failed op reports the extension's code.
+        let error = instance
+            .management_call_sync("cron.preview", serde_json::json!({ "expr": "bad" }))
+            .expect_err("invalid cron refuses");
+        assert!(error.contains("invalid_cron"), "{error}");
+
         host.recycle_expired_all_for_tests();
     }
 

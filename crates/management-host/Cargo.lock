@@ -112,6 +112,7 @@ version = "0.1.0"
 dependencies = [
  "pi-host",
  "serde_json",
+ "task-scheduler",
  "tempfile",
  "uuid",
 ]
@@ -244,6 +245,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "task-scheduler"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
