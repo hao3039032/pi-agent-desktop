@@ -26,6 +26,17 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 
 所有真实 pi 测试都跑在隔离沙箱（临时 `PI_CODING_AGENT_DIR`、临时 cwd），不碰真实 `~/.pi/agent` 数据。
 
+## 当前状态（M0–M1 进行中）补充
+
+M1 项：
+
+| 项 | 状态 | 工件 |
+|---|---|---|
+| 过渡版本：状态镜像/导出兼容 | ✅ 已落地（发布节奏仍由人工把控） | `lib/state-mirror.ts` + `lib/state-mirror-store.ts` + `app/api/state-mirror` + `hooks/useStateMirror`（AppShell 挂载）：显式白名单、schemaVersion/revision/校验和、ACK 后才推进 revision、原子写 + 0600、防抖/周期/pagehide 三路持久化。11 个测试 |
+| Vite 静态入口与诊断骨架 | ✅ 骨架可构建 | `static-frontend/`：`npm run build` 产物进 `desktop/frontend`（`emptyOutDir:false`，占位保留）；BootPage 无 Next/pi 可渲染，含宿主探测/诊断/重试；主题首屏内联离线初始化 |
+| IPC 类型层 | ✅ 初版 | `static-frontend/src/ipc/`：协议 v1 信封/错误码/流帧类型（对齐 `ipc-protocol.md`）、类型化客户端 + 可注入 transport（Tauri 桥/Mock）、封闭操作面（unknown_op 拒绝、超时不重发）、集中式导航适配（session/cwd/view，URL 优先）。12 个 mock-transport 测试 |
+| 页面组件迁移 | ⬜ M2 起 | 会话 UI、模型面板等 |
+
 ## 工件索引
 
 - `api-inventory.json` — 迁移清单：89 个路由文件、124 个方法，逐条 IPC 操作、实现归属（rust-host / mgmt-extension / session-bridge / rust-native / removed-web-only）与里程碑。重新生成：`node scripts/migration/generate-api-inventory.mjs`；校验：`--check`；守卫：`node --test scripts/migration/api-inventory.test.mjs`。

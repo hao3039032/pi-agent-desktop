@@ -80,3 +80,6 @@ crates/pi-host/target/
 crates/pty-host/target/
 crates/oauth-loopback/target/
 crates/resource-protocol/target/
+
+# static-frontend build output (M1: rebuilt by `npm run build` in static-frontend)
+desktop/frontend/assets/

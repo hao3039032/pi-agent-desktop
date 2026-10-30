@@ -1,0 +1,62 @@
+/* The M1 boot page's minimal styling. The migrated app keeps the upstream
+   globals.css/settings.css byte baseline and adds fork rules in
+   native-theme.css (M2 imports them); this skeleton only needs its own
+   fallback look. */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+.boot-page {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2rem;
+  background: light-dark(#f7f7f8, #17171a);
+  color: light-dark(#1a1a1f, #ececf1);
+}
+.boot-sub {
+  opacity: 0.65;
+  font-size: 0.9rem;
+  margin: 0;
+}
+.boot-status {
+  min-width: 18rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid light-dark(#d9d9e0, #2d2d33);
+  border-radius: 10px;
+  background: light-dark(#ffffff, #1f1f23);
+}
+.boot-status[data-status="degraded"] {
+  border-color: #b56a3a;
+}
+.boot-status pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+.boot-note {
+  font-size: 0.78rem;
+  opacity: 0.55;
+}
+.boot-page button {
+  margin-top: 0.5rem;
+  padding: 0.4rem 1.1rem;
+  border-radius: 8px;
+  border: 1px solid light-dark(#cfcfd6, #3a3a41);
+  background: light-dark(#ffffff, #26262b);
+  color: inherit;
+  cursor: pointer;
+}
+.boot-page button:hover {
+  background: light-dark(#f0f0f3, #2e2e34);
+}
