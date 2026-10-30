@@ -37,6 +37,14 @@ M1 项：
 | IPC 类型层 | ✅ 初版 | `static-frontend/src/ipc/`：协议 v1 信封/错误码/流帧类型（对齐 `ipc-protocol.md`）、类型化客户端 + 可注入 transport（Tauri 桥/Mock）、封闭操作面（unknown_op 拒绝、超时不重发）、集中式导航适配（session/cwd/view，URL 优先）。12 个 mock-transport 测试 |
 | 页面组件迁移 | ⬜ M2 起 | 会话 UI、模型面板等 |
 
+M2 项：
+
+| 项 | 状态 | 工件 |
+|---|---|---|
+| Rust 会话宿主骨干 | ✅ 骨干落地 | `crates/session-host`：id 键注册表、并发启动去重（每 id 一把启动锁）、10 分钟空闲租约/驱逐、会话文件头创建（host 为 header 作者）、生产启动形态（`--session` + 发现关闭 + bridge 资产 + nonce）、握手（get_state 身份一致性 + get_commands 桥接命令归属）、事件扇出（N 订阅者）、封闭操作分发表（`sessions.runState`/`agent.interrupt`/`agent.setSessionName`；unknown_op/not_found）。真实 pi lifecycle 测试（create→start→并发去重→bridge tools.list→runState→租约到期驱逐→关闭） |
+| 消息层状态机（queue/steer/compact/fleet 等） | ⬜ 骨干之上 | 逐命令迁移（prompt 事件、重试、压缩、树导航、fork/clone、统计） |
+| 会话 UI 静态迁移 | ⬜ | ChatWindow/MessageView/SSE→Channel 管线 |
+
 ## 工件索引
 
 - `api-inventory.json` — 迁移清单：89 个路由文件、124 个方法，逐条 IPC 操作、实现归属（rust-host / mgmt-extension / session-bridge / rust-native / removed-web-only）与里程碑。重新生成：`node scripts/migration/generate-api-inventory.mjs`；校验：`--check`；守卫：`node --test scripts/migration/api-inventory.test.mjs`。

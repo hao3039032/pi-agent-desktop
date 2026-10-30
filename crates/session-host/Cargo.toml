@@ -1,0 +1,28 @@
+[package]
+name = "session-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "The Rust session host: registry, lifecycle and IPC dispatch over pi-host children"
+publish = false
+
+# M2 backbone (plan §五 会话宿主 / §八 M2): one pi child per active session,
+# a registry keyed by session id with idle eviction and leases, the
+# production spawn shape (session file + bridge asset + nonce), the
+# handshake (get_state + get_commands + bridge command attribution), a
+# multi-subscriber event fan-out, and the closed-operation dispatch table
+# the Tauri `pi_ipc` command routes through. The full session state machine
+# (queueing, compaction, steering, fleet monitoring) builds on this crate.
+
+[dependencies]
+pi-host = { path = "../pi-host" }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "session_host"
+path = "src/lib.rs"
