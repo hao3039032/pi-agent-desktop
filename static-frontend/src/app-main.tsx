@@ -13,9 +13,9 @@ import "../../app/globals.css";
 import "../../app/settings.css";
 import "../../app/native-theme.css";
 
-import { AppShell } from "@/components/AppShell";
-import { I18nProvider } from "@/hooks/useI18n";
-import { DistroSetupGate } from "@/components/distro";
+import { AppShell } from "../../components/AppShell";
+import { I18nProvider } from "../../hooks/useI18n";
+import { DistroSetupGate } from "../../components/distro";
 
 const container = document.getElementById("root");
 if (container === null) throw new Error("static frontend: #root missing");

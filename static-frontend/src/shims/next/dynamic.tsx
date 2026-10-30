@@ -1,7 +1,7 @@
 /**
  * next/dynamic shim: React.lazy + Suspense (the migration plan's mapping).
- * The preload-then-render pattern the app actually uses (LazyTerminalPanel)
- * keeps its own state; this shim serves any remaining next/dynamic import.
+ * Generic over the component's props so call sites keep contextual typing
+ * (the app's loaders return either a bare component or a module).
  */
 import { Suspense, lazy, type ComponentType, type ReactNode } from "react";
 
@@ -10,20 +10,22 @@ type DynamicOptions = {
   ssr?: boolean;
 };
 
-export default function nextDynamic(
-  loader: () => Promise<{ default: ComponentType } | ComponentType>,
+export default function nextDynamic<P>(
+  loader: () => Promise<ComponentType<P> | { default: ComponentType<P> }>,
   options?: DynamicOptions,
-): ComponentType {
+): ComponentType<P> {
   const Lazy = lazy(async () => {
-    const module = await loader();
-    if (typeof module === "function") return { default: module };
-    return { default: module.default };
+    const loaded = await loader();
+    const component: ComponentType<P> =
+      typeof loaded === "function" ? loaded : loaded.default;
+    return { default: component };
   });
   const fallback = options?.loading ?? (() => null);
-  const Wrapped = (props: Record<string, unknown>) => (
+  const Wrapped = (props: P): ReactNode => (
     <Suspense fallback={fallback()}>
-      <Lazy {...props} />
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+      <Lazy {...(props as any)} />
     </Suspense>
   );
-  return Wrapped;
+  return Wrapped as ComponentType<P>;
 }
