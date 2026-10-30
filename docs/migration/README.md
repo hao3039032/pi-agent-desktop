@@ -53,6 +53,7 @@ M4 项：
 M3 项：
 
 | 项 | 状态 | 工件 |
+| 文件访问允许清单 + files.read/write | ✅ 落地 | `src-tauri/src/file_access.rs`（归一化/词法授权/解析后授权拒绝 symlink 逃逸/~/pi-cwd 扫描）+ pi_ipc 的 files.allowRoot/read/write（越界写拒绝于任何 IO 之前）；往返测试 |
 |---|---|---|
 | 管理实例宿主（Rust 侧） | ✅ 骨干落地 | `crates/management-host`：按 scope（global/项目 cwd）分区按需启动 `--mode rpc --no-session` 子进程（发现全关、仅显式扩展）、60 秒空闲回收 + 租约保持、provider/模型枚举（`get_available_models`，含扩展注册的 provider）、扩展命令调用（无 run 启动）、不写会话文件（实测）。真实 pi 测试 2/2 |
 | 管理扩展（JS 侧骨架） | ✅ 骨架落地 | `lib/pi-rpc/assets/pi-web-management.mjs`：管理协议 v1（nonce 绑定信封、能力表、错误码、进度帧预留）；cron.preview/previousRuns（vendored croner，UTC/上海时区实测）；session.readHeader/readEntries（vendored SDK 的 session-manager 隔离模块图——实例一致性规则的落地模式）；unknown op 拒绝；不写会话文件。端到端测试（真实 vendored 树，desktop:prepare 形态）
