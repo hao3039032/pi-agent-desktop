@@ -74,3 +74,6 @@ e2e_*.mjs
 /src-tauri/resources/git/
 /src-tauri/resources/pi/
 /src-tauri/tauri.distro.conf.json
+
+# Rust PoC crate build output (M0 migration)
+crates/pi-host/target/

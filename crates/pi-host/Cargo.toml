@@ -1,0 +1,33 @@
+[package]
+name = "pi-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "Rust host for `pi --mode rpc` child processes (M0 PoC of the static-frontend Tauri migration)"
+publish = false
+
+# M0 scope: the JSONL RPC client (lib/pi-rpc/client.ts), the bridge
+# request/reply channel (lib/pi-rpc/core.ts) and a minimal session handshake,
+# ported to Rust with deterministic protocol tests (mock_pi) and real-pi
+# integration tests gated on PI_CLI_BIN. M2 wires this into the Tauri app as
+# a path dependency; it deliberately has no tauri/tokio dependency yet.
+
+[dependencies]
+serde_json = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "mock_pi"
+path = "src/bin/mock_pi.rs"
+
+[lib]
+name = "pi_host"
+path = "src/lib.rs"
