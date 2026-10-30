@@ -1,0 +1,1428 @@
+{
+  "schemaVersion": 1,
+  "generatedFrom": "app/api/**/route.ts + scripts/migration/api-inventory-mapping.mjs",
+  "totals": {
+    "routeFiles": 89,
+    "methods": 124
+  },
+  "owners": [
+    "rust-host",
+    "mgmt-extension",
+    "session-bridge",
+    "rust-native",
+    "removed-web-only"
+  ],
+  "milestones": [
+    "M2",
+    "M3",
+    "M4",
+    "M5"
+  ],
+  "routes": [
+    {
+      "route": "app/api/agent/[id]/bash-output/route.ts",
+      "domain": "agent",
+      "owner": "session-bridge",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "agent.bashOutput",
+          "owner": "session-bridge",
+          "notes": "bashId-correlated tool output of the session child"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/[id]/events/route.ts",
+      "domain": "agent",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "agent.subscribeEvents",
+          "owner": "rust-host",
+          "notes": "Tauri Channel stream: subscriptionId + host epoch + monotonic sequence; snapshot then events"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/[id]/lease/route.ts",
+      "domain": "agent",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "agent.lease",
+          "owner": "rust-host",
+          "notes": "prevents idle eviction while a window is attached"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/[id]/route.ts",
+      "domain": "agent",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "agent.command",
+          "owner": "rust-host",
+          "notes": "typed per-command IPC ops (prompt/interrupt/queue/compact/reload/navigate_tree...), NOT a generic passthrough"
+        },
+        {
+          "method": "GET",
+          "op": "agent.get",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/[id]/subagents/route.ts",
+      "domain": "agent",
+      "owner": "session-bridge",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "agent.subagentsStatus",
+          "owner": "session-bridge",
+          "notes": "pi-subagents event bus via the bridge (restricted rpc)"
+        },
+        {
+          "method": "POST",
+          "op": "agent.subagentsControl",
+          "owner": "session-bridge",
+          "notes": "steer/interrupt/stop only"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/new/route.ts",
+      "domain": "agent",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "agent.create",
+          "owner": "rust-host",
+          "notes": "spawn the session child; concurrent starts dedup through one start lock"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/running/events/route.ts",
+      "domain": "agent",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "agent.subscribeRunning",
+          "owner": "rust-host",
+          "notes": "running-id set stream"
+        }
+      ]
+    },
+    {
+      "route": "app/api/agent/running/route.ts",
+      "domain": "agent",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "agent.runningSnapshot",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/appearance/fonts/route.ts",
+      "domain": "appearance",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "appearance.fontsGet",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PUT",
+          "op": "appearance.fontsSet",
+          "owner": "rust-host",
+          "notes": "font settings file; bundled fonts load offline"
+        }
+      ]
+    },
+    {
+      "route": "app/api/artifacts/settings/route.ts",
+      "domain": "artifacts",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "artifacts.settingsGet",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PUT",
+          "op": "artifacts.settingsSet",
+          "owner": "rust-host",
+          "notes": "the artifacts prompt switch file"
+        }
+      ]
+    },
+    {
+      "route": "app/api/auth/api-key/[provider]/route.ts",
+      "domain": "auth",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "auth.apiKeyStore",
+          "owner": "mgmt-extension"
+        },
+        {
+          "method": "DELETE",
+          "op": "auth.apiKeyDelete",
+          "owner": "mgmt-extension",
+          "notes": "removeStoredCredentialIfType(); both lists refresh after any change"
+        }
+      ]
+    },
+    {
+      "route": "app/api/auth/login/[provider]/route.ts",
+      "domain": "auth",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "auth.loginManualCode",
+          "owner": "rust-host"
+        },
+        {
+          "method": "GET",
+          "op": "auth.loginStream",
+          "owner": "rust-host",
+          "notes": "device-code/OAuth progress stream; loopback callback listener in Rust (state + PKCE, closed on done/cancel/timeout)"
+        }
+      ]
+    },
+    {
+      "route": "app/api/auth/logout/[provider]/route.ts",
+      "domain": "auth",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "auth.logout",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/auth/providers/route.ts",
+      "domain": "auth",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "auth.providers",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/chat-attachments/extract/route.ts",
+      "domain": "chats",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "chats.extractAttachmentText",
+          "owner": "rust-host",
+          "notes": "DOCX text via the mammoth worker; size caps and error contract stay"
+        }
+      ]
+    },
+    {
+      "route": "app/api/chat-downloads/reveal/route.ts",
+      "domain": "chats",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "chats.revealDownload",
+          "owner": "rust-native",
+          "notes": "scope-confined to the chat folder"
+        }
+      ]
+    },
+    {
+      "route": "app/api/chat-folder/reveal/route.ts",
+      "domain": "chats",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "chats.revealFolder",
+          "owner": "rust-native"
+        }
+      ]
+    },
+    {
+      "route": "app/api/chat-settings/route.ts",
+      "domain": "chats",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "chats.settingsGet",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PUT",
+          "op": "chats.settingsSet",
+          "owner": "rust-host",
+          "notes": "per-chat panel switch + folder-path guards stay"
+        }
+      ]
+    },
+    {
+      "route": "app/api/chat-workspace/route.ts",
+      "domain": "chats",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "chats.workspaceState",
+          "owner": "rust-host",
+          "notes": "workspaceKind/chatFolder identity from the host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/custom-css/route.ts",
+      "domain": "appearance",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "appearance.customCssGet",
+          "owner": "rust-host"
+        },
+        {
+          "method": "POST",
+          "op": "appearance.customCssSet",
+          "owner": "rust-host",
+          "notes": "injected after a restricted read; never an iframe-reachable file"
+        }
+      ]
+    },
+    {
+      "route": "app/api/cwd/browse/route.ts",
+      "domain": "cwd",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "cwd.browse",
+          "owner": "rust-native",
+          "notes": "native folder picker replaces HTML browsing; path listing stays host-side"
+        },
+        {
+          "method": "POST",
+          "op": "cwd.pickFolder",
+          "owner": "rust-native"
+        }
+      ]
+    },
+    {
+      "route": "app/api/cwd/status/route.ts",
+      "domain": "cwd",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "cwd.status",
+          "owner": "rust-host",
+          "notes": "read-only existence check; grants nothing"
+        }
+      ]
+    },
+    {
+      "route": "app/api/cwd/validate/route.ts",
+      "domain": "cwd",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "cwd.validate",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/default-cwd/route.ts",
+      "domain": "cwd",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "cwd.createDefault",
+          "owner": "rust-host",
+          "notes": "creates ~/pi-cwd-YYYYMMDD"
+        }
+      ]
+    },
+    {
+      "route": "app/api/desktop/describe-paths/route.ts",
+      "domain": "desktop",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "desktop.describePaths",
+          "owner": "rust-native",
+          "notes": "native path fields for dialogs"
+        }
+      ]
+    },
+    {
+      "route": "app/api/desktop/fonts/route.ts",
+      "domain": "desktop",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "desktop.fonts",
+          "owner": "rust-native"
+        }
+      ]
+    },
+    {
+      "route": "app/api/desktop/identity/route.ts",
+      "domain": "desktop",
+      "owner": "rust-host",
+      "milestone": "M5",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "desktop.identity",
+          "owner": "rust-host",
+          "notes": "in-process now: the host proves itself to the WebView at IPC handshake"
+        }
+      ]
+    },
+    {
+      "route": "app/api/desktop/read-images/route.ts",
+      "domain": "desktop",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "desktop.readImages",
+          "owner": "rust-native",
+          "notes": "native-picked images → attachment payloads; cap derives from MAX_ATTACHED_IMAGES"
+        }
+      ]
+    },
+    {
+      "route": "app/api/desktop/save/route.ts",
+      "domain": "desktop",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "desktop.saveFile",
+          "owner": "rust-native",
+          "notes": "dialog-scoped destination only; no arbitrary paths"
+        }
+      ]
+    },
+    {
+      "route": "app/api/distro/route.ts",
+      "domain": "updates",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "distro.status",
+          "owner": "mgmt-extension",
+          "notes": "service address/key status; key never leaves the host"
+        },
+        {
+          "method": "PUT",
+          "op": "distro.configure",
+          "owner": "mgmt-extension",
+          "notes": "distro service config + idempotent release seeding"
+        }
+      ]
+    },
+    {
+      "route": "app/api/file-index/route.ts",
+      "domain": "files",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "files.index",
+          "owner": "rust-host",
+          "notes": "file-tree visibility rules"
+        }
+      ]
+    },
+    {
+      "route": "app/api/files/[...path]/route.ts",
+      "domain": "files",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "files.write",
+          "owner": "rust-host"
+        },
+        {
+          "method": "GET",
+          "op": "files.read",
+          "owner": "rust-host",
+          "notes": "canonical-path allow-list stays in Rust; binary via the resource protocol"
+        }
+      ]
+    },
+    {
+      "route": "app/api/git/diff/route.ts",
+      "domain": "git",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "git.diff",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/git/status/route.ts",
+      "domain": "git",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "git.status",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/home/route.ts",
+      "domain": "cwd",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "cwd.home",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/mcp/route.ts",
+      "domain": "mcp",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "mcp.configGet",
+          "owner": "mgmt-extension",
+          "notes": "reads nothing running; masking stays"
+        },
+        {
+          "method": "POST",
+          "op": "mcp.configAction",
+          "owner": "mgmt-extension",
+          "notes": "add/update/remove/undo-takeover via the typed action union (NOT raw JSON passthrough)"
+        }
+      ]
+    },
+    {
+      "route": "app/api/mcp/sign-in/[flowId]/route.ts",
+      "domain": "mcp",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "mcp.signInStatus",
+          "owner": "mgmt-extension"
+        },
+        {
+          "method": "POST",
+          "op": "mcp.signInSubmit",
+          "owner": "mgmt-extension",
+          "notes": "manual code paste"
+        },
+        {
+          "method": "DELETE",
+          "op": "mcp.signInCancel",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/mcp/sign-in/route.ts",
+      "domain": "mcp",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "mcp.signInStart",
+          "owner": "mgmt-extension",
+          "notes": "entry request + status store"
+        }
+      ]
+    },
+    {
+      "route": "app/api/mcp/test/route.ts",
+      "domain": "mcp",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "mcp.test",
+          "owner": "mgmt-extension",
+          "notes": "bounded connection probe, !command queue, redaction"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models-config/catalog/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "modelsConfig.catalog",
+          "owner": "mgmt-extension",
+          "notes": "models.dev pricing presets"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models-config/discover/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "modelsConfig.discover",
+          "owner": "mgmt-extension",
+          "notes": "configured provider's upstream list fetch"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models-config/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "modelsConfig.get",
+          "owner": "mgmt-extension",
+          "notes": "literal-key redaction stays"
+        },
+        {
+          "method": "PUT",
+          "op": "modelsConfig.put",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models-config/test/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "modelsConfig.test",
+          "owner": "mgmt-extension",
+          "notes": "named model request; credentials never reach the frontend"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models/default/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "PUT",
+          "op": "models.setDefault",
+          "owner": "mgmt-extension",
+          "notes": "the only writer of global defaults"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models/enabled/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "models.enabledGet",
+          "owner": "mgmt-extension"
+        },
+        {
+          "method": "PUT",
+          "op": "models.enabledSet",
+          "owner": "mgmt-extension",
+          "notes": "minimal-edit engine; resync repairs; never string-compare patterns"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models/nonchat/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "models.nonchat",
+          "owner": "mgmt-extension",
+          "notes": "classifier + image models and the global Code mode choice"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models/refresh/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "models.refreshCatalog",
+          "owner": "mgmt-extension",
+          "notes": "network only on explicit user action"
+        }
+      ]
+    },
+    {
+      "route": "app/api/models/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "models.list",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/open-in-explorer/route.ts",
+      "domain": "files",
+      "owner": "rust-native",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "files.revealSupport",
+          "owner": "rust-native"
+        },
+        {
+          "method": "POST",
+          "op": "files.reveal",
+          "owner": "rust-native",
+          "notes": "explorer.exe on Windows, never cmd /C start"
+        }
+      ]
+    },
+    {
+      "route": "app/api/plugins/check/route.ts",
+      "domain": "plugins",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "plugins.check",
+          "owner": "mgmt-extension",
+          "notes": "updates available check"
+        }
+      ]
+    },
+    {
+      "route": "app/api/plugins/route.ts",
+      "domain": "plugins",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "plugins.list",
+          "owner": "mgmt-extension"
+        },
+        {
+          "method": "POST",
+          "op": "plugins.manage",
+          "owner": "mgmt-extension",
+          "notes": "install/uninstall via package tooling in the management instance"
+        }
+      ]
+    },
+    {
+      "route": "app/api/project-trust/route.ts",
+      "domain": "mcp",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "trust.status",
+          "owner": "rust-host"
+        },
+        {
+          "method": "POST",
+          "op": "trust.set",
+          "owner": "rust-host",
+          "notes": "trust.json stays the shared decision store; fresh-folder rules move to the host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/provider-usage/query/route.ts",
+      "domain": "models",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "models.providerUsage",
+          "owner": "mgmt-extension",
+          "notes": "provider usage query over stored credentials"
+        }
+      ]
+    },
+    {
+      "route": "app/api/push/config/route.ts",
+      "domain": "web",
+      "owner": "removed-web-only",
+      "milestone": "M5",
+      "methods": [
+        {
+          "method": "GET",
+          "op": null,
+          "owner": "removed-web-only",
+          "notes": "Web Push/VAPID — desktop notifications go through the tray/notifier"
+        }
+      ]
+    },
+    {
+      "route": "app/api/push/subscribe/route.ts",
+      "domain": "web",
+      "owner": "removed-web-only",
+      "milestone": "M5",
+      "methods": [
+        {
+          "method": "POST",
+          "op": null,
+          "owner": "removed-web-only"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/[id]/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "tasks.get",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PATCH",
+          "op": "tasks.update",
+          "owner": "rust-host"
+        },
+        {
+          "method": "DELETE",
+          "op": "tasks.delete",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/[id]/run/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "tasks.runNow",
+          "owner": "rust-host",
+          "notes": "marker confirmed by the CLI before the prompt is sent"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/[id]/runs/[runId]/seen/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "tasks.markRunSeen",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/[id]/runs/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "tasks.runs",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/events/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "tasks.subscribeEvents",
+          "owner": "rust-host",
+          "notes": "Channel stream; scheduler runs while the UI is closed"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/preview/route.ts",
+      "domain": "tasks",
+      "owner": "mgmt-extension",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "tasks.previewCron",
+          "owner": "mgmt-extension",
+          "notes": "cron next-run preview in the management instance"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "tasks.list",
+          "owner": "rust-host"
+        },
+        {
+          "method": "POST",
+          "op": "tasks.create",
+          "owner": "rust-host",
+          "notes": "cron calc via the management extension's fixed-version croner"
+        }
+      ]
+    },
+    {
+      "route": "app/api/scheduled-tasks/scheduler/takeover/route.ts",
+      "domain": "tasks",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "tasks.schedulerTakeover",
+          "owner": "rust-host",
+          "notes": "manual takeover after a stale lease (90s rule)"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/auto-name/route.ts",
+      "domain": "sessions",
+      "owner": "session-bridge",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "sessions.autoName",
+          "owner": "session-bridge",
+          "notes": "named bridge op on the session child; never a user-chat prompt"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/chat-access/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.chatAccessGet",
+          "owner": "rust-host"
+        },
+        {
+          "method": "POST",
+          "op": "sessions.chatAccessSet",
+          "owner": "rust-host",
+          "notes": "chat folder confinement checks stay server-side → host-side"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/context/route.ts",
+      "domain": "sessions",
+      "owner": "mgmt-extension",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.context",
+          "owner": "mgmt-extension",
+          "notes": "context projection over the fixed-SDK session reader; leafId paging"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/continue-in-project/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "sessions.continueInProject",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/entries/[entryId]/thinking/route.ts",
+      "domain": "sessions",
+      "owner": "mgmt-extension",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.entryThinking",
+          "owner": "mgmt-extension",
+          "notes": "lazy thinking load from the session file"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/entries/[entryId]/tool-result-image/route.ts",
+      "domain": "sessions",
+      "owner": "mgmt-extension",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.entryToolResultImage",
+          "owner": "mgmt-extension",
+          "notes": "session-reference read-only grant, binary via resource channel"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/export/route.ts",
+      "domain": "sessions",
+      "owner": "mgmt-extension",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.export",
+          "owner": "mgmt-extension",
+          "notes": "HTML export keeps the non-recursive deep-tree fix"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/reference/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.reference",
+          "owner": "rust-host",
+          "notes": "session-file reference grants (read-only, scope-checked)"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.get",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PATCH",
+          "op": "sessions.rename",
+          "owner": "rust-host",
+          "notes": "session_info entry stays in the session file"
+        },
+        {
+          "method": "DELETE",
+          "op": "sessions.delete",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/[id]/state/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.runState",
+          "owner": "rust-host",
+          "notes": "live wrapper snapshot (isRunning ORs isIdle===false)"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "notes": "incremental scanner + project grouping move into the Rust host",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.list",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/sessions/search/route.ts",
+      "domain": "sessions",
+      "owner": "rust-host",
+      "milestone": "M2",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "sessions.search",
+          "owner": "rust-host",
+          "notes": "history search over the Rust index"
+        }
+      ]
+    },
+    {
+      "route": "app/api/skills/check/route.ts",
+      "domain": "skills",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "skills.check",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/skills/install/route.ts",
+      "domain": "skills",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "skills.install",
+          "owner": "mgmt-extension",
+          "notes": "npx skills add runner; mirror/progress/cancel semantics stay"
+        }
+      ]
+    },
+    {
+      "route": "app/api/skills/route.ts",
+      "domain": "skills",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "skills.list",
+          "owner": "mgmt-extension"
+        },
+        {
+          "method": "PATCH",
+          "op": "skills.setDisabled",
+          "owner": "mgmt-extension",
+          "notes": "disable-model-invocation toggles"
+        }
+      ]
+    },
+    {
+      "route": "app/api/skills/search/route.ts",
+      "domain": "skills",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "skills.search",
+          "owner": "mgmt-extension",
+          "notes": "skills.sh search; manual refresh only"
+        }
+      ]
+    },
+    {
+      "route": "app/api/skills/update/route.ts",
+      "domain": "skills",
+      "owner": "mgmt-extension",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "skills.update",
+          "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/terminal/[id]/events/route.ts",
+      "domain": "terminal",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "terminal.subscribeOutput",
+          "owner": "rust-host",
+          "notes": "Channel stream; 120s connection lease"
+        }
+      ]
+    },
+    {
+      "route": "app/api/terminal/[id]/route.ts",
+      "domain": "terminal",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "terminal.history",
+          "owner": "rust-host",
+          "notes": "128 Ki UTF-16 history + cursor semantics"
+        },
+        {
+          "method": "POST",
+          "op": "terminal.write",
+          "owner": "rust-host",
+          "notes": "input + resize serialized; input failures never auto-retried"
+        },
+        {
+          "method": "DELETE",
+          "op": "terminal.close",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/terminal/route.ts",
+      "domain": "terminal",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "terminal.create",
+          "owner": "rust-host",
+          "notes": "portable-pty replaces node-pty; id/cwd idempotent create"
+        }
+      ]
+    },
+    {
+      "route": "app/api/terminal/settings/route.ts",
+      "domain": "terminal",
+      "owner": "rust-host",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "terminal.settingsGet",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PUT",
+          "op": "terminal.settingsSet",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/tools/settings/route.ts",
+      "domain": "tools",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "tools.settingsGet",
+          "owner": "rust-host",
+          "notes": "presets, Chat-only, exact prompt, Code mode and PowerShell switches"
+        },
+        {
+          "method": "PUT",
+          "op": "tools.settingsSet",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/updates/route.ts",
+      "domain": "updates",
+      "owner": "rust-native",
+      "milestone": "M4",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "updates.check",
+          "owner": "rust-native",
+          "notes": "mirror fallback, URL restrictions, signature/version checks, busy guard"
+        }
+      ]
+    },
+    {
+      "route": "app/api/web-auth/route.ts",
+      "domain": "web",
+      "owner": "removed-web-only",
+      "milestone": "M5",
+      "methods": [
+        {
+          "method": "GET",
+          "op": null,
+          "owner": "removed-web-only",
+          "notes": "web password gate — no desktop successor"
+        },
+        {
+          "method": "POST",
+          "op": null,
+          "owner": "removed-web-only"
+        },
+        {
+          "method": "DELETE",
+          "op": null,
+          "owner": "removed-web-only"
+        }
+      ]
+    },
+    {
+      "route": "app/api/worktrees/fetch/route.ts",
+      "domain": "worktrees",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "POST",
+          "op": "worktrees.fetch",
+          "owner": "rust-host"
+        }
+      ]
+    },
+    {
+      "route": "app/api/worktrees/route.ts",
+      "domain": "worktrees",
+      "owner": "rust-host",
+      "milestone": "M3",
+      "methods": [
+        {
+          "method": "GET",
+          "op": "worktrees.list",
+          "owner": "rust-host"
+        },
+        {
+          "method": "POST",
+          "op": "worktrees.create",
+          "owner": "rust-host"
+        },
+        {
+          "method": "PUT",
+          "op": "worktrees.switch",
+          "owner": "rust-host"
+        },
+        {
+          "method": "DELETE",
+          "op": "worktrees.delete",
+          "owner": "rust-host"
+        }
+      ]
+    }
+  ]
+}
