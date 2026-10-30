@@ -28,6 +28,9 @@
  *   rust-native     — Tauri native shell (menus, fonts, window, tray)
  *   removed-web-only— browser/PWA/remote-access features dropped with the
  *                     server (plan §二.1); no IPC successor
+ *
+ * `transitionOnly: true` marks migration scaffolding (no IPC successor;
+ * removed with the server once the static frontend owns the flow).
  */
 
 /** Allowed values, asserted by scripts/migration/api-inventory.test.mjs. */
@@ -491,6 +494,19 @@ export const ROUTE_MAP = {
     methods: {
       GET: { op: "distro.status", notes: "service address/key status; key never leaves the host" },
       PUT: { op: "distro.configure", notes: "distro service config + idempotent release seeding" },
+    },
+  },
+
+  // --- transition-only: scaffolding for the migration itself -----------------
+  // The state mirror is how the CURRENT app exports WebView persistence for
+  // the static frontend to import (docs/migration/README.md §M1). It has no
+  // IPC successor: the new architecture reads the mirror FILE at boot and
+  // writes host-owned state natively. Removed with the server in M5.
+  "app/api/state-mirror/route.ts": {
+    domain: "state-mirror", owner: "rust-host", milestone: "M5",
+    methods: {
+      GET: { op: null, transitionOnly: true, notes: "read for diagnostics; the importer reads the file directly" },
+      PUT: { op: null, transitionOnly: true, notes: "the transition version writes the mirror file" },
     },
   },
 

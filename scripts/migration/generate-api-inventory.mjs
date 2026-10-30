@@ -55,8 +55,11 @@ function assertMappingIsValid(route, entry, methods) {
     for (const method of methods) {
       const spec = entry.methods[method];
       if (!spec) problems.push(`${method}: no mapping entry (nothing is migrated "later")`);
-      else if (spec.op === undefined) problems.push(`${method}: missing op (use null for removed-web-only)`);
+      else if (spec.op === undefined) problems.push(`${method}: missing op (use null for removed-web-only/transition-only)`);
       else if (spec.op !== null && typeof spec.op !== "string") problems.push(`${method}: op must be a string or null`);
+      else if (spec.op === null && entry.owner !== "removed-web-only" && !spec.transitionOnly) {
+        problems.push(`${method}: null op requires a removed-web-only owner or transitionOnly`);
+      }
       if (spec?.owner && !OWNERS.includes(spec.owner)) problems.push(`${method}: unknown owner override`);
     }
     for (const method of Object.keys(entry.methods)) {
@@ -92,6 +95,7 @@ export function buildInventory() {
           method,
           op: spec.op ?? null,
           owner: spec.owner ?? entry?.owner ?? null,
+          ...(spec.transitionOnly ? { transitionOnly: true } : {}),
           ...(spec.notes ? { notes: spec.notes } : {}),
         };
         methodCount += 1;

@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "generatedFrom": "app/api/**/route.ts + scripts/migration/api-inventory-mapping.mjs",
   "totals": {
-    "routeFiles": 89,
-    "methods": 124
+    "routeFiles": 90,
+    "methods": 126
   },
   "owners": [
     "rust-host",
@@ -1252,6 +1252,28 @@
           "method": "POST",
           "op": "skills.update",
           "owner": "mgmt-extension"
+        }
+      ]
+    },
+    {
+      "route": "app/api/state-mirror/route.ts",
+      "domain": "state-mirror",
+      "owner": "rust-host",
+      "milestone": "M5",
+      "methods": [
+        {
+          "method": "GET",
+          "op": null,
+          "owner": "rust-host",
+          "transitionOnly": true,
+          "notes": "read for diagnostics; the importer reads the file directly"
+        },
+        {
+          "method": "PUT",
+          "op": null,
+          "owner": "rust-host",
+          "transitionOnly": true,
+          "notes": "the transition version writes the mirror file"
         }
       ]
     },

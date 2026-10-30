@@ -20,9 +20,12 @@ import { buildInventory } from "./generate-api-inventory.mjs";
 const ROOT = join(import.meta.dirname, "../..");
 const INVENTORY = JSON.parse(readFileSync(join(ROOT, "docs/migration/api-inventory.json"), "utf8"));
 
-// The plan's frozen counts (M0: "89 个路由文件、124 个具名 HTTP 方法导出").
-const EXPECTED_ROUTE_FILES = 89;
-const EXPECTED_METHODS = 124;
+// The plan's frozen M0 counts (89 route files / 124 methods) plus the M1
+// transition scaffolding this branch itself added (app/api/state-mirror,
+// GET+PUT — transitionOnly, removed in M5). A change here must be a
+// conscious mapping edit, never silent drift.
+const EXPECTED_ROUTE_FILES = 90;
+const EXPECTED_METHODS = 126;
 const WEB_ONLY_ROUTES = new Set(["app/api/web-auth/route.ts", "app/api/push/config/route.ts", "app/api/push/subscribe/route.ts"]);
 
 test("inventory regenerates identically from the current sources", () => {
@@ -48,10 +51,10 @@ test("every method has a unique op (or an explicit web-only removal)", () => {
       assert.ok(method.op !== undefined, `${route.route} ${method.method}: op must exist`);
       if (method.op === null) {
         assert.ok(
-          WEB_ONLY_ROUTES.has(route.route),
-          `${route.route} ${method.method}: null op is reserved for web-only routes`,
+          WEB_ONLY_ROUTES.has(route.route) || method.transitionOnly === true,
+          `${route.route} ${method.method}: null op is reserved for web-only routes or explicit transition-only scaffolding`,
         );
-        assert.equal(route.owner, "removed-web-only");
+        if (!method.transitionOnly) assert.equal(route.owner, "removed-web-only");
         continue;
       }
       assert.match(method.op, /^[a-z][A-Za-z0-9]*(\.[a-z][A-Za-z0-9]*)+$/, `${route.route} ${method.method}: op must be domain.name`);

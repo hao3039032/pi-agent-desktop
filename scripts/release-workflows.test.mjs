@@ -82,11 +82,13 @@ test("no test file is left out of npm test", async () => {
     .split("\n")
     .filter(Boolean);
 
-  const covered = tracked.filter((file) => /^(app|lib|scripts|components|hooks|public)\//.test(file));
+  const covered = tracked.filter((file) =>
+    /^(app|lib|scripts|components|hooks|public|static-frontend)\//.test(file),
+  );
   assert.deepEqual(
     tracked.filter((file) => !covered.includes(file)),
     [],
-    "a .test.mjs file lives outside app/, lib/, scripts/, components/, hooks/ and public/ — extend npm test",
+    "a .test.mjs file lives outside app/, lib/, scripts/, components/, hooks/, public/ and static-frontend/ — extend npm test",
   );
 });
 
