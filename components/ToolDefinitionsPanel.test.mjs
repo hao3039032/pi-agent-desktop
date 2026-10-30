@@ -12,7 +12,14 @@ test("keeps System and Tools in separate adjacent toolbar actions", () => {
   assert.match(appShellSource, /activeTopPanel === "system"[\s\S]*?<SystemPromptPanel/);
   assert.match(appShellSource, /activeTopPanel === "tools"[\s\S]*?<ToolDefinitionsPanel/);
   assert.doesNotMatch(systemSource, /ToolEntry|tools/);
-  assert.doesNotMatch(systemSource, /system-prompt-heading/);
+  // The panel MAY label which truth it shows (recorded replay vs configured
+  // exact prompt) — that is new information. What it must not do is repeat the
+  // action's own title, which the toolbar already carries.
+  assert.match(
+    systemSource,
+    /className="system-prompt-heading">\{status === "configured" \? translate\("system\.configuredHeading"\) : translate\("system\.recordedHeading"\)\}/,
+  );
+  assert.doesNotMatch(systemSource, /<h[1-6][^>]*>\s*\{translate\("system\.(prompt|title)"\)\}/);
   assert.doesNotMatch(panelSource, /tool-definitions-heading/);
 });
 

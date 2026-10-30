@@ -152,16 +152,19 @@ test("each pi-subagents policy seam independently requires upstream review", () 
   }
 });
 
-test("the subagent settings response and type are tracked low-risk overlaps", () => {
+test("the subagent settings response and type are tracked overlaps", () => {
   // app/api/subagents/settings/route.ts went with the built-in engine (M4);
-  // lib/api-types.ts stays tracked. Recording the boundary must not silently
-  // change the existing low-only policy.
+  // lib/api-types.ts stays tracked. Since the v0.7.8 merge its structural
+  // drift (30) crossed into medium: the file now carries LW's CLI-engine type
+  // surface plus upstream's adopted TerminalSettingsResponse while declining
+  // SubagentProfilesResponse (the built-in subagent system is gone). An
+  // upstream edit here therefore needs a human to decide which side a new type
+  // belongs to, so it is no longer a low-risk automatic sync.
   for (const path of ["lib/api-types.ts"]) {
     const result = classifyIncomingChanges([path], manifest);
     assert.deepEqual(result.overlaps.map((entry) => entry.path), [path]);
-    assert.equal(result.highestRisk, "low", path);
-    // Recording the boundary must not silently change the existing low-only policy.
-    assert.equal(result.reviewRequired, false, path);
+    assert.equal(result.highestRisk, "medium", path);
+    assert.equal(result.reviewRequired, true, path);
     assert.equal(result.overlaps[0].disposition, "accepted", path);
   }
 });
