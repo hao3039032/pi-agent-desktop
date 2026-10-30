@@ -16,6 +16,11 @@
 //! - cron slot math stays with the management extension's fixed-version
 //!   croner (plan §三): this crate consumes a [`CronOracle`].
 
+pub mod engine;
+pub mod store;
+pub use engine::{Engine, RunSpawner, TickReport};
+pub use store::{RunRecord, TaskStore};
+
 use std::collections::HashMap;
 use serde_json::Value;
 
