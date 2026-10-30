@@ -6,7 +6,7 @@
 
 | 项 | 状态 | 工件 |
 |---|---|---|
-| 124 个 HTTP 方法 → IPC 完整映射 | ✅ 完成 | `api-inventory.json` + `scripts/migration/api-inventory-mapping.mjs`（守卫测试 `scripts/migration/api-inventory.test.mjs`：89 文件/124 方法冻结、op 唯一、无遗漏） |
+| 全部 HTTP 方法 → IPC 完整映射 | ✅ 完成（90 文件/126 方法：M0 冻结的 89/124 + M1 新增的 state-mirror 过渡脚手架） | `api-inventory.json` + `scripts/migration/api-inventory-mapping.mjs`（守卫测试：冻结计数、op 唯一、无遗漏、transitionOnly 显式标记） |
 | IPC 协议规范（信封/错误码/流/资源通道） | ✅ 冻结初版 | `ipc-protocol.md` |
 | Rust→pi 握手/桥接/退出（最高风险项） | ✅ PoC 验证通过 | `crates/pi-host`：20 个确定性协议测试 + 3 个真实 pi 集成测试（`PI_CLI_BIN` 门控，隔离 `PI_CODING_AGENT_DIR` 沙箱） |
 | 管理依赖加载（隔离固定版本模块树，绝对路径导入） | ✅ 机制验证通过（本机 pi 1.4.0 托管安装 = release 目录布局，linux-x64） | `scripts/migration/management-deps-loading.test.mjs`：vendored croner 10.x 在子进程内解析、执行、回报 URL；空 NODE_PATH + 临时 cwd。已随 `PI_CLI_BIN=… npm test` 全量回归（3629/3629，0 跳过）。⚠️ 其余三个发行目标的打包布局（desktop:prepare 产物）验证仍待做 |
