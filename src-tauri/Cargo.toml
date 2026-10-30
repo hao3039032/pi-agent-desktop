@@ -19,7 +19,9 @@ tauri-build = { version = "2.5.5", features = [] }
 # the pi child RPC client; session-host is the session registry the pi_ipc
 # command dispatches into.
 pi-host = { path = "../crates/pi-host" }
+pty-host = { path = "../crates/pty-host" }
 session-host = { path = "../crates/session-host" }
+base64 = "0.22"
 dunce = "1"
 getrandom = "0.3"
 libc = "0.2"

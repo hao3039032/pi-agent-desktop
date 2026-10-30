@@ -36,6 +36,7 @@
     "allow-clear-app-cache",
     "allow-get-desktop-api-token",
     "allow-pi-ipc",
-    "allow-pi-ipc-subscribe-events"
+    "allow-pi-ipc-subscribe-events",
+    "allow-pi-ipc-subscribe-terminal"
   ]
 }

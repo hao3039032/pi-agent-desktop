@@ -87,3 +87,8 @@ commands.allow = ["pi_ipc"]
 identifier = "allow-pi-ipc-subscribe-events"
 description = "Allows the app WebView to subscribe a session's event stream over a Tauri Channel (snapshot-then-events, monotonic seq, host epoch)."
 commands.allow = ["pi_ipc_subscribe_events"]
+
+[[permission]]
+identifier = "allow-pi-ipc-subscribe-terminal"
+description = "Allows the app WebView to subscribe a terminal's output stream over a Tauri Channel (suffix reads with a cursor, reset+replay when the history window demands it)."
+commands.allow = ["pi_ipc_subscribe_terminal"]

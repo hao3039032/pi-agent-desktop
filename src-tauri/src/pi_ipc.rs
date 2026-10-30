@@ -6,13 +6,18 @@
 //! Closed operation surface: the op table here is exhaustive — unknown
 //! operations answer `unknown_op` without touching any session child.
 
+use base64::Engine;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::State;
 
 use session_host::{SessionRegistry, SessionSpawnConfig};
+
+/// Terminal output frames carry base64 inside JSON Channels today; the
+/// raw-bytes upgrade (protocol doc §4) lands with the M4 binary channel.
 
 /// Protocol version (must match static-frontend/src/ipc/protocol.ts and
 /// docs/migration/ipc-protocol.md).
@@ -28,6 +33,8 @@ pub struct IpcHostState {
     #[allow(dead_code)]
     pub spawn_config: std::sync::Mutex<Option<SessionSpawnConfig>>,
     subscription_counter: AtomicU64,
+    /// The terminal registry (portable-pty; crates/pty-host).
+    pub terminals: pty_host::PtyHost,
 }
 
 impl IpcHostState {
@@ -36,6 +43,7 @@ impl IpcHostState {
             registry: SessionRegistry::new(),
             spawn_config: std::sync::Mutex::new(None),
             subscription_counter: AtomicU64::new(0),
+            terminals: pty_host::PtyHost::new(),
         }
     }
 }
@@ -102,6 +110,88 @@ pub fn pi_ipc_subscribe_events(
         .ok();
 
     json!({ "subscriptionId": subscription_id, "epoch": epoch })
+}
+
+/// Stream one terminal's output over a Channel: the first frame carries the
+/// read since the caller's cursor (suffix or the reset+replay the history
+/// window demands), then new output follows. A closed channel detaches.
+#[tauri::command]
+pub fn pi_ipc_subscribe_terminal(
+    state: State<'_, IpcHostState>,
+    id: String,
+    cursor: u64,
+    on_output: Channel<Value>,
+) -> Value {
+    let Some(terminal) = state.terminals.get(&id) else {
+        return protocol_error("?", "not_found", &format!("no terminal {id}"));
+    };
+    let subscription_id = format!(
+        "term-{}",
+        state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    let subscription_id_for_relay = subscription_id.clone();
+    std::thread::Builder::new()
+        .name(format!("ipc-terminal-{subscription_id}"))
+        .spawn(move || {
+            let mut cursor = cursor;
+            let mut seq: u64 = 0;
+            loop {
+                let outcome = terminal.read_since(cursor);
+                match outcome {
+                    pty_host::ReadOutcome::Suffix { cursor: next, text } => {
+                        if text.is_empty() {
+                            // Nothing new: poll again shortly.
+                            std::thread::sleep(Duration::from_millis(120));
+                            // Detect exit: a closed terminal ends the stream.
+                            if terminal.wait_exit(Duration::from_millis(0)).is_some() {
+                                seq += 1;
+                                let _ = on_output.send(stream_frame(
+                                    &subscription_id,
+                                    1,
+                                    seq,
+                                    "event",
+                                    json!({ "kind": "exit" }),
+                                ));
+                                return;
+                            }
+                            continue;
+                        }
+                        cursor = next;
+                        seq += 1;
+                        if on_output
+                            .send(stream_frame(
+                                &subscription_id,
+                                1,
+                                seq,
+                                "event",
+                                json!({ "kind": "suffix", "cursor": cursor, "output": text }),
+                            ))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    pty_host::ReadOutcome::Reset { cursor: next, text } => {
+                        cursor = next;
+                        seq += 1;
+                        if on_output
+                            .send(stream_frame(
+                                &subscription_id,
+                                1,
+                                seq,
+                                "reset",
+                                json!({ "kind": "reset", "cursor": cursor, "output": text }),
+                            ))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .ok();
+    json!({ "subscriptionId": subscription_id_for_relay })
 }
 
 fn session_run_state_json(session: &Arc<session_host::Session>) -> Value {
@@ -185,6 +275,70 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, error.code(), &error.to_string()),
             }
         }
+        // Terminals (crates/pty-host): idempotent create, serialized input,
+        // cursor-based reads, explicit close. Input failures surface —
+        // terminal input is never auto-retried.
+        "terminal.create" => {
+            let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+            if terminal_id.is_empty() {
+                return protocol_error(&id, "invalid_args", "terminal id is required");
+            }
+            let cwd = args.get("cwd").and_then(Value::as_str).map(std::path::PathBuf::from);
+            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+            match state.terminals.create(terminal_id, cwd.as_deref(), pty_host::PtyOptions { cols, rows, ..Default::default() }) {
+                Ok(_) => protocol_ok(&id, json!({ "id": terminal_id })),
+                Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
+        "terminal.write" => {
+            let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+            let Some(terminal) = state.terminals.get(terminal_id) else {
+                return protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"));
+            };
+            let input = args
+                .get("input")
+                .and_then(Value::as_str)
+                .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok());
+            let Some(input) = input else {
+                return protocol_error(&id, "invalid_args", "input must be base64");
+            };
+            match terminal.write_input(&input) {
+                Ok(()) => protocol_ok(&id, json!({ "written": input.len() })),
+                Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
+        "terminal.resize" => {
+            let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+            let Some(terminal) = state.terminals.get(terminal_id) else {
+                return protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"));
+            };
+            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
+            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+            match terminal.resize(cols, rows) {
+                Ok(()) => protocol_ok(&id, json!({ "cols": cols, "rows": rows })),
+                Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
+        "terminal.read" => {
+            let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+            let Some(terminal) = state.terminals.get(terminal_id) else {
+                return protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"));
+            };
+            let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+            match terminal.read_since(cursor) {
+                pty_host::ReadOutcome::Suffix { cursor, text } => protocol_ok(&id, json!({ "kind": "suffix", "cursor": cursor, "output": text })),
+                pty_host::ReadOutcome::Reset { cursor, text } => protocol_ok(&id, json!({ "kind": "reset", "cursor": cursor, "output": text })),
+            }
+        }
+        "terminal.close" => {
+            let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+            if state.terminals.close(terminal_id) {
+                protocol_ok(&id, json!({ "closed": true }))
+            } else {
+                protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"))
+            }
+        }
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
     }
 }
@@ -245,6 +399,70 @@ mod tests {
         );
         assert_eq!(response["ok"], false);
         assert_eq!(response["error"]["code"], "unknown_op");
+    }
+
+    #[test]
+    fn terminal_roundtrip_over_the_dispatch_table() {
+        let state = state();
+        let create = send(
+            &state,
+            json!({ "v": 1, "id": "t1", "op": "terminal.create", "args": { "id": "term-1", "cols": 80, "rows": 24 } }),
+        );
+        assert_eq!(create["ok"], true, "{create}");
+        // Idempotent create: the same id answers again (the running PTY).
+        let again = send(
+            &state,
+            json!({ "v": 1, "id": "t2", "op": "terminal.create", "args": { "id": "term-1" } }),
+        );
+        assert_eq!(again["ok"], true);
+
+        // Input must be base64; a closed terminal refuses input explicitly.
+        let write = send(
+            &state,
+            json!({ "v": 1, "id": "t3", "op": "terminal.write", "args": { "id": "term-1", "input": "ZWNobyBwaV9pcGMK" } }),
+        );
+        assert_eq!(write["ok"], true, "{write}");
+        let bad = send(
+            &state,
+            json!({ "v": 1, "id": "t4", "op": "terminal.write", "args": { "id": "term-1", "input": "not base64!!" } }),
+        );
+        assert_eq!(bad["error"]["code"], "invalid_args");
+        let missing = send(
+            &state,
+            json!({ "v": 1, "id": "t5", "op": "terminal.write", "args": { "id": "ghost", "input": "eA==" } }),
+        );
+        assert_eq!(missing["error"]["code"], "not_found");
+
+        // The read surface answers (the shell echoed our line).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let read = loop {
+            let read = send(
+                &state,
+                json!({ "v": 1, "id": "t6", "op": "terminal.read", "args": { "id": "term-1", "cursor": 0 } }),
+            );
+            let output = read["data"]["output"].as_str().unwrap_or("");
+            if output.contains("pi_ipc") || std::time::Instant::now() > deadline {
+                break read;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert_eq!(read["ok"], true);
+        assert!(
+            read["data"]["output"].as_str().unwrap_or("").contains("pi_ipc"),
+            "the terminal echoed: {read}"
+        );
+
+        // Missing ids and unknown terminal ops stay refused.
+        let close = send(
+            &state,
+            json!({ "v": 1, "id": "t7", "op": "terminal.close", "args": { "id": "term-1" } }),
+        );
+        assert_eq!(close["ok"], true);
+        let closed = send(
+            &state,
+            json!({ "v": 1, "id": "t8", "op": "terminal.read", "args": { "id": "term-1", "cursor": 0 } }),
+        );
+        assert_eq!(closed["error"]["code"], "not_found", "a closed terminal is gone: {closed}");
     }
 
     #[test]
