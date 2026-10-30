@@ -38,13 +38,22 @@ M1 项：
 | IPC 类型层 | ✅ 初版 | `static-frontend/src/ipc/`：协议 v1 信封/错误码/流帧类型（对齐 `ipc-protocol.md`）、类型化客户端 + 可注入 transport（Tauri 桥/Mock）、封闭操作面（unknown_op 拒绝、超时不重发）、集中式导航适配（session/cwd/view，URL 优先）。12 个 mock-transport 测试 |
 | 页面组件迁移 | ⬜ M2 起 | 会话 UI、模型面板等 |
 
+M4 项：
+
+| 项 | 状态 | 工件 |
+|---|---|---|
+| 调度器核心 | ✅ 落地 | `crates/task-scheduler`：slot 决策（2 分钟准时宽限/7 天补跑一次/更旧丢弃带跳过计数）、overlap 跳过、2 并发上限（手动运行绕过上限不绕过 overlap）、连续 5 失败自动暂停（保留致停错误）、成功重置、90 秒租约心跳/过期/显式接管、超时清理、磁盘任务形状解析。8 测试 |
+| CronOracle（cron 计算经管理扩展的固定版 croner） | ✅ 桥接落地 | `ManagementCronOracle`：previous_run 一次 cron.previousRuns 调用；真实 pi + vendored croner 实测（UTC 表达式、独立核算的 epoch） |
+| 调度器接线（pi_ipc + 任务存储 + 30s tick 循环） | ⬜ | 核心与 oracle 已就位 |
+
 M3 项：
 
 | 项 | 状态 | 工件 |
 |---|---|---|
 | 管理实例宿主（Rust 侧） | ✅ 骨干落地 | `crates/management-host`：按 scope（global/项目 cwd）分区按需启动 `--mode rpc --no-session` 子进程（发现全关、仅显式扩展）、60 秒空闲回收 + 租约保持、provider/模型枚举（`get_available_models`，含扩展注册的 provider）、扩展命令调用（无 run 启动）、不写会话文件（实测）。真实 pi 测试 2/2 |
-| 管理扩展（JS 侧：vendored 依赖树 + 配置编辑/enabledModels/凭证/MCP 管理/插件技能） | ⬜ M3 主体 | 加载机制已验证（M0）；实例骨架已就位（本项）；扩展本体从现有 lib/*.ts 移植 |
-| MCP transport 实例一致性 | ⬜ 依赖上项 | 管理扩展骨架落地后的第一个验证 |
+| 管理扩展（JS 侧骨架） | ✅ 骨架落地 | `lib/pi-rpc/assets/pi-web-management.mjs`：管理协议 v1（nonce 绑定信封、能力表、错误码、进度帧预留）；cron.preview/previousRuns（vendored croner，UTC/上海时区实测）；session.readHeader/readEntries（vendored SDK 的 session-manager 隔离模块图——实例一致性规则的落地模式）；unknown op 拒绝；不写会话文件。端到端测试（真实 vendored 树，desktop:prepare 形态）
+| 管理扩展配置操作面（配置编辑/enabledModels/凭证/MCP 管理/插件技能的移植） | ⬜ M3 主体 | 骨架与协议已就位，按清单 op 逐个从 lib/*.ts 移植 |
+| MCP transport 实例一致性 | 🔶 模块图模式已证明 | vendored SDK 的 SessionManager 读写已在隔离模块图内完成（MCP transport 同一模式）；完整 MCP transport/OAuth 移植随配置操作面 |
 
 M2 项：
 
@@ -54,6 +63,7 @@ M2 项：
 | 消息层状态机 | ✅ 核心已移植 | `crates/session-host/src/machine.rs`：run epoch、isRunning OR 规则、autoRetry 未知语义、流式 delta 累积（text/thinking/toolcall 稠密块）、队列、压缩、model_change、陈旧快照防护；prompt 的 SDK 契约（started 等下一 epoch / queued 等当前 / handled 不起 run）。9 单测 + 真实 pi 生命周期 |
 | 事件流桥（Tauri Channel） | ✅ 落地 | `pi_ipc_subscribe_events`：snapshot 帧先行（与订阅原子）、事件单调 seq、宿主 epoch、关闭即分离；静态前端 transport 已接 Channel |
 | 剩余命令面（树导航、fork/clone、统计缓存、fleet 监控、自动命名桥接） | ⬜ 逐命令迁移 | 状态机与分发表已就位，按清单 op 逐个落 |
+| 会话历史索引 + sessions.list + 侧栏视图 | ✅ 落地 | `crates/session-host/src/history.rs`（只读扫描、项目分组、按时间排序、坏文件跳过带原因、ISO→epoch）；dispatch + pi_ipc 的 sessions.list；静态前端 SessionsView（首个迁移 UI 组件，typed IPC 驱动） |
 | 会话 UI 静态迁移 | ⬜ | ChatWindow/MessageView/SSE→Channel 管线 |
 | Tauri IPC 桥（`pi_ipc` 命令） | ✅ 垂直切片落地 | `src-tauri/src/pi_ipc.rs`：协议 v1 信封校验（版本/结构/参数对象）、封闭操作表（`desktop.identity` 先于任何子进程应答；会话操作路由 session-host 的分发表）、`unknown_op`/`not_found` 协议错误码。`allow-pi-ipc` 权限（desktop-shell.toml）+ 主窗口 capability；静态 BootPage 的 Tauri 探测路径真实可用（客户端超时，超时不重发）。src-tauri 24 测试全绿 |
 
