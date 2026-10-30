@@ -17,6 +17,7 @@ use std::os::windows::process::CommandExt as _;
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Url};
 
+mod file_access;
 mod logging;
 mod native_prefs;
 mod pi_ipc;

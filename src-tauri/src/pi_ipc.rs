@@ -48,6 +48,8 @@ pub struct IpcHostState {
     pub task_agent_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
+    /// The file access allow-list (the /api/files security boundary).
+    pub file_roots: std::sync::Mutex<crate::file_access::AllowedRoots>,
 }
 
 impl IpcHostState {
@@ -61,6 +63,15 @@ impl IpcHostState {
             management_config: std::sync::Mutex::new(None),
             task_agent_dir: std::sync::Mutex::new(None),
             resources: ResourceRegistry::new(),
+            file_roots: {
+                let mut roots = crate::file_access::AllowedRoots::new();
+                // The legacy default-cwd layouts stay browsable across
+                // restarts (the /api/files scan behavior).
+                if let Some(home) = std::env::var_os("HOME") {
+                    roots.add_default_cwd_roots(std::path::Path::new(&home));
+                }
+                std::sync::Mutex::new(roots)
+            },
         }
     }
 }
@@ -457,6 +468,70 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let revoked = state.resources.revoke(handle);
             protocol_ok(&id, json!({ "revoked": revoked }))
         }
+        // Files (the /api/files boundary): every path is re-checked against
+        // the allow-list (lexical + resolved); grants only widen it
+        // host-side (a dialog result, a worktree root).
+        "files.allowRoot" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            if path.is_empty() {
+                return protocol_error(&id, "invalid_args", "path is required");
+            }
+            let root = std::path::PathBuf::from(path);
+            if !root.is_absolute() {
+                return protocol_error(&id, "invalid_args", "the root must be absolute");
+            }
+            let roots = state.file_roots.lock().unwrap();
+            let known = roots.is_existing_path_allowed(&root);
+            drop(roots);
+            if !known && !root.is_dir() {
+                return protocol_error(&id, "unauthorized_scope", "the root does not exist");
+            }
+            state.file_roots.lock().unwrap().add(&root);
+            protocol_ok(&id, json!({ "added": path }))
+        }
+        "files.read" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            let target = std::path::PathBuf::from(path);
+            if !state.file_roots.lock().unwrap().is_existing_path_allowed(&target) {
+                return protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots");
+            }
+            match std::fs::read(&target) {
+                Ok(bytes) => protocol_ok(
+                    &id,
+                    json!({
+                        "mime": crate::file_access::mime_for(&target),
+                        "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                    }),
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    protocol_error(&id, "not_found", "no such file")
+                }
+                Err(error) => protocol_error(&id, "io", &error.to_string()),
+            }
+        }
+        "files.write" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            let data = args
+                .get("data")
+                .and_then(Value::as_str)
+                .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok());
+            let Some(data) = data else {
+                return protocol_error(&id, "invalid_args", "path and base64 data are required");
+            };
+            let target = std::path::Path::new(path);
+            {
+                let roots = state.file_roots.lock().unwrap();
+                if !roots.is_existing_path_allowed(target) && !roots.is_path_allowed(target) {
+                    return protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots");
+                }
+            }
+            // Writes only target existing allowed files or paths inside
+            // allowed directories (never create outside).
+            match std::fs::write(target, data) {
+                Ok(()) => protocol_ok(&id, json!({ "written": path })),
+                Err(error) => protocol_error(&id, "io", &error.to_string()),
+            }
+        }
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
     }
 }
@@ -604,6 +679,69 @@ mod tests {
             json!({ "v": 1, "id": "g7", "op": "resources.read", "args": { "handle": handle } }),
         );
         assert_eq!(after["error"]["code"], "not_found");
+    }
+
+    #[test]
+    fn files_roundtrip_through_the_allow_list() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        std::fs::write(project.join("a.txt"), b"hello").expect("a");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret"), b"no").expect("secret");
+
+        // Without a grant everything is out of scope.
+        let refused = send(
+            &state,
+            json!({ "v": 1, "id": "f1", "op": "files.read", "args": { "path": project.join("a.txt").display().to_string() } }),
+        );
+        assert_eq!(refused["error"]["code"], "unauthorized_scope");
+
+        // Grant the project root (host-side decision shape); reads inside
+        // pass, outside stays refused even with traversal tricks.
+        let grant = send(
+            &state,
+            json!({ "v": 1, "id": "f2", "op": "files.allowRoot", "args": { "path": project.display().to_string() } }),
+        );
+        assert_eq!(grant["ok"], true, "{grant}");
+        let read = send(
+            &state,
+            json!({ "v": 1, "id": "f3", "op": "files.read", "args": { "path": project.join("a.txt").display().to_string() } }),
+        );
+        assert_eq!(read["data"]["mime"], "text/plain; charset=utf-8");
+        let escaped = send(
+            &state,
+            json!({ "v": 1, "id": "f4", "op": "files.read", "args": { "path": project.join("../outside/secret").display().to_string() } }),
+        );
+        assert_eq!(escaped["error"]["code"], "unauthorized_scope");
+
+        // Writes: inside passes, outside is refused before any IO.
+        let write = send(
+            &state,
+            json!({
+                "v": 1, "id": "f5", "op": "files.write",
+                "args": {
+                    "path": project.join("b.txt").display().to_string(),
+                    "data": base64::engine::general_purpose::STANDARD.encode("written by host"),
+                },
+            }),
+        );
+        assert_eq!(write["ok"], true, "{write}");
+        assert_eq!(std::fs::read_to_string(project.join("b.txt")).unwrap(), "written by host");
+        let evil = send(
+            &state,
+            json!({
+                "v": 1, "id": "f6", "op": "files.write",
+                "args": {
+                    "path": outside.join("evil.txt").display().to_string(),
+                    "data": base64::engine::general_purpose::STANDARD.encode("x"),
+                },
+            }),
+        );
+        assert_eq!(evil["error"]["code"], "unauthorized_scope");
+        assert!(!outside.join("evil.txt").exists());
     }
 
     #[test]
