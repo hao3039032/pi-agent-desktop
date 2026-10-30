@@ -4,7 +4,8 @@ import type {
   AppUpdateProjectId,
 } from "@/lib/app-update-types";
 import { APP_DISTRIBUTION_NAME, APP_REPOSITORY, APP_VERSION } from "./branding";
-import { mirrorGitHubUrl, resolveUpdateMirrors } from "./update-mirrors";
+import { mirrorGitHubUrl } from "./update-mirrors";
+import { resolveUpdateMirrors } from "./update-mirrors-server";
 
 export const APP_UPDATE_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 export const APP_UPDATE_RETRY_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -128,22 +129,41 @@ function unpublishedRelease(project: AppUpdateProject): AppComponentReleaseInfo 
   };
 }
 
+/**
+ * The release page this repository would publish for `tag`, or null when the
+ * URL is any other page — including another repository's.
+ *
+ * A host check alone is not enough: release metadata may now arrive through a
+ * mirror, and "an update is available, click here" pointing at an arbitrary
+ * github.com page is exactly the phishing shape we must refuse.
+ */
+function repositoryReleaseUrl(project: AppUpdateProject, raw: string, tag: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "github.com") return null;
+  if (url.username || url.password || url.port || url.search || url.hash) return null;
+  const expectedPath = `/${project.repository}/releases/tag/${encodeURIComponent(tag)}`;
+  return url.pathname.replace(/\/+$/, "") === expectedPath ? url.toString() : null;
+}
+
 function parseRelease(project: AppUpdateProject, raw: GitHubRelease): AppComponentReleaseInfo {
   if (raw.draft === true || raw.prerelease === true) {
-    throw new Error("GitHub returned a non-stable latest release.");
+    throw new AppUpdatePayloadError("GitHub returned a non-stable latest release.");
   }
   if (typeof raw.tag_name !== "string" || typeof raw.html_url !== "string") {
-    throw new Error("GitHub returned an invalid release payload.");
+    throw new AppUpdatePayloadError("GitHub returned an invalid release payload.");
   }
 
   const latest = parseVersion(raw.tag_name);
   const current = parseVersion(project.currentVersion);
-  if (!latest || !current) throw new Error("GitHub returned an invalid release version.");
+  if (!latest || !current) throw new AppUpdatePayloadError("GitHub returned an invalid release version.");
 
-  const releaseUrl = new URL(raw.html_url);
-  if (releaseUrl.protocol !== "https:" || releaseUrl.hostname !== "github.com") {
-    throw new Error("GitHub returned an invalid release URL.");
-  }
+  const releaseUrl = repositoryReleaseUrl(project, raw.html_url, raw.tag_name);
+  if (!releaseUrl) throw new AppUpdatePayloadError("GitHub returned an invalid release URL.");
 
   return {
     project: project.id,
@@ -152,70 +172,123 @@ function parseRelease(project: AppUpdateProject, raw: GitHubRelease): AppCompone
     repositoryUrl: repositoryUrl(project),
     currentVersion: current.display,
     latestVersion: latest.display,
-    releaseUrl: releaseUrl.toString(),
+    releaseUrl,
     updateAvailable: compareAppVersions(latest.display, current.display) > 0,
     releaseStatus: "available",
   };
 }
 
+/**
+ * Why a metadata request produced no release. The distinction matters: only
+ * the canonical GitHub API may answer "this repository has no release yet",
+ * and only transport failures are worth trying against another mirror.
+ */
+export class AppUpdateTransportError extends Error {
+  readonly status: number | null;
+  constructor(message: string, status: number | null = null) {
+    super(message);
+    this.name = "AppUpdateTransportError";
+    this.status = status;
+  }
+}
+
+/** A mirror (or GitHub) answered with something that is not this release. */
+export class AppUpdatePayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AppUpdatePayloadError";
+  }
+}
+
+const LATEST_API_PATH = "/releases/latest";
+
+function canonicalApiUrl(project: AppUpdateProject): string {
+  return `https://api.github.com/repos/${project.repository}${LATEST_API_PATH}`;
+}
+
+/**
+ * Whether `url` is this repository's own GitHub API release URL — the only
+ * place a 404 may be read as "no release yet".
+ */
+function isCanonicalApiUrl(project: AppUpdateProject, url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:"
+      && parsed.hostname === "api.github.com"
+      && parsed.pathname === `/repos/${project.repository}${LATEST_API_PATH}`
+      && parsed.search === "";
+  } catch {
+    return false;
+  }
+}
+
 export async function getLatestAppRelease(
   project: AppUpdateProject,
-  options: { fetcher?: Fetcher; timeoutMs?: number; mirrors?: readonly string[] } = {},
+  options: {
+    fetcher?: Fetcher;
+    timeoutMs?: number;
+    mirrors?: readonly string[];
+    /** Ceiling for the whole check, all sources included. */
+    deadlineMs?: number;
+  } = {},
 ): Promise<AppComponentReleaseInfo> {
   const fetcher = options.fetcher ?? fetch;
   const timeoutMs = options.timeoutMs ?? 15_000;
+  // Every attempt shares one budget: a black-holed network must not hold the
+  // settings dialog open for 15s × (1 direct + 1 redirect probe + N mirrors).
+  const deadline = Date.now() + (options.deadlineMs ?? 45_000);
+  const remaining = () => Math.max(0, deadline - Date.now());
+  const attemptTimeout = Math.min(timeoutMs, remaining());
+
   try {
-    return await fetchLatestFromApi(project, fetcher, timeoutMs);
+    return await fetchLatestFromApi(project, canonicalApiUrl(project), { fetcher, timeoutMs: attemptTimeout });
   } catch (apiError) {
-    // The API endpoint may simply be unreachable — api.github.com is blocked
-    // or throttled on some networks while github.com itself resolves. Ask the
-    // website where its "latest" release landed: the redirect target names
-    // the tag without needing the API at all. (A definitive 404 never gets
-    // here: fetchLatestFromApi answers it with an unpublished release
-    // itself, so any error reaching this handler means the API call failed.)
+    if (!(apiError instanceof AppUpdateTransportError)) throw apiError;
+    // api.github.com is blocked or throttled on some networks while
+    // github.com resolves. Ask the website where "latest" landed: the redirect
+    // names the tag without the API.
     try {
-      return await fetchLatestFromRedirect(project, fetcher, Math.min(timeoutMs, 10_000));
+      return await fetchLatestFromRedirect(project, fetcher, Math.min(10_000, remaining()));
     } catch {
-      // Both GitHub hosts failed directly. Try public accelerator mirrors
-      // (PI_UPDATE_MIRRORS to override; empty disables). Only the API form is
-      // attempted per mirror — mirrors that do not proxy api.github.com
-      // answer 403 and the loop moves on. A payload that fails validation
-      // (forged html_url, invalid tag) is NOT retried on the next mirror:
-      // that failure is recorded and, if every mirror fails, it outranks the
-      // original network error so tampering is never reported as "unreachable".
-      const mirrors = options.mirrors ?? resolveUpdateMirrors();
-      let validationError: unknown;
-      for (const mirror of mirrors) {
-        const url = mirrorGitHubUrl(
-          `https://api.github.com/repos/${project.repository}/releases/latest`,
-          mirror,
-        );
-        try {
-          return await fetchLatestFromApi(project, fetcher, timeoutMs, url);
-        } catch (error) {
-          if (error instanceof Error && error.message.startsWith("GitHub request failed with HTTP")) {
-            // Transport-level answer from the mirror itself (403 from a
-            // file-only mirror, 5xx, a redirect the mirror did not follow):
-            // this mirror cannot serve the API — next mirror.
-            continue;
-          }
-          validationError ??= error;
-        }
-      }
-      throw validationError ?? apiError;
+      // Probe failed; mirrors below get the remaining budget.
     }
+
+    const mirrors = options.mirrors ?? resolveUpdateMirrors();
+    let payloadError: Error | undefined;
+    for (const mirror of mirrors) {
+      if (remaining() <= 0) break;
+      try {
+        return await fetchLatestFromApi(
+          project,
+          mirrorGitHubUrl(canonicalApiUrl(project), mirror),
+          { fetcher, timeoutMs: Math.min(timeoutMs, remaining()), mirror },
+        );
+      } catch (error) {
+        if (error instanceof AppUpdatePayloadError) {
+          // This mirror answered with something that is not the release we
+          // asked about. Remember it (it outranks the network error) but let a
+          // working mirror still answer — a broken mirror is not a verdict
+          // about the update.
+          payloadError ??= error;
+          continue;
+        }
+        // Transport-level failure (unreachable, timeout, 403/404 from a
+        // file-only mirror): next candidate.
+      }
+    }
+    throw payloadError ?? apiError;
   }
 }
 
 async function fetchLatestFromApi(
   project: AppUpdateProject,
-  fetcher: Fetcher,
-  timeoutMs: number,
-  url = `https://api.github.com/repos/${project.repository}/releases/latest`,
+  url: string,
+  { fetcher, timeoutMs, mirror }: { fetcher: Fetcher; timeoutMs: number; mirror?: string },
 ): Promise<AppComponentReleaseInfo> {
-  const response = await fetcher(
-    url,
-    {
+  if (timeoutMs <= 0) throw new AppUpdateTransportError("The update check ran out of time.");
+  let response: Response;
+  try {
+    response = await fetcher(url, {
       cache: "no-store",
       headers: {
         Accept: "application/vnd.github+json",
@@ -223,11 +296,31 @@ async function fetchLatestFromApi(
         "User-Agent": `pi-agent-desktop/${APP_VERSION}`,
       },
       signal: AbortSignal.timeout(timeoutMs),
-    },
-  );
-  if (response.status === 404) return unpublishedRelease(project);
-  if (!response.ok) throw new Error(`GitHub request failed with HTTP ${response.status}.`);
-  return parseRelease(project, await response.json() as GitHubRelease);
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new AppUpdateTransportError(mirror ? `${mirror}: ${reason}` : reason);
+  }
+  // Only the repository's own API URL may say "no release yet". A mirror
+  // answering 404 simply cannot serve this endpoint, and treating that as an
+  // authoritative "unpublished" would let a third party hide real updates for
+  // a whole check interval.
+  if (response.status === 404) {
+    if (isCanonicalApiUrl(project, url)) return unpublishedRelease(project);
+    throw new AppUpdateTransportError(`${mirror ?? url}: HTTP 404`, 404);
+  }
+  if (!response.ok) {
+    throw new AppUpdateTransportError(`${mirror ?? url}: HTTP ${response.status}`, response.status);
+  }
+  let payload: GitHubRelease;
+  try {
+    payload = await response.json() as GitHubRelease;
+  } catch {
+    // A mirror that answers 200 with an HTML error page is not serving the
+    // API; that is a broken mirror, not a release.
+    throw new AppUpdateTransportError(`${mirror ?? url}: response was not JSON`);
+  }
+  return parseRelease(project, payload);
 }
 
 /**
@@ -251,11 +344,11 @@ async function fetchLatestFromRedirect(
   });
 
   const location = response.headers.get("location");
-  if (!location) throw new Error("GitHub did not redirect the latest-release URL.");
+  if (!location) throw new AppUpdateTransportError("GitHub did not redirect the latest-release URL.");
 
   const target = new URL(location, "https://github.com/");
   if (target.protocol !== "https:" || target.hostname !== "github.com") {
-    throw new Error("GitHub redirected the latest-release URL to an unexpected target.");
+    throw new AppUpdateTransportError("GitHub redirected the latest-release URL to an unexpected target.");
   }
 
   // The redirect must land inside this repository: only its own tag page
@@ -268,13 +361,13 @@ async function fetchLatestFromRedirect(
   const tagPath = `${releasesPath}/tag/`;
   if (pathname === releasesPath) return unpublishedRelease(project);
   if (!pathname.startsWith(tagPath)) {
-    throw new Error("GitHub redirected the latest-release URL outside this repository.");
+    throw new AppUpdateTransportError("GitHub redirected the latest-release URL outside this repository.");
   }
 
   const tag = decodeURIComponent(pathname.slice(tagPath.length));
   const latest = parseVersion(tag);
   const current = parseVersion(project.currentVersion);
-  if (!latest || !current) throw new Error(`GitHub redirected to an invalid release tag: ${tag}`);
+  if (!latest || !current) throw new AppUpdateTransportError(`GitHub redirected to an invalid release tag: ${tag}`);
 
   const releaseUrl = `https://github.com/${project.repository}/releases/tag/${encodeURIComponent(tag)}`;
   return {

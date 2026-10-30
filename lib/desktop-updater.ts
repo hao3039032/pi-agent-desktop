@@ -1,5 +1,13 @@
-import { APP_REPOSITORY } from "./branding";
-import { mirrorGitHubUrl, resolveUpdateMirrors } from "./update-mirrors";
+/**
+ * Desktop auto-update driver.
+ *
+ * The webview never supplies a download URL, mirror list, signature or target:
+ * it asks the shell to install whatever update it finds, and the shell
+ * (`src-tauri/src/update_install.rs`) checks, downloads — direct first, then
+ * through the mirrors compiled in from `distro/distro.json` — verifies the
+ * minisign signature and installs. That keeps the trust boundary in Rust and
+ * keeps this file to progress reporting and error translation.
+ */
 
 export type DesktopUpgradePhase = "checking" | "downloading" | "installing";
 
@@ -8,23 +16,43 @@ export interface DesktopUpgradeProgress {
   downloadedBytes?: number;
   totalBytes?: number;
   targetVersion?: string;
+  /** `github.com` for the canonical asset, otherwise the mirror serving it. */
+  sourceHost?: string;
 }
 
 export interface DesktopUpgradeResult {
   installed: boolean;
   targetVersion?: string;
-  /** Present when the upgrade failed: a mirror-prefixed release page URL. */
-  mirrorReleaseUrl?: string;
+  sourceHost?: string;
 }
 
-/** Error thrown when the updater could not reach any endpoint or download. */
-export class DesktopUpgradeNetworkError extends Error {
-  /** Mirror-prefixed release page for manual download, when a mirror is configured. */
-  readonly mirrorReleaseUrl: string | null;
-  constructor(message: string, mirrorReleaseUrl: string | null) {
+/**
+ * `transport` is a network verdict and may succeed later — every configured
+ * source failed. `manifest` means the update metadata itself could not be read
+ * (an HTML error page, a truncated answer). The rest are verdicts about the
+ * update itself: `signature` a verification failure (never retried, never
+ * installed), `unavailable` a build or platform that cannot update, `install` a
+ * local installation failure, `busy` a second concurrent attempt.
+ */
+export type DesktopUpgradeFailureKind =
+  | "transport"
+  | "manifest"
+  | "signature"
+  | "unavailable"
+  | "install"
+  | "busy"
+  | "other";
+
+export class DesktopUpgradeError extends Error {
+  readonly kind: DesktopUpgradeFailureKind;
+  /** Hosts the shell actually tried, `github.com` first. */
+  readonly attemptedHosts: readonly string[];
+
+  constructor(kind: DesktopUpgradeFailureKind, message: string, attemptedHosts: readonly string[] = []) {
     super(message);
-    this.name = "DesktopUpgradeNetworkError";
-    this.mirrorReleaseUrl = mirrorReleaseUrl;
+    this.name = "DesktopUpgradeError";
+    this.kind = kind;
+    this.attemptedHosts = attemptedHosts;
   }
 }
 
@@ -37,76 +65,112 @@ declare global {
 export function isTauriDesktop(): boolean {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
 }
+
+interface NativeProgress {
+  phase: string;
+  sourceHost: string;
+  downloadedBytes: number;
+  totalBytes?: number;
+  targetVersion: string;
+}
+
+interface NativeOutcome {
+  installed: boolean;
+  targetVersion?: string;
+  sourceHost?: string;
+}
+
+interface NativeFailure {
+  kind?: unknown;
+  message?: unknown;
+  attemptedHosts?: unknown;
+}
+
+const FAILURE_KINDS = new Set<DesktopUpgradeFailureKind>([
+  "transport",
+  "manifest",
+  "signature",
+  "unavailable",
+  "install",
+  "busy",
+  "other",
+]);
+
+/**
+ * Translate the shell's structured failure into a typed error.
+ *
+ * The distinction is load-bearing: `transport` means every source failed to
+ * reach the network (retrying later may work), while `signature` and `install`
+ * are verdicts about this update and must keep the shell's own wording.
+ */
+export function toDesktopUpgradeError(error: unknown): DesktopUpgradeError {
+  if (error instanceof DesktopUpgradeError) return error;
+  if (error && typeof error === "object") {
+    const failure = error as NativeFailure;
+    const kind = typeof failure.kind === "string" && FAILURE_KINDS.has(failure.kind as DesktopUpgradeFailureKind)
+      ? failure.kind as DesktopUpgradeFailureKind
+      : "other";
+    const message = typeof failure.message === "string" && failure.message
+      ? failure.message
+      : "The update could not be installed.";
+    const hosts = Array.isArray(failure.attemptedHosts)
+      ? failure.attemptedHosts.filter((host): host is string => typeof host === "string")
+      : [];
+    return new DesktopUpgradeError(kind, message, hosts);
+  }
+  return new DesktopUpgradeError("other", error instanceof Error ? error.message : String(error));
+}
+
 export async function installLatestDesktopRelease(
   onProgress: (progress: DesktopUpgradeProgress) => void,
 ): Promise<DesktopUpgradeResult> {
   if (!isTauriDesktop()) {
-    throw new Error("Automatic installation is only available in the packaged desktop app.");
+    throw new DesktopUpgradeError(
+      "unavailable",
+      "Automatic installation is only available in the packaged desktop app.",
+    );
   }
 
-  // The updater's endpoints (direct github.com first, then the accelerator
-  // mirrors baked in at build time) are tried in order by the plugin itself.
-  // When even that fails — or the installer download fails on a network where
-  // github.com is unreachable — surface a mirror-prefixed release page so the
-  // user can fetch the signed installer manually. The Tauri signature check
-  // happens inside the installer flow, independent of which host served it.
-  const [{ check }, { relaunch }] = await Promise.all([
-    import("@tauri-apps/plugin-updater"),
-    import("@tauri-apps/plugin-process"),
+  // Arm the busy state before the first await. The native check can take a
+  // while on a slow network, and until it reports back the button must already
+  // be disabled and the settings dialog must already be held open.
+  onProgress({ phase: "checking" });
+
+  const [{ invoke }, { listen }] = await Promise.all([
+    import("@tauri-apps/api/core"),
+    import("@tauri-apps/api/event"),
   ]);
-  let update;
-  try {
-    update = await check({ timeout: 30_000 });
-  } catch (error) {
-    throw toNetworkError(error);
-  }
-  if (!update) return { installed: false };
 
-  let downloadedBytes = 0;
-  let totalBytes: number | undefined;
-  try {
-    await update.downloadAndInstall((event) => {
-      if (event.event === "Started") {
-        totalBytes = event.data.contentLength;
-        onProgress({
-          phase: "downloading",
-          downloadedBytes,
-          totalBytes,
-          targetVersion: update.version,
-        });
-      } else if (event.event === "Progress") {
-        downloadedBytes += event.data.chunkLength;
-        onProgress({
-          phase: "downloading",
-          downloadedBytes,
-          totalBytes,
-          targetVersion: update.version,
-        });
-      } else {
-        onProgress({ phase: "installing", targetVersion: update.version });
-      }
+  const unlisten = await listen<NativeProgress>("pi-update-progress", (event) => {
+    const payload = event.payload;
+    onProgress({
+      phase: payload.phase === "installing" ? "installing" : "downloading",
+      downloadedBytes: payload.downloadedBytes,
+      totalBytes: payload.totalBytes,
+      targetVersion: payload.targetVersion,
+      sourceHost: payload.sourceHost,
     });
+  });
+
+  try {
+    const outcome = await invoke<NativeOutcome>("install_available_update");
+    if (!outcome.installed) return { installed: false };
+
+    onProgress({
+      phase: "installing",
+      targetVersion: outcome.targetVersion,
+      sourceHost: outcome.sourceHost,
+    });
+    const { relaunch } = await import("@tauri-apps/plugin-process");
+    await relaunch();
+    return {
+      installed: true,
+      targetVersion: outcome.targetVersion,
+      sourceHost: outcome.sourceHost,
+    };
   } catch (error) {
-    throw toNetworkError(error, update.version);
+    throw toDesktopUpgradeError(error);
+  } finally {
+    await unlisten();
   }
-
-  onProgress({ phase: "installing", targetVersion: update.version });
-  await relaunch();
-  return { installed: true, targetVersion: update.version };
-}
-
-function toNetworkError(error: unknown, version?: string): DesktopUpgradeNetworkError {
-  const message = error instanceof Error ? error.message : String(error);
-  const mirror = mirrorReleasePageUrl(version);
-  return new DesktopUpgradeNetworkError(message, mirror);
-}
-
-/** First configured mirror's view of this fork's releases page, or null. */
-export function mirrorReleasePageUrl(version?: string | null): string | null {
-  if (typeof window === "undefined") return null;
-  const [mirror] = resolveUpdateMirrors();
-  if (!mirror) return null;
-  const base = `https://github.com/${APP_REPOSITORY}/releases`;
-  const target = version ? `${base}/tag/v${version.replace(/^v/, "")}` : `${base}/latest`;
-  return mirrorGitHubUrl(target, mirror);
 }

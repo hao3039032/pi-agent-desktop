@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { AppComponentReleaseInfo, AppUpdatesResponse } from "@/lib/app-update-types";
 import {
   APP_DISTRIBUTION_NAME,
@@ -9,7 +9,7 @@ import {
   APP_VERSION_DISPLAY,
 } from "@/lib/branding";
 import { handleExternalLinkClick } from "@/lib/desktop-native";
-import { DesktopUpgradeNetworkError, installLatestDesktopRelease, type DesktopUpgradeProgress } from "@/lib/desktop-updater";
+import { DesktopUpgradeError, installLatestDesktopRelease, type DesktopUpgradeProgress } from "@/lib/desktop-updater";
 import { useI18n } from "@/hooks/useI18n";
 import { ConfigButton } from "./SettingsUi";
 
@@ -31,8 +31,8 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [upgradeProgress, setUpgradeProgress] = useState<DesktopUpgradeProgress | null>(null);
-  const [upgradeError, setUpgradeError] = useState<string | null>(null);
-  const [mirrorUrl, setMirrorUrl] = useState<string | null>(null);
+  const [upgradeError, setUpgradeError] = useState<{ text: string; kind: DesktopUpgradeError["kind"] } | null>(null);
+  const upgradeInFlight = useRef(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -72,6 +72,13 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
     [components],
   );
   const canUpgrade = !loading && updateAvailable && !upgradeProgress;
+  // A mirror serving the installer is worth naming: it explains both the
+  // switched source and why the progress bar restarted at that switch.
+  const downloadSource = upgradeProgress?.phase === "downloading"
+    && upgradeProgress.sourceHost
+    && upgradeProgress.sourceHost !== "github.com"
+    ? upgradeProgress.sourceHost
+    : null;
   const downloadPercent = upgradeProgress?.phase === "downloading" && upgradeProgress.totalBytes
     ? Math.min(100, Math.round((upgradeProgress.downloadedBytes ?? 0) / upgradeProgress.totalBytes * 100))
     : null;
@@ -113,26 +120,37 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
     && appRelease?.releaseStatus !== "unknown" && appRelease?.releaseStatus !== "unpublished";
 
   const handleUpgrade = async () => {
-    if (!canUpgrade) return;
+    // The ref closes the same-tick window the render state cannot: a second
+    // click can land before `upgradeProgress` has been committed.
+    if (!canUpgrade || upgradeInFlight.current) return;
+    upgradeInFlight.current = true;
     setUpgradeError(null);
-    setMirrorUrl(null);
     try {
       const result = await installLatestDesktopRelease(setUpgradeProgress);
       if (!result.installed) {
         setUpgradeProgress(null);
-        setUpgradeError(t("appSettings.noSignedBundle", { name: APP_DISTRIBUTION_NAME }));
+        setUpgradeError({ text: t("appSettings.noSignedBundle", { name: APP_DISTRIBUTION_NAME }), kind: "other" });
       }
     } catch (error) {
       setUpgradeProgress(null);
-      if (error instanceof DesktopUpgradeNetworkError && error.mirrorReleaseUrl) {
-        // The direct download (and every baked-in mirror endpoint) failed;
-        // offer the accelerator-hosted release page for a manual download of
-        // the same signed installer.
-        setMirrorUrl(error.mirrorReleaseUrl);
-        setUpgradeError(t("appSettings.downloadFailedMirror"));
+      if (error instanceof DesktopUpgradeError) {
+        // Keep the shell's own wording: a signature or install failure is a
+        // verdict about this update, and replacing it with a generic sentence
+        // would hide exactly the detail a user has to act on.
+        const hosts = error.attemptedHosts.join(", ") || "GitHub";
+        setUpgradeError({
+          text: error.kind === "transport"
+            ? t("appSettings.updateDownloadUnreachable", { hosts })
+            : error.kind === "manifest"
+              ? t("appSettings.updateManifestUnreadable", { hosts })
+              : error.message,
+          kind: error.kind,
+        });
       } else {
-        setUpgradeError(error instanceof Error ? error.message : String(error));
+        setUpgradeError({ text: error instanceof Error ? error.message : String(error), kind: "other" });
       }
+    } finally {
+      upgradeInFlight.current = false;
     }
   };
 
@@ -168,7 +186,12 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
         <div className="settings-update-side">
           <span className="settings-update-status" role="status">{statusText}</span>
           {(updateAvailable || upgradeProgress) && (
-            <ConfigButton variant="primary" disabled={!canUpgrade} onClick={() => void handleUpgrade()}>
+            <ConfigButton
+              variant="primary"
+              disabled={!canUpgrade}
+              title={downloadSource ? t("appSettings.updateSource", { host: downloadSource }) : undefined}
+              onClick={() => void handleUpgrade()}
+            >
               {upgradeLabel}
             </ConfigButton>
           )}
@@ -181,7 +204,7 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
       )}
       {upgradeError && (
         <p role="alert" className="settings-general-error">
-          {upgradeError}
+          {upgradeError.text}
           {releaseUrl && (
             <a
               className="settings-updates-release-link"
@@ -191,17 +214,6 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
               onClick={(event) => handleExternalLinkClick(event, releaseUrl)}
             >
               {t("appSettings.openRelease")}
-            </a>
-          )}
-          {mirrorUrl && (
-            <a
-              className="settings-updates-release-link"
-              href={mirrorUrl}
-              target="_blank"
-              rel="noreferrer"
-              onClick={(event) => handleExternalLinkClick(event, mirrorUrl)}
-            >
-              {t("appSettings.openMirrorRelease")}
             </a>
           )}
         </p>

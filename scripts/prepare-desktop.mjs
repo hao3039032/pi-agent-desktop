@@ -242,6 +242,12 @@ async function assembleServer() {
     join(serverResourcesDir, "desktop-server.cjs"),
   );
 
+  // The server reads `updateMirrors` from this file at runtime (see
+  // lib/update-mirrors-server.ts). Staging it next to the launcher — the
+  // server's cwd — keeps `distro/distro.json` the single source for both the
+  // settings check and the installer built into the shell.
+  await copyFile(join(rootDir, "distro", "distro.json"), join(serverResourcesDir, "distro.json"));
+
   // The child extension assets (bridge, chat policy, artifacts guide) are
   // resolved at RUNTIME by resolveAssetPath() through process.cwd() and a
   // dynamic file name, which Next's file tracer cannot follow into the

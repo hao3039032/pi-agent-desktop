@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { distroResources, distroVersion, updateMirrorEndpoints } from "./distro-build-config.mjs";
+import { readFile } from "node:fs/promises";
+import {
+  distroResources,
+  distroVersion,
+  isMirrorHost,
+  updateMirrorEndpoints,
+  updateMirrorEnv,
+  updateMirrorList,
+} from "./distro-build-config.mjs";
 import { compareVersions } from "./release-components.mjs";
 import { seedRelativePath } from "./distro-seed.mjs";
 
@@ -46,6 +54,19 @@ test("seed paths match where pi installs each source", () => {
   assert.throws(() => seedRelativePath("./local"));
 });
 
+test("distro.json updateMirrors is the one list, validated at build time", () => {
+  assert.deepEqual(updateMirrorList(["gh-proxy.com", "https://ghproxy.cn/"]), ["gh-proxy.com", "ghproxy.cn"]);
+  assert.deepEqual(updateMirrorList(undefined), []);
+  assert.deepEqual(updateMirrorList([]), []);
+  // The value the native installer compiles in must match the manifest
+  // endpoints, so both legs of an update name the same hosts.
+  assert.equal(updateMirrorEnv(["gh-proxy.com", "ghproxy.cn"]), "gh-proxy.com,ghproxy.cn");
+  assert.throws(() => updateMirrorList(["https://evil.example/path"]), /not a host/);
+  assert.throws(() => updateMirrorList(["localhost"]), /not a host/);
+  assert.throws(() => updateMirrorList([42]), /strings/);
+  assert.throws(() => updateMirrorList("gh-proxy.com"), /must be an array/);
+});
+
 test("updater mirror endpoints are the prefixed latest.json URLs", () => {
   assert.deepEqual(updateMirrorEndpoints(["gh-proxy.com", "ghproxy.cn/"], "hao3039032/pi-agent-desktop"), [
     "https://gh-proxy.com/https://github.com/hao3039032/pi-agent-desktop/releases/latest/download/latest.json",
@@ -57,4 +78,58 @@ test("updater mirror endpoints are the prefixed latest.json URLs", () => {
   // A non-host entry fails the build loudly instead of shipping a broken endpoint.
   assert.throws(() => updateMirrorEndpoints(["https://evil.example/path"], "r"), /not a host/);
   assert.throws(() => updateMirrorEndpoints([42], "r"), /strings/);
+});
+
+test("the same distro.json list reaches both the manifest and the shell", async () => {
+  // The build step hands the shell its mirrors through $GITHUB_ENV, and the
+  // shell reads exactly that variable name at compile time. Asserting both
+  // sides here keeps the two legs of an update from drifting apart.
+  const buildConfig = await readFile(new URL("./distro-build-config.mjs", import.meta.url), "utf8");
+  const installer = await readFile(
+    new URL("../src-tauri/src/update_install.rs", import.meta.url),
+    "utf8",
+  );
+  assert.match(buildConfig, /appendFileSync\(process\.env\.GITHUB_ENV, `PI_AGENT_DESKTOP_UPDATE_MIRRORS=/);
+  assert.match(installer, /option_env!\("PI_AGENT_DESKTOP_UPDATE_MIRRORS"\)/);
+  // Both read the field from the distribution config, not a second list.
+  assert.match(buildConfig, /updateMirrorEnv\(distro\.updateMirrors\)/);
+  assert.match(buildConfig, /updateMirrorEndpoints\(distro\.updateMirrors, branding\.repository\)/);
+  // The packaged server gets the file itself, so it resolves the same list.
+  const prepare = await readFile(new URL("./prepare-desktop.mjs", import.meta.url), "utf8");
+  assert.match(prepare, /copyFile\(join\(rootDir, "distro", "distro\.json"\), join\(serverResourcesDir, "distro\.json"\)\)/);
+});
+
+// The release build, the server and the shell each validate `updateMirrors`
+// with their own copy of the rules. These cases are duplicated verbatim in
+// lib/update-mirrors.test.mjs and src-tauri/src/update_install.rs so a value
+// one side accepts cannot be silently dropped by another.
+const ACCEPTED_MIRRORS = ["gh-proxy.com", "ghproxy.cn", "mirror.example.org:8443", "a-b.c-d.example"];
+const REJECTED_MIRRORS = [
+  "", "localhost", "gh-proxy.com/", "https://gh-proxy.com", "gh-proxy.com/https://github.com",
+  "user:pass@gh-proxy.com", "-bad.example.com", "bad-.example.com", "bad..example.com",
+  "gh-proxy.com:abc", "gh-proxy.com:123456", "gh-proxy.com:0", "gh-proxy.com:65536",
+  "with space.example.com",
+];
+
+test("mirror hosts use the same accept/reject rules as the server and the shell", () => {
+  for (const host of ACCEPTED_MIRRORS) assert.equal(isMirrorHost(host), true, host);
+  for (const host of REJECTED_MIRRORS) assert.equal(isMirrorHost(host), false, host);
+});
+
+test("a mirror list is normalized, but duplicates and overflow fail the build", () => {
+  assert.deepEqual(updateMirrorList(["https://GH-Proxy.com/", " ghproxy.cn "]), ["gh-proxy.com", "ghproxy.cn"]);
+  assert.deepEqual(updateMirrorList(undefined), []);
+  assert.throws(() => updateMirrorList(["a.com", "a.com"]), /repeats a mirror/);
+  assert.throws(() => updateMirrorList(["a.com", "b.com", "c.com", "d.com"]), /at most 3/);
+  assert.throws(() => updateMirrorList(["gh-proxy.com:0"]), /not a host/);
+});
+
+test("the shell pins the repository this build releases from", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const distro = JSON.parse(await readFile(new URL("../distro/distro.json", import.meta.url), "utf8"));
+  const installer = await readFile(new URL("../src-tauri/src/update_install.rs", import.meta.url), "utf8");
+  const pinned = /const REPOSITORY: &str = "([^"]+)";/.exec(installer);
+  assert.equal(pinned?.[1], distro.app.repository);
+  const branding = await readFile(new URL("../lib/branding.ts", import.meta.url), "utf8");
+  assert.match(branding, new RegExp(`APP_REPOSITORY = "${distro.app.repository}"`));
 });

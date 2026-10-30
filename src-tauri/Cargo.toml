@@ -28,6 +28,9 @@ tauri-plugin-notification = "^2"
 tauri-plugin-process = "^2"
 tauri-plugin-updater = "^2"
 tauri-plugin-window-state = "^2"
+# Already in the tree via tauri; declared because `Update::download_url` is a
+# `url::Url` that the guarded installer rewrites per download source.
+url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSVisualEffectView behind the (transparent) webview: the sidebar material.
@@ -47,6 +50,11 @@ ksni = "0.2.2"
 # loop, so a plain MessageBoxW is the only thing that can be shown there.
 # 0.52 is already in the tree via tauri/wry; this only declares it.
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+# The guarded installer's retry state machine is async; its tests drive it with
+# a scripted closure instead of a network.
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [features]
 default = ["custom-protocol"]

@@ -72,3 +72,8 @@ commands.allow = ["show_popup_menu"]
 identifier = "allow-clear-app-cache"
 description = "Allows the UI to clear the webview's disk caches and learn how many bytes were freed."
 commands.allow = ["clear_app_cache"]
+
+[[permission]]
+identifier = "allow-install-available-update"
+description = "Allows the UI to install the signed update the shell finds: it checks, downloads (direct, then the mirrors compiled in from distro.json), verifies the minisign signature and installs. No download URL, mirror, signature or target is accepted from the page."
+commands.allow = ["install_available_update"]

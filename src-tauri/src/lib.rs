@@ -20,6 +20,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Url};
 mod logging;
 mod native_prefs;
 mod shell;
+mod update_install;
 
 use logging::{desktop_log, install_panic_hook, mark_process_start, since_process_start_ms};
 use native_prefs::{
@@ -1103,20 +1104,9 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_tray_menu_items_publish_visible_labels() {
-        for label in [LINUX_TRAY_SHOW_LABEL, LINUX_TRAY_QUIT_LABEL] {
-            let item = visible_linux_tray_item(label, |_: &mut LinuxTray| {});
-            let ksni::MenuItem::Standard(item) = item else {
-                panic!("Linux tray command must be a standard menu item");
-            };
-
-            assert_eq!(item.label, label);
-            assert!(item.enabled);
-            assert!(item.visible);
-        }
-    }
+    // The Linux tray label test lives beside the code it covers, in
+    // `shell::platform_tray`'s own test module: the three constants and the
+    // builder are private to that module, so a copy here never compiled.
     #[test]
     fn packaged_server_handshake_requires_the_expected_instance_header() {
         let expected = "instance-123";
@@ -1406,7 +1396,8 @@ pub fn run() {
             app_ready,
             window_painted,
             set_ui_theme,
-            clear_app_cache
+            clear_app_cache,
+            update_install::install_available_update
         ])
         .setup(move |app| {
             desktop_log(

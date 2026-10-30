@@ -1,67 +1,118 @@
 /**
- * Public ghproxy-style download accelerators for GitHub, used as fallbacks
- * when github.com / api.github.com are unreachable (common on mainland-China
- * networks). The mirror convention is a URL prefix:
+ * Public ghproxy-style download accelerators for GitHub.
+ *
+ * The convention these mirrors share is a URL prefix:
  *
  *   https://<mirror>/https://github.com/owner/repo/releases/download/...
  *
- * Mirrors are tried in order after the direct connection fails. None of them
- * is trusted: responses still pass the same validation as the direct answer
- * (parseRelease / parseUpdaterManifest), and the installer itself is verified
- * by the Tauri updater minisign signature regardless of which host served it.
+ * Two different callers use it for two different legs of an update:
+ * - this repository's server (`/api/updates`) mirrors the release-metadata
+ *   request so the version notice survives a network where github.com is
+ *   blocked;
+ * - the desktop shell mirrors the installer download (see
+ *   `src-tauri/src/update_install.rs`).
  *
- * The list is deliberately small and curated; public mirrors die regularly
- * (measured 2026-10: several well-known ones already time out). The first two
- * below also proxy api.github.com JSON, which the update CHECK needs; the
- * third serves release files only and simply fails the API attempt.
+ * Which mirrors are configured is decided in ONE place, `distro/distro.json`'s
+ * `updateMirrors`, and resolved per runtime:
+ * - the shell bakes the list in at release time (`PI_AGENT_DESKTOP_UPDATE_MIRRORS`);
+ * - the server reads the same file (see `lib/update-mirrors-server.ts`) unless
+ *   `PI_UPDATE_MIRRORS` overrides it.
  *
- * Override or clear with PI_UPDATE_MIRRORS="host1,host2" (comma/space
- * separated hosts or full origins; empty string disables all fallbacks).
+ * Nothing here trusts a mirror's answer. Metadata still goes through
+ * `parseRelease`, and installed bytes are always verified against the Tauri
+ * updater's minisign key, so a mirror can slow down or deny an update but
+ * cannot change what gets installed.
  */
-
-/** Hosts in try order. Must serve the `https://<mirror>/<full-url>` form. */
-export const DEFAULT_UPDATE_MIRRORS: readonly string[] = [
-  "gh-proxy.com",
-  "ghproxy.cn",
-  "ghfast.top",
-];
-
-export function resolveUpdateMirrors(env: Record<string, string | undefined> = {}): readonly string[] {
-  const raw = env.PI_UPDATE_MIRRORS;
-  if (raw === undefined) return DEFAULT_UPDATE_MIRRORS;
-  return raw.split(/[\s,]+/)
-    .map((host) => host.trim().replace(/^https?:\/\//, "").replace(/\/+$/, ""))
-    .filter(Boolean);
-}
-
-const GITHUB_HOSTS = new Set(["github.com", "api.github.com", "objects.githubusercontent.com", "codeload.github.com", "raw.githubusercontent.com"]);
 
 /**
- * Prefix a github.com URL with a mirror origin, e.g.
- * mirrorGitHubUrl("https://api.github.com/repos/o/r/releases/latest", "gh-proxy.com")
- *   -> "https://gh-proxy.com/https://api.github.com/repos/o/r/releases/latest"
+ * Hosts are `host` or `host:port`; a value can never become a path or URL.
  *
- * Non-GitHub or non-https URLs are returned unchanged — a mirror that would
- * proxy arbitrary hosts turns any URL-handling bug into an open redirect.
+ * The same rules live in `scripts/distro-build-config.mjs` (which throws) and
+ * `src-tauri/src/update_install.rs` (which filters). Tests on all three sides
+ * use the same accept/reject list, so a value the release build accepts cannot
+ * be silently dropped by the shell.
+ */
+export function isMirrorHost(value: string): boolean {
+  if (!value || value.length > 253) return false;
+  const separator = value.lastIndexOf(":");
+  const name = separator === -1 ? value : value.slice(0, separator);
+  const port = separator === -1 ? undefined : value.slice(separator + 1);
+  if (!name || name.length > 253) return false;
+  if (port !== undefined) {
+    if (!/^\d{1,5}$/.test(port)) return false;
+    const number = Number(port);
+    if (number < 1 || number > 65535) return false;
+  }
+  const labels = name.split(".");
+  // A single label would resolve through a search domain.
+  if (labels.length < 2) return false;
+  return labels.every((label) => (
+    label.length > 0
+    && label.length <= 63
+    && /^[a-z0-9-]+$/i.test(label)
+    && !label.startsWith("-")
+    && !label.endsWith("-")
+  ));
+}
+
+/** The retry budget the shell also enforces. */
+export const MAX_UPDATE_MIRRORS = 3;
+
+/** Comma- or whitespace-separated hosts, lowercased, de-duplicated and capped. */
+export function parseMirrorList(raw: string | undefined | null): string[] {
+  if (!raw) return [];
+  const hosts: string[] = [];
+  for (const part of raw.split(/[\s,]+/)) {
+    const host = normalizeMirrorHost(part);
+    if (host && !hosts.includes(host)) hosts.push(host);
+    if (hosts.length === MAX_UPDATE_MIRRORS) break;
+  }
+  return hosts;
+}
+
+/** `https://gh-proxy.com/` -> `gh-proxy.com`; anything not a host -> null. */
+export function normalizeMirrorHost(value: string): string | null {
+  const host = value.trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  return isMirrorHost(host) ? host : null;
+}
+
+const MIRRORABLE_HOSTS = new Set([
+  "github.com",
+  "api.github.com",
+  "objects.githubusercontent.com",
+  "codeload.github.com",
+  "raw.githubusercontent.com",
+]);
+
+/**
+ * Prefix a GitHub URL with a mirror origin, e.g.
+ * `mirrorGitHubUrl("https://api.github.com/repos/o/r/releases/latest", "gh-proxy.com")`
+ *   -> `https://gh-proxy.com/https://api.github.com/repos/o/r/releases/latest`
+ *
+ * Anything that is not an https GitHub URL is returned unchanged: mirroring an
+ * arbitrary host would turn a URL-handling bug into an open forwarder.
  */
 export function mirrorGitHubUrl(url: string, mirrorHost: string): string {
+  const host = normalizeMirrorHost(mirrorHost);
+  if (!host) return url;
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
     return url;
   }
-  if (parsed.protocol !== "https:" || !GITHUB_HOSTS.has(parsed.hostname)) return url;
-  const host = mirrorHost.replace(/^https?:\/\//, "").replace(/\/+$/, "");
-  if (!host || !/^[a-z0-9.-]+(:\d+)?$/i.test(host)) return url;
+  if (parsed.protocol !== "https:" || !MIRRORABLE_HOSTS.has(parsed.hostname)) return url;
   return `https://${host}/${parsed.toString()}`;
 }
 
-/** True when the URL is one this module would be willing to mirror. */
+/** True when `mirrorGitHubUrl` would rewrite this URL. */
 export function isMirrorableGitHubUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
-    return parsed.protocol === "https:" && GITHUB_HOSTS.has(parsed.hostname);
+    return parsed.protocol === "https:" && MIRRORABLE_HOSTS.has(parsed.hostname);
   } catch {
     return false;
   }

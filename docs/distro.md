@@ -36,9 +36,15 @@
 
 ## PATH/npm 镜像与 GitHub 加速
 
-- **更新检查回退**（`lib/app-updates.ts` + `lib/update-mirrors.ts`）：设置页的更新检查在直连 `api.github.com` 与 github.com 重定向探测都失败后，按序尝试公共加速镜像的 API 透传（默认 `gh-proxy.com`、`ghproxy.cn`、`ghfast.top`；环境变量 `PI_UPDATE_MIRRORS` 可覆盖，置空禁用）。镜像返回的 payload 走与直连相同的 `parseRelease` 校验（html_url 必须是本仓库的 github.com 页面），伪造答案会在所有镜像失败时以校验错误而非“网络不可达”上报。
-- **安装包下载回退**（`scripts/distro-build-config.mjs`）：`distro.json` 的 `updateMirrors`（默认 `gh-proxy.com`、`ghproxy.cn`）在发版时写成镜像前缀的 `latest.json` endpoints，排在直连 github.com 之后；tauri-plugin-updater 按序尝试，签名校验与下载源无关。升级按钮在所有端点失败时给出镜像发布页的手动下载链接（`appSettings.openMirrorRelease`）。
-- 公共镜像会失效（2026-10 实测一半已超时），所以两者都是列表+回退，不写死单源；镜像域名只接受纯 host，防住把任意 URL 变开放转发。
+镜像**只有一个配置来源**：`distro/distro.json` 的 `updateMirrors`（当前 `gh-proxy.com`、`ghproxy.cn`）。同一条列表供给两条链路，所以清单和安装包不会各自漂移；`scripts/distro-build-config.mjs` 校验它（重复、超过 3 个、非法 host 都直接让发版失败），服务端与原生安装器各自用同一套规则再校验一次。
+
+- **检查更新**（`lib/app-updates.ts` + `lib/update-mirrors-server.ts`）：先直连 `api.github.com`，再试 github.com 的 release 重定向探测，都失败才按序试镜像的 API 透传。服务端在**运行时**读 `distro/distro.json`（发行版把它拷到 server 根目录；源码树读 `distro/distro.json`），`PI_UPDATE_MIRRORS` 环境变量优先，**设为空字符串即禁用镜像**（与未设置不同）——这个变量**只影响服务端这一次检查**，安装器用的是构建期编译进去的列表。整次检查共享一个总时限，不是每个源各等一个超时。镜像返回 404、403 或 HTML 只说明该源不可用，换下一个；只有直连 `api.github.com` 的 404 才是"确实没有发布"。
+- **安装包下载**（`src-tauri/src/update_install.rs`）：原生命令 `install_available_update` 复用 tauri-plugin-updater 的 `Update::download`，先直连清单里给的 github.com 资产 URL，**传输失败**才换成镜像前缀 URL 重试**同一个 Update**（同一个签名、同一个版本）。清单获取也是逐源独立尝试：某个镜像回了 HTML 或坏 JSON 只算这个源不可用，不会像插件的多 endpoint 循环那样直接中断。每次下载都会走插件自己的 minisign 校验；`distro-build-config.mjs` 把同一份 `updateMirrors` 写进构建环境（`PI_AGENT_DESKTOP_UPDATE_MIRRORS`），本地构建没有该变量，因此只用直连。
+- **信任边界要说清**：`latest.json` 清单**本身没有签名**。所以清单里的资产 URL 在发出任何请求之前会被严格校验（https、`github.com`、本仓库、tag 必须等于 `v<声明版本>`、单一文件名、无端口/凭据/查询/片段/编码路径分隔符）；镜像只能对**通过校验的**那个 URL 加前缀。真正的信任来自下载字节的 minisign 校验和版本比对。
+- **版本绑定的实际强度**：插件在签名带版本且与清单不一致时无论开关如何都会拒绝；`requireSignedVersion` 当前**未开启**，因此签名不带版本的旧式产物不会被这条单独挡住（上游据此修复过绕过，配置说明见插件 `config.rs`）。当前的发布链路由 tauri-action 签名，产物带版本。
+- **失败语义**：只有传输类失败（连不上、超时、非 2xx）才会换下一个源。签名、平台缺失、安装失败是**对这次更新本身的判定**，立即中止：不换源重试，也不提供绕过校验的手动安装入口。清单读不出（HTML/坏 JSON）单独作为"读不到更新信息"上报，不谎报成网络故障或本地安装失败。前端只被动接收进度和结果，不能传下载地址、镜像表、签名或目标。
+- **镜像能做什么、不能做什么**：它能拖慢或拒绝更新，也能把清单指向别处——但别处同样过上面的 URL 校验和字节验签，所以改不了最终装进去的东西。一个镜像返回坏字节会让这次更新以验签失败终止（可用性代价，采用 fail-closed）。镜像确实会看到本机 IP 与 `User-Agent`（含应用版本）。
+- 镜像域名只接受纯 `host[:port]`（端口 1–65535），因此配置项不可能变成任意 URL 的开放转发。公共镜像会失效，所以是"列表 + 失败回退"而不是单点；本项目没有验证过任何第三方镜像的实际可用性。
 
 ## 运行时行为细节
 

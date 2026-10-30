@@ -22,7 +22,7 @@
  *
  * Prints the version on stdout.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,21 +58,93 @@ export function distroResources(platform, upstreamResources) {
 }
 
 /**
- * Accelerator endpoints for the updater manifest, each the mirror-prefixed
- * form of the direct github.com latest.json URL. Mirrors must proxy release
- * downloads, not just raw files. Invalid entries are rejected loudly rather
- * than silently shipping a broken endpoint.
+ * The validated mirror origins from `distro.json`, in try order.
+ *
+ * `updateMirrors` is the ONLY place a mirror is configured. It is baked into
+ * the desktop shell at build time (as `PI_AGENT_DESKTOP_UPDATE_MIRRORS`, see
+ * `updateMirrorEnv`) and read at runtime by this repository's server, so the
+ * manifest fetch and the installer download can never disagree about which
+ * mirrors exist. Invalid entries fail the build instead of shipping an
+ * endpoint nobody can use.
  */
-export function updateMirrorEndpoints(mirrors, repository) {
-  const list = Array.isArray(mirrors) ? mirrors : [];
-  return list.map((mirror) => {
+/** The retry budget the server and the shell both enforce. */
+export const MAX_UPDATE_MIRRORS = 3;
+
+/**
+ * `host` or `host:port`, nothing else. These are the same rules as
+ * `lib/update-mirrors.ts` (`isMirrorHost`) and
+ * `src-tauri/src/update_install.rs` (`is_valid_mirror_host`); the three
+ * accept/reject lists are kept identical by tests, because a value this build
+ * accepts must not be silently dropped by either runtime.
+ */
+export function isMirrorHost(value) {
+  if (typeof value !== "string" || value.length === 0) return false;
+  const separator = value.lastIndexOf(":");
+  const name = separator === -1 ? value : value.slice(0, separator);
+  const port = separator === -1 ? undefined : value.slice(separator + 1);
+  if (!name || name.length > 253) return false;
+  if (port !== undefined) {
+    if (!/^\d{1,5}$/.test(port)) return false;
+    const number = Number(port);
+    if (number < 1 || number > 65535) return false;
+  }
+  const labels = name.split(".");
+  // A single label would resolve through a search domain.
+  if (labels.length < 2) return false;
+  return labels.every((label) => (
+    label.length > 0
+    && label.length <= 63
+    && /^[a-z0-9-]+$/i.test(label)
+    && !label.startsWith("-")
+    && !label.endsWith("-")
+  ));
+}
+
+/**
+ * The validated mirror origins from `distro.json`, in try order.
+ *
+ * Rejections are loud: a mirror that the shell would drop must fail the build
+ * instead of shipping an endpoint nobody uses.
+ */
+export function updateMirrorList(mirrors) {
+  if (mirrors === undefined) return [];
+  if (!Array.isArray(mirrors)) {
+    throw new Error(`distro.json updateMirrors must be an array, got ${JSON.stringify(mirrors)}`);
+  }
+  const hosts = mirrors.map((mirror) => {
     if (typeof mirror !== "string") throw new Error(`distro.json updateMirrors entries must be strings, got ${JSON.stringify(mirror)}`);
-    const host = mirror.replace(/^https?:\/\//, "").replace(/\/+$/, "");
-    if (!/^[a-z0-9.-]+(:\d+)?$/i.test(host)) {
+    const host = mirror.trim()
+      .replace(/^https?:\/\//i, "")
+      .replace(/\/+$/, "")
+      .toLowerCase();
+    if (!isMirrorHost(host)) {
       throw new Error(`distro.json updateMirrors entry is not a host: ${JSON.stringify(mirror)}`);
     }
-    return `https://${host}/https://github.com/${repository}/releases/latest/download/latest.json`;
+    return host;
   });
+  if (new Set(hosts).size !== hosts.length) {
+    throw new Error(`distro.json updateMirrors repeats a mirror: ${JSON.stringify(hosts)}`);
+  }
+  if (hosts.length > MAX_UPDATE_MIRRORS) {
+    throw new Error(`distro.json updateMirrors lists ${hosts.length} mirrors; at most ${MAX_UPDATE_MIRRORS} are used`);
+  }
+  return hosts;
+}
+
+/**
+ * Accelerator endpoints for the updater manifest, each the mirror-prefixed
+ * form of the direct github.com latest.json URL. Mirrors must proxy release
+ * downloads, not just raw files.
+ */
+export function updateMirrorEndpoints(mirrors, repository) {
+  return updateMirrorList(mirrors).map(
+    (host) => `https://${host}/https://github.com/${repository}/releases/latest/download/latest.json`,
+  );
+}
+
+/** The `PI_AGENT_DESKTOP_UPDATE_MIRRORS` value the native installer compiles in. */
+export function updateMirrorEnv(mirrors) {
+  return updateMirrorList(mirrors).join(",");
 }
 
 function main() {
@@ -105,19 +177,31 @@ function main() {
   const upstreamResources = (platformFile ? readJson(join(tauriDir, platformFile)).bundle?.resources : null)
     ?? base.bundle.resources;
 
+  // `src-tauri/src/update_install.rs` pins REPOSITORY: the installer will only
+  // accept assets under it, so a renamed distribution must fail here instead of
+  // shipping a shell that rejects its own releases.
+  const installerSource = readFileSync(join(tauriDir, "src", "update_install.rs"), "utf8");
+  const pinned = /const REPOSITORY: &str = "([^"]+)";/.exec(installerSource);
+  if (!pinned || pinned[1] !== branding.repository) {
+    throw new Error(
+      `update_install.rs REPOSITORY (${pinned?.[1] ?? "missing"}) must match distro.json app.repository (${branding.repository})`,
+    );
+  }
+
   const overlay = {
     productName: branding.productName,
     identifier: branding.identifier,
     bundle: { resources: distroResources(platform, upstreamResources) },
     plugins: {
       updater: {
-        // The plugin tries endpoints in order until one answers, so the
-        // direct github.com manifest comes first and public accelerator
+        // The direct github.com manifest comes first and public accelerator
         // mirrors follow for networks where github.com is unreachable. The
-        // mirror prefix form is https://<mirror>/<full-github-url>; the
-        // manifest content is served verbatim, and the installer it points
-        // at is still verified by the updater's minisign signature. Set
-        // distro.json's "updateMirrors" to [] to ship direct-only.
+        // manifest is NOT signed, so `update_install.rs` also checks every
+        // asset URL against this repository and the announced version before
+        // requesting it, and verifies the downloaded bytes. `update_install.rs`
+        // fetches these endpoints one at a time (the plugin's own loop stops
+        // at the first candidate that answers with non-JSON). Set distro.json's
+        // "updateMirrors" to [] to ship direct-only.
         endpoints: [
           `https://github.com/${branding.repository}/releases/latest/download/latest.json`,
           ...updateMirrorEndpoints(distro.updateMirrors, branding.repository),
@@ -126,6 +210,15 @@ function main() {
     },
   };
   writeFileSync(join(tauriDir, "tauri.distro.conf.json"), `${JSON.stringify(overlay, null, 2)}\n`);
+
+  // The native installer reads the same list through `option_env!`, which means
+  // it must reach the `tauri build` environment. Writing it to $GITHUB_ENV is
+  // what carries it from this configuration step to the build step.
+  const mirrors = updateMirrorEnv(distro.updateMirrors);
+  if (process.env.GITHUB_ENV) {
+    appendFileSync(process.env.GITHUB_ENV, `PI_AGENT_DESKTOP_UPDATE_MIRRORS=${mirrors}\n`);
+  }
+  if (mirrors) console.error(`installer mirrors: ${mirrors}`);
   console.log(version);
 }
 
