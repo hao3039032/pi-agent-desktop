@@ -268,6 +268,84 @@ fn real_pi_bridge_tools_list_over_the_shipped_asset() {
     assert_eq!(client.close(CLOSE_GRACE), Some(0));
 }
 
+/// A fixture extension registering a provider, the way custom providers
+/// (mirrors, proxies) register in real setups.
+const PROVIDER_FIXTURE: &str = r#"
+export default function providerFixture(pi) {
+  pi.registerProvider("poc-fixture", {
+    name: "PoC Fixture Provider",
+    baseUrl: "http://127.0.0.1:9",
+    apiKey: "$POC_UNUSED_KEY",
+    api: "openai-chat",
+    models: [{
+      id: "poc-fixture-model",
+      name: "PoC Fixture Model",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 8192,
+      maxTokens: 1024,
+    }],
+  });
+}
+"#;
+
+#[test]
+fn real_pi_management_instance_enumerates_extension_providers() {
+    let Some(_) = pi_bin() else {
+        eprintln!("skipping: PI_CLI_BIN not set");
+        return;
+    };
+    let sandbox = Sandbox::new("mgmt-providers");
+    // The management-instance shape: --mode rpc --no-session, discovery off,
+    // only the explicit fixture extension — no user session file is created
+    // and no model is ever called.
+    let fixture = sandbox.root.join("provider-fixture.mjs");
+    std::fs::write(&fixture, PROVIDER_FIXTURE).expect("fixture");
+    let executable = pi_bin().expect("PI_CLI_BIN");
+    let client = PiRpcClient::spawn(
+        &executable,
+        SpawnOptions {
+            args: vec![
+                "--no-session".into(),
+                "--no-extensions".into(),
+                "--no-skills".into(),
+                "--no-prompt-templates".into(),
+                "--no-themes".into(),
+                "--no-context-files".into(),
+                "--extension".into(),
+                fixture.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(sandbox.work()),
+            env: EnvPolicy::inherit()
+                .set("PI_CODING_AGENT_DIR", sandbox.agent().to_string_lossy().into_owned())
+                .set("POC_UNUSED_KEY", "x"),
+            ..SpawnOptions::default()
+        },
+    )
+    .expect("management-shaped pi spawns");
+
+    // Provider enumeration is the child's own registry over the standard RPC:
+    // extension-registered providers appear exactly like built-ins.
+    let result = client
+        .command("get_available_models", json!({}), Some(HANDSHAKE))
+        .expect("get_available_models answers");
+    let models = result["models"].as_array().expect("models array");
+    let fixture_model = models
+        .iter()
+        .find(|model| model["provider"] == "poc-fixture")
+        .expect("the extension-registered provider is enumerated");
+    assert_eq!(fixture_model["id"], "poc-fixture-model");
+    assert_eq!(fixture_model["api"], "openai-chat");
+
+    // The management shape wrote no session file into the sandbox.
+    assert_eq!(client.close(CLOSE_GRACE), Some(0));
+    let sessions: Vec<_> = std::fs::read_dir(sandbox.sessions())
+        .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default();
+    assert!(sessions.is_empty(), "--no-session created no session files: {sessions:?}");
+}
+
 #[test]
 fn real_pi_bridge_rejects_unknown_ops() {
     let Some(_) = pi_bin() else {
