@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { IpcClient, IpcFailure, MockTransport } from "./client.ts";
+import { IpcClient, IpcFailure, MockTransport } from "./ipc/client.ts";
 
 test("sessions.list consumes the projects shape", async () => {
   const mock = new MockTransport().on("sessions.list", () => ({
@@ -31,7 +31,7 @@ test("sessions.list failures surface their protocol code", async () => {
   // No handler registered: unknown_op.
   const error = await new IpcClient(new MockTransport())
     .request("sessions.list")
-    .catch((error: unknown) => error);
+    .catch((error) => error);
   assert.ok(error instanceof IpcFailure);
   assert.equal(error.error.code, "unknown_op");
 });
