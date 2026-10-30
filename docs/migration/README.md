@@ -44,6 +44,7 @@ M2 项：
 | Rust 会话宿主骨干 | ✅ 骨干落地 | `crates/session-host`：id 键注册表、并发启动去重（每 id 一把启动锁）、10 分钟空闲租约/驱逐、会话文件头创建（host 为 header 作者）、生产启动形态（`--session` + 发现关闭 + bridge 资产 + nonce）、握手（get_state 身份一致性 + get_commands 桥接命令归属）、事件扇出（N 订阅者）、封闭操作分发表（`sessions.runState`/`agent.interrupt`/`agent.setSessionName`；unknown_op/not_found）。真实 pi lifecycle 测试（create→start→并发去重→bridge tools.list→runState→租约到期驱逐→关闭） |
 | 消息层状态机（queue/steer/compact/fleet 等） | ⬜ 骨干之上 | 逐命令迁移（prompt 事件、重试、压缩、树导航、fork/clone、统计） |
 | 会话 UI 静态迁移 | ⬜ | ChatWindow/MessageView/SSE→Channel 管线 |
+| Tauri IPC 桥（`pi_ipc` 命令） | ✅ 垂直切片落地 | `src-tauri/src/pi_ipc.rs`：协议 v1 信封校验（版本/结构/参数对象）、封闭操作表（`desktop.identity` 先于任何子进程应答；会话操作路由 session-host 的分发表）、`unknown_op`/`not_found` 协议错误码。`allow-pi-ipc` 权限（desktop-shell.toml）+ 主窗口 capability；静态 BootPage 的 Tauri 探测路径真实可用（客户端超时，超时不重发）。src-tauri 24 测试全绿 |
 
 ## 工件索引
 

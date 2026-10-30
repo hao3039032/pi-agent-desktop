@@ -13,6 +13,23 @@ type HostState =
   | { status: "ready"; version: string }
   | { status: "degraded"; diagnosis: string; retryable: boolean };
 
+/** Client-side timeout for one invoke (a timeout never resends). */
+function invokeWithTimeout(
+  invoke: (cmd: string, payload: unknown) => Promise<unknown>,
+  request: { op: string; id: string },
+  timeoutMs: number,
+): Promise<unknown> {
+  return Promise.race([
+    invoke("pi_ipc", { request }),
+    new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error(`ipc '${request.op}' timed out; the operation may still have happened — never resend blindly`)),
+        timeoutMs,
+      );
+    }),
+  ]);
+}
+
 /** Detect the Tauri host bridge (M2 registers `pi_ipc`); the mock is the M1 stand-in. */
 function detectTransport(): { transport: IpcTransport; label: string } {
   const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: unknown } }).__TAURI_INTERNALS__;
@@ -20,13 +37,12 @@ function detectTransport(): { transport: IpcTransport; label: string } {
     return {
       label: "tauri",
       transport: {
-        send: async (request, timeoutMs) => {
-          const response = await (internals.invoke as (cmd: string, payload: unknown) => Promise<unknown>)(
-            "pi_ipc",
-            { request, timeoutMs },
-          );
-          return response;
-        },
+        send: (request, timeoutMs) =>
+          invokeWithTimeout(
+            internals.invoke as (cmd: string, payload: unknown) => Promise<unknown>,
+            request,
+            timeoutMs,
+          ),
         subscribe: () => () => {},
       },
     };

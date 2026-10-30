@@ -15,6 +15,11 @@ crate-type = ["staticlib", "cdylib", "lib"]
 tauri-build = { version = "2.5.5", features = [] }
 
 [dependencies]
+# The migration's Rust host crates (docs/migration/README.md). pi-host is
+# the pi child RPC client; session-host is the session registry the pi_ipc
+# command dispatches into.
+pi-host = { path = "../crates/pi-host" }
+session-host = { path = "../crates/session-host" }
 dunce = "1"
 getrandom = "0.3"
 libc = "0.2"

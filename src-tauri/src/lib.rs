@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Url};
 
 mod logging;
 mod native_prefs;
+mod pi_ipc;
 mod shell;
 mod update_install;
 
@@ -1379,9 +1380,11 @@ pub fn run() {
             }
         })
         .manage(CloseQuits(Mutex::new(false)))
+        .manage(pi_ipc::IpcHostState::new())
         .manage(PopupMenuSelection::default())
         .manage(DesktopApiToken(desktop_api_token))
         .invoke_handler(tauri::generate_handler![
+            pi_ipc::pi_ipc,
             get_desktop_api_token,
             open_external_url,
             open_path,

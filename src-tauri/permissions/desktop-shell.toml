@@ -77,3 +77,8 @@ commands.allow = ["clear_app_cache"]
 identifier = "allow-install-available-update"
 description = "Allows the UI to install the signed update the shell finds: it checks, downloads (direct, then the mirrors compiled in from distro.json), verifies the minisign signature and installs. No download URL, mirror, signature or target is accepted from the page."
 commands.allow = ["install_available_update"]
+
+[[permission]]
+identifier = "allow-pi-ipc"
+description = "Allows the app WebView to call the typed IPC bridge (protocol v1): one closed operation table (docs/migration/ipc-protocol.md), no generic execution surface. Unknown operations are refused by the host."
+commands.allow = ["pi_ipc"]

@@ -2,9 +2,13 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "desktop-dialog",
   "description": "Allow native dialogs, clipboard, notifications, shell helpers, and tray/window lifecycle commands.",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "remote": {
-    "urls": ["http://127.0.0.1:*/*"]
+    "urls": [
+      "http://127.0.0.1:*/*"
+    ]
   },
   "permissions": [
     "dialog:allow-open",
@@ -30,6 +34,7 @@
     "allow-window-painted",
     "allow-set-ui-theme",
     "allow-clear-app-cache",
-    "allow-get-desktop-api-token"
+    "allow-get-desktop-api-token",
+    "allow-pi-ipc"
   ]
 }
