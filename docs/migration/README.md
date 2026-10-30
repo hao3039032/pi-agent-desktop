@@ -12,6 +12,7 @@
 | 管理依赖加载（隔离固定版本模块树，绝对路径导入） | ✅ 机制验证通过（本机 pi 1.4.0 托管安装 = release 目录布局，linux-x64） | `scripts/migration/management-deps-loading.test.mjs`：vendored croner 10.x 在子进程内解析、执行、回报 URL；空 NODE_PATH + 临时 cwd。已随 `PI_CLI_BIN=… npm test` 全量回归（3629/3629，0 跳过）。⚠️ 其余三个发行目标的打包布局（desktop:prepare 产物）验证仍待做 |
 | 扩展 provider 枚举 | ✅ 验证通过 | `crates/pi-host/tests/real_pi.rs::real_pi_management_instance_enumerates_extension_providers`：管理形态 child（`--mode rpc --no-session`）加载 pi.registerProvider fixture 后，标准 `get_available_models` RPC 枚举出该 provider 的模型；`--no-session` 不写会话文件 |
 | 模拟 OAuth 取消/回调 | ✅ 验证通过 | `crates/oauth-loopback`：OS 随机端口的 127.0.0.1 监听、唯一 `/callback` 端点（路径外的都 404）、state 不匹配绝不是成功、PKCE S256 挑战独立复算一致（verifier 只留宿主侧）、完成/取消后监听关闭、百分号解码。7 测试 + 1 显式忽略的超时长路径 |
+| 终端 IPC 接线 | ✅ 落地 | `pi_ipc`：terminal.create（幂等）/write（base64，失败不重试）/read（游标 suffix/reset+重放）/resize/close + `pi_ipc_subscribe_terminal` 输出流（真实 PTY 往返测试）
 | PTY（portable-pty） | ✅ 可行性验证通过 | `crates/pty-host`：幂等创建（同 id 返回同一实例）、输入/resize 串行、128 Ki UTF-16 历史窗口 + 游标后缀读 + 过旧游标 reset/有界重放、退出码传播（exit 7 实测）、Unicode 分块、关闭后输入显式失败。120 秒租约与 Tauri 接线是 M4 |
 | 无权限资源预览（自定义资源协议） | ✅ 逻辑层验证通过 | `crates/resource-protocol`：随机 128 位句柄、单文件/目录授权、请求时重校验（canonical 一致 + 目录包含检查拒绝穿越/绝对路径/反斜杠/树内逃逸 symlink）、授权绑定解析后的目标（symlink 重定向不动授权；锚点被换成 symlink 则拒绝）、MIME/Range、过期与撤销。Tauri 协议注册是 M3 |
 
@@ -50,7 +51,9 @@ M2 项：
 | 项 | 状态 | 工件 |
 |---|---|---|
 | Rust 会话宿主骨干 | ✅ 骨干落地 | `crates/session-host`：id 键注册表、并发启动去重（每 id 一把启动锁）、10 分钟空闲租约/驱逐、会话文件头创建（host 为 header 作者）、生产启动形态（`--session` + 发现关闭 + bridge 资产 + nonce）、握手（get_state 身份一致性 + get_commands 桥接命令归属）、事件扇出（N 订阅者）、封闭操作分发表（`sessions.runState`/`agent.interrupt`/`agent.setSessionName`；unknown_op/not_found）。真实 pi lifecycle 测试（create→start→并发去重→bridge tools.list→runState→租约到期驱逐→关闭） |
-| 消息层状态机（queue/steer/compact/fleet 等） | ⬜ 骨干之上 | 逐命令迁移（prompt 事件、重试、压缩、树导航、fork/clone、统计） |
+| 消息层状态机 | ✅ 核心已移植 | `crates/session-host/src/machine.rs`：run epoch、isRunning OR 规则、autoRetry 未知语义、流式 delta 累积（text/thinking/toolcall 稠密块）、队列、压缩、model_change、陈旧快照防护；prompt 的 SDK 契约（started 等下一 epoch / queued 等当前 / handled 不起 run）。9 单测 + 真实 pi 生命周期 |
+| 事件流桥（Tauri Channel） | ✅ 落地 | `pi_ipc_subscribe_events`：snapshot 帧先行（与订阅原子）、事件单调 seq、宿主 epoch、关闭即分离；静态前端 transport 已接 Channel |
+| 剩余命令面（树导航、fork/clone、统计缓存、fleet 监控、自动命名桥接） | ⬜ 逐命令迁移 | 状态机与分发表已就位，按清单 op 逐个落 |
 | 会话 UI 静态迁移 | ⬜ | ChatWindow/MessageView/SSE→Channel 管线 |
 | Tauri IPC 桥（`pi_ipc` 命令） | ✅ 垂直切片落地 | `src-tauri/src/pi_ipc.rs`：协议 v1 信封校验（版本/结构/参数对象）、封闭操作表（`desktop.identity` 先于任何子进程应答；会话操作路由 session-host 的分发表）、`unknown_op`/`not_found` 协议错误码。`allow-pi-ipc` 权限（desktop-shell.toml）+ 主窗口 capability；静态 BootPage 的 Tauri 探测路径真实可用（客户端超时，超时不重发）。src-tauri 24 测试全绿 |
 
