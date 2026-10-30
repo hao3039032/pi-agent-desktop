@@ -65,6 +65,7 @@ import { artifactPanelTab, artifactTabId, artifactTabsForSession, upsertArtifact
 import { ArtifactPanel } from "./ArtifactPanel";
 import { setArtifactOpener, useArtifactTitles } from "@/lib/artifact-store";
 import { useAudio } from "@/hooks/useAudio";
+import { useStateMirror } from "@/hooks/useStateMirror";
 import { copyText } from "@/lib/clipboard";
 import { sendAgentCommand } from "@/lib/agent-client";
 import {
@@ -138,6 +139,10 @@ export function AppShell() {
   // sun/moon toggle was removed — theme selection lives in Settings → General.
   useTheme();
   useFonts();
+  // Transition-version state mirror (docs/migration/README.md §M1): the
+  // whitelisted WebView state ships to the host-owned mirror file so the
+  // future static-frontend version can import it. No-op outside a browser.
+  useStateMirror();
   const { locale, t: translate } = useI18n();
   const isMobile = useIsMobile();
   useViewportHeight();
