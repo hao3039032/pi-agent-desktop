@@ -2229,6 +2229,7 @@ version = "0.1.0"
 dependencies = [
  "pi-host",
  "serde_json",
+ "task-scheduler",
  "uuid",
 ]
 
@@ -2884,6 +2885,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session-host",
+ "task-scheduler",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2893,6 +2895,7 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
+ "tempfile",
  "tokio",
  "url",
  "window-vibrancy",
@@ -4105,6 +4108,13 @@ name = "target-lexicon"
 version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
+
+[[package]]
+name = "task-scheduler"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "tauri"

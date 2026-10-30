@@ -7,6 +7,7 @@
 //! operations answer `unknown_op` without touching any session child.
 
 use base64::Engine;
+use task_scheduler::TaskStore;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,8 +18,8 @@ use tauri::State;
 use management_host::{ManagementHost, ManagementSpawnConfig};
 use session_host::{SessionRegistry, SessionSpawnConfig};
 
-/// Terminal output frames carry base64 inside JSON Channels today; the
-/// raw-bytes upgrade (protocol doc §4) lands with the M4 binary channel.
+// Terminal output frames carry base64 inside JSON Channels today; the
+// raw-bytes upgrade (protocol doc §4) lands with the M4 binary channel.
 
 /// Protocol version (must match static-frontend/src/ipc/protocol.ts and
 /// docs/migration/ipc-protocol.md).
@@ -42,6 +43,8 @@ pub struct IpcHostState {
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
     pub management_config: std::sync::Mutex<Option<ManagementSpawnConfig>>,
+    /// The scheduled-task store root (the agent dir the host runs against).
+    pub task_agent_dir: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl IpcHostState {
@@ -53,6 +56,7 @@ impl IpcHostState {
             terminals: pty_host::PtyHost::new(),
             management: ManagementHost::new(),
             management_config: std::sync::Mutex::new(None),
+            task_agent_dir: std::sync::Mutex::new(None),
         }
     }
 }
@@ -201,6 +205,16 @@ pub fn pi_ipc_subscribe_terminal(
         })
         .ok();
     json!({ "subscriptionId": subscription_id_for_relay })
+}
+
+/// The agent dir the desktop runs against (packaged layout resolves it
+/// through the app's agent-dir contract).
+fn default_agent_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".pi/agent")
 }
 
 fn session_run_state_json(session: &Arc<session_host::Session>) -> Value {
@@ -365,6 +379,25 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, "management_unavailable", &error),
             }
         }
+        // Scheduled tasks (crates/task-scheduler): list/preview read the
+        // store; the tick loop itself runs on the host's 30 s timer (M4
+        // wiring), never through request dispatch.
+        "tasks.list" => {
+            let agent_dir = state
+                .task_agent_dir
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(default_agent_dir);
+            let store = TaskStore::new(agent_dir);
+            match store.read_tasks() {
+                Ok(tasks) => protocol_ok(
+                    &id,
+                    json!({ "tasks": tasks.values().map(|(_, raw)| raw).collect::<Vec<_>>() }),
+                ),
+                Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
     }
 }
@@ -425,6 +458,37 @@ mod tests {
         );
         assert_eq!(response["ok"], false);
         assert_eq!(response["error"]["code"], "unknown_op");
+    }
+
+    #[test]
+    fn tasks_list_reads_the_store_and_reports_corruption() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+
+        // Empty store: an empty list, not an error.
+        let response = send(&state, json!({ "v": 1, "id": "k1", "op": "tasks.list" }));
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["data"]["tasks"].as_array().unwrap().len(), 0);
+
+        // One task roundtrips its raw shape.
+        std::fs::write(
+            dir.path().join("scheduled-tasks.json"),
+            serde_json::json!({ "tasks": [{
+                "id": "t1", "name": "T", "prompt": "go", "cwd": "/w",
+                "schedule": { "kind": "cron", "expr": "*/10 * * * *", "timezone": "UTC" },
+                "enabled": true,
+            }]})
+            .to_string(),
+        )
+        .expect("write");
+        let response = send(&state, json!({ "v": 1, "id": "k2", "op": "tasks.list" }));
+        assert_eq!(response["data"]["tasks"][0]["id"], "t1");
+
+        // A corrupt store is an io error, never an empty success.
+        std::fs::write(dir.path().join("scheduled-tasks.json"), "{ broken").expect("write");
+        let response = send(&state, json!({ "v": 1, "id": "k3", "op": "tasks.list" }));
+        assert_eq!(response["error"]["code"], "io");
     }
 
     #[test]
