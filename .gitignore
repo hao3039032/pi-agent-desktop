@@ -85,3 +85,4 @@ crates/resource-protocol/target/
 desktop/frontend/assets/
 crates/session-host/target/
 crates/management-host/target/
+crates/task-scheduler/target/

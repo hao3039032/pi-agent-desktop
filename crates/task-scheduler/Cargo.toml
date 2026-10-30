@@ -1,0 +1,36 @@
+[package]
+name = "task-scheduler"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "The Rust scheduled-task engine: slot decisions, leases, concurrency, failure pause (M4)"
+publish = false
+
+# The plan (§六 PTY 与调度 / docs/agents/scheduled-tasks.md) moves task
+# scheduling into the Rust host. Semantics frozen from the TS engine:
+#
+# - a 30 s tick (a task may start up to 30 s late);
+# - slot decisions: on-time grace → fire, within the 7-day catch-up window
+#   → catch-up fire (at most ONE missed run), beyond → drop with the
+#   skipped count; overlap while a run is active → skip with the count;
+# - at most 2 concurrent runs; MIN interval 5 minutes;
+# - 5 consecutive failures auto-pause (the pausing error is kept);
+# - a run lease is stale after 90 s without heartbeat; another process
+#   (or this one after takeover) may claim it;
+# - cron slot math itself stays with the management extension's
+#   fixed-version croner (plan §三): this crate takes a CronOracle.
+#
+# The run book is deliberately storage-agnostic: the store trait is
+# implemented by the host (files under the agent dir keep the existing
+# on-disk format compatibility).
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "task_scheduler"
+path = "src/lib.rs"
