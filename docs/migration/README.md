@@ -9,11 +9,22 @@
 | 124 个 HTTP 方法 → IPC 完整映射 | ✅ 完成 | `api-inventory.json` + `scripts/migration/api-inventory-mapping.mjs`（守卫测试 `scripts/migration/api-inventory.test.mjs`：89 文件/124 方法冻结、op 唯一、无遗漏） |
 | IPC 协议规范（信封/错误码/流/资源通道） | ✅ 冻结初版 | `ipc-protocol.md` |
 | Rust→pi 握手/桥接/退出（最高风险项） | ✅ PoC 验证通过 | `crates/pi-host`：20 个确定性协议测试 + 3 个真实 pi 集成测试（`PI_CLI_BIN` 门控，隔离 `PI_CODING_AGENT_DIR` 沙箱） |
-| 管理依赖加载（隔离固定版本模块树，绝对路径导入） | ✅ 机制验证通过（开发机 pi 1.4.0 托管安装形态） | `scripts/migration/management-deps-loading.test.mjs`：vendored croner 10.x 在子进程内解析、执行、回报 URL；空 NODE_PATH + 临时 cwd。⚠️ 四发行目标的实际打包布局（desktop:prepare 产物）验证仍待做 |
+| 管理依赖加载（隔离固定版本模块树，绝对路径导入） | ✅ 机制验证通过（本机 pi 1.4.0 托管安装 = release 目录布局，linux-x64） | `scripts/migration/management-deps-loading.test.mjs`：vendored croner 10.x 在子进程内解析、执行、回报 URL；空 NODE_PATH + 临时 cwd。已随 `PI_CLI_BIN=… npm test` 全量回归（3629/3629，0 跳过）。⚠️ 其余三个发行目标的打包布局（desktop:prepare 产物）验证仍待做 |
 | 扩展 provider 枚举 | ⬜ 未开始 | 依赖管理实例设计（pi.registerProvider 已确认存在；扩展上下文无 getAvailable，需管理扩展自带枚举路径） |
 | 模拟 OAuth 取消/回调 | ⬜ 未开始 | |
 | PTY（portable-pty） | ⬜ 未开始 | M4 主项，M0 仅需可行性确认 |
 | 无权限资源预览（自定义资源协议） | ⬜ 未开始 | |
+
+## 如何跑真实 pi 测试
+
+真实 pi 测试（Rust `crates/pi-host/tests/real_pi.rs`、JS `lib/pi-rpc/*.smoke.test.mjs`、`scripts/migration/management-deps-loading.test.mjs`）都以 `PI_CLI_BIN` 门控，未设置时跳过。开发机上直接指向本地托管安装即可（它就是桌面随包的 release 目录布局）：
+
+```bash
+PI_CLI_BIN=$HOME/.pi/agent/bin/pi npm test          # 全量套件含真实 pi 冒烟（3629 个，0 跳过）
+PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-host 下
+```
+
+所有真实 pi 测试都跑在隔离沙箱（临时 `PI_CODING_AGENT_DIR`、临时 cwd），不碰真实 `~/.pi/agent` 数据。
 
 ## 工件索引
 
