@@ -114,47 +114,49 @@ jobs:
           tagName: v__VERSION__
           releaseName: pi-agent-desktop v__VERSION__
           releaseBody: |
-            ## Pi Agent Desktop 0.7.7
+            ## Pi Agent Desktop 0.7.8
 
             ### New
 
-            - **Appearance settings.** A new Appearance page lets you pick light, dark or system mode, one of five background presets, and separate fonts for the interface and for code. Installed fonts are listed in the desktop app; Reset appears once you change something.
-            - **Open the files a chat made.** A chat can now open and browse the files it generated (an HTML report, for example) in the right panel, from the "Edited files" card or from file links in the reply. Only files inside the chat's own folder open.
+            - **Find in conversation.** Press Ctrl/Cmd+F to search the loaded part of a conversation, with match highlighting, a counter, Enter / Shift+Enter to step through matches and Esc to return to the composer. Matches stay put while a reply is streaming.
+            - **Choose the terminal shell.** General settings now lets you pick the shell used by "Open in terminal". Windows prefers PowerShell 7, then Windows PowerShell, then CMD; macOS and Linux keep your login shell. The choice applies to new or restarted terminals.
+            - **Richer replies.** A leading YAML block is shown as a code block instead of disappearing, GitHub alerts (`> [!NOTE]`) render as callouts, long code blocks fold, and code blocks that the reply says were saved to a file get an Open button.
+            - **Conversation titles.** Title generation shows its progress and gives an actionable message when it fails.
 
             ### Improved
 
-            - The conversation navigator now hides when the chat column is too narrow, so it no longer overlaps the transcript.
-            - Settings controls share consistent spacing, and the configuration editors match the General page.
-            - A `write` tool call now shows the file's text instead of raw JSON.
-            - The development server stays quiet by default; run `npm run web -- --verbose` (or set `PI_WEB_VERBOSE=1`) to see request logs.
+            - **A calmer look.** Neutral grays, a flat window and sidebar canvas, thinner two-tier borders that stay visible on Retina screens, softer code colors and consistent corner radii. The accent color follows the system. The background presets from 0.7.7 are gone, replaced by this neutral canvas; light, dark and system modes remain.
+            - Terminals use the workbench's light and dark colors and start faster, and closing a terminal on Windows no longer errors.
+            - Project and session menus stay inside the window, and delete confirmations are shared and keyboard friendly.
+            - Line numbers are excluded when you select code.
 
             ### Fixed
 
-            - Windows: the app waits longer for its server (up to 3 minutes when launched at sign-in), and a failed start now shows an error and exits cleanly instead of crashing. The reason is written to `desktop.log`.
-            - Fixed a rendering warning in the notification toasts.
+            - A project that is a subfolder of a Git repository no longer shows the parent repository's worktrees in the sidebar.
 
             Bundled components: pi 1.4.0, pi-web 0.10.0.
 
             ---
 
-            ## Pi Agent Desktop 0.7.7
+            ## Pi Agent Desktop 0.7.8
 
             ### 新增
 
-            - **外观设置。** 新增“外观”页：可选择浅色、深色或跟随系统，五种背景预设，并分别设置界面字体和代码字体。桌面版会列出已安装的字体；修改后才会出现“重置”。
-            - **打开对话生成的文件。** 对话现在可以在右侧面板中打开并浏览自己生成的文件（例如 HTML 报告），入口是“已编辑文件”卡片或回复中的文件链接。只有对话自己文件夹内的文件可以打开。
+            - **对话内查找。** 按 Ctrl/Cmd+F 搜索已加载的对话内容：高亮匹配、显示计数，Enter / Shift+Enter 在匹配间跳转，Esc 回到输入框。回复流式输出时，当前匹配位置保持不动。
+            - **选择终端 Shell。** “通用”设置可选择“在终端中打开”使用的 Shell。Windows 优先 PowerShell 7，其次 Windows PowerShell，再次 CMD；macOS 和 Linux 沿用登录 Shell。新建或重启的终端会使用该选择。
+            - **更丰富的回复渲染。** 开头的 YAML 块现在以代码块显示而不是消失；支持 GitHub 提示块（`> [!NOTE]`）；长代码块可折叠；回复中说明已保存到文件的代码块会出现“打开”按钮。
+            - **对话标题生成。** 标题生成会显示进度，失败时给出可操作的提示。
 
             ### 改进
 
-            - 对话区过窄时会隐藏对话导航，不再遮挡正文。
-            - 设置页控件的间距统一，各配置编辑器与“通用”页样式一致。
-            - `write` 工具调用现在直接显示文件正文，而不是原始 JSON。
-            - 开发服务器默认不再输出请求日志；需要时运行 `npm run web -- --verbose`（或设置 `PI_WEB_VERBOSE=1`）。
+            - **更平静的外观。** 中性灰、统一的窗口与侧栏纯色底、更细的两档边线（在 Retina 屏上依然清晰）、更柔和的代码配色和统一圆角；强调色跟随系统。0.7.7 的背景预设已移除，由中性底色取代；浅色、深色与跟随系统模式保留。
+            - 终端使用工作台的明暗配色且启动更快；Windows 上关闭终端不再报错。
+            - 项目和会话菜单不会超出窗口，删除确认改为共用组件并支持键盘操作。
+            - 选择代码时不再选中行号。
 
             ### 修复
 
-            - Windows：应用等待服务启动的时间更长（开机自启时最长 3 分钟）；启动失败时会弹出错误并正常退出，不再崩溃，原因会写入 `desktop.log`。
-            - 修复通知提示在渲染时出现的警告。
+            - 位于 Git 仓库子目录的项目，侧栏不再显示父仓库的 worktree。
 
             内置组件版本：pi 1.4.0、pi-web 0.10.0。
           releaseDraft: true

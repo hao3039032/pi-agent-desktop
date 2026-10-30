@@ -403,3 +403,36 @@ test("keeps a block that opens a raw-text tag as it renders without line breaks"
   const list = renderMarkdown("- item <textarea>\n  more\n- two\n  lines", { keepLineBreaks: true });
   assert.match(list, /<li>two<br\/>lines<\/li>/);
 });
+
+test("shows a leading YAML block as a code fence instead of dropping it", () => {
+  const html = renderMarkdown("---\ntitle: Demo\ntags: [a]\n---\n\nBody text");
+
+  assert.match(html, /title/);
+  assert.match(html, /Demo/);
+  assert.match(html, /markdown-code-lang">yaml</);
+  assert.match(html, /Body text/);
+});
+
+test("renders GitHub alerts as titled callouts", () => {
+  const html = renderMarkdown("> [!WARNING]\n> Back up **first**.\n\nafter");
+
+  assert.match(html, /<div class="markdown-alert markdown-alert-warning">/);
+  assert.match(html, /<p class="markdown-alert-title">Warning<\/p>/);
+  assert.match(html, /Back up <strong>first<\/strong>\./);
+  assert.doesNotMatch(html, /\[!WARNING\]/);
+});
+
+test("a marker on its own line leaves no empty paragraph and unknown markers stay quotes", () => {
+  const alert = renderMarkdown("> [!NOTE]\n>\n> Second paragraph");
+  assert.match(alert, /markdown-alert-note/);
+  assert.doesNotMatch(alert, /<p><\/p>/);
+
+  const plain = renderMarkdown("> [!INFO]\n> text");
+  assert.doesNotMatch(plain, /markdown-alert/);
+  assert.match(plain, /<blockquote>/);
+});
+
+test("alert markers inside lists stay ordinary quotes", () => {
+  const html = renderMarkdown("- item\n\n  > [!NOTE]\n  > nested");
+  assert.doesNotMatch(html, /markdown-alert/);
+});

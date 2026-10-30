@@ -11,18 +11,20 @@ import { SessionSidebar } from "./SessionSidebar";
 import { ChatWindow } from "./ChatWindow";
 import type { SystemPromptStatus } from "@/hooks/useAgentSession";
 import { AppNoticeShelf } from "./AppNoticeShelf";
+import { appNotify, updateAppNotice } from "@/lib/notification-store";
+import { useMenuPlacement } from "@/hooks/useMenuPlacement";
+import type { MenuAnchor } from "@/lib/menu-placement";
 import { useScheduledRunNotifications } from "@/hooks/useScheduledRunNotifications";
 import type { ChatScrollPosition } from "@/lib/chat-scroll-position";
 import { clearDraft, flushDrafts, parkedNewSessionDraftKey, parkDraftForPageHide, rekeyDraft, unparkDraftAfterPageRestore, type PageHideDraftPark } from "@/lib/draft-store";
 import { TabBar, type Tab } from "./TabBar";
+import { LazyTerminalPanel as TerminalPanel, preloadTerminalPanel } from "./LazyTerminalPanel";
 
 // Heavy, rarely-used surfaces are code-split out of the main bundle. The
 // config modals may never be opened at all; FileViewer drags in markdown +
 // syntax highlighting a second time and only matters once a file tab opens.
 const FileViewer = dynamic(() => import("./FileViewer").then((m) => m.FileViewer), { ssr: false });
 const FileExplorer = dynamic(() => import("./FileExplorer").then((m) => m.FileExplorer), { ssr: false });
-// Only mounted once opened; xterm alone is a large share of the page bundle.
-const TerminalPanel = dynamic(() => import("./TerminalPanel").then((m) => m.TerminalPanel), { ssr: false });
 const ScheduledView = dynamic(() => import("./scheduled/ScheduledView").then((m) => m.ScheduledView), { ssr: false });
 import { openFileTab, saveFileViewerState } from "./file-tab-state";
 import { SettingsPanel } from "./SettingsPanel";
@@ -31,7 +33,6 @@ import { ProjectTrustDialog, type ProjectTrustFailure } from "./ProjectTrustDial
 import { BranchNavigator, hasSessionBranches } from "./BranchNavigator";
 import { UpdateReminder } from "./UpdateReminder";
 import { useTheme } from "@/hooks/useTheme";
-import { useBackground } from "@/hooks/useBackground";
 import { useFonts } from "@/hooks/useFonts";
 import { useI18n } from "@/hooks/useI18n";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -136,7 +137,6 @@ export function AppShell() {
   // into the desktop config while the settings dialog is closed. The sidebar's
   // sun/moon toggle was removed — theme selection lives in Settings → General.
   useTheme();
-  useBackground();
   useFonts();
   const { locale, t: translate } = useI18n();
   const isMobile = useIsMobile();
@@ -275,6 +275,7 @@ export function AppShell() {
   const topMoreRef = useRef<HTMLDivElement>(null);
   const topMoreMenuRef = useRef<HTMLDivElement>(null);
   const [topMorePos, setTopMorePos] = useState<{ top: number; right: number } | null>(null);
+  const [topMoreAnchor, setTopMoreAnchor] = useState<MenuAnchor | null>(null);
   useMenuNavigation(topMoreOpen && Boolean(topMorePos), topMoreMenuRef, () => setTopMoreOpen(false));
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const shortcutHelpDialogRef = useRef<HTMLDivElement | null>(null);
@@ -287,6 +288,23 @@ export function AppShell() {
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [rightPanelExpanded, setRightPanelExpanded] = useState(false);
   const rightPanelFullWidth = rightPanelOpen && rightPanelExpanded && !isMobile;
+  useEffect(() => {
+    const preload = () => {
+      // A failed speculative load must not make the on-demand loader's state
+      // sticky; opening the panel below retries the same import.
+      void preloadTerminalPanel().catch(() => {});
+    };
+    if (rightPanelOpen) {
+      preload();
+      return;
+    }
+    if (typeof window.requestIdleCallback === "function") {
+      const id = window.requestIdleCallback(preload, { timeout: 2_000 });
+      return () => window.cancelIdleCallback(id);
+    }
+    const id = window.setTimeout(preload, 1_000);
+    return () => window.clearTimeout(id);
+  }, [rightPanelOpen]);
   useEffect(() => {
     if (!rightPanelOpen || isMobile) setRightPanelExpanded(false);
   }, [rightPanelOpen, isMobile]);
@@ -479,6 +497,8 @@ export function AppShell() {
   const [sessionStats, setSessionStats] = useState<SessionStatsInfo | null>(null);
   const [autoNameStatus, setAutoNameStatus] = useState<AutoNameStatus>({ kind: "idle" });
   const autoNameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoNameInFlightRef = useRef(new Set<string>());
+  const autoNameNoticeIdsRef = useRef(new Map<string, string>());
   const activeSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
   activeSessionIdRef.current = selectedSession?.id ?? null;
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
@@ -606,11 +626,16 @@ export function AppShell() {
       const rect = topMoreRef.current?.getBoundingClientRect();
       if (!rect) return;
       setTopMorePos({ top: rect.bottom + 7, right: window.innerWidth - rect.right - 2 });
+      setTopMoreAnchor({ top: rect.top, bottom: rect.bottom, right: rect.right + 2 });
     };
     update();
     window.addEventListener("resize", update);
     return () => window.removeEventListener("resize", update);
   }, [topMoreOpen]);
+
+  // The menu is measured after rendering, so a short window flips it above
+  // the trigger instead of letting its last entries fall off the screen.
+  const placedTopMorePos = useMenuPlacement(topMoreOpen ? topMoreAnchor : null, topMoreMenuRef);
 
   useEffect(() => {
     if (!topMoreOpen) return;
@@ -1479,12 +1504,21 @@ export function AppShell() {
 
   const handleAutoName = useCallback(async () => {
     const sessionId = selectedSession?.id;
-    if (!sessionId || autoNameStatus.kind === "naming") return;
+    if (!sessionId || autoNameInFlightRef.current.has(sessionId)) return;
+    autoNameInFlightRef.current.add(sessionId);
+    if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
     setAutoNameStatus({ kind: "naming" });
+    const progress = { message: translate("title.generatingNotice"), type: "info" as const, persistent: true, action: undefined };
+    const previousNoticeId = autoNameNoticeIdsRef.current.get(sessionId);
+    const noticeId = previousNoticeId && updateAppNotice(previousNoticeId, progress)
+      ? previousNoticeId
+      : appNotify.info(progress);
+    autoNameNoticeIdsRef.current.set(sessionId, noticeId);
 
     try {
       const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/auto-name`, {
         method: "POST",
+        signal: AbortSignal.timeout(105_000),
       });
       const body = (await response.json().catch(() => ({}))) as { title?: string; error?: string };
       if (!response.ok || !body.title) {
@@ -1492,6 +1526,9 @@ export function AppShell() {
       }
 
       const title = body.title.trim();
+      if (!title) throw new Error(translate("title.emptyResponse"));
+      const completed = { message: translate("title.updatedNotice", { title }), type: "success" as const, persistent: false };
+      if (!updateAppNotice(noticeId, completed)) appNotify.success(completed);
       setRefreshKey((key) => key + 1);
       if (activeSessionIdRef.current !== sessionId) return;
       setSelectedSession((current) => current?.id === sessionId ? { ...current, name: title } : current);
@@ -1499,16 +1536,29 @@ export function AppShell() {
       setAutoNameStatus({ kind: "success" });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 1800);
     } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const authenticationFailed = /\b401\b|authentication[_ ](?:error|fails?)|invalid[_ ]api[_ ]?key/i.test(detail);
+      const message = authenticationFailed
+        ? translate("title.authError")
+        : error instanceof Error && error.name === "TimeoutError"
+          ? translate("title.timeoutNotice")
+          : translate("title.errorNotice", { error: detail });
+      const failed = {
+        message, type: "error" as const, persistent: true,
+        action: { label: translate("title.modelSettings"), run: () => setSettingsSection("models") },
+      };
+      if (!updateAppNotice(noticeId, failed)) appNotify.error(failed);
       if (activeSessionIdRef.current !== sessionId) return;
-      const message = error instanceof Error ? error.message : String(error);
       setAutoNameStatus({ kind: "error", message });
       autoNameTimerRef.current = setTimeout(() => setAutoNameStatus({ kind: "idle" }), 5000);
+    } finally {
+      autoNameInFlightRef.current.delete(sessionId);
     }
-  }, [autoNameStatus.kind, selectedSession?.id]);
+  }, [selectedSession?.id, translate]);
 
   useEffect(() => {
     if (autoNameTimerRef.current) clearTimeout(autoNameTimerRef.current);
-    setAutoNameStatus({ kind: "idle" });
+    setAutoNameStatus(selectedSession?.id && autoNameInFlightRef.current.has(selectedSession.id) ? { kind: "naming" } : { kind: "idle" });
   }, [selectedSession?.id]);
 
   const handleSessionForked = useCallback((newSessionId: string) => {
@@ -2423,7 +2473,12 @@ export function AppShell() {
                         className="native-popover app-menu app-topbar-more-menu"
                         role="menu"
                         aria-label={translate("appshell.moreActions")}
-                        style={{ position: "fixed", top: topMorePos.top, right: topMorePos.right, zIndex: 700 }}
+                        style={{
+                          position: "fixed", zIndex: 700,
+                          ...(placedTopMorePos
+                            ? { top: placedTopMorePos.top, left: placedTopMorePos.left }
+                            : { top: topMorePos.top, right: topMorePos.right }),
+                        }}
                       >
                         <button
                           className="app-topbar-more-item"

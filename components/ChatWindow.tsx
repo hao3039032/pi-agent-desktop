@@ -7,6 +7,7 @@ import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecuti
 import { normalizeCustomPanelLines } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
 import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, hasAssistantAnswer, isAssistantTruncated, isMessageGroupAnchor, splitFinalAssistantBlocks } from "@/lib/message-display";
+import { ConversationFind } from "./ConversationFind";
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
@@ -1471,6 +1472,28 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {/* Search owns only rendered transcript text. Reveal the local window on
+          open, but keep server history paging explicit and reuse loadContext's
+          session/request guards. A leaf switch is a new search scope too. */}
+      <ConversationFind
+        contentRef={messageContentRef}
+        scopeKey={`${lazyLoadSessionKey}:${activeLeafId}`}
+        onReveal={() => setVisibleCount((count) => Math.max(count, messages.length))}
+        hasEarlier={hasEarlierMessages}
+        busy={sessionBusy || loading}
+        onLoadEarlier={async () => {
+          if (!session?.id || !historyCursor || loadingOlderRef.current || sessionBusy) return;
+          // Share the sentinel's paging lock so search and scroll cannot prepend
+          // the same page concurrently. Do not fetch older pages during a run.
+          loadingOlderRef.current = true;
+          try {
+            const context = await loadContext(session.id, activeLeafId, historyCursor, { tail: 200 });
+            if (context) setVisibleCount((count) => count + context.messages.length);
+          } finally {
+            loadingOlderRef.current = false;
+          }
+        }}
+      />
       {/* Zero-content twin of the message scrollport: same scrollbar styling and
           a forced track, so it reports the exact width the real scrollbar takes
           before any content renders one. */}

@@ -11,7 +11,21 @@ import type { Locale, LocalePlugin, TranslationParams } from "@/lib/i18n/types";
 // `node --test` (NODE_TEST_CONTEXT set) the fallback is English so the
 // upstream suite's English-string assertions stay deterministic — production
 // never sets that variable.
-const defaultLocale: Locale = process.env.NODE_TEST_CONTEXT ? "en" : "zh-CN";
+//
+// Reading it through try/catch keeps two things true at once: a bundler that
+// `define`s `process.env.*` still gets the literal substituted (the isolated
+// fixtures pin NODE_TEST_CONTEXT exactly that way), while a plain browser
+// bundle that never defines `process` reads false instead of throwing a
+// ReferenceError that would take the whole page down.
+function isNodeTestContext(): boolean {
+  try {
+    return Boolean(process.env.NODE_TEST_CONTEXT);
+  } catch {
+    return false;
+  }
+}
+
+const defaultLocale: Locale = isNodeTestContext() ? "en" : "zh-CN";
 
 interface I18nContextValue {
   locale: Locale;

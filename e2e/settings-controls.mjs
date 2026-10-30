@@ -16,7 +16,7 @@ const mcpServers = ['docs','search','issues'].map(name=>({name, scope:'global', 
   variableReferences:[], masked:false, transport:'http', exposure:'codemode', url:'https://example.invalid/'+name}));
 const counts = {extensions:0, skills:0, prompts:0, themes:0};
 const data = {
-  '/api/appearance':{background:'rex'},
+  '/api/terminal/settings':{shell:'auto',defaultShell:'PowerShell 7',options:[{value:'C:/PowerShell/pwsh.exe',label:'PowerShell 7'}],unavailable:false},
   '/api/chat-settings':{model:null,thinkingLevel:null,instructions:'',allowedTools:[],confirmSave:false,instructionsMaxChars:8000},
   '/api/updates':{components:[],updates:[]},
   '/api/distro':{providerId:'lw',providerName:'LW',configured:true,baseUrl:'https://example.invalid',hasApiKey:true,npmMirror:false},

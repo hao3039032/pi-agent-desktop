@@ -57,6 +57,8 @@ import { isScheduledRunSession } from "@/hooks/useScheduledTasks";
 import { prefetchSessionData } from "@/lib/session-data-cache";
 import { isImeComposing } from "@/lib/ime";
 import { appNotify } from "@/lib/notification-store";
+import { useMenuPlacement } from "@/hooks/useMenuPlacement";
+import type { MenuAnchor } from "@/lib/menu-placement";
 
 function sessionListUrl(summary: boolean, force: boolean): string {
   if (summary) return "/api/sessions?summary=1";
@@ -370,7 +372,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     if (worktreeState && worktreeState.forCwd === cwd) return worktreeState.projectRoot;
     // Any path in the loaded worktree list belongs to that project — covers
     // worktrees without sessions, so switching to them keeps the row mounted.
-    if (worktreeState?.worktrees.some((w) => w.path === cwd)) return worktreeState.projectRoot;
+    // Only for a top-level checkout: a repo subfolder's list also holds the
+    // parent repo, which keeps its own project identity.
+    if (worktreeState?.isTopLevel && worktreeState.worktrees.some((w) => w.path === cwd)) return worktreeState.projectRoot;
     const match = allSessions.find((s) => s.cwd === cwd);
     return match?.projectRoot ?? null;
   }, [allSessions, worktreeState]);
@@ -430,10 +434,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [projectViewMode, setProjectViewMode] = useState<ProjectViewMode>(loadProjectViewMode);
   const [projectViewMenuOpen, setProjectViewMenuOpen] = useState(false);
   const [projectViewMenuPos, setProjectViewMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [projectViewMenuAnchor, setProjectViewMenuAnchor] = useState<MenuAnchor | null>(null);
   const projectViewMenuRef = useRef<HTMLDivElement>(null);
   const projectViewMenuButtonRef = useRef<HTMLButtonElement>(null);
   const [projectMenu, setProjectMenu] = useState<{ root: string } | null>(null);
   const [projectMenuPos, setProjectMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [projectMenuAnchor, setProjectMenuAnchor] = useState<MenuAnchor | null>(null);
   const [projectBranchMenu, setProjectBranchMenu] = useState<ProjectBranchMenuState | null>(null);
   const [projectMenuView, setProjectMenuView] = useState<ProjectMenuView>("actions");
   const [projectBranchLoading, setProjectBranchLoading] = useState(false);
@@ -895,7 +901,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     }
     // Any path in the loaded worktree list belongs to that project — covers
     // worktrees without sessions, so switching to them keeps the row mounted.
-    if (worktreeState?.worktrees.some((w) => w.path === cwd)) {
+    // Only for a top-level checkout: a repo subfolder's list also holds the
+    // parent repo, which keeps its own project identity.
+    if (worktreeState?.isTopLevel && worktreeState.worktrees.some((w) => w.path === cwd)) {
       return projectSelection(worktreeState.projectRoot, worktreeState.projectKey);
     }
     const match = allSessions.find((session) => (
@@ -1055,6 +1063,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const closeProjectMenu = useCallback(() => {
     setProjectMenu(null);
     setProjectMenuPos(null);
+    setProjectMenuAnchor(null);
     setProjectBranchMenu(null);
     setProjectMenuView("actions");
   }, []);
@@ -1116,6 +1125,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       top: Math.max(8, Math.min(at.y, window.innerHeight - 160)),
       left: Math.max(8, Math.min(at.x, window.innerWidth - menuWidth - 8)),
     });
+    // The native popup's point stands in for the anchor, so the DOM menu that
+    // takes over still flips above when the space below runs out.
+    setProjectMenuAnchor({ top: at.y, bottom: at.y, right: at.x });
     setProjectMenuView(view);
     setProjectRevealError(null);
     if (loaded?.root === projectRoot) setProjectBranchMenu(loaded);
@@ -1332,13 +1344,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     }
     const rect = e.currentTarget.getBoundingClientRect();
     const menuWidth = 168;
-    const menuHeight = 42;
     const left = Math.max(8, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - 8));
-    const top = rect.bottom + menuHeight > window.innerHeight - 8
-      ? rect.top - menuHeight - 4
-      : rect.bottom + 4;
     setProjectMenu({ root: projectRoot });
-    setProjectMenuPos({ top, left });
+    setProjectMenuPos({ top: rect.bottom + 4, left });
+    // The menu measures its own height and flips above the row when the space
+    // below is too small, so the last items stay reachable.
+    setProjectMenuAnchor({ top: rect.top, bottom: rect.bottom, right: rect.right });
     setProjectBranchMenu(null);
     setProjectMenuView("actions");
     setProjectRevealError(null);
@@ -1722,6 +1733,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const closeProjectViewMenu = () => {
     setProjectViewMenuOpen(false);
     setProjectViewMenuPos(null);
+    setProjectViewMenuAnchor(null);
   };
 
   const changeProjectViewMode = (mode: ProjectViewMode) => {
@@ -1797,12 +1809,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const openProjectViewDomMenu = (anchor: HTMLElement) => {
     const rect = anchor.getBoundingClientRect();
     const width = 216;
-    const estimatedHeight = 180;
     const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
-    const top = rect.bottom + 4 + estimatedHeight > window.innerHeight - 8
-      ? Math.max(8, rect.top - estimatedHeight - 4)
-      : rect.bottom + 4;
-    setProjectViewMenuPos({ top, left });
+    setProjectViewMenuPos({ top: rect.bottom + 4, left });
+    setProjectViewMenuAnchor({ top: rect.top, bottom: rect.bottom, right: rect.right });
     setProjectViewMenuOpen(true);
   };
 
@@ -2175,6 +2184,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         <ProjectViewMenu
           menuRef={projectViewMenuRef}
           pos={projectViewMenuPos}
+          anchor={projectViewMenuAnchor}
           mode={projectViewMode}
           canCollapseAll={canCollapseAllProjects}
           canExpandAll={canExpandAllProjects}
@@ -2190,6 +2200,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           menuRef={projectMenuRef}
           projectRoot={projectMenu.root}
           pos={projectMenuPos}
+          anchor={projectMenuAnchor}
           view={projectMenuView}
           branchMenu={projectBranchMenu}
           branchLoading={projectBranchLoading}
@@ -2572,12 +2583,15 @@ function SessionItem({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
-  // A chat with a folder asks in a dialog, which can also move the folder to the Trash.
+  // Folder-owning chats add the optional Trash checkbox to the shared confirmation.
   const [folderDeleteOpen, setFolderDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const [menuAnchor, setMenuAnchor] = useState<MenuAnchor | null>(null);
   const [treeFocused, setTreeFocused] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
@@ -2609,6 +2623,7 @@ function SessionItem({
 
   const beginDeleteConfirmation = useCallback(() => {
     if (session.transient) return;
+    setDeleteError(null);
     if (session.chatFolder) setFolderDeleteOpen(true);
     else setConfirmDelete(true);
   }, [session.chatFolder, session.transient]);
@@ -2643,8 +2658,8 @@ function SessionItem({
 
   const performDelete = useCallback(async (trashChatFolder = false) => {
     if (session.transient) return;
-    setConfirmDelete(false);
     setDeleting(true);
+    setDeleteError(null);
     try {
       const res = await fetch(
         `/api/sessions/${encodeURIComponent(session.id)}${trashChatFolder ? "?chatFolder=trash" : ""}`,
@@ -2654,12 +2669,16 @@ function SessionItem({
         const d = await res.json().catch(() => ({})) as { error?: string };
         throw new Error(d.error ?? `HTTP ${res.status}`);
       }
+      setConfirmDelete(false);
+      setFolderDeleteOpen(false);
       onDeleted?.(session.id);
     } catch (e) {
       setDeleting(false);
-      reportActionError(t("sidebar.deleteFailed", { error: e instanceof Error ? e.message : String(e) }));
+      const message = t("sidebar.deleteFailed", { error: e instanceof Error ? e.message : String(e) });
+      if (confirmDelete || folderDeleteOpen) setDeleteError(message);
+      else reportActionError(message);
     }
-  }, [session.id, session.transient, onDeleted, reportActionError, t]);
+  }, [session.id, session.transient, onDeleted, reportActionError, t, confirmDelete, folderDeleteOpen]);
 
   // "…" menu: fixed-position portal so the sidebar's overflow/backdrop-filter can't clip it
   const MENU_WIDTH = 190;
@@ -2725,11 +2744,11 @@ function SessionItem({
     if (menuOpen) { setMenuOpen(false); return; }
     const rect = e.currentTarget.getBoundingClientRect();
     const openDomMenu = () => {
-      const estHeight = 124 + (onContinueInProject ? 30 : 0) + (chatActions ? 60 : 0);
       const left = Math.max(8, Math.min(rect.right - MENU_WIDTH, window.innerWidth - MENU_WIDTH - 8));
-      let top = rect.bottom + 4;
-      if (top + estHeight > window.innerHeight - 8) top = rect.top - estHeight - 4;
-      setMenuPos({ top, left });
+      setMenuPos({ top: rect.bottom + 4, left });
+      // The menu measures itself and flips above the row when the space below
+      // is too small, so the delete entry stays reachable.
+      setMenuAnchor({ top: rect.top, bottom: rect.bottom, right: rect.right });
       setMenuOpen(true);
     };
     if (canUseNativeMenu()) {
@@ -2739,7 +2758,7 @@ function SessionItem({
       return;
     }
     openDomMenu();
-  }, [chatActions, menuOpen, onContinueInProject, showNativeSessionMenu]);
+  }, [menuOpen, showNativeSessionMenu]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -2763,26 +2782,22 @@ function SessionItem({
     };
   }, [menuOpen]);
 
-  const handleDeleteConfirm = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    void performDelete();
-  }, [performDelete]);
-
-  const handleDeleteCancel = useCallback((e: React.MouseEvent) => {
-    e.stopPropagation();
-    setConfirmDelete(false);
-  }, []);
+  // The menu's real height decides whether it opens downward or upward.
+  const placedMenuPos = useMenuPlacement(menuOpen ? menuAnchor : null, menuRef);
 
 
   // Fixed-height outer wrapper — content swaps in place so the list never reflows
   return (
     <div
+      ref={rowRef}
       className={`session-item${isSelected ? " is-selected" : ""}${isRunning ? " is-running" : ""}${isUnread ? " is-unread" : ""}`}
       data-sidebar-tree-row
       tabIndex={0}
       role="treeitem"
       aria-selected={isSelected}
-      onBlur={() => setTreeFocused(false)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setTreeFocused(false);
+      }}
       onClick={confirmDelete || renaming ? undefined : onClick}
       onKeyDown={(e) => handleSidebarTreeKeyDown(e, {
         activate: () => {
@@ -2813,61 +2828,16 @@ function SessionItem({
         alignItems: "center",
         paddingLeft: 11,
         paddingRight: 8,
-        cursor: confirmDelete || renaming ? "default" : "pointer",
-        background: confirmDelete
-          ? "color-mix(in srgb, var(--danger) 6%, transparent)"
-          : isSelected ? "var(--bg-selected)" : (hovered || treeFocused || menuOpen) ? "var(--bg-hover)" : "transparent",
-        borderLeft: confirmDelete
-          ? "2px solid var(--danger)"
-          : isSelected ? "2px solid var(--accent)" : "2px solid transparent",
+        cursor: renaming ? "default" : "pointer",
+        background: isSelected ? "var(--bg-selected)" : (hovered || treeFocused || menuOpen) ? "var(--bg-hover)" : "transparent",
+        borderLeft: isSelected ? "2px solid var(--accent)" : "2px solid transparent",
         transition: "background 0.1s",
         opacity: deleting ? 0.5 : 1,
         gap: 6,
         overflow: "hidden",
       }}
     >
-      {confirmDelete ? (
-        /* ── Delete confirmation: same height, two flat buttons ── */
-        <>
-          <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {t("sidebar.deleteSession", { title: title.slice(0, 22) + (title.length > 22 ? "…" : "") })}
-          </div>
-          <div style={{ display: "flex", gap: 5, flexShrink: 0 }}>
-            <button
-              onClick={handleDeleteConfirm}
-              style={{
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 4,
-                height: 26, padding: "0 9px",
-                background: "var(--danger)", border: "none",
-                borderRadius: 6, color: "#fff",
-                cursor: "pointer", fontSize: 12, fontWeight: 600,
-                whiteSpace: "nowrap",
-              }}
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="3 6 5 6 21 6" />
-                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                <path d="M10 11v6M14 11v6" />
-                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-              </svg>
-              {t("sidebar.delete")}
-            </button>
-            <button
-              onClick={handleDeleteCancel}
-              style={{
-                display: "flex", alignItems: "center", justifyContent: "center",
-                height: 26, padding: "0 9px",
-                background: "var(--bg)", border: "var(--hairline) solid var(--border)",
-                borderRadius: 6, color: "var(--text-muted)",
-                cursor: "pointer", fontSize: 12, fontWeight: 500,
-                whiteSpace: "nowrap",
-              }}
-            >
-              {t("sidebar.cancel")}
-            </button>
-          </div>
-        </>
-      ) : renaming ? (
+      {renaming ? (
         /* ── Rename: input fills the same row ── */
         <input
           ref={inputRef}
@@ -2969,10 +2939,6 @@ function SessionItem({
           {!session.transient && (
             <div
               className="session-item-trailing"
-              style={{
-                display: "flex", alignItems: "center", justifyContent: "flex-end",
-                width: 28, height: 24, flexShrink: 0,
-              }}
             >
               {hovered || treeFocused || touchMode || menuOpen ? (
                 <button
@@ -2984,11 +2950,13 @@ function SessionItem({
                   aria-expanded={menuOpen}
                   className={`session-item-more${menuOpen ? " is-open" : ""}`}
                 >
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                    <circle cx="5" cy="12" r="1.7" />
-                    <circle cx="12" cy="12" r="1.7" />
-                    <circle cx="19" cy="12" r="1.7" />
-                  </svg>
+                  <span className="session-item-more-icon" aria-hidden="true">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                      <circle cx="5" cy="12" r="1.7" />
+                      <circle cx="12" cy="12" r="1.7" />
+                      <circle cx="19" cy="12" r="1.7" />
+                    </svg>
+                  </span>
                 </button>
               ) : (
                 <span
@@ -3013,7 +2981,9 @@ function SessionItem({
               role="menu"
               onClick={(e) => e.stopPropagation()}
               style={{
-                position: "fixed", top: menuPos.top, left: menuPos.left,
+                position: "fixed",
+                top: (placedMenuPos ?? menuPos).top,
+                left: (placedMenuPos ?? menuPos).left,
                 width: MENU_WIDTH, zIndex: 800, padding: 5,
                 display: "flex", flexDirection: "column", gap: 1,
               }}
@@ -3096,7 +3066,7 @@ function SessionItem({
                 onClick={(e) => {
                   setMenuOpen(false);
                   if (e.shiftKey) void performDelete();
-                  else setConfirmDelete(true);
+                  else beginDeleteConfirmation();
                 }}
                 style={{
                   display: "flex", alignItems: "center", gap: 8,
@@ -3140,19 +3110,26 @@ function SessionItem({
 
         </>
       )}
-      {folderDeleteOpen && createPortal(
+      {(confirmDelete || folderDeleteOpen) && createPortal(
         <ChatConfirmDialog
           title={t("sidebar.deleteChatTitle")}
+          subject={title}
           body={t("sidebar.deleteChatBody")}
-          checkboxLabel={t("sidebar.deleteChatFolder")}
+          checkboxLabel={folderDeleteOpen ? t("sidebar.deleteChatFolder") : undefined}
           checkboxDefault
           confirmLabel={t("sidebar.delete")}
           cancelLabel={t("sidebar.cancel")}
           danger
-          onCancel={() => setFolderDeleteOpen(false)}
-          onConfirm={(trashFolder) => {
+          busy={deleting}
+          error={deleteError}
+          onCancel={() => {
+            setConfirmDelete(false);
             setFolderDeleteOpen(false);
-            void performDelete(trashFolder);
+            setDeleteError(null);
+            rowRef.current?.focus({ preventScroll: true });
+          }}
+          onConfirm={(trashFolder) => {
+            void performDelete(folderDeleteOpen && trashFolder);
           }}
         />,
         document.body,

@@ -30,7 +30,16 @@ const inputStyle: CSSProperties = {
 export async function fetchDistroStatus(): Promise<DistroServiceStatus> {
   const response = await fetch("/api/distro", { cache: "no-store" });
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return (await response.json()) as DistroServiceStatus;
+  const data = (await response.json()) as Partial<DistroServiceStatus>;
+  // A 200 that is not the status shape (a partial failure, or a fixture that
+  // does not know this endpoint yet) must never reach the form: it reads
+  // `baseUrl` as a string and an undefined one throws during render, taking
+  // the whole Settings dialog down with it. Same guard the upstream terminal
+  // section applies to its own response.
+  if (typeof data?.baseUrl !== "string" || typeof data?.providerId !== "string") {
+    throw new Error("Invalid distro status");
+  }
+  return data as DistroServiceStatus;
 }
 
 export function DistroServiceForm({

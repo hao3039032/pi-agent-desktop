@@ -1,6 +1,13 @@
 import type { McpExposure, ResourceDiagnostic } from "@earendil-works/pi-coding-agent";
 import type { McpImportNote } from "./mcp-import-core";
 
+export interface TerminalSettingsResponse {
+  shell: string;
+  defaultShell: string | null;
+  options: { value: string; label: string }[];
+  unavailable: boolean;
+}
+
 export interface SubagentSettingsResponse {
   enabled: boolean;
   maxConcurrent: number;
