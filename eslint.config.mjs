@@ -15,6 +15,9 @@ const eslintConfig = [
       "src-tauri/target/**",
       // demo/ is a separate Next.js project with its own lint config.
       "demo/**",
+      // static-frontend/ is the migration's Vite project with its own lint
+      // setup (docs/migration/README.md); Next rules do not apply to it.
+      "static-frontend/**",
       // Generated, minified library bundles (scripts/build-preview-runtime.mjs).
       "public/preview-runtime/**",
     ],
