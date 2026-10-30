@@ -69,7 +69,9 @@ M2 项：
 | 事件流桥（Tauri Channel） | ✅ 落地 | `pi_ipc_subscribe_events`：snapshot 帧先行（与订阅原子）、事件单调 seq、宿主 epoch、关闭即分离；静态前端 transport 已接 Channel |
 | 剩余命令面（树导航、fork/clone、统计缓存、fleet 监控、自动命名桥接） | ⬜ 逐命令迁移 | 状态机与分发表已就位，按清单 op 逐个落 |
 | 会话历史索引 + sessions.list + 侧栏视图 | ✅ 落地 | `crates/session-host/src/history.rs`（只读扫描、项目分组、按时间排序、坏文件跳过带原因、ISO→epoch）；dispatch + pi_ipc 的 sessions.list；静态前端 SessionsView（首个迁移 UI 组件，typed IPC 驱动） |
-| 会话 UI 静态迁移 | ⬜ | ChatWindow/MessageView/SSE→Channel 管线 |
+| 全量 UI 迁移机制 | ✅ 落地 | `static-frontend`：整棵现有组件树（3636 模块）经 Vite 构建进 desktop/frontend，tsc 0 错误。Next 客户端 API 四件套经 shim（navigation→History/URLSearchParams 适配、image→img、dynamic→lazy、link→anchor）；CSS 级联按 layout 顺序（katex/globals/settings/native-theme）；主题首屏内联、Google 字体移除（系统回退） |
+| 数据层逐域替换 | 🔶 已开工 | `agent.command`（封闭命令枚举 + 形状校验，错误→协议码）+ agent-client IPC 版（同表面：AgentCommandError/code/accepted/instanceId）；会话事件流 SSE→IPC Channel（快照/事件帧、seq/epoch、reset→重连、close 即分离）；传输层唯一接线点 `src/data/transport.ts`。⚠️ 其余领域（sessions 目录、models、MCP、插件技能、文件、git/worktree、scheduled、appearance、desktop）仍走 fetch——生产合规检查（无 /api、无 EventSource）尚未通过，逐域对齐响应形状是 M2/M3 主体 |
+| 消息层状态机 | ✅ 核心已移植 |
 | Tauri IPC 桥（`pi_ipc` 命令） | ✅ 垂直切片落地 | `src-tauri/src/pi_ipc.rs`：协议 v1 信封校验（版本/结构/参数对象）、封闭操作表（`desktop.identity` 先于任何子进程应答；会话操作路由 session-host 的分发表）、`unknown_op`/`not_found` 协议错误码。`allow-pi-ipc` 权限（desktop-shell.toml）+ 主窗口 capability；静态 BootPage 的 Tauri 探测路径真实可用（客户端超时，超时不重发）。src-tauri 24 测试全绿 |
 
 ## 工件索引
