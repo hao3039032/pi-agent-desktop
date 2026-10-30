@@ -609,6 +609,19 @@ pub fn dispatch_session_op(
             let _ = session.refresh_state_now();
             Ok(result)
         }
+        // The typed agent command surface: a CLOSED command enum forwarded to
+        // the session's child. Unknown types and shapes are refused before
+        // anything reaches a child (plan: Rust 使用封闭操作枚举).
+        "agent.command" => {
+            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            let Some(command_type) = args.get("type").and_then(Value::as_str) else {
+                return Err(DispatchError::invalid("the command has no type"));
+            };
+            validate_agent_command(command_type, args)?;
+            session
+                .command(command_type, args.clone(), Some(Duration::from_secs(120)))
+                .map_err(DispatchError::Transport)
+        }
         // The projected run state (the message-level machine's view).
         "agent.runState" => {
             let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
@@ -638,6 +651,35 @@ fn default_agent_dir() -> PathBuf {
     PathBuf::from(home).join(".pi/agent")
 }
 
+/// The closed agent-command enum with per-type argument validation. A
+/// command outside this table never reaches a child.
+fn validate_agent_command(command_type: &str, args: &Value) -> Result<(), DispatchError> {
+    let requires_str = |field: &str| -> Result<(), DispatchError> {
+        if args.get(field).and_then(Value::as_str).is_some() {
+            Ok(())
+        } else {
+            Err(DispatchError::invalid(&format!("{command_type} requires a string {field}")))
+        }
+    };
+    match command_type {
+        "get_state" | "get_commands" | "get_session_stats" | "get_last_assistant_text"
+        | "abort" | "clear_queue" | "compact" | "reload" | "get_tools" => Ok(()),
+        "prompt" | "steer" | "follow_up" => requires_str("message"),
+        "set_model" => requires_str("provider").and_then(|()| requires_str("modelId")),
+        "set_thinking_level" => requires_str("level"),
+        "set_session_name" => requires_str("name"),
+        "set_auto_compaction" => {
+            if args.get("enabled").and_then(Value::as_bool).is_some() {
+                Ok(())
+            } else {
+                Err(DispatchError::invalid("set_auto_compaction requires a boolean enabled"))
+            }
+        }
+        "navigate_tree" => requires_str("targetId"),
+        other => Err(DispatchError::invalid(&format!("unknown agent command {other}"))),
+    }
+}
+
 /// Serialize the projected run state for IPC responses.
 fn run_state_json(state: &crate::machine::SessionRunState) -> Value {
     json!({
@@ -663,6 +705,7 @@ fn run_state_json(state: &crate::machine::SessionRunState) -> Value {
 pub enum DispatchError {
     UnknownOp(String),
     NotFound(String),
+    InvalidArgs(String),
     Transport(pi_host::PiRpcError),
 }
 
@@ -675,12 +718,22 @@ impl DispatchError {
         DispatchError::NotFound(format!("no running session {session_id}"))
     }
 
+    fn invalid(message: &str) -> Self {
+        DispatchError::InvalidArgs(message.to_string())
+    }
+
     /// The protocol error code for this dispatch failure.
     pub fn code(&self) -> &'static str {
         match self {
             DispatchError::UnknownOp(_) => "unknown_op",
             DispatchError::NotFound(_) => "not_found",
-            DispatchError::Transport(_) => "io",
+            DispatchError::InvalidArgs(_) => "invalid_args",
+            DispatchError::Transport(error) => match error.kind {
+                pi_host::ErrorKind::Exit => "agent_child_exited",
+                pi_host::ErrorKind::Timeout => "agent_child_timeout",
+                pi_host::ErrorKind::Command => "bridge_op",
+                _ => "io",
+            },
         }
     }
 }
@@ -689,7 +742,9 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DispatchError::UnknownOp(op) => write!(f, "unknown operation {op}"),
-            DispatchError::NotFound(message) => write!(f, "{message}"),
+            DispatchError::NotFound(message) | DispatchError::InvalidArgs(message) => {
+                write!(f, "{message}")
+            }
             DispatchError::Transport(error) => write!(f, "{error}"),
         }
     }
@@ -740,4 +795,22 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn the_agent_command_enum_is_closed_and_shape_checked() {
+        assert!(validate_agent_command("get_state", &json!({})).is_ok());
+        assert!(validate_agent_command("prompt", &json!({ "message": "hi" })).is_ok());
+        assert!(validate_agent_command("set_model", &json!({ "provider": "p", "modelId": "m" })).is_ok());
+        assert!(validate_agent_command("set_auto_compaction", &json!({ "enabled": true })).is_ok());
+        // Unknown commands never reach a child.
+        assert!(validate_agent_command("shell.exec", &json!({})).is_err());
+        assert!(validate_agent_command("prompt", &json!({})).is_err(), "message required");
+        assert!(validate_agent_command("set_model", &json!({ "provider": "p" })).is_err());
+        assert!(validate_agent_command("navigate_tree", &json!({})).is_err());
+    }
 }

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { IpcClient, IpcFailure, MockTransport, type IpcTransport } from "./ipc/client.ts";
+import { IpcClient, IpcFailure } from "./ipc/client.ts";
 import type { IpcError } from "./ipc/protocol.ts";
 import { SessionsView } from "./SessionsView.tsx";
+import { detectTransport } from "./data/transport.ts";
 
 /**
  * The M1 boot/diagnostic page: the window renders WITHOUT Next.js and
@@ -14,74 +15,6 @@ type HostState =
   | { status: "ready"; version: string }
   | { status: "degraded"; diagnosis: string; retryable: boolean };
 
-/** Client-side timeout for one invoke (a timeout never resends). */
-function invokeWithTimeout(
-  invoke: (cmd: string, payload: unknown) => Promise<unknown>,
-  request: { op: string; id: string },
-  timeoutMs: number,
-): Promise<unknown> {
-  return Promise.race([
-    invoke("pi_ipc", { request }),
-    new Promise<never>((_, reject) => {
-      setTimeout(
-        () => reject(new Error(`ipc '${request.op}' timed out; the operation may still have happened — never resend blindly`)),
-        timeoutMs,
-      );
-    }),
-  ]);
-}
-
-/** Detect the Tauri host bridge (M2 registers `pi_ipc`); the mock is the M1 stand-in. */
-function detectTransport(): { transport: IpcTransport; label: string } {
-  const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: unknown } }).__TAURI_INTERNALS__;
-  if (internals && typeof internals.invoke === "function") {
-    return {
-      label: "tauri",
-      transport: {
-        send: (request, timeoutMs) =>
-          invokeWithTimeout(
-            internals.invoke as (cmd: string, payload: unknown) => Promise<unknown>,
-            request,
-            timeoutMs,
-          ),
-        subscribe: (op, args, onMessage) => {
-          if (op !== "agent.subscribeEvents") {
-            return () => {};
-          }
-          // The host exposes the stream as its own command returning a
-          // Channel; wire it through the protocol frame type.
-          const channel = new (window as unknown as {
-            __TAURI_INTERNALS__: {
-              Channel: new () => {
-                onmessage: (message: unknown) => void;
-              };
-            };
-          }).__TAURI_INTERNALS__.Channel();
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const anyChannel = channel as any;
-          anyChannel.onmessage = (message: unknown) => {
-            onMessage(message as import("./ipc/protocol.ts").IpcStreamMessage);
-          };
-          void (internals.invoke as (cmd: string, payload: unknown) => Promise<unknown>)(
-            "pi_ipc_subscribe_events",
-            { session: args?.session, onEvent: channel },
-          );
-          return () => {
-            // Dropping the reference detaches host-side on the next send.
-            anyChannel.onmessage = () => {};
-          };
-        },
-      },
-    };
-  }
-  // M1 skeleton: no host command yet. The mock answers the probe so the
-  // diagnostics page itself is testable end-to-end.
-  const mock = new MockTransport().on("desktop.identity", () => ({
-    version: "static-frontend-m1",
-    host: "mock",
-  }));
-  return { transport: mock, label: "mock (no Tauri host bridge yet)" };
-}
 
 export function BootPage(): React.ReactElement {
   const [state, setState] = useState<HostState>({ status: "probing" });

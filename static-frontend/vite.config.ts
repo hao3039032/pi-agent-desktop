@@ -31,6 +31,12 @@ export default defineConfig({
         find: new RegExp(`^${module}$`),
         replacement: resolve(import.meta.dirname, `src/shims/next/${shim}`),
       })),
+      // The data-layer swaps (M2): typed IPC implementations replace the
+      // HTTP clients module-by-module. The Next app keeps the originals.
+      {
+        find: /^@\/lib\/agent-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/agent-client.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

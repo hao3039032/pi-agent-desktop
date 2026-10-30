@@ -16,6 +16,12 @@ import "../../app/native-theme.css";
 import { AppShell } from "../../components/AppShell";
 import { I18nProvider } from "../../hooks/useI18n";
 import { DistroSetupGate } from "../../components/distro";
+import { bindAgentClient } from "./data/agent-client.ts";
+import { detectTransport } from "./data/transport.ts";
+
+// Bind the data layer to the host bridge BEFORE the tree mounts (the plan:
+// 唯一底层接线入口在传输层; every domain client flows through this).
+bindAgentClient(detectTransport().transport);
 
 const container = document.getElementById("root");
 if (container === null) throw new Error("static frontend: #root missing");
