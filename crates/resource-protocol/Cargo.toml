@@ -1,0 +1,31 @@
+[package]
+name = "resource-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "Capability-less resource protocol for media/scriptless previews (M0 PoC)"
+publish = false
+
+# M0 PoC of the plan's preview resource channel (§六 资源通道):
+# - random, unguessable handles (never paths from the frontend);
+# - a handle is scoped to ONE file or directory picked by the host;
+# - every request re-validates: canonical path, symlink/junction targets,
+#   directory-escape and parent traversal are refused;
+# - MIME by extension for scriptless serving, Range support;
+# - handles expire and can be revoked;
+# - the protocol itself carries NO IPC capability: nothing here can invoke
+#   app commands, read credentials or touch anything outside the granted
+#   scope — that is the point the security tests freeze.
+#
+# Tauri registers this as a custom protocol (M3); the logic frozen here is
+# what backs it.
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "resource_protocol"
+path = "src/lib.rs"

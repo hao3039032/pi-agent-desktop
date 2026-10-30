@@ -1,0 +1,33 @@
+[package]
+name = "oauth-loopback"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "Loopback OAuth callback listener for the Rust desktop host (M0 PoC)"
+publish = false
+
+# M0 PoC of the plan's OAuth requirement (§二.5): OAuth may briefly open a
+# loopback callback listener; it MUST validate state, and PKCE where the
+# protocol applies, and shut down after completion, cancellation or timeout
+# — never offering an application API. This crate freezes that listener:
+#
+# - binds 127.0.0.1 on an OS-assigned port, one path only (`/callback`);
+# - every response frame is checked against the expected `state`; a state
+#   mismatch is an error completion, never a success;
+# - PKCE: the code_verifier is generated here, its SHA-256 challenge is
+#   exposed for the authorization URL, and the verifier never leaves the
+#   host process (token exchange stays host-side);
+# - completion arrives exactly once: success, error, cancel or timeout
+#   (the listener stops accepting and the socket closes);
+# - any other request gets 404 — there is no other surface to probe.
+
+[dependencies]
+sha2 = "0.10"
+getrandom = "0.3"
+
+[dev-dependencies]
+
+[lib]
+name = "oauth_loopback"
+path = "src/lib.rs"

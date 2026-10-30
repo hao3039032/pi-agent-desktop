@@ -78,3 +78,5 @@ e2e_*.mjs
 # Rust PoC crate build output (M0 migration)
 crates/pi-host/target/
 crates/pty-host/target/
+crates/oauth-loopback/target/
+crates/resource-protocol/target/
