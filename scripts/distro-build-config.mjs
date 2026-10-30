@@ -57,6 +57,24 @@ export function distroResources(platform, upstreamResources) {
   return [...new Set([...upstreamResources, ...extra])];
 }
 
+/**
+ * Accelerator endpoints for the updater manifest, each the mirror-prefixed
+ * form of the direct github.com latest.json URL. Mirrors must proxy release
+ * downloads, not just raw files. Invalid entries are rejected loudly rather
+ * than silently shipping a broken endpoint.
+ */
+export function updateMirrorEndpoints(mirrors, repository) {
+  const list = Array.isArray(mirrors) ? mirrors : [];
+  return list.map((mirror) => {
+    if (typeof mirror !== "string") throw new Error(`distro.json updateMirrors entries must be strings, got ${JSON.stringify(mirror)}`);
+    const host = mirror.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+    if (!/^[a-z0-9.-]+(:\d+)?$/i.test(host)) {
+      throw new Error(`distro.json updateMirrors entry is not a host: ${JSON.stringify(mirror)}`);
+    }
+    return `https://${host}/https://github.com/${repository}/releases/latest/download/latest.json`;
+  });
+}
+
 function main() {
   const platform = process.argv[2];
   if (!["macos", "windows", "linux"].includes(platform)) {
@@ -93,7 +111,17 @@ function main() {
     bundle: { resources: distroResources(platform, upstreamResources) },
     plugins: {
       updater: {
-        endpoints: [`https://github.com/${branding.repository}/releases/latest/download/latest.json`],
+        // The plugin tries endpoints in order until one answers, so the
+        // direct github.com manifest comes first and public accelerator
+        // mirrors follow for networks where github.com is unreachable. The
+        // mirror prefix form is https://<mirror>/<full-github-url>; the
+        // manifest content is served verbatim, and the installer it points
+        // at is still verified by the updater's minisign signature. Set
+        // distro.json's "updateMirrors" to [] to ship direct-only.
+        endpoints: [
+          `https://github.com/${branding.repository}/releases/latest/download/latest.json`,
+          ...updateMirrorEndpoints(distro.updateMirrors, branding.repository),
+        ],
       },
     },
   };

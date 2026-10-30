@@ -9,7 +9,7 @@ import {
   APP_VERSION_DISPLAY,
 } from "@/lib/branding";
 import { handleExternalLinkClick } from "@/lib/desktop-native";
-import { installLatestDesktopRelease, type DesktopUpgradeProgress } from "@/lib/desktop-updater";
+import { DesktopUpgradeNetworkError, installLatestDesktopRelease, type DesktopUpgradeProgress } from "@/lib/desktop-updater";
 import { useI18n } from "@/hooks/useI18n";
 import { ConfigButton } from "./SettingsUi";
 
@@ -32,6 +32,7 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [upgradeProgress, setUpgradeProgress] = useState<DesktopUpgradeProgress | null>(null);
   const [upgradeError, setUpgradeError] = useState<string | null>(null);
+  const [mirrorUrl, setMirrorUrl] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -114,6 +115,7 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
   const handleUpgrade = async () => {
     if (!canUpgrade) return;
     setUpgradeError(null);
+    setMirrorUrl(null);
     try {
       const result = await installLatestDesktopRelease(setUpgradeProgress);
       if (!result.installed) {
@@ -122,7 +124,15 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
       }
     } catch (error) {
       setUpgradeProgress(null);
-      setUpgradeError(error instanceof Error ? error.message : String(error));
+      if (error instanceof DesktopUpgradeNetworkError && error.mirrorReleaseUrl) {
+        // The direct download (and every baked-in mirror endpoint) failed;
+        // offer the accelerator-hosted release page for a manual download of
+        // the same signed installer.
+        setMirrorUrl(error.mirrorReleaseUrl);
+        setUpgradeError(t("appSettings.downloadFailedMirror"));
+      } else {
+        setUpgradeError(error instanceof Error ? error.message : String(error));
+      }
     }
   };
 
@@ -181,6 +191,17 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
               onClick={(event) => handleExternalLinkClick(event, releaseUrl)}
             >
               {t("appSettings.openRelease")}
+            </a>
+          )}
+          {mirrorUrl && (
+            <a
+              className="settings-updates-release-link"
+              href={mirrorUrl}
+              target="_blank"
+              rel="noreferrer"
+              onClick={(event) => handleExternalLinkClick(event, mirrorUrl)}
+            >
+              {t("appSettings.openMirrorRelease")}
             </a>
           )}
         </p>

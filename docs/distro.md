@@ -23,7 +23,7 @@
 | `distro/distro.json` | 唯一配置入口：provider（LW）的模型表、扩展包列表、默认值、web-search 默认值、`pi-plan-vanguard.json` 等随包 JSON（`agentFiles`）、`WATCHDOG.yml` 等文本文件（`agentTextFiles`）、`app`（改名、更新指向）、`revision`（发行修订号） |
 | `scripts/distro-seed.mjs` | 构建时把扩展包装进 `src-tauri/resources/pi-seed/`，并写 `manifest.json`（含 `seedVersion`）和 `bin/npm` shim。git 包去掉 peer 依赖和 `.map`/`.d.ts` 以减小体积 |
 | `scripts/distro-portable-git.mjs` | Windows 构建时下载 PortableGit（版本和 sha256 写死在脚本里），解压、裁剪文档/翻译后放进 `resources/git/`。`post-install.bat` 保留，由运行时执行 |
-| `scripts/distro-build-config.mjs` | 发版时生成 `tauri.distro.conf.json`（改名、identifier、updater 指向本仓库、附加 resources），并把版本号写成 上游X.Y.Z×100+revision |
+| `scripts/distro-build-config.mjs` | 发版时生成 `tauri.distro.conf.json`（改名、identifier、updater 指向本仓库、附加 resources），并把版本号写成 上游X.Y.Z×100+revision。`updateMirrors` 列出公共加速镜像（ghproxy 形式），会以镜像前缀形式追加到 updater 的 endpoints（直连 github.com 恒为首位，插件按序尝试），空数组则仅直连 |
 | `scripts/pi-cli-release.mjs` | 发版时按 **Rust target triple** 挑上游 pi 发版的归档（darwin/linux 为 `pi-*/{arm64,x64}.tar.gz`，Windows 为 `pi-*.zip`），用该发版自己的 `SHA256SUMS` 校验后解包；包里布局不同（tar 是 `pi/pi`，zip 是扁平的 `pi.exe`），脚本统一落到 `resolvePiExecutable()` 认的文件名并导出 `PI_CLI_SOURCE` |
 | `scripts/distro-reset-revision.mjs` | 合并上游后若版本变化，把 `distro.json` 的 `revision` 重置为 1（revision 按上游版本分别计数，`distro-sync.yml` 自动执行，也并入 merge commit） |
 | `lib/distro/` | 运行时：PATH 注入（npm shim、Git Bash）、首次启动种子（packages 重写、默认值、`pi-plan-vanguard.json`、`WATCHDOG.yml`）、服务配置读写、一次性迁移（`mcp-migration.ts`、`lazy-tool-activation.ts`） |
@@ -33,6 +33,12 @@
 | `.github/workflows/distro-sync.yml` | 每日检查上游 release，合并→跑检查→推送→触发发版 |
 
 构建产物 `resources/pi-seed/`、`resources/git/`、`tauri.distro.conf.json` 均在 `.gitignore` 中，不进仓库。
+
+## PATH/npm 镜像与 GitHub 加速
+
+- **更新检查回退**（`lib/app-updates.ts` + `lib/update-mirrors.ts`）：设置页的更新检查在直连 `api.github.com` 与 github.com 重定向探测都失败后，按序尝试公共加速镜像的 API 透传（默认 `gh-proxy.com`、`ghproxy.cn`、`ghfast.top`；环境变量 `PI_UPDATE_MIRRORS` 可覆盖，置空禁用）。镜像返回的 payload 走与直连相同的 `parseRelease` 校验（html_url 必须是本仓库的 github.com 页面），伪造答案会在所有镜像失败时以校验错误而非“网络不可达”上报。
+- **安装包下载回退**（`scripts/distro-build-config.mjs`）：`distro.json` 的 `updateMirrors`（默认 `gh-proxy.com`、`ghproxy.cn`）在发版时写成镜像前缀的 `latest.json` endpoints，排在直连 github.com 之后；tauri-plugin-updater 按序尝试，签名校验与下载源无关。升级按钮在所有端点失败时给出镜像发布页的手动下载链接（`appSettings.openMirrorRelease`）。
+- 公共镜像会失效（2026-10 实测一半已超时），所以两者都是列表+回退，不写死单源；镜像域名只接受纯 host，防住把任意 URL 变开放转发。
 
 ## 运行时行为细节
 

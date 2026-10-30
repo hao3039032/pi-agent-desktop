@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { distroResources, distroVersion } from "./distro-build-config.mjs";
+import { distroResources, distroVersion, updateMirrorEndpoints } from "./distro-build-config.mjs";
 import { compareVersions } from "./release-components.mjs";
 import { seedRelativePath } from "./distro-seed.mjs";
 
@@ -44,4 +44,17 @@ test("seed paths match where pi installs each source", () => {
   assert.equal(seedRelativePath("npm:@scope/pkg@^1"), "npm/node_modules/@scope/pkg");
   assert.equal(seedRelativePath("git:github.com/o/repo@v1"), "git/github.com/o/repo");
   assert.throws(() => seedRelativePath("./local"));
+});
+
+test("updater mirror endpoints are the prefixed latest.json URLs", () => {
+  assert.deepEqual(updateMirrorEndpoints(["gh-proxy.com", "ghproxy.cn/"], "hao3039032/pi-agent-desktop"), [
+    "https://gh-proxy.com/https://github.com/hao3039032/pi-agent-desktop/releases/latest/download/latest.json",
+    "https://ghproxy.cn/https://github.com/hao3039032/pi-agent-desktop/releases/latest/download/latest.json",
+  ]);
+  // No mirrors configured → direct-only, unchanged release feed.
+  assert.deepEqual(updateMirrorEndpoints(undefined, "hao3039032/pi-agent-desktop"), []);
+  assert.deepEqual(updateMirrorEndpoints([], "hao3039032/pi-agent-desktop"), []);
+  // A non-host entry fails the build loudly instead of shipping a broken endpoint.
+  assert.throws(() => updateMirrorEndpoints(["https://evil.example/path"], "r"), /not a host/);
+  assert.throws(() => updateMirrorEndpoints([42], "r"), /strings/);
 });

@@ -4,6 +4,7 @@ import type {
   AppUpdateProjectId,
 } from "@/lib/app-update-types";
 import { APP_DISTRIBUTION_NAME, APP_REPOSITORY, APP_VERSION } from "./branding";
+import { mirrorGitHubUrl, resolveUpdateMirrors } from "./update-mirrors";
 
 export const APP_UPDATE_CHECK_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
 export const APP_UPDATE_RETRY_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -159,7 +160,7 @@ function parseRelease(project: AppUpdateProject, raw: GitHubRelease): AppCompone
 
 export async function getLatestAppRelease(
   project: AppUpdateProject,
-  options: { fetcher?: Fetcher; timeoutMs?: number } = {},
+  options: { fetcher?: Fetcher; timeoutMs?: number; mirrors?: readonly string[] } = {},
 ): Promise<AppComponentReleaseInfo> {
   const fetcher = options.fetcher ?? fetch;
   const timeoutMs = options.timeoutMs ?? 15_000;
@@ -175,7 +176,33 @@ export async function getLatestAppRelease(
     try {
       return await fetchLatestFromRedirect(project, fetcher, Math.min(timeoutMs, 10_000));
     } catch {
-      throw apiError;
+      // Both GitHub hosts failed directly. Try public accelerator mirrors
+      // (PI_UPDATE_MIRRORS to override; empty disables). Only the API form is
+      // attempted per mirror — mirrors that do not proxy api.github.com
+      // answer 403 and the loop moves on. A payload that fails validation
+      // (forged html_url, invalid tag) is NOT retried on the next mirror:
+      // that failure is recorded and, if every mirror fails, it outranks the
+      // original network error so tampering is never reported as "unreachable".
+      const mirrors = options.mirrors ?? resolveUpdateMirrors();
+      let validationError: unknown;
+      for (const mirror of mirrors) {
+        const url = mirrorGitHubUrl(
+          `https://api.github.com/repos/${project.repository}/releases/latest`,
+          mirror,
+        );
+        try {
+          return await fetchLatestFromApi(project, fetcher, timeoutMs, url);
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith("GitHub request failed with HTTP")) {
+            // Transport-level answer from the mirror itself (403 from a
+            // file-only mirror, 5xx, a redirect the mirror did not follow):
+            // this mirror cannot serve the API — next mirror.
+            continue;
+          }
+          validationError ??= error;
+        }
+      }
+      throw validationError ?? apiError;
     }
   }
 }
@@ -184,9 +211,10 @@ async function fetchLatestFromApi(
   project: AppUpdateProject,
   fetcher: Fetcher,
   timeoutMs: number,
+  url = `https://api.github.com/repos/${project.repository}/releases/latest`,
 ): Promise<AppComponentReleaseInfo> {
   const response = await fetcher(
-    `https://api.github.com/repos/${project.repository}/releases/latest`,
+    url,
     {
       cache: "no-store",
       headers: {
