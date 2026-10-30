@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { IpcClient, IpcFailure, MockTransport, type IpcTransport } from "./ipc/client.ts";
 import type { IpcError } from "./ipc/protocol.ts";
+import { SessionsView } from "./SessionsView.tsx";
 
 /**
  * The M1 boot/diagnostic page: the window renders WITHOUT Next.js and
@@ -137,6 +138,11 @@ export function BootPage(): React.ReactElement {
           </>
         )}
       </div>
+      {state.status === "ready" && (
+        <div className="boot-sessions">
+          <SessionsView />
+        </div>
+      )}
     </main>
   );
 }

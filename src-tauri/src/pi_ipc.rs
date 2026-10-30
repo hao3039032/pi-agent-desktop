@@ -277,7 +277,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }),
         ),
         // Session operations route through the closed table in session-host.
-        "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
+        "sessions.list" | "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
         | "agent.eventsSnapshot" => {
             match session_host::dispatch_session_op(&state.registry, op, &args) {
                 Ok(data) => protocol_ok(&id, data),

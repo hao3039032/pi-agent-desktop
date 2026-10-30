@@ -24,7 +24,9 @@
 //! tool events, fleet monitoring) layers on top in later M2 steps; this
 //! crate freezes the process-level backbone with real-pi tests.
 
+pub mod history;
 pub mod machine;
+pub use history::{scan_sessions, SessionIndex, SessionSummary};
 pub use machine::{FollowUp, SessionMachine, SessionRunState, StreamingMessage};
 
 use std::collections::HashMap;
@@ -566,6 +568,16 @@ pub fn dispatch_session_op(
 ) -> Result<Value, DispatchError> {
     let session_id = args.get("session").and_then(Value::as_str).unwrap_or_default();
     match op {
+        // The history index (read-only scan of the agent dir's sessions).
+        "sessions.list" => {
+            let agent_dir = args
+                .get("agentDir")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(default_agent_dir);
+            let index = crate::history::scan_sessions(&agent_dir);
+            Ok(crate::history::index_json(&index))
+        }
         "sessions.runState" => {
             let Some(session) = registry.get(session_id) else {
                 return Ok(json!({ "running": false }));
@@ -614,6 +626,16 @@ pub fn dispatch_session_op(
         }
         _ => Err(DispatchError::unknown_op(op)),
     }
+}
+
+/// The default agent dir (the packaged layout resolves this through the
+/// desktop's agent-dir contract; tests pass theirs explicitly).
+fn default_agent_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".pi/agent")
 }
 
 /// Serialize the projected run state for IPC responses.

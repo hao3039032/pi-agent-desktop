@@ -60,3 +60,80 @@ body,
 .boot-page button:hover {
   background: light-dark(#f0f0f3, #2e2e34);
 }
+
+/* The sessions sidebar view (M2 UI step). */
+.boot-sessions {
+  width: min(92vw, 22rem);
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid light-dark(#d9d9e0, #2d2d33);
+  border-radius: 10px;
+  background: light-dark(#ffffff, #1f1f23);
+}
+.sessions-view {
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0.25rem;
+}
+.sessions-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.25rem 0.75rem;
+  font-size: 0.85rem;
+  opacity: 0.85;
+}
+.sessions-header button {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1rem;
+}
+.sessions-note {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+.sessions-error {
+  color: #d07040;
+  opacity: 1;
+  word-break: break-all;
+}
+.sessions-project h2 {
+  font-size: 0.72rem;
+  font-weight: 600;
+  opacity: 0.55;
+  padding: 0.5rem 0.75rem 0.15rem;
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sessions-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+  text-align: left;
+  border-radius: 6px;
+}
+.sessions-row:hover {
+  background: light-dark(#f0f0f3, #2a2a30);
+}
+.sessions-row-name {
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessions-row-time {
+  font-size: 0.7rem;
+  opacity: 0.5;
+  white-space: nowrap;
+}
