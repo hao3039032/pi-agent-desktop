@@ -84,3 +84,4 @@ crates/resource-protocol/target/
 # static-frontend build output (M1: rebuilt by `npm run build` in static-frontend)
 desktop/frontend/assets/
 crates/session-host/target/
+crates/management-host/target/

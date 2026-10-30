@@ -1,0 +1,39 @@
+[package]
+name = "management-host"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT"
+description = "The management-instance host: on-demand pi children for config/model/MCP operations"
+publish = false
+
+# M3 backbone (plan §五 管理实例): the management instances run as
+# `pi --mode rpc --no-session` children with discovery off and the
+# explicit management extension(s), partitioned by scope (global or a
+# trusted project), started on demand and recycled after 60 idle seconds
+# (held alive by leases during logins/installs/MCP tests). The management
+# EXTENSION (JS, vendored dependency tree) is the other half of M3; this
+# crate is the Rust host it plugs into:
+#
+# - scope partitioning: "global" and project cwds never share a child
+#   (their resource scopes differ);
+# - the standard RPC surface covers provider/model enumeration
+#   (get_available_models — proven in M0 with registerProvider fixtures);
+#   extension-provided management commands arrive as prompts the same way
+#   the bridge does;
+# - a management instance never creates session files (--no-session) and
+#   never runs a model prompt (only extension commands, which the runtime
+#   consumes without starting a run);
+# - idle recycle at 60s unless a lease is held (login/install/test flows).
+
+[dependencies]
+pi-host = { path = "../pi-host" }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "management_host"
+path = "src/lib.rs"

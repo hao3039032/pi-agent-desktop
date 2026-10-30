@@ -37,6 +37,14 @@ M1 项：
 | IPC 类型层 | ✅ 初版 | `static-frontend/src/ipc/`：协议 v1 信封/错误码/流帧类型（对齐 `ipc-protocol.md`）、类型化客户端 + 可注入 transport（Tauri 桥/Mock）、封闭操作面（unknown_op 拒绝、超时不重发）、集中式导航适配（session/cwd/view，URL 优先）。12 个 mock-transport 测试 |
 | 页面组件迁移 | ⬜ M2 起 | 会话 UI、模型面板等 |
 
+M3 项：
+
+| 项 | 状态 | 工件 |
+|---|---|---|
+| 管理实例宿主（Rust 侧） | ✅ 骨干落地 | `crates/management-host`：按 scope（global/项目 cwd）分区按需启动 `--mode rpc --no-session` 子进程（发现全关、仅显式扩展）、60 秒空闲回收 + 租约保持、provider/模型枚举（`get_available_models`，含扩展注册的 provider）、扩展命令调用（无 run 启动）、不写会话文件（实测）。真实 pi 测试 2/2 |
+| 管理扩展（JS 侧：vendored 依赖树 + 配置编辑/enabledModels/凭证/MCP 管理/插件技能） | ⬜ M3 主体 | 加载机制已验证（M0）；实例骨架已就位（本项）；扩展本体从现有 lib/*.ts 移植 |
+| MCP transport 实例一致性 | ⬜ 依赖上项 | 管理扩展骨架落地后的第一个验证 |
+
 M2 项：
 
 | 项 | 状态 | 工件 |
