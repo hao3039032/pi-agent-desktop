@@ -63,6 +63,15 @@ try {
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
       await page.screenshot({ path: `${out}/${theme}-${width}.png` });
     }
+    // Real CodeBlock keeps folded text in the DOM; none of it is searchable
+    // until explicitly expanded. Folding must refresh results without typing.
+    await input.fill("folded-tail-target");
+    await count.filter({ hasText: "0 / 0" }).waitFor();
+    await page.locator(".markdown-code-fold").click();
+    await count.filter({ hasText: "1 / 1" }).waitFor();
+    await input.press("Enter");
+    await page.locator(".markdown-code-fold").click();
+    await count.filter({ hasText: "0 / 0" }).waitFor();
     await page.getByRole("button", { name: "Switch session" }).click();
     await page.getByRole("search").waitFor({ state: "detached" });
     await page.locator("#file-panel").focus(); await page.keyboard.press("Control+f");
@@ -88,5 +97,53 @@ try {
     assert.deepEqual(errors, []);
     await page.close();
   }
-  console.log("PASS: conversation find, light/dark, 320–1280px, shortcuts, ranges, navigation, history, streaming, focus and session reset");
+  // Real ChatWindow + real session hook: two messages per turn become three
+  // render items (user/process/answer). The local window must use render items,
+  // not messages.length, and the reveal must not leak across session switches.
+  for (const theme of ["light", "dark"]) {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    const errors = []; page.on("pageerror", error => errors.push(error.message));
+    const messages = Array.from({ length: 30 }, (_, i) => [
+      { role: "user", content: `User turn ${i}`, timestamp: i * 2 },
+      { role: "assistant", content: [{ type: "thinking", thinking: `Private reasoning ${i}` },
+        { type: "text", text: `Answer turn ${i}: history-target-${i}` }],
+        api: "anthropic-messages", provider: "fixture", model: "fixture", stopReason: "stop", timestamp: i * 2 + 1 },
+    ]).flat();
+    const entryIds = messages.map((_, i) => `entry-${i}`);
+    await page.route("**/api/**", async route => {
+      const path = new URL(route.request().url()).pathname;
+      const id = path.split("/")[3];
+      let data = {};
+      if (path.startsWith("/api/sessions/")) data = path.endsWith("/state") ? { running: false } : {
+        sessionId: id, tree: [], leafId: entryIds.at(-1), filePath: "", totalActiveMs: 0,
+        context: { messages, entryIds, oldestEntryId: entryIds[0], hasMore: false, thinkingLevel: "off", model: null },
+      };
+      else if (path.startsWith("/api/models")) data = { models: {}, modelList: [] };
+      else if (path === "/api/agent/running") data = { sessions: [] };
+      else if (path.startsWith("/api/agent/")) data = { running: false, state: { isStreaming: false }, success: true, data: [] };
+      await route.fulfill({ json: data });
+    });
+    await page.goto(`http://127.0.0.1:${server.address().port}/?history`);
+    await page.evaluate(theme => document.documentElement.classList.toggle("dark", theme === "dark"), theme);
+    await page.getByText("Answer turn 29: history-target-29", { exact: true }).waitFor();
+    assert.equal(await page.getByText("Answer turn 0: history-target-0", { exact: true }).count(), 0);
+    await page.keyboard.press("Control+f");
+    const input = page.getByRole("textbox", { name: "Find in conversation" });
+    await input.fill("history-target-");
+    await page.locator(".conversation-find-count").filter({ hasText: "1 / 30" }).waitFor();
+    await input.fill("history-target-0");
+    await page.locator(".conversation-find-count").filter({ hasText: "1 / 1" }).waitFor();
+    await input.fill("Private reasoning");
+    await page.locator(".conversation-find-count").filter({ hasText: "0 / 0" }).waitFor();
+    await page.getByRole("button", { name: "Switch history session" }).click();
+    await page.getByRole("search").waitFor({ state: "detached" });
+    await page.getByText("Answer turn 29: history-target-29", { exact: true }).waitFor();
+    assert.equal(await page.getByText("Answer turn 0: history-target-0", { exact: true }).count(), 0);
+    await page.keyboard.press("Control+f");
+    await input.fill("history-target-");
+    await page.locator(".conversation-find-count").filter({ hasText: "1 / 30" }).waitFor();
+    assert.deepEqual(errors, []);
+    await page.close();
+  }
+  console.log("PASS: conversation find, real ChatWindow split history, folded CodeBlock, light/dark, 320–1280px, shortcuts, navigation, streaming and scope reset");
 } finally { await browser.close(); await new Promise((resolve) => server.close(resolve)); }

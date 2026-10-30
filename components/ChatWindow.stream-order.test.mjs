@@ -12,7 +12,10 @@ const source = await readFile(new URL("./ChatWindow.tsx", import.meta.url), "utf
 // algorithm. Leaf components are inert descriptors so no browser, model or
 // the application's installed SDK state is needed.
 const helpers = source.slice(source.indexOf("function hasFinalAssistantAnswer("), source.indexOf("function getUserInputText("));
-const loop = source.slice(source.indexOf("const rendered: ReactNode[] = [];"), source.indexOf("const { startIndex } = getVisibleRenderWindow(rendered.length, visibleCount);"));
+const loopStart = source.indexOf("const rendered: ReactNode[] = [];");
+const loopEnd = source.indexOf("const { startIndex } = getVisibleRenderWindow(", loopStart);
+assert.ok(loopStart >= 0 && loopEnd > loopStart, "render loop boundaries must exist");
+const loop = source.slice(loopStart, loopEnd);
 assert.ok(loop.includes("idx = endIdx"));
 const compiled = ts.transpile(helpers + loop + "\nreturn rendered;", {
   target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.React,

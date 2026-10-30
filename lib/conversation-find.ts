@@ -41,7 +41,9 @@ export function findConversationRanges(root: HTMLElement, query: string): Range[
     if (!(node instanceof HTMLElement)) { flush(); return; }
     // Excluded content is a boundary, not an empty string: otherwise text
     // before/after a control or <br> would create a match not visible on screen.
-    if (node.matches('button, input, textarea, select, script, style, [aria-hidden="true"], [hidden], br, hr')) { flush(); return; }
+    if (node.matches('button, input, textarea, select, script, style, [aria-hidden="true"], [hidden], [data-conversation-find-exclude], br, hr')) { flush(); return; }
+    // Folded code stays in the DOM for layout, but is outside the expanded-text
+    // search scope until the user opens it. Do not advertise clipped matches.
     const style = getComputedStyle(node);
     if (!node.getClientRects().length || style.visibility === "hidden") { flush(); return; }
     // Flush both sides of each block during depth-first traversal. Grouping

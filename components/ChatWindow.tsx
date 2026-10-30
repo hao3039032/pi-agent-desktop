@@ -556,6 +556,15 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     () => (lazyLoadSessionKey != null ? sessionVisibleCounts.get(lazyLoadSessionKey) : undefined) ?? VISIBLE_PAGE_SIZE,
   );
   const [appliedLazyLoadSessionKey, setAppliedLazyLoadSessionKey] = useState(lazyLoadSessionKey);
+  const findScopeKey = `${lazyLoadSessionKey}:${activeLeafId}`;
+  const [findWindow, setFindWindow] = useState({ scope: findScopeKey, revealed: false });
+  if (findWindow.scope !== findScopeKey) {
+    setFindWindow({ scope: findScopeKey, revealed: false });
+  }
+  // A source message can produce several render items (process, answer, images).
+  // Once find reveals this branch, keep ALL loaded items searchable, including
+  // new history pages and streaming additions, without expanding process details.
+  const revealFindWindow = findWindow.scope === findScopeKey && findWindow.revealed;
   const sentinelRef = useRef<HTMLDivElement>(null);
   const messageContentRef = useRef<HTMLDivElement | null>(null);
   const prevScrollDistanceRef = useRef<number | null>(null);
@@ -1477,8 +1486,8 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           session/request guards. A leaf switch is a new search scope too. */}
       <ConversationFind
         contentRef={messageContentRef}
-        scopeKey={`${lazyLoadSessionKey}:${activeLeafId}`}
-        onReveal={() => setVisibleCount((count) => Math.max(count, messages.length))}
+        scopeKey={findScopeKey}
+        onReveal={() => setFindWindow({ scope: findScopeKey, revealed: true })}
         hasEarlier={hasEarlierMessages}
         busy={sessionBusy || loading}
         onLoadEarlier={async () => {
@@ -1801,7 +1810,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
                 idx = endIdx;
                 if (endIdx === messages.length) break;
               }
-              const { startIndex } = getVisibleRenderWindow(rendered.length, visibleCount);
+              const { startIndex } = getVisibleRenderWindow(rendered.length, revealFindWindow ? rendered.length : visibleCount);
               const hasMore = startIndex > 0 || hasEarlierMessages;
               return (
                 <>

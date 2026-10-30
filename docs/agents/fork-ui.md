@@ -41,9 +41,13 @@ Fork-owned notes moved out of `AGENTS.md` to keep it short. The upstream doc on 
 
 `ConversationFind` is mounted by `ChatWindow`. Ctrl+F / Cmd+F searches the current
 conversation's loaded, expanded text (not the sidebar, composer or file panel).
-Opening reveals the loaded render window; older server pages are requested explicitly
-with “Load earlier messages”, idle-only through the existing guarded `loadContext`.
-Collapsed process content is not silently expanded or advertised as searched.
+Opening reveals every loaded render item (not merely `messages.length`: LW splits
+process and answer into separate items). The revealed local window stays open until
+the session/leaf changes, including newly paged or streamed items; older server pages
+are requested explicitly with “Load earlier messages”, idle-only through the existing
+guarded `loadContext`. Collapsed process content and folded code bodies are excluded
+from search, not silently expanded. Code bodies mark their fold state with
+`data-conversation-find-exclude`; expanding/collapsing refreshes matches without retyping.
 Literal case-insensitive DOM ranges use CSS Custom Highlights, never DOM text replacement,
 so React, syntax highlighting and streaming remain intact. Enter / Shift+Enter cycle
 matches; Escape closes without aborting the agent and restores focus. DOM refreshes

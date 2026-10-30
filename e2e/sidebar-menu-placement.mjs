@@ -48,8 +48,8 @@ async function assertMenuFitsUpwards(page, menu, anchor, label) {
 }
 
 try {
-  for (const theme of ["light", "dark"]) for (const locale of ["zh-CN", "en"]) {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 620 }, colorScheme: theme });
+  for (const theme of ["light", "dark"]) for (const locale of ["zh-CN", "en"]) for (const width of [1280, 390, 320]) {
+    const page = await browser.newPage({ viewport: { width, height: 620 }, colorScheme: theme });
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
     await page.addInitScript(({ theme, locale }) => {
@@ -57,6 +57,12 @@ try {
       localStorage.setItem("pi-theme", theme);
     }, { theme, locale });
     await page.goto(base);
+    const palette = await page.evaluate(() => ({
+      dark: document.documentElement.classList.contains("dark"),
+      surface: getComputedStyle(document.documentElement).getPropertyValue("--surface-elevated").trim(),
+    }));
+    assert.equal(palette.dark, theme === "dark");
+    assert.equal(palette.surface, theme === "dark" ? "#262626" : "#ffffff");
 
     // The session row's "…" menu, opened on a row near the bottom edge.
     const row = page.locator(".session-item").first();
@@ -64,11 +70,12 @@ try {
     await row.locator(".session-item-more").click();
     const sessionMenu = page.locator(".session-item-menu");
     await sessionMenu.waitFor();
+    await sessionMenu.evaluate(el => Promise.all(el.getAnimations({ subtree: true }).map(animation => animation.finished)));
     await assertMenuFitsUpwards(page, ".session-item-menu", ".session-item-more", "session menu");
     const deleteItem = sessionMenu.getByRole("menuitem", { name: locale === "zh-CN" ? "删除" : "Delete" });
     await deleteItem.waitFor();
     assert.ok(await deleteItem.isVisible(), "the delete entry must be reachable");
-    await page.screenshot({ path: `${out}/session-menu-${theme}-${locale}.png` });
+    await page.screenshot({ path: `${out}/session-menu-${theme}-${locale}-${width}.png` });
     await page.keyboard.press("Escape");
     await sessionMenu.waitFor({ state: "detached" });
 
@@ -76,11 +83,12 @@ try {
     await page.locator("#project-more").click();
     const projectMenu = page.locator(".sidebar-project-context-menu");
     await projectMenu.waitFor();
+    await projectMenu.evaluate(el => Promise.all(el.getAnimations({ subtree: true }).map(animation => animation.finished)));
     await assertMenuFitsUpwards(page, ".sidebar-project-context-menu", "#project-more", "project menu");
     const archiveItem = projectMenu.getByRole("menuitem", { name: locale === "zh-CN" ? "移除项目" : "Remove project" });
     await archiveItem.waitFor();
     assert.ok(await archiveItem.isVisible(), "the remove-project entry must be reachable");
-    await page.screenshot({ path: `${out}/project-menu-${theme}-${locale}.png` });
+    await page.screenshot({ path: `${out}/project-menu-${theme}-${locale}-${width}.png` });
 
     assert.deepEqual(errors, []);
     await page.close();

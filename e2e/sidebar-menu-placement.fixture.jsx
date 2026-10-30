@@ -5,6 +5,9 @@ import { I18nProvider, useI18n } from "../hooks/useI18n";
 // Exported by the test bundler only; the menus are the application's own.
 import { SidebarSessionFixture } from "../components/SessionSidebar";
 import { ProjectContextMenuPanel } from "../components/ProjectContextMenu";
+import { THEME_INIT_SCRIPT } from "../lib/theme";
+
+window.eval(THEME_INIT_SCRIPT);
 
 const session = {
   id: "fixture-session", path: "/fixture/session.jsonl", cwd: "/fixture/project",

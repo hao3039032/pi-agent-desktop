@@ -385,7 +385,7 @@ export const CodeBlock = memo(function CodeBlock({ code, lang, headerAction, isS
           </button>
         </div>
       </div>
-      <div className={`markdown-code-body${folded ? " is-folded" : ""}${wrap ? " is-wrapped" : ""}`}>
+      <div className={`markdown-code-body${folded ? " is-folded" : ""}${wrap ? " is-wrapped" : ""}`} data-conversation-find-exclude={folded || undefined}>
       {isStreaming ? (
         <pre
           style={{

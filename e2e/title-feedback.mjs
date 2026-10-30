@@ -65,6 +65,8 @@ try {
   assert.ok(ready, logs.join(""));
   browser = await chromium.launch();
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, locale: "en-US" });
+  // LW intentionally ignores navigator.language; pin the UI preference before hydration.
+  await context.addInitScript(() => localStorage.setItem("pi-locale", "en"));
   page = await context.newPage();
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
@@ -91,6 +93,9 @@ try {
   };
   const notice = page.locator(".app-notice-item");
   await page.goto(`${origin}/?session=${first}`);
+  // Fresh LW profiles show the service setup gate. Dismiss it as a user would;
+  // this test never stores credentials or calls a real title model.
+  await page.getByRole("dialog", { name: "Connect to the service", exact: true }).getByRole("button", { name: "Later", exact: true }).click();
   await page.getByText("Synthetic Title target message", { exact: true }).waitFor();
   await generate();
   await page.getByText("Generating a conversation title…", { exact: true }).waitFor();
@@ -148,6 +153,7 @@ try {
   await narrowPage.route(`**/api/sessions/${first}/auto-name`, route =>
     route.fulfill({ status: 500, json: { error: "401: authentication_error" } }));
   await narrowPage.goto(`${origin}/?session=${first}`);
+  await narrowPage.getByRole("dialog", { name: "连接服务", exact: true }).getByRole("button", { name: "稍后", exact: true }).click();
   await narrowPage.getByText("Synthetic Title target message", { exact: true }).waitFor();
   await narrowPage.locator(".app-topbar-more-trigger").click();
   await narrowPage.locator(".app-topbar-more-menu").getByRole("menuitem").first().click();

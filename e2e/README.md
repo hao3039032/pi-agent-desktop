@@ -25,9 +25,8 @@ Coverage:
 - `node e2e/terminal-settings.mjs` checks the General terminal picker with Windows
   and macOS lists, light/dark, English/Chinese, narrow layouts, keyboard navigation,
   persistence, unavailable shells and load/save errors. No PTY starts on selection.
-- `node e2e/appearance.mjs` checks ten backgrounds in light/dark, five-column
-  desktop rows, narrow wrapping, preview/canvas agreement, new-wash text contrast,
-  keyboard selection, persistence and save races/errors.
+- `node e2e/appearance.mjs` checks light/dark mode, desktop and narrow widths,
+  the flat neutral canvas, and the absence of the removed background picker.
 - `node e2e/sidebar-menu-placement.mjs` opens the session and project "…" menus
   on rows near the bottom of the window and checks that they flip upward, stay
   inside the viewport and keep their last entry reachable, in both themes and

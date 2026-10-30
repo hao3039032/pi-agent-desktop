@@ -97,7 +97,7 @@ export function ConversationFind({ contentRef, scopeKey, onReveal, hasEarlier, o
     // can change searchable content without changing the message array. Debounce
     // streamed mutations and release the observer/timer when closed or switched.
     const observer = new MutationObserver(() => { clearTimeout(timer); timer = setTimeout(refresh, 100); });
-    observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["hidden", "aria-expanded", "style"] });
+    observer.observe(root, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ["hidden", "aria-expanded", "style", "data-conversation-find-exclude"] });
     return () => { observer.disconnect(); clearTimeout(timer); };
   }, [contentRef, open, query]);
 
