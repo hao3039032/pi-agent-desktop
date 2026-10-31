@@ -28,6 +28,7 @@ mod native_prefs;
 // exposure.
 pub mod pi_ipc;
 mod session_view;
+pub mod settings_extras;
 mod shell;
 mod update_install;
 

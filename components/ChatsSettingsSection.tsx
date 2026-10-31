@@ -6,6 +6,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { AppSelect } from "./AppSelect";
 import { ConfigSwitch } from "./SettingsUi";
 import { CHAT_THINKING_LEVELS, parseToolNameList, type ChatSettings } from "@/lib/chat-settings-shared";
+import { fetchChatSettings, saveChatSettings } from "@/lib/chat-settings-service";
 
 type Loaded = ChatSettings & { instructionsMaxChars: number };
 type ModelOption = { id: string; name: string; provider: string };
@@ -35,8 +36,7 @@ export function ChatsSettingsSection() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/chat-settings", { cache: "no-store" })
-      .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+    fetchChatSettings()
       .then((data: Loaded) => {
         if (cancelled) return;
         setSettings(data);
@@ -56,12 +56,7 @@ export function ChatsSettingsSection() {
   const save = useCallback((patch: Partial<Pick<ChatSettings, "model" | "thinkingLevel" | "instructions" | "allowedTools" | "confirmSave">>) => {
     setSaving(true);
     setFailed(false);
-    return fetch("/api/chat-settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    })
-      .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+    return saveChatSettings(patch)
       .then((data: Loaded) => {
         setSettings(data);
         if ("instructions" in patch) setDraft(data.instructions);

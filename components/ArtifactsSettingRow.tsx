@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
+import { fetchArtifactsSettings, saveArtifactsSettings } from "@/lib/artifact-settings-service";
 import { ConfigSwitch } from "./SettingsUi";
 
 /**
@@ -17,10 +18,9 @@ export function ArtifactsSettingRow() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/artifacts/settings")
-      .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
-      .then((data: { enabled?: unknown }) => {
-        if (!cancelled) setEnabled(data.enabled !== false);
+    fetchArtifactsSettings()
+      .then((data) => {
+        if (!cancelled) setEnabled(data.enabled);
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
@@ -35,13 +35,8 @@ export function ArtifactsSettingRow() {
     setEnabled(next);
     setSaving(true);
     setFailed(false);
-    fetch("/api/artifacts/settings", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: next }),
-    })
-      .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
-      .then((data: { enabled?: unknown }) => setEnabled(data.enabled !== false))
+    saveArtifactsSettings(next)
+      .then((data) => setEnabled(data.enabled))
       .catch(() => {
         setEnabled(previous);
         setFailed(true);

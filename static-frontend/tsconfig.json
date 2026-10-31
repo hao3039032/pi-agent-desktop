@@ -72,6 +72,18 @@
       ],
       "@/lib/models-config-service": [
         "./static-frontend/src/data/models-config-service.ts"
+      ],
+      "@/lib/tool-settings-service": [
+        "./static-frontend/src/data/tool-settings-service.ts"
+      ],
+      "@/lib/artifact-settings-service": [
+        "./static-frontend/src/data/artifact-settings-service.ts"
+      ],
+      "@/lib/chat-settings-service": [
+        "./static-frontend/src/data/chat-settings-service.ts"
+      ],
+      "@/lib/custom-css-service": [
+        "./static-frontend/src/data/custom-css-service.ts"
       ]
     }
   },

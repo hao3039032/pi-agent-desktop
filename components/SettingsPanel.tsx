@@ -18,6 +18,7 @@ import {
 import { useEnterSendMode, setEnterSendMode } from "@/hooks/useEnterSendMode";
 import { sendAgentCommand } from "@/lib/agent-client";
 import type { ProjectTrustStatus, ToolSettingsResponse } from "@/lib/api-types";
+import { fetchToolSettings, saveToolSettings } from "@/lib/tool-settings-service";
 import {
   setLastSettingsSection,
   settingsSectionRequiresProject,
@@ -131,10 +132,8 @@ function GeneralSettings({
 
   useEffect(() => {
     let cancelled = false;
-    void fetch("/api/tools/settings")
-      .then(async (response) => {
-        const data = await response.json() as ToolSettingsResponse & { error?: string };
-        if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+    void fetchToolSettings()
+      .then((data) => {
         if (!cancelled) setShellSettings(data);
       })
       .catch((cause) => {
@@ -147,13 +146,7 @@ function GeneralSettings({
     setShellSaving(true);
     setShellError(null);
     try {
-      const response = await fetch("/api/tools/settings", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled }),
-      });
-      const data = await response.json() as ToolSettingsResponse & { error?: string };
-      if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+      const data = await saveToolSettings({ enabled });
       setShellSettings(data);
       if (sessionId) {
         await sendAgentCommand(sessionId, { type: "reload" });
