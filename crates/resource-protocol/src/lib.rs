@@ -221,12 +221,18 @@ impl ResourceRegistry {
             }
         };
 
-        let bytes = match std::fs::read(&target) {
+        // Read through a beneath-walk anchored at the GRANT's canonical
+        // directory: openat(O_DIRECTORY|O_NOFOLLOW) per component, the file
+        // itself O_NOFOLLOW — a component swapped for a symlink between the
+        // containment check above and this read refuses instead of reading
+        // outside the granted tree (the same hardening the files domain's
+        // write/read/list paths carry).
+        let bytes = match read_beneath_anchor(&grant.canonical, &target) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return ResourceResponse::Denied(DenyReason::NotFound)
             }
-            Err(_) => return ResourceResponse::Denied(DenyReason::IoError),
+            Err(_) => return ResourceResponse::Denied(DenyReason::OutOfScope),
         };
         let mime = mime_for(&target);
         let total_len = bytes.len() as u64;
@@ -502,5 +508,145 @@ mod tests {
         assert_eq!(mime_for(Path::new("a.png")), "image/png");
         assert_eq!(mime_for(Path::new("a.HTML")), "text/html; charset=utf-8");
         assert_eq!(mime_for(Path::new("noext")), "application/octet-stream");
+    }
+}
+
+
+/// Open the ANCHOR directory (the grant's canonical path — the trust anchor
+/// a grant lives or dies by), then descend one component at a time with
+/// openat(O_DIRECTORY|O_NOFOLLOW) and open the final file O_NOFOLLOW. Every
+/// component below the anchor refuses to be a symlink; a swapped component
+/// is ELOOP/ENOTDIR-refused, never followed.
+#[cfg(unix)]
+fn read_beneath_anchor(anchor: &Path, target: &Path) -> std::io::Result<Vec<u8>> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    fn open_dir_no_follow(parent: Option<&std::fs::File>, path: &str) -> std::io::Result<std::fs::File> {
+        let c_path = CString::new(path)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = match parent {
+            Some(parent) => unsafe { libc::openat(parent.as_raw_fd(), c_path.as_ptr(), flags) },
+            None => unsafe { libc::open(c_path.as_ptr(), flags) },
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd from a successful open; File owns and closes it.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    // A FILE grant's anchor IS the file: open it directly with O_NOFOLLOW
+    // (its identity was just re-validated by the caller's canonicalize
+    // comparison — a symlinked final component refuses here).
+    if target == anchor {
+        let c_path = CString::new(anchor.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd from a successful open; File owns and closes it.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        return Ok(data);
+    }
+    let mut current = open_dir_no_follow(None, &anchor.to_string_lossy())?;
+    let relative = target
+        .strip_prefix(anchor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the anchor"))?;
+    let mut components: Vec<String> = Vec::new();
+    for component in relative.components() {
+        let step = component.as_os_str().to_string_lossy().into_owned();
+        if step == "." || step == ".." || step.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));
+        }
+        components.push(step);
+    }
+    let Some((name, dirs)) = components.split_last() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the anchor is not a file"));
+    };
+    for step in dirs {
+        current = open_dir_no_follow(Some(&current), step)?;
+    }
+    let c_name = CString::new(name.as_str())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(current.as_raw_fd(), c_name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd from a successful openat; File owns and closes it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// Windows until a handle-based implementation ships: the granted read
+/// falls back to the plain path read (the anchor's identity was just
+/// re-validated); the component-swap race is documented in the migration
+/// README and closes with the Windows files work.
+#[cfg(windows)]
+fn read_beneath_anchor(_anchor: &Path, target: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(target)
+}
+
+
+#[cfg(all(test, unix))]
+mod race_tests {
+    use super::*;
+
+    #[test]
+    fn a_swapped_in_tree_component_refuses_instead_of_reading_out() {
+        // Grant a DIRECTORY; authorize reads inside it; then swap one of its
+        // files for a symlink to a secret outside. The granted read must
+        // refuse (beneath-walk O_NOFOLLOW), never serve the secret.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::write(tree.join("page.html"), b"<p>inside</p>").expect("page");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").expect("secret");
+
+        let registry = ResourceRegistry::new();
+        let handle = registry
+            .grant_directory(&tree, Duration::from_secs(60))
+            .expect("grant");
+        // The honest read works.
+        assert!(matches!(
+            registry.read(&handle, "page.html", None),
+            ResourceResponse::Ok { .. }
+        ));
+        // The ATTACK: swap the file for a symlink to the secret.
+        std::fs::remove_file(tree.join("page.html")).expect("remove");
+        std::os::unix::fs::symlink(&secret, tree.join("page.html")).expect("swap");
+        // The read refuses: the containment check resolves through the link
+        // to OUTSIDE the granted tree.
+        match registry.read(&handle, "page.html", None) {
+            ResourceResponse::Denied(_) => {}
+            ResourceResponse::Ok { .. } => panic!("the swapped component must refuse"),
+        }
+        // And the walk itself (the check→open race) refuses a stale pair:
+        // authorize the resolved-inside spelling first via a fresh tree
+        // file, swap it, then read with the stale target.
+        std::fs::write(tree.join("doc.txt"), b"doc").expect("doc");
+        let stale_target = tree.join("doc.txt");
+        let mut walked = None;
+        if let Ok(resolved) = std::fs::canonicalize(&stale_target) {
+            if resolved.starts_with(&tree) {
+                walked = Some(resolved);
+            }
+        }
+        std::fs::remove_file(&stale_target).expect("remove");
+        std::os::unix::fs::symlink(&secret, &stale_target).expect("swap again");
+        if let Some(stale) = walked {
+            let outcome = read_beneath_anchor(&tree.canonicalize().unwrap(), &stale);
+            assert!(outcome.is_err(), "the stale in-tree target must refuse: {outcome:?}");
+        }
     }
 }

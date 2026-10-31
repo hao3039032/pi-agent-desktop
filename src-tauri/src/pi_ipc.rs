@@ -832,7 +832,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     }),
                 ),
                 Err(message) => {
-                    let code = if message == "Not a directory" { "invalid_args" } else { "unauthorized_scope" };
+                    let code = if message.contains("Not a directory") { "invalid_args" } else { "unauthorized_scope" };
                     protocol_error(&id, code, &message)
                 }
             }
@@ -873,31 +873,47 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         "files.read" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             let target = PathBuf::from(path);
-            let allowed = {
+            // The read twin of the hardened write: canonicalize + containment
+            // authorize, then a beneath-walk (openat O_NOFOLLOW per
+            // component off the ROOT's descriptor) so a final component or
+            // an ancestor swapped for a symlink after the check refuses
+            // instead of reading outside the roots. A symlink inside the
+            // roots pointing inside the roots reads its target (canonical
+            // resolution), same as /api/files.
+            #[cfg(unix)]
+            let outcome = {
                 let roots = state.file_roots.lock().unwrap();
-                // An existing file authorizes through itself (resolved
-                // containment); a not-yet-existing path through its parent.
-                if target.exists() {
-                    roots.is_existing_path_allowed(&target)
-                } else {
-                    roots.is_new_path_allowed(&target)
-                }
+                crate::file_access::resolved_read_target_with_root(&roots, &target)
+                    .map(|(resolved, root)| crate::file_access::read_beneath_root(&root, &resolved))
             };
-            if !allowed {
-                return protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots");
-            }
-            match std::fs::read(&target) {
-                Ok(bytes) => protocol_ok(
+            #[cfg(windows)]
+            let outcome: Option<Result<Vec<u8>, std::io::Error>> = {
+                // Fail-closed until the handle-based implementation ships:
+                // the naive read re-opens by path and re-introduces the
+                // check→open race the Unix side closed.
+                let _ = &target;
+                None
+            };
+            match outcome {
+                None => protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots"),
+                Some(Ok(bytes)) => protocol_ok(
                     &id,
                     json!({
                         "mime": crate::file_access::mime_for(&target),
                         "data": base64::engine::general_purpose::STANDARD.encode(bytes),
                     }),
                 ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     protocol_error(&id, "not_found", "no such file")
                 }
-                Err(error) => protocol_error(&id, "io", &error.to_string()),
+                #[cfg(windows)]
+                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                #[cfg(unix)]
+                Some(Err(error)) => protocol_error(
+                    &id,
+                    if error.kind() == std::io::ErrorKind::NotFound { "not_found" } else { "unauthorized_scope" },
+                    &error.to_string(),
+                ),
             }
         }
         "files.write" => {
@@ -1254,6 +1270,153 @@ mod tests {
             .expect_err("refuses after the swap");
         assert!(matches!(refusal, crate::file_access::WriteRefusal::OutsideRoots));
         assert!(!outside.join("file.txt").exists(), "nothing escaped");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn listing_refuses_a_directory_swapped_to_a_symlink_after_authorization() {
+        // The listing twin: authorization passes on an honest subdirectory,
+        // then the directory's name is replaced by a symlink pointing at a
+        // directory OUTSIDE. The listing walks from the root's descriptor
+        // (openat O_NOFOLLOW per component) and lists THROUGH the walked fd
+        // (/proc/self/fd) — the swapped component refuses instead of
+        // enumerating the outside directory.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub");
+        std::fs::write(sub.join("inside.txt"), b"x").expect("inside");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret.txt"), b"s").expect("secret");
+        state.propose_path(&project);
+        let roots = state.file_roots.lock().unwrap();
+        let (resolved, root) = crate::file_access::resolved_read_target_with_root(&roots, &sub)
+            .expect("the honest directory authorizes");
+        // The ATTACK: swap `sub` for a symlink to the outside directory.
+        std::fs::remove_dir_all(&sub).expect("remove");
+        std::os::unix::fs::symlink(&outside, &sub).expect("swap");
+        // The stale pair + the walk: the open refuses the swapped component.
+        let outcome = crate::file_access::open_directory_beneath_root(&root, &resolved);
+        assert!(outcome.is_err(), "the swapped directory refuses: {outcome:?}");
+        // Fresh authorization through IPC also refuses (canonicalize now
+        // resolves through the link to outside → containment fails).
+        drop(roots);
+        let listed = send(
+            &state,
+            json!({ "v": 1, "id": "lsr1", "op": "files.list", "args": { "path": sub.display().to_string() } }),
+        );
+        assert_eq!(listed["error"]["code"], "unauthorized_scope", "{listed}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reads_refuse_a_final_component_swapped_to_a_symlink_after_authorization() {
+        // The read twin of the write race: authorization passes on a real
+        // file INSIDE the roots, then the file's name is replaced by a
+        // symlink pointing at a secret OUTSIDE. The beneath-walk opens the
+        // final component O_NOFOLLOW off the walked parent descriptor — the
+        // swap refuses instead of reading the secret.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        std::fs::write(project.join("doc.txt"), b"inside").expect("doc");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").expect("secret");
+        state.propose_path(&project);
+        let roots = state.file_roots.lock().unwrap();
+        let (resolved, root) = crate::file_access::resolved_read_target_with_root(
+            &roots,
+            &project.join("doc.txt"),
+        )
+        .expect("the honest file authorizes");
+        // The ATTACK: swap the final component for a symlink to the secret.
+        std::fs::remove_file(project.join("doc.txt")).expect("remove");
+        std::os::unix::fs::symlink(&secret, project.join("doc.txt")).expect("swap");
+        // The stale authorized pair + the walk: refuses, never reads out.
+        let outcome = crate::file_access::read_beneath_root(&root, &resolved);
+        assert!(outcome.is_err(), "the swapped final component refuses: {outcome:?}");
+        // And through the IPC surface (fresh authorization) it also refuses:
+        // canonicalize now resolves through the link to the secret — outside.
+        drop(roots);
+        let read = send(
+            &state,
+            json!({ "v": 1, "id": "rr1", "op": "files.read", "args": { "path": project.join("doc.txt").display().to_string() } }),
+        );
+        assert_eq!(read["error"]["code"], "unauthorized_scope", "{read}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_refuse_an_ancestor_directory_swapped_to_a_symlink() {
+        // THE ancestor race the open(parent, O_NOFOLLOW) shape missed:
+        // O_NOFOLLOW only guards the parent path's FINAL component, so an
+        // ANCESTOR (root/a when writing root/a/b/file) swapped for a symlink
+        // was followed to wherever it pointed. The beneath-walk refuses it:
+        // every component below the authorized root opens
+        // openat(O_DIRECTORY|O_NOFOLLOW) off the ROOT's descriptor.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        let a = project.join("a");
+        let b = a.join("b");
+        std::fs::create_dir_all(&b).expect("b");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        state.propose_path(&project);
+        let roots = state.file_roots.lock().unwrap();
+
+        // Authorization passes on the honest layout — and SNAPSHOT the
+        // authorized (root, parent) pair, exactly what production holds
+        // between its check and its open.
+        let (authorized_parent, authorized_root) = roots
+            .resolved_write_parent_with_root(&b.join("file.txt"))
+            .expect("the honest path authorizes");
+        // ...then the ATTACK: `a` is replaced by a symlink pointing out.
+        std::fs::remove_dir_all(&a).expect("remove a");
+        std::os::unix::fs::symlink(&outside, &a).expect("swap a");
+
+        // THE race window: the authorization above already PASSED (it ran on
+        // the honest layout, exactly like production where the check and the
+        // open are separate steps). Now the write walks with the STALE
+        // authorized pair — the walk must refuse the swapped ancestor
+        // instead of following it (the old open(parent, O_NOFOLLOW) shape
+        // followed `a` and landed in outside/b).
+        let refusal = match crate::file_access::write_beneath_root_for_tests(
+            &authorized_root,
+            &authorized_parent,
+            "file.txt",
+            b"escaped",
+        ) {
+            Err(refusal) => refusal,
+            Ok(()) => panic!("the swapped ancestor must refuse the write"),
+        };
+        assert!(
+            matches!(refusal, crate::file_access::WriteRefusal::FinalComponentSymlink),
+            "refused as a symlink component: {refusal:?}"
+        );
+        assert!(
+            !outside.join("b").join("file.txt").exists(),
+            "NOTHING was created through the swapped ancestor"
+        );
+        drop(roots);
+
+        // Sanity: the refusal is not an accident of ordering — the same
+        // request through the IPC surface answers unauthorized_scope.
+        let evil = send(
+            &state,
+            json!({
+                "v": 1, "id": "anc1", "op": "files.write",
+                "args": {
+                    "path": b.join("file.txt").display().to_string(),
+                    "data": base64::engine::general_purpose::STANDARD.encode("x"),
+                },
+            }),
+        );
+        assert_eq!(evil["error"]["code"], "unauthorized_scope", "{evil}");
+        assert!(!outside.join("b").join("file.txt").exists());
     }
 
     #[test]

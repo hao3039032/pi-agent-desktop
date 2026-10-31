@@ -76,7 +76,9 @@ impl AllowedRoots {
     /// component must be a plain name (never `..`, never empty) — the
     /// /api/files rule (existingAuthorizationPath = dirname for new files).
     /// A symlink final component therefore never authorizes: the write
-    /// would follow it outside the roots.
+    /// would follow it outside the roots. (Tests assert the rule; the write
+    /// path itself walks beneath the root — see write_beneath_root.)
+    #[cfg(test)]
     pub fn is_new_path_allowed(&self, target: &Path) -> bool {
         self.is_existing_path_allowed_at(target, false)
     }
@@ -116,7 +118,12 @@ impl AllowedRoots {
     /// escapes the roots. This is the ONE authorization point for writes:
     /// the final component is never resolved here (that is the open's job,
     /// symlink-refusing — see write_through_allowed_parent).
-    pub fn resolved_write_parent(&self, target: &Path) -> Option<PathBuf> {
+    /// Like [`Self::resolved_write_parent`], but also returns WHICH root
+    /// (canonicalized) the parent sits under — the anchor a beneath-walk
+    /// starts from, so no path component between the root and the parent
+    /// is ever resolved through a symlink (an ancestor swapped for a link
+    /// after the check is refused at the walk, not followed).
+    pub fn resolved_write_parent_with_root(&self, target: &Path) -> Option<(PathBuf, PathBuf)> {
         if has_parent_segment(target) {
             return None;
         }
@@ -130,10 +137,15 @@ impl AllowedRoots {
                 continue;
             };
             if resolved.starts_with(&resolved_root) {
-                return Some(resolved);
+                return Some((resolved, resolved_root));
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    pub fn resolved_write_parent(&self, target: &Path) -> Option<PathBuf> {
+        self.resolved_write_parent_with_root(target).map(|(parent, _root)| parent)
     }
 }
 
@@ -142,10 +154,15 @@ impl AllowedRoots {
 pub enum WriteRefusal {
     /// The path (parent) is not inside the allowed roots.
     OutsideRoots,
-    /// The final component is a symlink: the write would follow it.
+    /// A path component is a symlink the write must not follow (the file's
+    /// own name, or an ancestor directory swapped for a link mid-walk).
     FinalComponentSymlink,
     /// The filesystem refused the open/write.
     Io(std::io::Error),
+    /// Windows until a handle-based implementation ships (fail-closed,
+    /// never a silently weaker path).
+    #[cfg(windows)]
+    UnsupportedPlatform,
 }
 
 impl std::fmt::Display for WriteRefusal {
@@ -153,32 +170,49 @@ impl std::fmt::Display for WriteRefusal {
         match self {
             WriteRefusal::OutsideRoots => write!(f, "the path is outside the allowed roots"),
             WriteRefusal::FinalComponentSymlink => {
-                write!(f, "the final path component is a symbolic link")
+                write!(f, "a path component is a symbolic link the write must not follow")
             }
             WriteRefusal::Io(error) => write!(f, "{error}"),
+            #[cfg(windows)]
+            WriteRefusal::UnsupportedPlatform => write!(
+                f,
+                "writes are not supported on this platform until the handle-based implementation ships"
+            ),
         }
     }
 }
 
-/// Write `data` at `target`, refusing to follow a symlinked FINAL component
-/// and closing the authorization→open TOCTOU window:
+/// Write `data` at `target`, refusing every symlink-escape class the
+/// original /api/files write refused — plus the ancestor-swap race:
 ///
-/// - the parent is canonicalized and authorized INSIDE this function (the
-///   caller passes the roots, never a pre-computed verdict);
-/// - Unix: the open happens `openat(dirfd, name, O_NOFOLLOW)` on a directory
-///   descriptor opened O_NOFOLLOW itself — the name resolves atomically
-///   against the FIXED directory, so swapping the parent for a symlink (or
-///   the final component between check and open) cannot redirect the write;
-/// - Windows (untested here): the canonicalized parent is prefixed `\\?\`
-///   (no reparse resolution) and the final component is checked as a
-///   reparse point, refusing known link types before the write.
+/// - the target's parent canonicalizes and must sit inside a canonicalized
+///   allowed root (lexical `..` and out-of-root spellings refuse);
+/// - the walk to the parent starts at a file descriptor opened on the
+///   AUTHORIZED ROOT and descends one component at a time with
+///   `openat(..., O_NOFOLLOW | O_DIRECTORY)` — a component swapped for a
+///   symlink at ANY depth below the root (an ancestor directory, not just
+///   the file's own name) is ELOOP-refused, never followed;
+/// - the file itself opens `openat(parent_fd, name, O_NOFOLLOW)` — a
+///   symlinked final component (dangling or not) refuses atomically.
+///
+/// Residual, inherent to path-based APIs and shared with the original TS
+/// implementation: a component legitimately RENAMED (not linked) between
+/// authorization and the open makes the walk enter the new directory at
+/// the old name. Only holding descriptors from authorization time (or an
+/// openat2 RESOLVE_BENEATH kernel API) closes that; the rename race is
+/// documented rather than claimed closed.
+///
+/// Windows: the host refuses the write outright (`UnsupportedPlatform`)
+/// rather than shipping the earlier \?\-prefix + reparse-probe code —
+/// the prefix does not disable reparse resolution and probe-then-open is
+/// itself a TOCTOU. A handle-based (NtCreateFile relative opens)
+/// implementation is required before the static app ships on Windows.
 pub fn write_through_allowed_parent(
     roots: &AllowedRoots,
     target: &Path,
     data: &[u8],
 ) -> Result<(), WriteRefusal> {
-    use std::io::Write;
-    let Some(resolved_parent) = roots.resolved_write_parent(target) else {
+    let Some((resolved_parent, resolved_root)) = roots.resolved_write_parent_with_root(target) else {
         return Err(WriteRefusal::OutsideRoots);
     };
     let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
@@ -190,19 +224,61 @@ pub fn write_through_allowed_parent(
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW on the directory: a parent swapped to a symlink between
-        // the canonicalize above and this open refuses rather than resolving
-        // through the link.
-        let parent_fd = std::fs::File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-            .open(&resolved_parent)
+        write_beneath_root(&resolved_root, &resolved_parent, name, data)
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = (resolved_parent, resolved_root);
+        Err(WriteRefusal::UnsupportedPlatform)
+    }
+}
+
+/// The beneath-walk + write, separated from the authorization step so the
+/// check→open race is testable deterministically (a test can authorize on an
+/// honest layout, swap an ancestor, then call THIS with the stale pair).
+#[cfg(unix)]
+pub(crate) fn write_beneath_root(
+    resolved_root: &Path,
+    resolved_parent: &Path,
+    name: &str,
+    data: &[u8],
+) -> Result<(), WriteRefusal> {
+    use std::io::Write;
+    {
+        // 1. Open the authorized ROOT: the anchor every later step hangs off.
+        let root_fd = openat_directory_no_follow_by_path(resolved_root)
             .map_err(WriteRefusal::Io)?;
-        // openat against the fixed descriptor with O_NOFOLLOW: a symlinked
-        // final component is ELOOP, atomically — no window between an
-        // lstat check and the open.
-        let file = openat_no_follow(&parent_fd, name).map_err(|error| {
+        // 2. Descend component by component beneath the root. resolved_parent
+        //    is canonical (symlink-free at authorization time), so every
+        //    component here names a real directory — a component swapped for
+        //    a symlink since is ELOOP-refused, never followed.
+        let mut current = root_fd;
+        let relative = resolved_parent
+            .strip_prefix(resolved_root)
+            .map_err(|_| WriteRefusal::OutsideRoots)?;
+        for component in relative.components() {
+            let Some(step) = component.as_os_str().to_str() else {
+                return Err(WriteRefusal::OutsideRoots);
+            };
+            if step == "." || step == ".." {
+                return Err(WriteRefusal::OutsideRoots);
+            }
+            let next = openat_directory_no_follow(&current, step).map_err(|error| {
+                // Linux returns ELOOP for O_NOFOLLOW|O_DIRECTORY on a
+                // self-referential link and ENOTDIR for one pointing at a
+                // directory; both mean "this component is now a symlink" —
+                // the walk refuses instead of following either way.
+                if matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+                    WriteRefusal::FinalComponentSymlink
+                } else {
+                    WriteRefusal::Io(error)
+                }
+            })?;
+            current = next;
+        }
+        // 3. The file itself, relative to the walked parent descriptor.
+        let file = openat_no_follow(&current, name).map_err(|error| {
             if error.raw_os_error() == Some(libc::ELOOP) {
                 WriteRefusal::FinalComponentSymlink
             } else {
@@ -214,48 +290,43 @@ pub fn write_through_allowed_parent(
         file.flush().map_err(WriteRefusal::Io)?;
         Ok(())
     }
+}
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // The canonicalized parent with the NT prefix keeps the path from
-        // being re-resolved through intermediate reparse points.
-        let full = std::path::PathBuf::from(format!(
-            "\\\\?\\{}\\{}",
-            resolved_parent.to_string_lossy().replace('/', "\\"),
-            name
-        ));
-        // A reparse-point final component (symlink/junction) is REFUSED:
-        // probe with FILE_FLAG_OPEN_REPARSE_POINT (which opens the link
-        // itself instead of following it) and inspect the file type.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let probe = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&full);
-        match probe {
-            Ok(handle) => {
-                let meta = handle.metadata().map_err(WriteRefusal::Io)?;
-                drop(handle);
-                if meta.file_type().is_symlink() {
-                    return Err(WriteRefusal::FinalComponentSymlink);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A new file: no reparse point to refuse.
-            }
-            Err(error) => return Err(WriteRefusal::Io(error)),
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&full)
-            .map_err(WriteRefusal::Io)?;
-        file.write_all(data).map_err(WriteRefusal::Io)?;
-        file.flush().map_err(WriteRefusal::Io)?;
-        Ok(())
+/// Open a directory BY PATH with O_NOFOLLOW (the root anchor: its own final
+/// component refuses to be a symlink; ancestors resolve as the host's scan
+/// saw them — see the function-level docs for the residual rename race).
+#[cfg(unix)]
+fn openat_directory_no_follow_by_path(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: fd comes from a successful open; File owns and closes it.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Open one DIRECTORY component beneath `parent`, refusing a component that
+/// is a symlink (O_NOFOLLOW: ELOOP) — the beneath-walk's every step.
+#[cfg(unix)]
+fn openat_directory_no_follow(
+    parent: &std::fs::File,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let c_name = CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path component"))?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd comes from a successful openat; File owns and closes it.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 #[cfg(unix)]
@@ -510,22 +581,61 @@ pub struct ListedEntry {
 /// first then files, both alphabetically; a directory symlink resolving
 /// outside the roots carries `outsideLinkTarget` for the confirmation flow.
 pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<ListedEntry>, String> {
-    if !roots.is_existing_path_allowed(directory) {
+    // Authorize on the canonical form (a directory symlink inside the roots
+    // pointing inside the roots lists its target — the /api/files
+    // semantics), then LIST THROUGH THE WALKED DESCRIPTOR so a component
+    // swapped for a symlink after the check cannot redirect the listing
+    // outside the roots. On Linux the fd lists via /proc/self/fd; elsewhere
+    // the fd is (dev,ino)-verified against the canonical path and the
+    // listing re-opens that path (the rename race remains, documented with
+    // the write path).
+    let Some((resolved_dir, resolved_root)) = resolved_read_target_with_root(roots, directory)
+    else {
         return Err("the path is outside the allowed roots".to_string());
-    }
-    let meta = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
-    if !meta.is_dir() {
-        return Err("Not a directory".to_string());
-    }
-    let dirents: Vec<std::fs::DirEntry> = std::fs::read_dir(directory)
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .collect();
+    };
+    #[cfg(unix)]
+    let dirents: Vec<std::fs::DirEntry> = {
+        let walked = open_directory_beneath_root(&resolved_root, &resolved_dir)
+            .map_err(|error| error.to_string())?;
+        if !walked.metadata().map_err(|error| error.to_string())?.is_dir() {
+            return Err("Not a directory".to_string());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let via_fd = format!("/proc/self/fd/{}", {
+                use std::os::fd::AsRawFd;
+                walked.as_raw_fd()
+            });
+            std::fs::read_dir(via_fd)
+                .map_err(|error| error.to_string())?
+                .flatten()
+                .collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Verify the walked fd IS the canonical directory, then read the
+            // canonical path (macOS has no /proc).
+            use std::os::unix::fs::MetadataExt;
+            let walked_meta = walked.metadata().map_err(|error| error.to_string())?;
+            let path_meta = std::fs::metadata(&resolved_dir).map_err(|error| error.to_string())?;
+            if walked_meta.dev() != path_meta.dev() || walked_meta.ino() != path_meta.ino() {
+                return Err("the path is outside the allowed roots".to_string());
+            }
+            std::fs::read_dir(&resolved_dir)
+                .map_err(|error| error.to_string())?
+                .flatten()
+                .collect()
+        }
+    };
+    #[cfg(windows)]
+    let dirents: Vec<std::fs::DirEntry> = {
+        let _ = (resolved_dir, resolved_root);
+        return Err("listing is not supported on this platform until the handle-based implementation ships".to_string());
+    };
     let names: Vec<String> = dirents.iter().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
-
     // Visibility: Git's view first (tracked wins over ignored), the fixed
     // name list where git has no view (missing, outside a work tree, failed).
-    let visibility = directory_visibility(directory, &names);
+    let visibility = directory_visibility(&resolved_dir, &names);
 
     let mut entries: Vec<ListedEntry> = Vec::new();
     for entry in &dirents {
@@ -533,13 +643,17 @@ pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<List
         if !visibility(&name) {
             continue;
         }
+        // Every probe goes through the CANONONICAL directory path, never the
+        // /proc/self/fd listing path (stat through an fd link component is
+        // not portable); the fd only sourced the NAME list.
+        let entry_path = resolved_dir.join(&name);
         // Avoid per-entry stat where the dirent type is known; symlinks and
         // filesystems without type info fall back to metadata.
         let file_type = entry.file_type().ok();
         let is_dir = match file_type {
             Some(kind) if kind.is_dir() => true,
             Some(kind) if kind.is_file() => false,
-            _ => match std::fs::metadata(entry.path()) {
+            _ => match std::fs::metadata(&entry_path) {
                 Ok(meta) => meta.is_dir(),
                 Err(_) => continue, // raced away: skip, not an error
             },
@@ -550,8 +664,8 @@ pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<List
         let mut outside_link_target = None;
         let mut outside_link_encloses = false;
         let is_symlink_dir = is_dir && file_type.map(|kind| !kind.is_dir()).unwrap_or(false);
-        if is_symlink_dir || (is_dir && std::fs::symlink_metadata(entry.path()).map(|m| m.file_type().is_symlink()).unwrap_or(false)) {
-            if let Ok(resolved) = std::fs::canonicalize(entry.path()) {
+        if is_symlink_dir || (is_dir && std::fs::symlink_metadata(&entry_path).map(|m| m.file_type().is_symlink()).unwrap_or(false)) {
+            if let Ok(resolved) = std::fs::canonicalize(&entry_path) {
                 if !roots.is_existing_path_allowed(&resolved) {
                     outside_link_target = Some(resolved.to_string_lossy().into_owned());
                     outside_link_encloses = encloses_home_or_root(&resolved);
@@ -768,4 +882,119 @@ pub fn check_linked_directory_approval(
     }
     let already_allowed = roots.is_existing_path_allowed(&target);
     LinkApproval::Ok { target: target_text, already_allowed }
+}
+
+/// Test seam for the check→open race: the walk with a caller-supplied
+/// (possibly stale) authorized pair — production always authorizes freshly
+/// inside write_through_allowed_parent.
+#[cfg(all(unix, test))]
+#[doc(hidden)]
+pub fn write_beneath_root_for_tests(
+    resolved_root: &Path,
+    resolved_parent: &Path,
+    name: &str,
+    data: &[u8],
+) -> Result<(), WriteRefusal> {
+    write_beneath_root(resolved_root, resolved_parent, name, data)
+}
+
+/// A read authorized against the roots: the CANONICALIZED target (symlinks
+/// resolved — a link inside the roots to another location inside the roots
+/// reads its target, the /api/files semantics) must sit inside a
+/// canonicalized root. Returns (canonical target, canonical root) — the
+/// pair a beneath-walk descends without ever resolving a symlink again.
+pub fn resolved_read_target_with_root(
+    roots: &AllowedRoots,
+    target: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    if has_parent_segment(target) {
+        return None;
+    }
+    if !roots.is_path_allowed(target) {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(target).ok()?;
+    for root in &roots.roots {
+        let Ok(resolved_root) = std::fs::canonicalize(PathBuf::from(root)) else {
+            continue;
+        };
+        if resolved.starts_with(&resolved_root) {
+            return Some((resolved, resolved_root));
+        }
+    }
+    None
+}
+
+/// Read a file through the beneath-walk (the read twin of
+/// write_beneath_root): descend from the authorized ROOT's descriptor with
+/// openat(O_DIRECTORY|O_NOFOLLOW) per component, then openat the file
+/// itself O_NOFOLLOW — a final component (or any ancestor) swapped for a
+/// symlink after authorization refuses instead of reading outside the
+/// roots. Same residual rename race as the write path (documented there).
+#[cfg(unix)]
+pub fn read_beneath_root(
+    resolved_root: &Path,
+    resolved_target: &Path,
+) -> Result<Vec<u8>, std::io::Error> {
+    use std::os::fd::FromRawFd;
+    let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
+    let mut current = root_fd;
+    let relative = resolved_target
+        .strip_prefix(resolved_root)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the root"))?;
+    let mut components: Vec<&str> = Vec::new();
+    for component in relative.components() {
+        let Some(step) = component.as_os_str().to_str() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));
+        };
+        if step == "." || step == ".." {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));
+        }
+        components.push(step);
+    }
+    let (name, dirs) = components
+        .split_last()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the root itself is not a file"))?;
+    for step in dirs {
+        current = openat_directory_no_follow(&current, step)?;
+    }
+    let c_name = std::ffi::CString::new(*name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    use std::os::fd::AsRawFd;
+    let fd = unsafe { libc::openat(current.as_raw_fd(), c_name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd from a successful openat; File owns and closes it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut data)?;
+    Ok(data)
+}
+
+/// Open the directory at `resolved_target` by WALKING from the authorized
+/// root's descriptor (openat O_DIRECTORY|O_NOFOLLOW per component) — the
+/// listing twin of the write/read walks. A component swapped for a symlink
+/// refuses; nothing below the root is ever resolved through a link.
+#[cfg(unix)]
+pub fn open_directory_beneath_root(
+    resolved_root: &Path,
+    resolved_target: &Path,
+) -> std::io::Result<std::fs::File> {
+    let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
+    let mut current = root_fd;
+    let relative = resolved_target
+        .strip_prefix(resolved_root)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the root"))?;
+    for component in relative.components() {
+        let Some(step) = component.as_os_str().to_str() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));
+        };
+        if step == "." || step == ".." {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));
+        }
+        current = openat_directory_no_follow(&current, step)?;
+    }
+    Ok(current)
 }
