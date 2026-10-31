@@ -229,6 +229,14 @@ export interface RoutedModelInfo {
   thinkingLevel?: string;
 }
 
+/** The last public pre-override cache-warming proposal observed in this child run. */
+export interface RecentCacheWarmingDecision {
+  action: "warm" | "stop";
+  warmCost: number;
+  missCost: number;
+  continuationProbability: number;
+}
+
 /** pi's prompt-cache warming: the global mode plus the session's next decision, as `/session` shows it. */
 export interface CacheWarmingInfo {
   mode: "off" | "streaming" | "idle";

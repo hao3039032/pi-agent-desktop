@@ -2992,6 +2992,8 @@ fn session_view_dispatch(
                     }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
                 let (extension_statuses, extension_widgets) = session.extension_ui_state();
+                let recent_cache_decision = session.bridge_request("cache.recentDecision", None, Some(Duration::from_secs(3)))
+                    .ok().and_then(|result| result.get("decision").filter(|value| value.is_object()).cloned());
                 // Only the child's active entries/leaf can identify a recorded prompt.
                 // A failed read or absence of a record is unknown (a spawn-time
                 // custom prompt may still exist); never invent a composed prompt.
@@ -3058,6 +3060,7 @@ fn session_view_dispatch(
                     "systemPromptStatus": prompt_status,
                     "extensionStatuses": extension_statuses,
                     "extensionWidgets": extension_widgets,
+                    "recentCacheDecision": recent_cache_decision,
                 });
                 return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
             }
@@ -4390,6 +4393,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let state = state();
         let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
         let (_sub, events, _) = session.subscribe_with_ui();
+        let cache = session.bridge_request("cache.recentDecision", None, Some(Duration::from_secs(10))).unwrap();
+        assert!(cache["decision"].is_null(), "no cache event must remain unknown: {cache}");
         let prompt = Arc::clone(&session);
         let handle = std::thread::spawn(move || prompt.command("prompt", json!({"message":"/fixture-confirm"}), Some(Duration::from_secs(10))));
         let event = loop {
