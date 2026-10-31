@@ -298,6 +298,12 @@ impl Session {
         self.state.lock().unwrap().ui.ids()
     }
 
+    /// Extension status and string-array widget state observed from the child.
+    pub fn extension_ui_state(&self) -> (Vec<Value>, Vec<Value>) {
+        let state = self.state.lock().unwrap();
+        (state.ui.statuses(), state.ui.widgets())
+    }
+
     /// Consume a current dialog once, with a response appropriate to its method.
     pub fn respond_ui(&self, id: &str, response: &Value) -> Result<(), &'static str> {
         let mut state = self.state.lock().unwrap();

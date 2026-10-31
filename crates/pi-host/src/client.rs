@@ -937,6 +937,14 @@ fn deliver_ui_request(
     let is_bypass = registration.bypass.as_ref().is_some_and(|predicate| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| predicate(record))).unwrap_or(false)
     });
+    // UI records enter bounded queues; bound each record as well as their count.
+    // Internal bridge envelopes use their own independent transport budget.
+    if !is_bypass && (matches!(&registration.tx, UiSender::Bounded(_)) || registration.forward_plain.is_some())
+        && serde_json::to_vec(record).map_or(true, |bytes| bytes.len() > 262_144)
+    {
+        cancel_ui_request(shared, id, method);
+        return;
+    }
     let sent = if let Some(forward) = &registration.forward_plain {
         if !is_bypass { forward.try_send(request).is_ok() } else {
             match &registration.tx {

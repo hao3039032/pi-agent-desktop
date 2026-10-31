@@ -17,13 +17,40 @@ struct Pending {
 #[derive(Default)]
 pub(crate) struct SessionUi {
     pending: VecDeque<Pending>,
+    statuses: Vec<Value>,
+    widgets: Vec<Value>,
 }
 
 impl SessionUi {
     pub fn insert(&mut self, mut record: Value) -> (Option<Value>, Option<(String, String)>) {
         let Some(child_id) = record.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) else { return (None, None) };
         let Some(method) = record.get("method").and_then(Value::as_str) else { return (None, None) };
-        if !matches!(method, "confirm" | "select" | "input" | "editor") { return (Some(record), None) }
+        if !matches!(method, "confirm" | "select" | "input" | "editor") {
+            match method {
+                "setStatus" => {
+                    if let Some(key) = record.get("statusKey").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 256) {
+                        let text = record.get("statusText");
+                        if text.is_none() || text.is_some_and(Value::is_null) {
+                            update_keyed(&mut self.statuses, key, None);
+                        } else if let Some(text) = text.and_then(Value::as_str).filter(|s| s.len() <= 65_536) {
+                            update_keyed(&mut self.statuses, key, Some(json!({"key":key,"text":text})));
+                        }
+                    }
+                }
+                "setWidget" => {
+                    if let Some(key) = record.get("widgetKey").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 256) {
+                        let raw_lines = record.get("widgetLines");
+                        if raw_lines.is_none() || raw_lines.is_some_and(Value::is_null) {
+                            update_keyed(&mut self.widgets, key, None);
+                        } else if let Some(lines) = raw_lines.and_then(Value::as_array).filter(|lines| lines.len() <= 512 && lines.iter().all(|v| v.as_str().is_some()) && lines.iter().filter_map(Value::as_str).map(str::len).sum::<usize>() <= 131_072) {
+                            update_keyed(&mut self.widgets, key, Some(json!({"key":key,"lines":lines,"placement":record.get("widgetPlacement").and_then(Value::as_str).filter(|v| *v == "belowEditor").unwrap_or("aboveEditor")})));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return (Some(record), None)
+        }
         let child_id = child_id.to_owned();
         let method = method.to_owned();
         // Duplicate child ids cannot be safely correlated; cancel the newcomer.
@@ -42,6 +69,8 @@ impl SessionUi {
         (Some(record), evicted)
     }
 
+    pub fn statuses(&self) -> Vec<Value> { self.statuses.clone() }
+    pub fn widgets(&self) -> Vec<Value> { self.widgets.clone() }
     pub fn records(&self) -> Vec<Value> { self.pending.iter().map(|p| p.record.clone()).collect() }
     pub fn ids(&self) -> Vec<String> { self.pending.iter().filter_map(|p| p.record["id"].as_str().map(str::to_owned)).collect() }
 
@@ -78,9 +107,31 @@ impl SessionUi {
     pub fn drain(&mut self) -> Vec<String> { self.pending.drain(..).map(|p| p.child_id).collect() }
 }
 
+fn update_keyed(items: &mut Vec<Value>, key: &str, value: Option<Value>) {
+    if let Some(index) = items.iter().position(|item| item["key"] == key) {
+        if let Some(value) = value { items[index] = value; } else { items.remove(index); }
+    } else if let Some(value) = value {
+        if items.len() == LIMIT { items.remove(0); }
+        items.push(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_and_widget_snapshots_follow_updates_and_removals() {
+        let mut ui = SessionUi::default();
+        ui.insert(json!({"id":"1","method":"setStatus","statusKey":"ext","statusText":"ready"}));
+        ui.insert(json!({"id":"2","method":"setWidget","widgetKey":"panel","widgetLines":["a"],"widgetPlacement":"belowEditor"}));
+        assert_eq!(ui.statuses(), vec![json!({"key":"ext","text":"ready"})]);
+        assert_eq!(ui.widgets(), vec![json!({"key":"panel","lines":["a"],"placement":"belowEditor"})]);
+        ui.insert(json!({"id":"3","method":"setStatus","statusKey":"ext"}));
+        ui.insert(json!({"id":"4","method":"setWidget","widgetKey":"panel"}));
+        assert!(ui.statuses().is_empty());
+        assert!(ui.widgets().is_empty());
+    }
+
     #[test]
     fn timeout_and_capacity_cancel_the_oldest() {
         let mut ui = SessionUi::default();

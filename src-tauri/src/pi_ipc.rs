@@ -2655,6 +2655,7 @@ fn session_view_dispatch(
                         "tokens": usage.get("tokens").cloned().unwrap_or(Value::Null),
                     }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
+                let (extension_statuses, extension_widgets) = session.extension_ui_state();
                 let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
@@ -2699,8 +2700,8 @@ fn session_view_dispatch(
                     // unfixed list keeps it honest).
                     "systemPrompt": "",
                     "systemPromptStatus": "none",
-                    "extensionStatuses": [],
-                    "extensionWidgets": [],
+                    "extensionStatuses": extension_statuses,
+                    "extensionWidgets": extension_widgets,
                 });
                 return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
             }
@@ -3988,6 +3989,8 @@ mod tests {
         let output = dir.path().join("answer");
         std::fs::write(&ext, format!(r#"import {{ writeFileSync }} from 'node:fs';
 export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_, ctx) => {{
+  ctx.ui.setStatus('fixture', 'ready');
+  ctx.ui.setWidget('fixture-widget', ['fixture line'], {{ placement: 'belowEditor' }});
   const answer = await ctx.ui.confirm('Allow?', 'fixture');
   writeFileSync({:?}, JSON.stringify(answer));
 }} }});"#, output.to_string_lossy())).unwrap();
@@ -4010,6 +4013,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             if event["method"] == "confirm" { break event }
         };
         let request_id = event["id"].as_str().unwrap();
+        let view = send(&state, json!({"v":1,"id":"view","op":"sessions.state","args":{"session":id}}));
+        assert_eq!(view["data"]["state"]["extensionStatuses"], json!([{"key":"fixture","text":"ready"}]));
+        assert_eq!(view["data"]["state"]["extensionWidgets"], json!([{"key":"fixture-widget","lines":["fixture line"],"placement":"belowEditor"}]));
         let reply = send(&state, json!({"v":1,"id":"reply","op":"agent.respondUi","args":{
             "session":id,"type":"extension_ui_response","id":request_id,"confirmed":false
         }}));
