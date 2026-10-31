@@ -79,11 +79,21 @@ pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &
             Some(Value::String(value)) => Some(PathBuf::from(value)),
             _ => return Err(error("not_supported", "Cannot verify a parent session path.")),
         };
-        let second = bounded_line(&mut reader, 256 * 1024)?;
-        let subagent_parent = match second.as_ref().filter(|entry| entry.get("type").and_then(Value::as_str) == Some("custom") && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent")) {
-            Some(entry) => Some(entry.pointer("/data/parentSessionId").and_then(Value::as_str).ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))?.to_string()),
-            None => None,
-        };
+        // The metadata may appear anywhere in the transcript, not just after
+        // the header. A malformed or oversized entry makes absence unprovable.
+        let mut subagent_parent = None;
+        while let Some(entry) = bounded_line(&mut reader, 16 * 1024 * 1024)? {
+            if entry.get("type").and_then(Value::as_str) == Some("custom")
+                && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent")
+            {
+                let parent = entry.pointer("/data/parentSessionId").and_then(Value::as_str)
+                    .ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))?;
+                if subagent_parent.is_some() {
+                    return Err(error("not_supported", "Cannot verify duplicate subagent metadata."));
+                }
+                subagent_parent = Some(parent.to_string());
+            }
+        }
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
             if subagent_parent.is_some() { return Err(error("not_supported", "Subagent deletion requires the full cascade operation.")); }
@@ -178,9 +188,21 @@ mod tests {
         let child = session(&root, "sub", None);
         let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target"}});
         use std::io::Write;
-        writeln!(std::fs::OpenOptions::new().append(true).open(&child).unwrap(), "{marker}").unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&child).unwrap();
+        writeln!(file, "{}", json!({"type":"model_change","provider":"fixture","modelId":"fixture"})).unwrap();
+        writeln!(file, "{marker}").unwrap();
         assert_eq!(delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
         assert!(target.exists() && child.exists() && chat.join("kept.txt").exists());
+    }
+    #[test]
+    fn malformed_transcript_cannot_prove_absence_of_subagents() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let other = session(&root, "other", None);
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&other).unwrap(), "{{broken").unwrap();
+        assert_eq!(delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(target.exists() && other.exists());
     }
     #[test]
     fn malformed_or_duplicate_metadata_never_deletes() {
