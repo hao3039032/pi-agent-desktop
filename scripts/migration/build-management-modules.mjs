@@ -85,6 +85,8 @@ export {
   refreshProviderCatalogs,
   queryProviderUsageReport,
 } from "${ROOT}/lib/models-extras-service.server.ts";
+export { loadSkillsWithInstallInfo } from "${ROOT}/lib/skills-service.ts";
+export { setVisibleSkillsDisabled } from "${ROOT}/lib/skills-management.server.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
