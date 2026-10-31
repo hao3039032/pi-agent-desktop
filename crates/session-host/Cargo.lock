@@ -274,6 +274,7 @@ dependencies = [
  "base64",
  "pi-host",
  "serde_json",
+ "session-host",
  "sha2",
  "tempfile",
  "uuid",

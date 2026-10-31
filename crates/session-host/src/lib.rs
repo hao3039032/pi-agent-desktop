@@ -213,6 +213,13 @@ pub struct Session {
     /// must not drop queued messages; the Next registry survived wrapper
     /// eviction the same way).
     pub composer_outbox: Arc<composer_outbox::ComposerOutbox>,
+    /// The delivery-generation this Session's drain claims under: captured
+    /// from the outbox at spawn, fenced off by
+    /// [`ComposerOutbox::invalidate_delivery_generation`] the moment this
+    /// session leaves the registry (removal/replacement/eviction) — a drain
+    /// parked between its alive-check and its claim must never take the
+    /// replacement's queue (Terra round-4).
+    pub(crate) composer_generation: u64,
     /// One drain at a time (the wrapper's `delivering` flag).
     composer_delivering: Mutex<bool>,
     /// Notified when a run settles (prompt waits) or the child exits.
@@ -513,18 +520,24 @@ impl Session {
         exit
     }
 
-    /// Test seam: shorten the lease to force the idle path deterministically.
+    /// Test seam (`test-seams` feature — this crate's own test builds only;
+    /// release builds never compile it): shorten the lease to force the
+    /// idle path deterministically.
+    #[cfg(feature = "test-seams")]
     pub fn state_for_tests_set_lease(&self, remaining: Duration) {
         self.state.lock().unwrap().lease_until = Instant::now() + remaining;
     }
 
-    /// Test seam: whether the child process exited.
+    /// Test seam (`test-seams` feature): whether the child process exited.
+    #[cfg(feature = "test-seams")]
     pub fn client_has_exited_for_tests(&self) -> bool {
         self.client.has_exited()
     }
 
-    /// Test seam: SIGKILL the child (deterministically reproducing a child
-    /// crash while a delivery or settle waiter is in flight).
+    /// Test seam (`test-seams` feature — this crate's own test builds only):
+    /// SIGKILL the child (deterministically reproducing a child crash while
+    /// a delivery or settle waiter is in flight).
+    #[cfg(feature = "test-seams")]
     pub fn client_kill_for_tests(&self) {
         self.client.kill();
     }
@@ -713,9 +726,14 @@ impl SessionRegistry {
             .cloned()
     }
 
-    /// Detach and shut a session down; returns its exit code.
+    /// Detach and shut a session down; returns its exit code. The fence is
+    /// raised BEFORE the shutdown: the moment the id leaves the registry,
+    /// every outstanding claim right of this session's drain is gone —
+    /// wherever that drain is parked — so it cannot wake into the queue the
+    /// next owner (or the user) holds (Terra round-4).
     pub fn remove(&self, id: &str, grace: Duration) -> Option<Option<i32>> {
         let session = self.sessions.lock().unwrap().remove(id)?;
+        self.composer_outbox_for(id).invalidate_delivery_generation();
         let exit = session.shutdown(grace);
         // The session left the registry: it is out of the running set
         // whatever the child's state was — record the transition so a
@@ -945,6 +963,10 @@ fn spawn_session(
     // Ownership here keeps the subscription alive exactly as long as the
     // fan thread lives, which ends when the child's transport closes.
     let (events, subscription) = client.on_event();
+    // The drain's delivery generation: whatever the outbox accepts NOW (a
+    // resumed id inherits the queue an evicted child left behind — and the
+    // generation its removal raised: the old child's drain is fenced).
+    let composer_generation = composer_outbox.generation();
     let state = Arc::new(Session {
         id: id.to_string(),
         session_file_id: session_file_id.to_string(),
@@ -961,6 +983,7 @@ fn spawn_session(
         epoch: AtomicU64::new(1),
         machine: Mutex::new(crate::machine::SessionMachine::new(session_file_id)),
         composer_outbox,
+        composer_generation,
         composer_delivering: Mutex::new(false),
         settle_cv: std::sync::Condvar::new(),
         running_signal,

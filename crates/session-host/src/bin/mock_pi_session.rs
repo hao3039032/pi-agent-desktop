@@ -14,6 +14,13 @@
 //!   (`{"commands":[{name,source,sourceInfo:{path}}, ...]}`);
 //! - `--mock-prompt-hold`            `prompt` blocks until a
 //!   `release_prompt` record arrives on stdin;
+//! - `--mock-prompt-hold-past-eof`   like `--mock-prompt-hold`, but the hold
+//!   SURVIVES stdin EOF (sleeping through the EOF reads until the host's
+//!   grace kill takes the child down): a replacement's `close(grace)` then
+//!   delays the held delivery's failure to the kill, giving the
+//!   interleaving tests a deterministic window in which the NEW session
+//!   starts and queues its own items before the old drain's in-flight
+//!   RESULT lands.
 //! - `--mock-prompt-events <b64l>`   base64 JSONL records emitted before
 //!   each prompt response (agent_start / message_update / agent_settled …);
 //! - `--mock-prompt-disposition <d>` the prompt response's disposition
@@ -52,6 +59,7 @@ struct Config {
     session_id: String,
     commands: serde_json::Value,
     prompt_hold: bool,
+    prompt_hold_past_eof: bool,
     prompt_events: Vec<serde_json::Value>,
     prompt_disposition: String,
     prompt_log: Option<std::path::PathBuf>,
@@ -62,6 +70,7 @@ fn parse_args() -> Config {
         session_id: "mock-session-id".into(),
         commands: serde_json::json!({ "commands": [] }),
         prompt_hold: false,
+        prompt_hold_past_eof: false,
         prompt_events: Vec::new(),
         prompt_disposition: "started".into(),
         prompt_log: None,
@@ -82,6 +91,10 @@ fn parse_args() -> Config {
                 }
             }
             "--mock-prompt-hold" => config.prompt_hold = true,
+            "--mock-prompt-hold-past-eof" => {
+                config.prompt_hold = true;
+                config.prompt_hold_past_eof = true;
+            }
             "--mock-prompt-events" => {
                 if let Some(value) = args.next() {
                     for line in String::from_utf8_lossy(&b64_decode(&value)).lines() {
@@ -174,7 +187,22 @@ fn main() {
                             loop {
                                 held.clear();
                                 match reader.read_until(b'\n', &mut held) {
-                                    Ok(0) => return,
+                                    Ok(0) => {
+                                        // EOF: the host began the orderly
+                                        // shutdown. A plain hold ends here
+                                        // (the delivery fails at once); the
+                                        // past-eof hold keeps sleeping
+                                        // through it so only the grace KILL
+                                        // ends the child — the failure of
+                                        // the held delivery is then delayed
+                                        // to the kill, after the grace
+                                        // window the test relies on.
+                                        if !config.prompt_hold_past_eof {
+                                            return;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                        continue;
+                                    }
                                     Ok(_) => {
                                         if held.last() == Some(&b'\n') {
                                             held.pop();

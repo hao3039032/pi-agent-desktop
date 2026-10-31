@@ -64,6 +64,16 @@ struct OutboxState {
     /// the items beside it.
     version: u64,
     paused: bool,
+    /// The delivery-generation fence (Terra round-4): bumped every time the
+    /// session that owned this outbox is removed from the registry. A drain
+    /// claims with the generation its Session captured at spawn; a claim
+    /// under a stale generation is refused under the SAME lock — a replaced
+    /// session's drain that wakes between its alive-check and its claim
+    /// must never consume or pause the queue the replacement now owns.
+    /// (The fence only gates CLAIMS: an item the old drain already claimed
+    /// is in flight, and its outcome — parked unknown — still lands here,
+    /// because losing it would be worse than pausing for it.)
+    generation: u64,
 }
 
 impl OutboxState {
@@ -186,17 +196,47 @@ impl ComposerOutbox {
         !state.paused && !state.front_is_unknown_locked() && !state.items.is_empty()
     }
 
+    /// The delivery generation this outbox currently accepts claims from
+    /// (a Session captures it at spawn).
+    pub fn generation(&self) -> u64 {
+        self.state.lock().unwrap().generation
+    }
+
+    /// Fence every outstanding claim: the session that owned this outbox
+    /// left the registry (removal/replacement/eviction), so its drain —
+    /// wherever it is parked — may no longer claim from the queue the next
+    /// owner (or the user) now holds.
+    pub fn invalidate_delivery_generation(&self) {
+        self.state.lock().unwrap().generation += 1;
+    }
+
+    /// Whether `generation` may still claim and deliver: the fence matches
+    /// AND the front is deliverable. The wake's pre-check and the drain's
+    /// exit re-check both route through here so a stale session never even
+    /// spawns a drain (and a stale drain never stays the deliverer).
+    pub fn may_deliver(&self, generation: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        state.generation == generation && !state.paused && !state.front_is_unknown_locked() && !state.items.is_empty()
+    }
+
     /// Atomically decide "the front is deliverable" and claim it: ONE lock
-    /// covers the paused check, the unknown-front check and the pop. The
-    /// check and the claim must not be separable: between a check under one
-    /// acquisition and a `pop` under another, a concurrent `send_now` whose
-    /// outcome turned UNKNOWN can `park_unknown` a item at the front — a
-    /// plain `pop_front` would then remove the UNKNOWN item and deliver it,
-    /// re-executing a prompt that may already be running, without the
-    /// user's explicit confirmation (Terra P1-2).
-    pub fn claim_front_for_delivery(&self) -> Option<PendingComposerMessage> {
+    /// covers the generation fence, the paused check, the unknown-front
+    /// check and the pop. The check and the claim must not be separable:
+    /// between a check under one acquisition and a `pop` under another, a
+    /// concurrent `send_now` whose outcome turned UNKNOWN can
+    /// `park_unknown` a item at the front — a plain `pop_front` would then
+    /// remove the UNKNOWN item and deliver it, re-executing a prompt that
+    /// may already be running, without the user's explicit confirmation
+    /// (Terra P1-2) — and a drain whose session was replaced meanwhile
+    /// would steal the replacement's queue (Terra round-4: the fence rides
+    /// the same decision).
+    pub fn claim_front_for_delivery(&self, generation: u64) -> Option<PendingComposerMessage> {
         let mut state = self.state.lock().unwrap();
-        if state.paused || state.front_is_unknown_locked() || state.items.is_empty() {
+        if state.generation != generation
+            || state.paused
+            || state.front_is_unknown_locked()
+            || state.items.is_empty()
+        {
             return None;
         }
         let item = state.items.remove(0);
@@ -356,7 +396,7 @@ impl Session {
     /// strand its item (the JS original closed this race by being
     /// single-threaded — `drain`'s `finally { this.wake() }`).
     pub fn composer_wake(self: &Arc<Self>) {
-        if !self.composer_outbox.has_deliverable_front() {
+        if !self.composer_outbox.may_deliver(self.composer_generation) {
             return;
         }
         let session = Arc::clone(self);
@@ -389,10 +429,26 @@ impl Session {
                 // that lands while this thread is at the barrier (or anywhere
                 // else) pauses the queue or marks the front unknown, and the
                 // claim answers None — an unknown outcome is never popped and
-                // delivered by the drain (Terra P1-2).
-                let Some(item) = self.composer_outbox.claim_front_for_delivery() else { break };
+                // delivered by the drain (Terra P1-2). The generation in the
+                // same call fences this drain once its session was replaced:
+                // a drain parked between its alive-check and its claim must
+                // not take the replacement's queue (Terra round-4).
+                let Some(item) = self
+                    .composer_outbox
+                    .claim_front_for_delivery(self.composer_generation)
+                else {
+                    break;
+                };
                 self.emit_composer_update();
                 if let Err(error) = self.deliver_composer(&item, "followUp") {
+                    // The delivery's result is about to land on the shared
+                    // outbox (restore or park) — the deterministic seam for
+                    // the replacement interleavings: a drain whose child died
+                    // mid-delivery reaches this point AFTER the replacement
+                    // session has started (the fence already refuses its
+                    // CLAIMS; the in-flight item's result must still land,
+                    // never be lost).
+                    self.drain_barrier("result");
                     match error.kind {
                         pi_host::ErrorKind::Command | pi_host::ErrorKind::Spawn
                         | pi_host::ErrorKind::Invalid | pi_host::ErrorKind::Closing => {
@@ -416,7 +472,7 @@ impl Session {
             {
                 let mut delivering = self.composer_delivering.lock().unwrap();
                 *delivering = false;
-                if self.composer_outbox.has_deliverable_front()
+                if self.composer_outbox.may_deliver(self.composer_generation)
                     && !self.run_state().is_running()
                     && !self.client.has_exited()
                 {
@@ -433,10 +489,18 @@ impl Session {
     /// `<dir>/<point>.reached` and waits for `<dir>/<point>.release`
     /// (bounded; a missing or late release never wedges the drain). Points:
     /// `claim` (immediately before the atomic claim — where a concurrent
-    /// `park_unknown` must be observed) and `exit` (the exit window between
-    /// the last deliverability check and clearing the delivering flag).
-    /// Inert without the env var: no production path sets it, and the
-    /// id/point match keeps parallel tests on other sessions unaffected.
+    /// `park_unknown` must be observed), `exit` (the exit window between
+    /// the last deliverability check and clearing the delivering flag) and
+    /// `result` (after a delivery failed, immediately before its result is
+    /// written to the shared outbox — the replacement interleavings).
+    ///
+    /// TEST-SEAM ONLY (`test-seams` feature): the env-reading, file-writing,
+    /// 30-second-waiting body exists solely in this crate's own test builds
+    /// (the self dev-dependency enables the feature); release and dependent
+    /// builds compile the no-op below — an inherited `PI_COMPOSER_DRAIN_BARRIER`
+    /// can never stall a shipped host (Terra round-4). The id/point match
+    /// keeps parallel tests on other sessions unaffected.
+    #[cfg(feature = "test-seams")]
     fn drain_barrier(&self, point: &str) {
         let Ok(spec) = std::env::var("PI_COMPOSER_DRAIN_BARRIER") else { return };
         let mut parts = spec.splitn(3, ':');
@@ -459,6 +523,12 @@ impl Session {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+
+    /// The release-build body of the test seam: nothing. (See the
+    /// `test-seams` twin above for the contract this stands in for.)
+    #[cfg(not(feature = "test-seams"))]
+    #[inline]
+    fn drain_barrier(&self, _point: &str) {}
 }
 
 #[cfg(test)]
@@ -525,7 +595,7 @@ mod tests {
         // exercised end-to-end against the real drain in
         // `the_drain_never_claims_an_item_parked_unknown_in_the_check_window`.
         assert!(outbox.front_is_unknown());
-        assert!(outbox.claim_front_for_delivery().is_none(), "the claim refuses the unknown front");
+        assert!(outbox.claim_front_for_delivery(outbox.generation()).is_none(), "the claim refuses the unknown front");
         let (items_after, _) = outbox.snapshot();
         assert_eq!(items_after.len(), 2, "the refused claim changed nothing");
     }
@@ -544,7 +614,7 @@ mod tests {
         outbox.restore_front(a.clone());
         assert!(outbox.is_paused());
         let (_, version) = outbox.snapshot();
-        assert!(outbox.claim_front_for_delivery().is_none(), "paused refuses the claim");
+        assert!(outbox.claim_front_for_delivery(outbox.generation()).is_none(), "paused refuses the claim");
         let (items, version_after) = outbox.snapshot();
         assert_eq!(items.len(), 1, "the refused claim did not touch the items");
         assert_eq!(version_after, version, "the refused claim did not bump the version");
@@ -554,7 +624,7 @@ mod tests {
         let taken = outbox.take(&a.id).expect("resolve the refusal");
         outbox.park_unknown(taken);
         assert!(outbox.is_paused());
-        assert!(outbox.claim_front_for_delivery().is_none(), "an unknown front refuses the claim");
+        assert!(outbox.claim_front_for_delivery(outbox.generation()).is_none(), "an unknown front refuses the claim");
         assert!(outbox.has_items(), "the refused claim kept the item");
 
         // Deliverable: claimed (removed) under the same decision, with the
@@ -562,11 +632,53 @@ mod tests {
         let front = outbox.snapshot().0.first().and_then(|item| item.get("id")).and_then(|id| id.as_str()).map(str::to_string).expect("front id");
         outbox.take(&front).expect("resolve the barrier");
         let b = outbox.enqueue("B", None).expect("B");
-        let claimed = outbox.claim_front_for_delivery().expect("a deliverable front is claimed");
+        let claimed = outbox.claim_front_for_delivery(outbox.generation()).expect("a deliverable front is claimed");
         assert_eq!(claimed.id, b.id);
         assert!(!outbox.has_items(), "the claim removed the item");
         assert!(!outbox.has_deliverable_front());
-        assert!(outbox.claim_front_for_delivery().is_none(), "an empty queue refuses the claim");
+        assert!(outbox.claim_front_for_delivery(outbox.generation()).is_none(), "an empty queue refuses the claim");
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_claim_the_replacements_queue() {
+        // Terra round-4: the fence. A drain whose session was replaced holds
+        // a generation the outbox no longer accepts — its claim is refused
+        // under the SAME lock (no item taken, no version bump), and the
+        // replacement's own generation still claims. The parked-unknown and
+        // restore paths stay open to it (an in-flight item must not be
+        // lost) — only CLAIMS are fenced.
+        let outbox = ComposerOutbox::new();
+        let stale = outbox.generation();
+        outbox.enqueue("A", None).expect("A queued for the replacement");
+
+        // The replacement happens: the fence bumps, the old generation is
+        // stale, and a drain parked between its alive-check and its claim
+        // arrives here with the OLD generation.
+        outbox.invalidate_delivery_generation();
+        assert_ne!(outbox.generation(), stale, "the fence moved");
+        assert!(!outbox.may_deliver(stale), "the stale drain may not deliver");
+        let (_, version) = outbox.snapshot();
+        assert!(
+            outbox.claim_front_for_delivery(stale).is_none(),
+            "the stale claim is refused"
+        );
+        let (items, version_after) = outbox.snapshot();
+        assert_eq!(items.len(), 1, "the refused stale claim took nothing");
+        assert_eq!(version_after, version, "the refused stale claim changed nothing");
+
+        // The replacement's session claims with the CURRENT generation.
+        assert!(outbox.may_deliver(outbox.generation()));
+        let claimed = outbox
+            .claim_front_for_delivery(outbox.generation())
+            .expect("the current generation claims");
+        assert_eq!(claimed.message, "A");
+
+        // The fence does not close the in-flight paths: the old drain's
+        // claimed-but-unknown item still parks here (visible, paused, never
+        // silently dropped).
+        outbox.park_unknown(claimed);
+        assert!(outbox.front_is_unknown());
+        assert!(outbox.is_paused());
     }
 
     #[test]

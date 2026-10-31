@@ -841,10 +841,13 @@ fn real_pi_chat_session_registers_its_policy_command() {
 // ---------------------------------------------------------------------------
 // Terra round-3 P1-2 / P1-3 / lifecycle-fence regressions: the atomic claim,
 // the take's own wake, the drain's exit window, and the replaced session's
-// in-flight drain. The two barrier tests drive the REAL drain thread through
+// in-flight drain. The barrier tests drive the REAL drain thread through
 // the deterministic-interleaving seam (`PI_COMPOSER_DRAIN_BARRIER`); the env
 // is process-global, so every barrier test holds this mutex and names its
 // own session id (other tests' drains are inert — the id never matches).
+// The seam is compiled ONLY in this crate's own test builds (the
+// `test-seams` feature via the self dev-dependency): a release host has no
+// env-reading barrier at all (Terra round-4).
 // ---------------------------------------------------------------------------
 
 static BARRIER_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1140,6 +1143,366 @@ fn a_replaced_sessions_inflight_drain_only_parks_its_own_item() {
     wait_for_outbox_empty(&second, Duration::from_secs(10), "A never reached the replacement child");
     assert_eq!(log_lines(&log_old), vec!["A".to_string()], "the old child saw A exactly once");
     assert_eq!(log_lines(&log_new), vec!["A".to_string()], "the new child saw A exactly once");
+    registry.remove(&id, Duration::from_secs(5));
+}
+
+/// Terra round-4 (the reviewer's exact window): an old drain parked between
+/// its ALIVE-CHECK and its CLAIM while the session is replaced underneath
+/// it. The replacement owns the shared outbox now; the new session queues
+/// its own item; the released old drain must claim NOTHING and must not
+/// pause or modify the new queue — only the generation fence in the claim
+/// (and the exit re-check) answers that, because the old child is already
+/// dead, so a naive claim would fail its delivery and park the new queue's
+/// item as outcome-unknown.
+#[test]
+fn an_old_drain_parked_before_its_claim_never_touches_the_replacements_queue() {
+    let _guard = BARRIER_ENV.lock().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, _) = create_session_file(&sessions, &cwd).expect("create");
+
+    let id = "fence-claim-window-1".to_string();
+    let barrier = dir.path().join("barrier");
+    std::fs::create_dir_all(&barrier).expect("barrier dir");
+    let log_old = dir.path().join("old.log");
+    let log_new = dir.path().join("new.log");
+    std::env::set_var(
+        "PI_COMPOSER_DRAIN_BARRIER",
+        format!("{}:claim:{}", id, barrier.display()),
+    );
+
+    let events = b64(&serde_json::json!([
+        { "type": "agent_start" },
+        { "type": "agent_settled" },
+    ]));
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    // Child #1 never needs to hold anything: the drain parks BEFORE the
+    // claim, so no prompt can reach it.
+    let config_old = mock_config(&agent_dir, &[
+        "--mock-session-id", &id,
+        "--mock-commands", &commands,
+        "--mock-prompt-events", &events,
+        "--mock-prompt-log", log_old.to_string_lossy().as_ref(),
+    ]);
+    let registry = SessionRegistry::new();
+    let first = registry.start(&id, &file, &id, &cwd, &config_old).expect("first session");
+
+    // A's wake sends the OLD drain through its alive-check and into the
+    // claim barrier — A stays in the queue, unclaimed.
+    first.composer_enqueue("A", None).expect("enqueue A");
+    wait_for_file(&barrier.join("claim.reached"), Duration::from_secs(5));
+    assert!(first.composer_outbox.has_items(), "A is still queued (the drain is parked before its claim)");
+
+    // The replacement: the lease expires, the next start fences the old
+    // drain's generation and kills the old child BEFORE the new one spawns.
+    first.state_for_tests_set_lease(Duration::from_secs(0));
+    let config_new = mock_config(&agent_dir, &[
+        "--mock-session-id", &id,
+        "--mock-commands", &commands,
+        "--mock-prompt-events", &events,
+        "--mock-prompt-log", log_new.to_string_lossy().as_ref(),
+    ]);
+    let second = registry.start(&id, &file, &id, &cwd, &config_new).expect("replacement session");
+    assert!(!Arc::ptr_eq(&first, &second), "the session was replaced");
+
+    // The NEW session queues its own item. Its drain parks at the same
+    // claim barrier (the id matches); both drains wait on the one release.
+    second.composer_enqueue("B", None).expect("enqueue B on the replacement");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Release BOTH drains at once: the replacement's drain must take the
+    // queue (A then B, to the NEW child); the old drain's claim is fenced.
+    std::fs::write(barrier.join("claim.release"), b"1\n").expect("release");
+    wait_for_outbox_empty(&second, Duration::from_secs(10), "the replacement never drained its queue");
+
+    assert!(
+        log_lines(&log_old).is_empty(),
+        "the old child saw no prompt at all: {:?}",
+        log_lines(&log_old)
+    );
+    assert_eq!(
+        log_lines(&log_new),
+        vec!["A".to_string(), "B".to_string()],
+        "the replacement delivered exactly A then B, once each"
+    );
+    let (items, _) = second.composer_outbox.snapshot();
+    assert!(items.is_empty());
+    assert!(!second.composer_outbox.is_paused(), "the old drain did not pause the new queue");
+    assert!(!second.composer_outbox.front_is_unknown(), "no item was parked unknown by the old drain");
+
+    std::env::remove_var("PI_COMPOSER_DRAIN_BARRIER");
+    registry.remove(&id, Duration::from_secs(5));
+}
+
+/// Terra round-4 (the second required interleaving): the old drain's
+/// in-flight RESULT lands on the shared outbox AFTER the replacement
+/// session started and queued its own item. The `result` barrier holds the
+/// old drain between its delivery failure and the write, so the ordering is
+/// deterministic: the replacement's queue holds B when the old item parks.
+/// The park must PRESERVE everything — A lands at the front as
+/// outcome-unknown (visible, never auto-redelivered, never delivered to the
+/// new child), B stays behind it, and the user resolving A lets B deliver to
+/// the replacement exactly once.
+#[test]
+fn an_old_drains_inflight_result_lands_after_the_replacement_queued_its_own_item() {
+    let _guard = BARRIER_ENV.lock().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, _) = create_session_file(&sessions, &cwd).expect("create");
+
+    let id = "fence-result-late-1".to_string();
+    let barrier = dir.path().join("barrier");
+    std::fs::create_dir_all(&barrier).expect("barrier dir");
+    let log_old = dir.path().join("old.log");
+    let log_new = dir.path().join("new.log");
+    std::env::set_var(
+        "PI_COMPOSER_DRAIN_BARRIER",
+        format!("{}:result:{}", id, barrier.display()),
+    );
+
+    let events = b64(&serde_json::json!([
+        { "type": "agent_start" },
+        { "type": "agent_settled" },
+    ]));
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    // Child #1 HOLDS the prompt: the old drain stays in-flight mid-delivery.
+    let config_old = mock_config(&agent_dir, &[
+        "--mock-session-id", &id,
+        "--mock-commands", &commands,
+        "--mock-prompt-hold",
+        "--mock-prompt-events", &events,
+        "--mock-prompt-log", log_old.to_string_lossy().as_ref(),
+    ]);
+    let registry = SessionRegistry::new();
+    let first = registry.start(&id, &file, &id, &cwd, &config_old).expect("first session");
+
+    // The old drain claims A and blocks inside the held delivery.
+    first.composer_enqueue("A", None).expect("enqueue A");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while log_lines(&log_old) != vec!["A".to_string()] {
+        assert!(std::time::Instant::now() < deadline, "the old drain never claimed A");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The replacement: the fence rises, child #1 dies (EOF), the held
+    // delivery fails, and the old drain parks at the RESULT barrier — its
+    // write to the shared outbox is now held AFTER the replacement exists.
+    first.state_for_tests_set_lease(Duration::from_secs(0));
+    let config_new = mock_config(&agent_dir, &[
+        "--mock-session-id", &id,
+        "--mock-commands", &commands,
+        "--mock-prompt-hold",
+        "--mock-prompt-events", &events,
+        "--mock-prompt-log", log_new.to_string_lossy().as_ref(),
+    ]);
+    let second = registry.start(&id, &file, &id, &cwd, &config_new).expect("replacement session");
+    wait_for_file(&barrier.join("result.reached"), Duration::from_secs(10));
+
+    // The replacement queues and delivers ITS OWN item W (held mid-delivery
+    // by child #2 — the delivering flag stays busy)…
+    second.composer_enqueue("W", None).expect("enqueue W");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while log_lines(&log_new) != vec!["W".to_string()] {
+        assert!(std::time::Instant::now() < deadline, "the replacement never claimed W");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // …and B behind it, which must STAY queued (the delivery of W holds the
+    // delivering flag; B's wake finds it busy and returns).
+    second.composer_enqueue("B", None).expect("enqueue B");
+    std::thread::sleep(Duration::from_millis(200));
+    let (items, _) = second.composer_outbox.snapshot();
+    assert_eq!(items.len(), 1, "only B is queued: {items:?}");
+    assert_eq!(items[0]["message"], serde_json::json!("B"));
+
+    // NOW the old drain's result lands: A parks at the FRONT, the queue
+    // pauses — B is preserved behind the unknown barrier, nothing is lost.
+    std::fs::write(barrier.join("result.release"), b"1\n").expect("release the result barrier");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (items, _) = second.composer_outbox.snapshot();
+        let parked = items.len() == 2
+            && items[0]["message"] == serde_json::json!("A")
+            && items[0]["unknown"] == serde_json::json!(true)
+            && items[1]["message"] == serde_json::json!("B");
+        if parked {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old drain's late result never parked A: {items:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(second.composer_outbox.is_paused(), "the unknown park pauses the shared queue");
+    assert!(
+        !log_lines(&log_new).contains(&"A".to_string()),
+        "the parked A never auto-delivered to the replacement: {:?}",
+        log_lines(&log_new)
+    );
+
+    // The user resolves A (take = edit/delete, not a resend); B then
+    // delivers to the replacement exactly once (the release of W's hold
+    // settles the run; the drain's exit re-check picks B up).
+    let a_id = second
+        .composer_outbox
+        .snapshot()
+        .0
+        .first()
+        .and_then(|item| item.get("id").and_then(|id| id.as_str()))
+        .expect("the parked A's id")
+        .to_string();
+    let _ = second.composer_take(&a_id);
+    second
+        .command("release_prompt", serde_json::json!({}), Some(Duration::from_secs(10)))
+        .expect("release W");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while log_lines(&log_new) != vec!["W".to_string(), "B".to_string()] {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B never delivered to the replacement: {:?}",
+            log_lines(&log_new)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    second
+        .command("release_prompt", serde_json::json!({}), Some(Duration::from_secs(10)))
+        .expect("release B");
+    wait_for_outbox_empty(&second, Duration::from_secs(10), "the queue never settled");
+    assert!(!second.composer_outbox.is_paused());
+    assert_eq!(log_lines(&log_old), vec!["A".to_string()], "the old child saw A exactly once");
+
+    std::env::remove_var("PI_COMPOSER_DRAIN_BARRIER");
+    registry.remove(&id, Duration::from_secs(5));
+}
+
+/// The DIRECT regression for the pi-host exit-wake fix (5b48b407): a settle
+/// waiter (the drain's delivery AND an explicit send-now) must wake when the
+/// child DIES — the fan thread's exit path notifies the settle condvar. The
+/// deleted WIP test tried to assert this through send_now alone and was
+/// eaten by the drain's claim; the correct construction makes the session
+/// RUNNING first (the drain's canDeliver breaks, the queued item stays
+/// editable), records the REAL prompt count the child saw, and bounds every
+/// wait — a regression hangs nothing: the join times out and fails.
+#[test]
+fn a_child_exit_wakes_the_settle_waiters_of_every_in_flight_delivery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, id) = create_session_file(&sessions, &cwd).expect("create");
+
+    let prompt_log = dir.path().join("prompts.log");
+    // The run STARTS but never settles: agent_start without agent_settled,
+    // so the drain's delivery sits in wait_for_settle for real.
+    let events = b64(&serde_json::json!([
+        { "type": "agent_start" },
+    ]));
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&agent_dir, &[
+        "--mock-session-id", &id,
+        "--mock-commands", &commands,
+        "--mock-prompt-events", &events,
+        "--mock-prompt-log", prompt_log.to_string_lossy().as_ref(),
+    ]);
+    let registry = SessionRegistry::new();
+    let session = registry.start(&id, &file, &id, &cwd, &config).expect("session");
+
+    // A's delivery starts a run and blocks in the settle wait.
+    session.composer_enqueue("A", None).expect("enqueue A");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let delivered = log_lines(&prompt_log) == vec!["A".to_string()];
+        if delivered && session.run_state().is_running() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A never started its run: prompts={:?} running={}",
+            log_lines(&prompt_log),
+            session.run_state().is_running()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // B stays EDITABLE while the run is live (the drain's canDeliver breaks
+    // on a running session — this is what the deleted WIP test missed: its
+    // enqueue woke an IDLE drain that claimed the item out from send_now).
+    session.composer_enqueue("B", None).expect("enqueue B");
+    std::thread::sleep(Duration::from_millis(200));
+    let (items, _) = session.composer_outbox.snapshot();
+    assert_eq!(items.len(), 1, "B stays queued while the run is live: {items:?}");
+    assert_eq!(items[0]["message"], serde_json::json!("B"));
+    let b_id = items[0]["id"].as_str().expect("B's id").to_string();
+
+    // The explicit send-now delivers B as a steer and blocks in its OWN
+    // settle wait (on a helper thread — the wake under test must end it).
+    let sender = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let session = Arc::clone(&session);
+        std::thread::spawn(move || {
+            let answer = session
+                .composer_send_now(&b_id)
+                .map(|_| "delivered".to_string())
+                .unwrap_or_else(|error| format!("parked: {error}"));
+            let _ = tx.send(answer);
+        });
+        rx
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while log_lines(&prompt_log) != vec!["A".to_string(), "B".to_string()] {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the steer never reached the child: {:?}",
+            log_lines(&prompt_log)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The child dies: BOTH settle waiters (the drain on A, the send-now on
+    // B) must observe the exit at once — the fan thread's exit notify is
+    // the only wake (the settle deadline is 600 s). The BOUNDED receive is
+    // the regression assertion: without the wake it fails in 15 s instead
+    // of hanging the deadline, and the observable parks below double as
+    // the drain-side proof.
+    session.client_kill_for_tests();
+    let send_now_answer = sender
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the child exit never woke the send-now's settle wait (it would hang the 600 s deadline)");
+    assert!(
+        send_now_answer.starts_with("parked:"),
+        "the dead-child delivery reports its unknown outcome: {send_now_answer}"
+    );
+
+    // The DRAIN's waiter woke the same way: its in-flight A lands parked
+    // beside B (both unknown, the queue paused) — bounded, because a missing
+    // wake would leave it sleeping the 600 s settle deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (items, _) = session.composer_outbox.snapshot();
+        let both = items.len() == 2 && items.iter().all(|item| item["unknown"] == serde_json::json!(true));
+        if both {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the exit never woke the drain's settle wait (a 600 s hang would follow): {items:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(session.composer_outbox.is_paused(), "the unknown parks paused the queue");
+    // The REAL prompt count: exactly A then B reached the child, once each.
+    assert_eq!(log_lines(&prompt_log), vec!["A".to_string(), "B".to_string()]);
+    assert!(session.client_has_exited_for_tests(), "the child is dead");
     registry.remove(&id, Duration::from_secs(5));
 }
 

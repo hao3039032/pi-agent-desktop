@@ -22,9 +22,24 @@ serde_json = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 
+[features]
+# Test-only seams for the deterministic interleaving tests
+# (tests/lifecycle.rs): the composer drain barrier
+# (`PI_COMPOSER_DRAIN_BARRIER`) and the child kill/lease test hooks. This is
+# enabled ONLY through the self dev-dependency below, so `cargo build`
+# (and every release/binary build of a dependent, which never sees a
+# dev-dependency) does not compile the seam at all — the inherited-env
+# barrier can never be armed in a shipped host (Terra round-4).
+test-seams = []
+
 [dev-dependencies]
 sha2 = "0.10"
 tempfile = "3"
+# The feature gate for this crate's own test seams: the dev-dependency on
+# itself turns `test-seams` on for `cargo test` of THIS crate (unit and
+# integration builds) while a normal/build dependency (src-tauri) keeps it
+# off. See [features].
+session-host = { path = ".", features = ["test-seams"] }
 
 [lib]
 name = "session_host"
