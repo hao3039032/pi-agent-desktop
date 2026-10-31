@@ -184,16 +184,54 @@ function retireFlow(flowId: string, flow: LoginFlow): void {
   }
 }
 
+export interface StartLoginFlowResultStarted {
+  started: true;
+  promise: Promise<{ success: true }>;
+}
+
+export interface StartLoginFlowResultRefused {
+  started: false;
+  message: string;
+}
+
+export type StartLoginFlowResult = StartLoginFlowResultStarted | StartLoginFlowResultRefused;
+
+/** Desensitize events before reporting host-level task progress: strip tokens, URLs and query parameters. */
+function desensitizeProgress(event: OAuthLoginEvent, provider: string): Record<string, unknown> {
+  switch (event.type) {
+    case "auth":
+      return { type: "auth", provider, hasInstructions: Boolean(event.instructions) };
+    case "device_code":
+      return { type: "device_code", provider, userCode: event.userCode };
+    case "prompt_request":
+      return { type: "prompt_request", provider };
+    case "select_request":
+      return { type: "select_request", provider, optionCount: event.options.length };
+    case "progress":
+      return { type: "progress", provider, message: event.message };
+    case "success":
+      return { type: "success", provider };
+    case "error":
+      return { type: "error", provider, message: event.message };
+    case "cancelled":
+      return { type: "cancelled", provider };
+  }
+}
+
 /**
  * auth.loginStart: validate the provider and begin the flow. The flowId is
  * the HOST's (never accepted from the WebView); a duplicate id refuses.
- * The login itself runs detached — the op answers immediately and the flow's
- * events buffer until a terminal outcome (the SSE stream's whole lifetime).
+ *
+ * When an operation context (opContext) is provided from the management host,
+ * the task guard is held for the flow's real lifetime via flow.promise.
+ * opContext.signal provides cooperative task cancellation, and opContext.progress
+ * delivers desensitized progress without leaking credentials or tokens.
  */
 export async function startLoginFlow(
   flowId: string,
   provider: string,
-): Promise<{ started: true } | { started: false; message: string }> {
+  opContext?: { signal?: AbortSignal; progress?: (value: unknown) => void },
+): Promise<StartLoginFlowResult> {
   if (flows.has(flowId)) return { started: false, message: "A login flow is already running" };
   const modelRuntime = await createModelRuntimeWithExtensions();
   if (!modelRuntime.getProvider(provider)?.auth.oauth) {
@@ -217,6 +255,17 @@ export async function startLoginFlow(
   };
   flows.set(flowId, flow);
 
+  // Link cooperative task cancellation signal if provided
+  if (opContext?.signal) {
+    if (opContext.signal.aborted) {
+      cancelLoginFlow(flowId);
+    } else {
+      opContext.signal.addEventListener("abort", () => {
+        cancelLoginFlow(flowId);
+      }, { once: true });
+    }
+  }
+
   const getManualInputRequest = (): { pending: PendingPrompt; answer: Promise<string> } => {
     // One manual-code handshake reused across auth_url + manual_code (the
     // GET route's dedup: the paste panel's token answers the SDK prompt).
@@ -232,7 +281,7 @@ export async function startLoginFlow(
     return flow.pendingManual;
   };
 
-  void (async () => {
+  const promise = (async () => {
     try {
       await modelRuntime.login(provider, "oauth", {
         signal: flow.abort.signal,
@@ -240,58 +289,81 @@ export async function startLoginFlow(
           const manual = prompt.type === "manual_code";
           const minted = manual ? getManualInputRequest() : mintPrompt(flow);
           if (prompt.type === "select") {
-            enqueue(flow, {
+            const selectEvent: OAuthLoginEvent = {
               type: "select_request",
               message: prompt.message,
               options: prompt.options.map((option) => ({ id: option.id, label: option.label })),
               token: minted.pending.token,
-            });
+            };
+            enqueue(flow, selectEvent);
+            opContext?.progress?.(desensitizeProgress(selectEvent, provider));
           } else {
-            enqueue(flow, {
+            const promptEvent: OAuthLoginEvent = {
               type: "prompt_request",
               message: prompt.message,
               placeholder: prompt.placeholder ?? null,
               token: minted.pending.token,
-            });
+            };
+            enqueue(flow, promptEvent);
+            opContext?.progress?.(desensitizeProgress(promptEvent, provider));
           }
           flow.lastPolled = Date.now();
           return minted.answer;
         },
         notify: (event: AuthEvent) => {
           if (event.type === "auth_url") {
-            enqueue(flow, {
+            const authEvt: OAuthLoginEvent = {
               type: "auth",
               url: event.url,
               instructions: event.instructions ?? null,
               token: getManualInputRequest().pending.token,
-            });
+            };
+            enqueue(flow, authEvt);
+            opContext?.progress?.(desensitizeProgress(authEvt, provider));
           } else if (event.type === "device_code") {
-            enqueue(flow, {
+            const devEvt: OAuthLoginEvent = {
               type: "device_code",
               userCode: event.userCode,
               verificationUri: event.verificationUri,
               intervalSeconds: event.intervalSeconds ?? null,
               expiresInSeconds: event.expiresInSeconds ?? null,
-            });
+            };
+            enqueue(flow, devEvt);
+            opContext?.progress?.(desensitizeProgress(devEvt, provider));
           } else {
-            enqueue(flow, { type: "progress", message: event.message });
+            const progEvt: OAuthLoginEvent = { type: "progress", message: event.message };
+            enqueue(flow, progEvt);
+            opContext?.progress?.(desensitizeProgress(progEvt, provider));
           }
           flow.lastPolled = Date.now();
         },
       }, oauthLoginOptions());
+
       invalidateModelsCache();
       finishFlow(flow, { type: "success" });
+      opContext?.progress?.(desensitizeProgress({ type: "success" }, provider));
+      return { success: true as const };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      finishFlow(flow, message === "Login cancelled"
-        ? { type: "cancelled" }
-        : { type: "error", message });
+      const isCancelled = message === "Login cancelled" || flow.abort.signal.aborted || opContext?.signal?.aborted;
+      finishFlow(flow, isCancelled ? { type: "cancelled" } : { type: "error", message });
+      opContext?.progress?.(desensitizeProgress(isCancelled ? { type: "cancelled" } : { type: "error", message }, provider));
+      if (isCancelled) {
+        const err = new Error("Login cancelled");
+        (err as any).code = "cancelled";
+        throw err;
+      }
+      throw error;
     } finally {
       retireFlow(flowId, flow);
     }
   })();
 
-  return { started: true };
+  // Attach a no-op rejection sink to prevent unhandledRejection in runtimes
+  // that inspect flow.started without awaiting flow.promise.
+  promise.catch(() => {});
+
+  return { started: true, promise };
 }
 
 /**

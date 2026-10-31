@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -68,13 +68,15 @@ pub(crate) struct LoginRelayHandle {
     pub stop: Arc<AtomicBool>,
     /// The flow this relay drives (unsubscribe cancels it host-side too).
     pub flow_id: String,
+    /// The management task handle for cooperative cancellation and activity guard.
+    pub task_handle: String,
 }
 
 /// The login-stream relays by subscription id (pi_ipc's event_relays
 /// pattern, this domain's own map so the shared one stays untouched).
 #[derive(Default)]
 pub(crate) struct LoginRelays {
-    relays: Mutex<BTreeMap<String, LoginRelayHandle>>,
+    pub(crate) relays: Mutex<BTreeMap<String, LoginRelayHandle>>,
 }
 
 impl LoginRelays {
@@ -273,12 +275,34 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
                     return Some(crate::pi_ipc::protocol_ok(id, json!({ "cancelled": cancelled })));
                 }
             }
+            if let Some(task_handle) = args.get("taskHandle").and_then(Value::as_str) {
+                if !task_handle.is_empty() {
+                    let config = state.management_config.lock().unwrap().clone();
+                    if let Some(config) = config {
+                        if let Ok(instance) = state.management.instance("global", &config) {
+                            let res = instance.cancel_task(task_handle);
+                            return Some(crate::pi_ipc::protocol_ok(id, json!({ "cancelled": res.is_ok() })));
+                        }
+                    }
+                }
+            }
             let flow_id = match string_arg(args, "flowId") {
                 Ok(flow_id) => flow_id,
                 Err(message) => {
                     return Some(crate::pi_ipc::protocol_error(id, "invalid_args", &message));
                 }
             };
+            let task_handle = {
+                let relays = state.login_relays.relays.lock().unwrap();
+                relays.values().find(|h| h.flow_id == flow_id).map(|h| h.task_handle.clone())
+            };
+            if let Some(th) = task_handle {
+                if let Some(config) = state.management_config.lock().unwrap().clone() {
+                    if let Ok(instance) = state.management.instance("global", &config) {
+                        let _ = instance.cancel_task(&th);
+                    }
+                }
+            }
             Some(
                 match management_call_bounded(
                     state,
@@ -298,23 +322,28 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
 // --- the OAuth login stream (the pi_ipc_login_stream command) -------------
 
 /// The login-stream relay: polls the flow's buffered events out of the
-/// management instance and forwards each as a Channel frame. Every exit
-/// path cancels the flow (extension-side abort) unless it already ended —
-/// the unsubscribe/page-reload release the plan's stream contract requires.
+/// management instance and forwards each as a Channel frame.
+/// The task holds a real management activity guard for the flow's lifetime;
+/// unsubscription or WebView exit triggers cooperative cancel_task host-side.
 fn login_relay(
     state: &Arc<IpcHostState>,
     subscription_id: String,
     flow_id: String,
+    task_handle: String,
     instance: Arc<management_host::ManagementInstance>,
     on_event: Channel<Value>,
 ) {
     let stop = Arc::new(AtomicBool::new(false));
     state.login_relays.insert(
         &subscription_id,
-        LoginRelayHandle { stop: Arc::clone(&stop), flow_id: flow_id.clone() },
+        LoginRelayHandle {
+            stop: Arc::clone(&stop),
+            flow_id: flow_id.clone(),
+            task_handle: task_handle.clone(),
+        },
     );
     let relays = Arc::clone(&state.login_relays);
-    let started = Instant::now();
+    let th = task_handle.clone();
     std::thread::Builder::new()
         .name(format!("ipc-login-{subscription_id}"))
         .spawn(move || {
@@ -334,13 +363,21 @@ fn login_relay(
                     .is_ok()
             };
             loop {
-                if stop.load(Ordering::SeqCst) || started.elapsed() >= LOGIN_FLOW_DEADLINE {
+                if stop.load(Ordering::SeqCst) {
                     break;
                 }
                 std::thread::sleep(LOGIN_POLL_INTERVAL);
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
+
+                // 1. Inspect host task status (authoritative lease and lifecycle):
+                let snapshot = match instance.task_snapshot(&th) {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                // 2. Poll buffered user-facing events:
                 let poll = instance.management_call(
                     "auth.loginPoll",
                     json!({ "flowId": flow_id, "since": since }),
@@ -349,7 +386,6 @@ fn login_relay(
                 match poll {
                     Ok(snapshot) => {
                         failures = 0;
-                        let done = snapshot.get("done").and_then(Value::as_bool).unwrap_or(true);
                         if let Some(events) = snapshot.get("events").and_then(Value::as_array) {
                             for queued in events {
                                 let Some(event) = queued.get("event") else { continue };
@@ -362,9 +398,6 @@ fn login_relay(
                         }
                         if let Some(last) = snapshot.get("lastSeq").and_then(Value::as_u64) {
                             since = last;
-                        }
-                        if stop.load(Ordering::SeqCst) || done {
-                            break;
                         }
                     }
                     Err(_) => {
@@ -379,25 +412,50 @@ fn login_relay(
                         }
                     }
                 }
+
+                // 3. Act on task terminal state from management host:
+                match snapshot.status {
+                    management_host::TaskStatus::Unknown => {
+                        let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": "Login timed out; outcome unknown" }));
+                        break;
+                    }
+                    management_host::TaskStatus::Cancelled => {
+                        let _ = send(&mut frame_seq, "event", json!({ "type": "cancelled" }));
+                        break;
+                    }
+                    management_host::TaskStatus::Failed => {
+                        let msg = snapshot.error.unwrap_or_else(|| "Login failed".to_string());
+                        let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": msg }));
+                        break;
+                    }
+                    management_host::TaskStatus::Succeeded => {
+                        if let Some(res) = snapshot.result.as_ref() {
+                            if res.get("started").and_then(Value::as_bool) == Some(false) {
+                                let msg = res.get("message").and_then(Value::as_str).unwrap_or("Unknown provider");
+                                let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": msg }));
+                                break;
+                            }
+                        }
+                        let _ = send(&mut frame_seq, "event", json!({ "type": "success" }));
+                        break;
+                    }
+                    management_host::TaskStatus::Running => {}
+                }
             }
-            // Every exit path cancels the flow (idempotent: an ended flow
-            // answers cancelled:false and the child state is already gone).
-            let _ = instance.management_call(
-                "auth.loginCancel",
-                json!({ "flowId": flow_id }),
-                Duration::from_secs(5),
-            );
+
+            // If relay is ending because of stop or unsubscription, cancel the task cooperatively:
+            if stop.load(Ordering::SeqCst) {
+                let _ = instance.cancel_task(&th);
+            }
             relays.remove(&subscription_id);
         })
         .expect("the login relay thread spawns");
 }
 
 /// Open the OAuth login stream (the static transport's auth.loginStream):
-/// starts the flow in the management instance and streams its events over a
-/// Tauri Channel — the old GET /api/auth/login/[provider] SSE stream. The
-/// ack always carries a subscriptionId (the stream opened); a refused start
-/// (unknown provider) arrives as the stream's FIRST error event, exactly
-/// like the old stream's `{type:"error"}` before close.
+/// starts the flow in the management instance as a bounded task with a hard
+/// 10-minute deadline, guarded by ManagementInstance activity for the flow's
+/// real lifetime. Streams its events over a Tauri Channel.
 #[tauri::command]
 pub fn pi_ipc_login_stream(
     state: State<'_, Arc<IpcHostState>>,
@@ -424,38 +482,25 @@ pub fn pi_ipc_login_stream(
     let number = LOGIN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let subscription_id = format!("login-{number}");
     let flow_id = format!("loginflow-{number}");
-    // Start the flow BEFORE the relay exists is impossible to miss events:
-    // events buffer in the child from the login's first moment, and the
-    // relay's first poll reads from since=0.
-    let start = instance.management_call(
+
+    // Start the flow with a 10-minute hard deadline, holding an activity guard:
+    let task_start = instance.start_task(
         "auth.loginStart",
         json!({ "flowId": flow_id, "provider": provider }),
-        Duration::from_secs(60),
+        LOGIN_FLOW_DEADLINE,
+        management_host::TaskKind::Mutation,
     );
-    match start {
-        Ok(answer) if answer.get("started").and_then(Value::as_bool) == Some(true) => {
-            login_relay(&state, subscription_id.clone(), flow_id.clone(), instance, on_event);
-            json!({ "subscriptionId": subscription_id, "flowId": flow_id })
-        }
-        Ok(answer) => {
-            // The stream opened; the refusal is its first (and last) event —
-            // the old SSE stream's exact shape for an unknown provider.
-            let message = answer
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown provider")
-                .to_string();
-            let subscription_id = format!("login-refused-{number}");
-            let mut frame_seq: u64 = 0;
-            frame_seq += 1;
-            let _ = on_event.send(crate::pi_ipc::stream_frame(
-                &subscription_id,
-                1,
-                frame_seq,
-                "event",
-                json!({ "type": "error", "message": message }),
-            ));
-            json!({ "subscriptionId": subscription_id })
+    match task_start {
+        Ok(task_handle) => {
+            login_relay(
+                &state,
+                subscription_id.clone(),
+                flow_id.clone(),
+                task_handle.clone(),
+                instance,
+                on_event,
+            );
+            json!({ "subscriptionId": subscription_id, "flowId": flow_id, "taskHandle": task_handle })
         }
         Err(error) => {
             let (code, message) = crate::pi_ipc::management_error_code(&error);
@@ -465,22 +510,15 @@ pub fn pi_ipc_login_stream(
 }
 
 /// The unsubscribe half for login streams (pi_ipc's agent.unsubscribeEvents
-/// arm delegates here): stop the relay and cancel the flow host-side. The
-/// relay also cancels as its last act — this is the prompt path so an
-/// unsubscribe is not stuck behind a slow poll.
+/// arm delegates here): stop the relay and cancel the flow host-side via cancel_task.
 pub(crate) fn unsubscribe_login_stream(state: &IpcHostState, subscription_id: &str) -> bool {
     let Some(handle) = state.login_relays.cancel(subscription_id) else {
         return false;
     };
     handle.stop.store(true, Ordering::SeqCst);
-    // Best-effort prompt cancel; the relay's own cancel is the backstop.
     if let Some(config) = state.management_config.lock().unwrap().clone() {
         if let Ok(instance) = state.management.instance("global", &config) {
-            let _ = instance.management_call(
-                "auth.loginCancel",
-                json!({ "flowId": handle.flow_id }),
-                Duration::from_secs(5),
-            );
+            let _ = instance.cancel_task(&handle.task_handle);
         }
     }
     true
@@ -725,6 +763,31 @@ mod tests {
         let cancel_res = send("auth.loginCancel", json!({ "flowId": "nonexistent-flow" }));
         assert_eq!(cancel_res["ok"], true, "{cancel_res}");
         assert_eq!(cancel_res["data"]["cancelled"], false, "{cancel_res}");
+
+        // 9. Start a login task via start_task on the real instance, inspect snapshot, and cancel:
+        let config = state.management_config.lock().unwrap().clone().unwrap();
+        let instance = state.management.instance("global", &config).unwrap();
+        let task_handle = instance
+            .start_task(
+                "auth.loginStart",
+                json!({ "flowId": "flow-test-real-1", "provider": "anthropic" }),
+                LOGIN_FLOW_DEADLINE,
+                management_host::TaskKind::Mutation,
+            )
+            .expect("login task starts");
+        assert!(task_handle.starts_with("task-"), "{task_handle}");
+        let snap = instance.task_snapshot(&task_handle).expect("snapshot exists");
+        assert!(
+            matches!(
+                snap.status,
+                management_host::TaskStatus::Running
+                    | management_host::TaskStatus::Cancelled
+                    | management_host::TaskStatus::Succeeded
+            ),
+            "status: {:?}",
+            snap.status
+        );
+        let _ = instance.cancel_task(&task_handle);
     }
 
     /// A custom models.json provider stays out of the API-key list even with
