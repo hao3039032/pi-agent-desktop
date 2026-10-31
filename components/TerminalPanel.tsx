@@ -6,8 +6,7 @@ import { Terminal } from "@xterm/xterm";
 import { useI18n } from "@/hooks/useI18n";
 import { FONT_CHANGE_EVENT } from "@/lib/font-preferences";
 import { terminalTheme } from "@/lib/terminal-theme";
-import { createTerminalWriter, terminalRequest } from "@/lib/terminal-client";
-import type { TerminalEvent } from "@/lib/terminal-manager";
+import { checkTerminal, closeTerminal, createTerminal, createTerminalWriter, subscribeTerminal } from "@/lib/terminal-client";
 import type { TerminalTab } from "./terminal-tab-state";
 
 interface Props {
@@ -36,7 +35,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     const container = containerRef.current;
     if (!container) return;
     let disposed = false;
-    let events: EventSource | null = null;
+    let disconnect: (() => void) | null = null;
     let offset: number | undefined;
     let connected = false;
     let exited = false;
@@ -107,25 +106,25 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
 
     const connect = () => {
       if (disposed || exited || !navigator.onLine) return;
-      events?.close();
-      events = new EventSource(`/api/terminal/${encodeURIComponent(id)}/events${offset === undefined ? "" : `?after=${offset}`}`);
-      events.onmessage = (message) => {
-        const event = JSON.parse(message.data) as TerminalEvent;
+      disconnect?.();
+      disconnect = subscribeTerminal(id, offset, {
+      onEvent: (event, done) => {
         if (event.type === "output") {
           if (event.reset) terminal.reset();
-          else if (offset !== undefined && event.offset <= offset) return;
-          terminal.write(event.data);
+          else if (offset !== undefined && event.offset <= offset) { done(); return; }
+          terminal.write(event.data, done);
           offset = event.offset;
         } else {
           exited = true;
           connected = false;
           terminal.options.disableStdin = true;
-          events?.close();
+          disconnect?.();
           setExitCode(event.type === "exit" ? event.exitCode : null);
           setStatus("exited");
+          done();
         }
-      };
-      events.onopen = () => {
+      },
+      onOpen: () => {
         connected = true;
         if (inputFailed) return;
         terminal.options.disableStdin = false;
@@ -133,26 +132,23 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
         fitAndResize();
         writer.resize(terminal.cols, terminal.rows);
         if (container.offsetWidth && container.offsetHeight) terminal.focus();
-      };
-      events.onerror = () => {
+      },
+      onError: (closed) => {
         if (disposed || exited) return;
         connected = false;
         terminal.options.disableStdin = true;
-        setStatus(events?.readyState === EventSource.CLOSED ? "error" : "connecting");
-      };
+        setStatus(closed ? "error" : "connecting");
+      },
+      });
     };
 
     startRef.current = (async () => {
       fitAndResize();
       if (restored && reconnectKey === 0) {
         // Restoring a tab must never silently launch a replacement shell.
-        await terminalRequest(`/api/terminal/${encodeURIComponent(id)}`);
+        await checkTerminal(id);
       } else {
-        await terminalRequest("/api/terminal", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id, cwd, cols: terminal.cols, rows: terminal.rows }),
-        });
+        await createTerminal(id, cwd, terminal.cols, terminal.rows);
       }
       connect();
     })().catch((reason: Error) => {
@@ -164,7 +160,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     const pageHide = () => {
       connected = false;
       terminal.options.disableStdin = true;
-      events?.close();
+      disconnect?.();
       if (!exited && !inputFailed) setStatus("connecting");
     };
     const pageShow = (event: PageTransitionEvent) => { if (event.persisted) connect(); };
@@ -174,7 +170,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     window.addEventListener("online", connect);
     return () => {
       disposed = true;
-      events?.close();
+      disconnect?.();
       void writer.stop();
       resizeObserver.disconnect();
       themeObserver.disconnect();
@@ -203,7 +199,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     void (async () => {
       await startRef.current;
       await writerRef.current?.stop();
-      await terminalRequest(`/api/terminal/${encodeURIComponent(id)}`, { method: "DELETE", keepalive: true });
+      await closeTerminal(id);
       if (!cancelled) callbacksRef.current.onClosed();
     })().catch((reason: Error) => {
       if (cancelled) return;

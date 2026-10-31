@@ -69,6 +69,7 @@ export {
   parseEnabledModelsMutation,
   EnabledModelsRefusalError,
 } from "${ROOT}/lib/enabled-models-service.server.ts";
+export { getTerminalSettings, setTerminalShell, resolveTerminalShell } from "${ROOT}/lib/terminal-settings.ts";
 export { readRedactedModelsConfig } from "${ROOT}/lib/models-config-store.ts";
 export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-config-service.server.ts";
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";

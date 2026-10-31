@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import type { TerminalSettingsResponse } from "@/lib/api-types";
+import { getTerminalSettings, setTerminalSettings } from "@/lib/terminal-client";
 import { AppSelect } from "./AppSelect";
 import { ConfigButton } from "./SettingsUi";
 
@@ -18,10 +19,8 @@ export function TerminalSettingsSection() {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    void fetch("/api/terminal/settings", { signal: controller.signal, cache: "no-store" })
-      .then(async response => {
-        if (!response.ok) throw new Error("Load failed");
-        const data = await response.json() as TerminalSettingsResponse;
+    void getTerminalSettings(controller.signal)
+      .then(data => {
         if (!Array.isArray(data.options)) throw new Error("Invalid settings");
         if (!controller.signal.aborted) setSettings(data);
       })
@@ -35,11 +34,7 @@ export function TerminalSettingsSection() {
     setSaving(true);
     setError(null);
     try {
-      const response = await fetch("/api/terminal/settings", {
-        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shell }),
-      });
-      if (!response.ok) throw new Error("Save failed");
-      setSettings(await response.json() as TerminalSettingsResponse);
+      setSettings(await setTerminalSettings(shell));
     } catch {
       setError("save");
     } finally {

@@ -72,6 +72,9 @@
       ],
       "@/lib/models-config-service": [
         "./static-frontend/src/data/models-config-service.ts"
+      ],
+      "@/lib/terminal-client": [
+        "./static-frontend/src/data/terminal-client.ts"
       ]
     }
   },

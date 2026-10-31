@@ -48,7 +48,11 @@ pub struct IpcHostState {
     /// end instead of merely being deregistered.
     running_relay_threads: Arc<AtomicUsize>,
     /// The terminal registry (portable-pty; crates/pty-host).
-    pub terminals: pty_host::PtyHost,
+    pub terminals: Arc<pty_host::PtyHost>,
+    terminal_streams: crate::terminal_host::TerminalStreams,
+    terminal_management_lock: Mutex<()>,
+    #[cfg(test)]
+    terminal_test_shell: Mutex<Option<(PathBuf, Vec<String>)>>,
     /// The management instances (crates/management-host). The spawn config
     /// (packaged pi executable + the vendored management extension) is
     /// resolved at startup; until then the models ops answer
@@ -89,13 +93,18 @@ struct EventRelayHandle {
 
 impl IpcHostState {
     pub fn new() -> Self {
+        let terminals = Arc::new(pty_host::PtyHost::new());
         Self {
             registry: Arc::new(SessionRegistry::new()),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
-            terminals: pty_host::PtyHost::new(),
+            terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
+            terminal_management_lock: Mutex::new(()),
+            terminals,
+            #[cfg(test)]
+            terminal_test_shell: Mutex::new(None),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             task_agent_dir: Mutex::new(None),
@@ -737,76 +746,11 @@ pub fn pi_ipc_subscribe_terminal(
     cursor: u64,
     on_output: Channel<Value>,
 ) -> Value {
-    let Some(terminal) = state.terminals.get(&id) else {
-        return protocol_error("?", "not_found", &format!("no terminal {id}"));
-    };
-    let subscription_id = format!(
-        "term-{}",
-        state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1
-    );
-    let subscription_id_for_relay = subscription_id.clone();
-    std::thread::Builder::new()
-        .name(format!("ipc-terminal-{subscription_id}"))
-        .spawn(move || {
-            let mut cursor = cursor;
-            let mut seq: u64 = 0;
-            loop {
-                let outcome = terminal.read_since(cursor);
-                match outcome {
-                    pty_host::ReadOutcome::Suffix { cursor: next, text } => {
-                        if text.is_empty() {
-                            // Nothing new: poll again shortly.
-                            std::thread::sleep(Duration::from_millis(120));
-                            // Detect exit: a closed terminal ends the stream.
-                            if terminal.wait_exit(Duration::from_millis(0)).is_some() {
-                                seq += 1;
-                                let _ = on_output.send(stream_frame(
-                                    &subscription_id,
-                                    1,
-                                    seq,
-                                    "event",
-                                    json!({ "kind": "exit" }),
-                                ));
-                                return;
-                            }
-                            continue;
-                        }
-                        cursor = next;
-                        seq += 1;
-                        if on_output
-                            .send(stream_frame(
-                                &subscription_id,
-                                1,
-                                seq,
-                                "event",
-                                json!({ "kind": "suffix", "cursor": cursor, "output": text }),
-                            ))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    pty_host::ReadOutcome::Reset { cursor: next, text } => {
-                        cursor = next;
-                        seq += 1;
-                        if on_output
-                            .send(stream_frame(
-                                &subscription_id,
-                                1,
-                                seq,
-                                "reset",
-                                json!({ "kind": "reset", "cursor": cursor, "output": text }),
-                            ))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-        })
-        .ok();
-    json!({ "subscriptionId": subscription_id_for_relay })
+    let subscription_id = format!("term-{}", state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1);
+    match state.terminal_streams.subscribe(&id, subscription_id.clone(), cursor, move |frame| on_output.send(frame).is_ok()) {
+        Ok(()) => json!({ "subscriptionId": subscription_id }),
+        Err(error) => protocol_error("?", "not_found", &error),
+    }
 }
 
 /// The agent dir the desktop runs against (packaged layout resolves it
@@ -1233,39 +1177,68 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             if terminal_id.is_empty() {
                 return protocol_error(&id, "invalid_args", "terminal id is required");
             }
-            let cwd = args.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-            // A terminal runs a shell with the user's environment: its cwd
-            // must be a directory the host already allows (a session cwd,
-            // project root, default-cwd layout) — never an arbitrary
-            // client-supplied path.
-            if let Some(cwd) = &cwd {
-                let allowed = state.file_roots.lock().unwrap().is_existing_path_allowed(cwd);
-                if !allowed {
-                    return protocol_error(
-                        &id,
-                        "unauthorized_scope",
-                        "the terminal cwd is outside the allowed roots",
-                    );
-                }
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "terminal cwd is required");
+            };
+            let cwd = match crate::terminal_host::authorize_cwd(&state.file_roots.lock().unwrap(), &state.agent_dir(), cwd) {
+                Ok(cwd) => cwd,
+                Err(code) => return protocol_error(&id, code, "terminal cwd is not an authorized project directory"),
+            };
+            match state.terminal_streams.reuse(terminal_id, &cwd) {
+                Ok(true) => return protocol_ok(&id, json!({ "id": terminal_id })),
+                Ok(false) => {},
+                Err(error) => return protocol_error(&id, "invalid_args", &error),
             }
-            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
-            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
-            match state.terminals.create(terminal_id, cwd.as_deref(), pty_host::PtyOptions { cols, rows, ..Default::default() }) {
-                Ok(_) => protocol_ok(&id, json!({ "id": terminal_id })),
+            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80).clamp(2, 1000) as u16;
+            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24).clamp(2, 1000) as u16;
+            let shell = match terminal_shell(state) {
+                Ok(shell) => shell,
+                Err((code, message)) => return protocol_error(&id, &code, &message),
+            };
+            match state.terminal_streams.create(terminal_id, &cwd, pty_host::PtyOptions { cols, rows, shell: Some(shell), ..Default::default() }) {
+                Ok(()) => protocol_ok(&id, json!({ "id": terminal_id })),
                 Err(error) => protocol_error(&id, "io", &error),
             }
         }
+        "terminal.ack" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            if state.terminal_streams.ack(subscription, seq) { protocol_ok(&id, json!({ "acknowledged": seq })) }
+            else { protocol_error(&id, "not_found", "terminal subscription or sequence not found") }
+        },
+        "terminal.unsubscribe" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            if state.terminal_streams.unsubscribe(subscription) { protocol_ok(&id, json!({ "unsubscribed": subscription })) }
+            else { protocol_error(&id, "not_found", "terminal subscription not found") }
+        },
+        "terminal.settingsGet" => {
+            let _guard = state.terminal_management_lock.lock().unwrap();
+            match management_call(state, "terminal.settingsGet", json!({})) {
+                Ok(settings) => protocol_ok(&id, settings),
+                Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        },
+        "terminal.settingsSet" => {
+            let Some(shell) = args.get("shell").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "shell is required");
+            };
+            let _guard = state.terminal_management_lock.lock().unwrap();
+            match management_call(state, "terminal.settingsSet", json!({ "shell": shell })) {
+                Ok(settings) => protocol_ok(&id, settings),
+                Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        },
         "terminal.write" => {
             let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
             let Some(terminal) = state.terminals.get(terminal_id) else {
                 return protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"));
             };
-            let input = args
-                .get("input")
-                .and_then(Value::as_str)
-                .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok());
+            let input = args.get("input").and_then(Value::as_str)
+                .filter(|encoded| encoded.len() <= 349_528)
+                .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok())
+                .filter(|bytes| bytes.len() <= 262_144);
             let Some(input) = input else {
-                return protocol_error(&id, "invalid_args", "input must be base64");
+                return protocol_error(&id, "invalid_args", "input must be bounded base64");
             };
             match terminal.write_input(&input) {
                 Ok(()) => protocol_ok(&id, json!({ "written": input.len() })),
@@ -1277,8 +1250,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let Some(terminal) = state.terminals.get(terminal_id) else {
                 return protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"));
             };
-            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80) as u16;
-            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24) as u16;
+            let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80).clamp(2, 1000) as u16;
+            let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24).clamp(2, 1000) as u16;
             match terminal.resize(cols, rows) {
                 Ok(()) => protocol_ok(&id, json!({ "cols": cols, "rows": rows })),
                 Err(error) => protocol_error(&id, "io", &error),
@@ -1297,7 +1270,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "terminal.close" => {
             let terminal_id = args.get("id").and_then(Value::as_str).unwrap_or_default();
-            if state.terminals.close(terminal_id) {
+            if state.terminal_streams.close(terminal_id) {
                 protocol_ok(&id, json!({ "closed": true }))
             } else {
                 protocol_error(&id, "not_found", &format!("no terminal {terminal_id}"))
@@ -1729,6 +1702,20 @@ pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
 }
 
 // --- the session view (sessions.get / sessions.context / sessions.state) ---
+
+fn terminal_shell(state: &IpcHostState) -> Result<(PathBuf, Vec<String>), (String, String)> {
+    #[cfg(test)]
+    if let Some(shell) = state.terminal_test_shell.lock().unwrap().clone() { return Ok(shell); }
+    let _guard = state.terminal_management_lock.lock().unwrap();
+    let value = management_call(state, "terminal.resolveShell", json!({}))?;
+    let path = value.get("path").and_then(Value::as_str).filter(|p| !p.is_empty())
+        .ok_or_else(|| ("io".to_string(), "terminal shell path missing".to_string()))?;
+    let args = value.get("args").and_then(Value::as_array)
+        .ok_or_else(|| ("io".to_string(), "terminal shell arguments missing".to_string()))?
+        .iter().map(|arg| arg.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>().ok_or_else(|| ("io".to_string(), "invalid terminal shell arguments".to_string()))?;
+    Ok((PathBuf::from(path), args))
+}
 
 /// One management-op call: the instance is per-scope on demand (60 s idle
 /// recycle), and every failure is (code, message) — never a fallback that
@@ -3358,7 +3345,16 @@ mod tests {
     use super::*;
 
     fn state() -> IpcHostState {
-        IpcHostState::new()
+        let state = IpcHostState::new();
+        #[cfg(unix)]
+        if let Some(shell) = std::env::var_os("SHELL") {
+            *state.terminal_test_shell.lock().unwrap() = Some((PathBuf::from(shell), vec!["-i".into()]));
+        }
+        #[cfg(windows)]
+        if let Some(shell) = std::env::var_os("COMSPEC") {
+            *state.terminal_test_shell.lock().unwrap() = Some((PathBuf::from(shell), Vec::new()));
+        }
+        state
     }
 
     /// A spawn base for tests: the real executable the caller resolved plus
@@ -4412,12 +4408,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).expect("proj");
-        // No cwd: fine (the shell's default).
+        // A missing cwd cannot inherit the host process cwd.
         let bare = send(
             &state,
             json!({ "v": 1, "id": "tc1", "op": "terminal.create", "args": { "id": "t-a" } }),
         );
-        assert_eq!(bare["ok"], true, "{bare}");
+        assert_eq!(bare["error"]["code"], "invalid_args", "{bare}");
         // An allowed cwd: fine.
         state.propose_path(&project);
         let inside = send(
@@ -4431,6 +4427,19 @@ mod tests {
             json!({ "v": 1, "id": "tc3", "op": "terminal.create", "args": { "id": "t-c", "cwd": "/etc" } }),
         );
         assert_eq!(refused["error"]["code"], "unauthorized_scope", "{refused}");
+        let agent = dir.path().join("agent");
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        let chat = agent.join("chats/folder/nested");
+        let legacy = agent.join("chat-workspace/nested");
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        state.propose_path(dir.path());
+        for (i, path) in [agent.join("chats"), chat, legacy].iter().enumerate() {
+            let result = send(&state, json!({ "v": 1, "id": format!("chat-{i}"), "op": "terminal.create", "args": { "id": format!("chat-{i}"), "cwd": path } }));
+            assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
+            assert!(state.terminals.get(&format!("chat-{i}")).is_none());
+        }
+        state.terminals.close("t-b");
     }
 
     #[test]
@@ -5085,15 +5094,18 @@ mod tests {
     #[test]
     fn terminal_roundtrip_over_the_dispatch_table() {
         let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        state.propose_path(dir.path());
+        let cwd = dir.path().to_str().unwrap();
         let create = send(
             &state,
-            json!({ "v": 1, "id": "t1", "op": "terminal.create", "args": { "id": "term-1", "cols": 80, "rows": 24 } }),
+            json!({ "v": 1, "id": "t1", "op": "terminal.create", "args": { "id": "term-1", "cwd": cwd, "cols": 80, "rows": 24 } }),
         );
         assert_eq!(create["ok"], true, "{create}");
         // Idempotent create: the same id answers again (the running PTY).
         let again = send(
             &state,
-            json!({ "v": 1, "id": "t2", "op": "terminal.create", "args": { "id": "term-1" } }),
+            json!({ "v": 1, "id": "t2", "op": "terminal.create", "args": { "id": "term-1", "cwd": cwd } }),
         );
         assert_eq!(again["ok"], true);
 

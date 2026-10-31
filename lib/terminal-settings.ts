@@ -21,6 +21,15 @@ export function getTerminalSettings(): TerminalSettingsResponse {
     unavailable: shell !== "auto" && !selected };
 }
 
+export function setTerminalShell(shell: string): TerminalSettingsResponse {
+  const settings = getTerminalSettings();
+  if (shell !== "auto" && !settings.options.some(option => option.value === shell)) {
+    throw new Error("Terminal is unavailable");
+  }
+  writeTerminalShellPreference(shell);
+  return getTerminalSettings();
+}
+
 export function resolveTerminalShell(): TerminalShell {
   const preference = readTerminalShellPreference();
   const { shells, defaultPath } = discoverTerminalShells();

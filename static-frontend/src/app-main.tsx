@@ -26,6 +26,7 @@ import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
+import { bindTerminalClient } from "./data/terminal-client.ts";
 import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
 import { bindWorkspaceService } from "./data/workspace-service.ts";
 import { detectTransport } from "./data/transport.ts";
@@ -37,6 +38,7 @@ async function boot(): Promise<void> {
   const { transport, label } = detectTransport();
   const client = new IpcClient(transport);
   bindAgentClient(transport);
+  bindTerminalClient(client);
   bindFileService(client);
   bindModelsService(client);
   bindEnabledModelsService(client);

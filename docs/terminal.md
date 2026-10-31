@@ -55,6 +55,26 @@ On Debian/Ubuntu, install `python3` and `build-essential` first. This forces a
 source build instead of reusing a missing or incompatible prebuilt binary.
 Restart Pi Web after repair.
 
+## Static desktop host migration
+
+The static frontend swaps the terminal client at build time; the Next path
+above remains unchanged. The static client uses named IPC operations and a
+Tauri Channel, not HTTP/SSE. The Rust host authorizes an existing project cwd
+before spawning, rejects the chat roots and descendants, and resolves the
+configured shell through the same terminal-settings implementation as Next.
+The shell choice is never supplied by the WebView.
+
+A Channel starts with a cursor-based snapshot. Each output frame is ACKed
+only after xterm consumes it; at most one frame per subscriber is in flight.
+If the retained window moves past the cursor, the next frame resets and
+replays the bounded history. Explicit unsubscribe and missed ACKs reap the
+relay; a terminal without subscribers expires after 120 seconds. Terminal
+input is serialized with resize and is never retried after an ambiguous error.
+On Unix a close sends SIGHUP to the shell and escalates after two seconds;
+application exit force-terminates retained shells. Windows uses portable-pty's
+native process termination, not Unix signal names. Real Windows and macOS PTY
+lifecycle and native-WebView acceptance remain required.
+
 ## Verification
 
 Run `npm test` for native PTY, lease, output cursor, input queue, and storage
