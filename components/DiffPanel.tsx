@@ -5,6 +5,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { getFileIcon } from "./FileIcons";
 import { getRelativeFilePath } from "@/lib/file-paths";
 import type { GitFileStatus, GitStatusResponse } from "@/lib/git-types";
+import { fetchGitStatus } from "@/lib/git-status-service";
 
 interface Props {
   cwd: string;
@@ -41,10 +42,7 @@ export function DiffPanel({ cwd, selectedFilePath, refreshKey = 0, onOpenFile }:
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`/api/git/status?cwd=${encodeURIComponent(cwd)}`, { signal });
-      const data = await response.json() as GitStatusResponse & { error?: string };
-      if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
-      setStatus(data);
+      setStatus(await fetchGitStatus(cwd, signal));
     } catch (reason) {
       if (reason instanceof DOMException && reason.name === "AbortError") return;
       setError(reason instanceof Error ? reason.message : String(reason));

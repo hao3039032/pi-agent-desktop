@@ -137,6 +137,8 @@ export default defineConfig({
         find: /^@\/lib\/font-service$/,
         replacement: resolve(import.meta.dirname, "src/data/font-service.ts"),
       },
+      { find: /^@\/lib\/git-status-service$/, replacement: resolve(import.meta.dirname, "src/data/git-status-service.ts") },
+      { find: /^@\/lib\/worktree-service$/, replacement: resolve(import.meta.dirname, "src/data/worktree-service.ts") },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

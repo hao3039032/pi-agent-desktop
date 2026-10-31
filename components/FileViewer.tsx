@@ -24,6 +24,7 @@ import { CodeBlock, MermaidBlock } from "./MermaidBlock";
 import { FrontmatterCard } from "./FrontmatterCard";
 import { parseUnifiedPatch } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
+import { fetchGitDiff as fetchGitDiffRequest } from "@/lib/git-status-service";
 import { getFileIcon } from "./FileIcons";
 import { useI18n } from "@/hooks/useI18n";
 import {
@@ -1182,11 +1183,9 @@ function TextFileViewer({
     }
 
     try {
-      const params = new URLSearchParams({ cwd, path: targetPath });
-      const response = await fetch(`/api/git/diff?${params.toString()}`);
-      const next = await response.json() as GitFileDiffResponse & { error?: string };
+      const next = await fetchGitDiffRequest(cwd, targetPath);
       if (requestId !== gitDiffRequestRef.current) return;
-      setGitDiff(response.ok && next.supported && typeof next.patch === "string" ? next : null);
+      setGitDiff(next.supported && typeof next.patch === "string" ? next : null);
     } catch {
       if (requestId === gitDiffRequestRef.current) setGitDiff(null);
     } finally {

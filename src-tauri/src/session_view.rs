@@ -235,6 +235,10 @@ impl ProjectResolver {
         Self::default()
     }
 
+    pub fn invalidate(&self) {
+        if let Ok(mut cache) = self.cache.lock() { cache.clear(); }
+    }
+
     /// Resolve one cwd's project identity. Non-git and failing directories
     /// answer `projectRoot = cwd` (the TS fallback — a session keeps its own
     /// identity instead of disappearing).
@@ -261,6 +265,19 @@ impl ProjectResolver {
             is_top_level: false,
         };
         if !cwd.is_dir() {
+            if let Some(parent) = cwd.parent() {
+                if let Some(base) = parent.to_str().and_then(|p| p.strip_suffix("-worktrees")) {
+                    let repo = PathBuf::from(base);
+                    if repo.join(".git").exists() {
+                        return ProjectInfo {
+                            project_root: repo.canonicalize().unwrap_or(repo),
+                            branch: cwd.file_name().map(|n| n.to_string_lossy().into_owned()),
+                            is_worktree: true,
+                            is_top_level: true,
+                        };
+                    }
+                }
+            }
             return fallback();
         }
         // One call, exactly the TS invocation (lib/worktree.ts): the common

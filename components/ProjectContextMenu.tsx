@@ -17,6 +17,7 @@ import { useMenuPlacement } from "@/hooks/useMenuPlacement";
 import type { MenuAnchor } from "@/lib/menu-placement";
 import { showNativeMenu, type NativeMenuEntry, type NativeMenuPoint } from "@/lib/desktop-menu";
 import type { TranslationParams } from "@/lib/i18n/types";
+import { listWorktrees, createWorktree, deleteWorktree, fetchWorktreeBranches } from "@/lib/worktree-service";
 
 export interface WorktreeEntry {
   path: string;
@@ -47,15 +48,8 @@ type Translate = (key: string, params?: TranslationParams) => string;
 /** A project's local and remote branches plus its worktrees; empty when the read fails. */
 export async function fetchProjectBranchMenu(projectRoot: string): Promise<ProjectBranchMenuState> {
   try {
-    const res = await fetch(`/api/worktrees?cwd=${encodeURIComponent(projectRoot)}&branches=1`);
-    const data = await res.json().catch(() => ({})) as {
-      projectRoot?: string;
-      isGit?: boolean;
-      branches?: string[];
-      remoteBranches?: string[];
-      worktrees?: WorktreeEntry[];
-    };
-    if (!res.ok || data.projectRoot !== projectRoot) throw new Error(`HTTP ${res.status}`);
+    const data = await listWorktrees(projectRoot, true);
+    if (data.projectRoot !== projectRoot) throw new Error("Project identity changed");
     return {
       root: projectRoot,
       isGit: data.isGit === true,
@@ -69,19 +63,9 @@ export async function fetchProjectBranchMenu(projectRoot: string): Promise<Proje
   }
 }
 
-async function readError(res: Response): Promise<{ error?: string; dirty?: boolean; [key: string]: unknown }> {
-  return await res.json().catch(() => ({})) as { error?: string; dirty?: boolean };
-}
-
 /** `git fetch --prune`, then the fresh branch lists. Throws with git's message on failure. */
 export async function fetchRemoteBranches(projectRoot: string): Promise<{ branches: string[]; remoteBranches: string[] }> {
-  const res = await fetch("/api/worktrees/fetch", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd: projectRoot }),
-  });
-  const data = await readError(res) as { error?: string; branches?: unknown; remoteBranches?: unknown };
-  if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+  const data = await fetchWorktreeBranches(projectRoot);
   return {
     branches: Array.isArray(data.branches) ? data.branches as string[] : [],
     remoteBranches: Array.isArray(data.remoteBranches) ? data.remoteBranches as string[] : [],
@@ -90,13 +74,8 @@ export async function fetchRemoteBranches(projectRoot: string): Promise<{ branch
 
 /** Creates `<repo>-worktrees/<branch>` for an existing or new branch. Throws with git's message on failure. */
 export async function createProjectWorktree(projectRoot: string, branch: string): Promise<{ path: string; branch: string }> {
-  const res = await fetch("/api/worktrees", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd: projectRoot, branch }),
-  });
-  const data = await readError(res) as { error?: string; path?: string; branch?: string };
-  if (!res.ok || data.error || !data.path) throw new Error(data.error ?? `HTTP ${res.status}`);
+  const data = await createWorktree(projectRoot, branch);
+  if (!data.path) throw new Error("Worktree creation returned no path");
   return { path: data.path, branch: data.branch ?? branch };
 }
 
@@ -106,15 +85,13 @@ export async function createProjectWorktree(projectRoot: string, branch: string)
  * caller can ask again before forcing.
  */
 export async function removeProjectWorktree(projectRoot: string, path: string, force: boolean): Promise<"removed" | "needs-force"> {
-  const res = await fetch("/api/worktrees", {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd: projectRoot, path, force }),
-  });
-  if (res.ok) return "removed";
-  const data = await readError(res);
-  if (data.dirty && !force) return "needs-force";
-  throw new Error(data.error ?? `HTTP ${res.status}`);
+  try {
+    await deleteWorktree(projectRoot, path, force);
+    return "removed";
+  } catch (error) {
+    if (!force && (error as { dirty?: boolean }).dirty) return "needs-force";
+    throw error;
+  }
 }
 
 /** The checkout a project's menu treats as current: the selected worktree, else the main one. */

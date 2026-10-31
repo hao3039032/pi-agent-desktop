@@ -21,6 +21,7 @@ import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindEnabledModelsService } from "./data/enabled-models-service.ts";
 import { bindFileService } from "./data/file-service.ts";
 import { bindFontService } from "./data/font-service.ts";
+import { bindGitStatusService } from "./data/git-status-service.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
@@ -29,6 +30,7 @@ import { bindSessionListService } from "./data/session-list-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
 import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
 import { bindWorkspaceService } from "./data/workspace-service.ts";
+import { bindWorktreeService } from "./data/worktree-service.ts";
 import { detectTransport } from "./data/transport.ts";
 import { IpcClient } from "./ipc/client.ts";
 
@@ -39,6 +41,7 @@ async function boot(): Promise<void> {
   const client = new IpcClient(transport);
   bindAgentClient(transport);
   bindFileService(client);
+  bindGitStatusService(client);
   bindModelsService(client);
   bindEnabledModelsService(client);
   bindModelsConfigService(client);
@@ -46,6 +49,7 @@ async function boot(): Promise<void> {
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);
+  bindWorktreeService(client);
   bindDesktopConnection(client);
   bindScheduledTasksStore(client);
   bindProjectTrustClient(client);
