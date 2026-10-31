@@ -96,6 +96,8 @@ pub struct IpcHostState {
     session_list_version: Arc<AtomicU64>,
     /// Set only by a future packaged static-app startup path, never by IPC.
     chat_unlock_policy: ChatUnlockPolicy,
+    #[cfg(test)]
+    pub(crate) session_writer_timeout: Mutex<Duration>,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
@@ -188,6 +190,8 @@ impl IpcHostState {
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
             chat_unlock_policy: ChatUnlockPolicy::Denied,
+            #[cfg(test)]
+            session_writer_timeout: Mutex::new(Duration::from_secs(60)),
         }
     }
 
@@ -1288,6 +1292,14 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         },
         "sessions.chatAccessGet" => match crate::chat_sessions::get_access(state, &args) {
             Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.chatAccessSet" => match crate::chat_sessions::set_access(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.continueInProject" => match crate::chat_sessions::continue_in_project(state, &args) {
+            Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) },
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
         "sessions.search" => match crate::session_search::search(state, &args) {
@@ -2447,8 +2459,21 @@ pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -
 /// comes from the `AppHandle` (not a `State<'_, _>` argument) because an
 /// async command must return a `Result` to carry borrowed arguments — the
 /// envelope is the reply shape, so the handle is the honest input.
+pub(crate) fn is_trusted_static_chat_window(label: &str, url: &tauri::Url) -> bool {
+    if label != crate::shell::WINDOW_LABEL || url.host_str() != Some(if cfg!(windows) { "tauri.localhost" } else { "localhost" })
+        || url.port().is_some() || !matches!(url.path(), "/" | "/index.html") {
+        return false;
+    }
+    url.scheme() == if cfg!(windows) { "http" } else { "tauri" }
+}
+
 #[tauri::command]
-pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
+pub async fn pi_ipc(app: tauri::AppHandle, window: tauri::WebviewWindow, request: Value) -> Value {
+    if request.get("op").and_then(Value::as_str) == Some("sessions.chatAccessSet")
+        && !window.url().ok().is_some_and(|url| is_trusted_static_chat_window(window.label(), &url)) {
+        let id = request.get("id").and_then(Value::as_str).unwrap_or("");
+        return protocol_error(id, "access_denied", "Chat access changes require the trusted packaged desktop window");
+    }
     let state = app.state::<Arc<IpcHostState>>().inner().clone();
     dispatch_envelope_gated(state, request).await
 }
@@ -3357,6 +3382,7 @@ fn build_spawn_plan(
         // windows and the test harness cannot honour a stored unlock.
         let unlocked = state.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
             && chat_folder
+            && crate::chat_sessions::is_owned_chat_folder(cwd, &agent_dir)
             && session_host::spawn_plan::read_chat_unlocked(session_file);
         // Chats read Settings › Chats while they are still empty.
         let (chat_model, chat_thinking) = if file_has_messages(session_file) {
@@ -6006,7 +6032,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn pi_ipc_command_stays_the_async_gated_entry() {
         let source = include_str!("pi_ipc.rs");
         assert!(
-            source.contains("pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value"),
+            source.contains("pub async fn pi_ipc(app: tauri::AppHandle, window: tauri::WebviewWindow, request: Value) -> Value"),
             "pi_ipc must stay an async command (a sync command runs envelopes on the WebView's UI thread)"
         );
         assert!(

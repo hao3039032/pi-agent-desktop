@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { IpcClient, MockTransport } from "../ipc/client.ts";
+import { parseIpcResponse } from "../ipc/protocol.ts";
 import { bindChatSessionService, getChatAccess, setChatAccess, continueChatInProject } from "./chat-session-service.ts";
 
 test("chat service sends explicit host-owned session operations", async () => {
@@ -25,4 +26,13 @@ test("unknown mutation outcomes are not retried", async () => {
   await assert.rejects(setChatAccess("chat", true));
   await assert.rejects(continueChatInProject("chat", "/project"));
   assert.equal(calls, 2);
+});
+
+test("unknown and partial outcomes remain distinct and non-retryable", () => {
+  for (const code of ["outcome_unknown", "partial_success", "access_denied"]) {
+    const response = parseIpcResponse({ v: 1, id: "x", ok: false, error: { code, message: "do not retry", retryable: false } }, "x");
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, code);
+    assert.equal(response.error.retryable, false);
+  }
 });

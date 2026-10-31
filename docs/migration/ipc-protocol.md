@@ -46,7 +46,9 @@
 | `unknown_op` | 封闭枚举外的操作 | false |
 | `version_mismatch` | 协议版本不符 | false |
 | `invalid_args` | 参数校验失败 | false |
-| `unauthorized_scope` | 路径/资源超出授权范围（文件、终端、聊天文件夹） | false |
+| `unauthorized_scope` / `access_denied` | 路径/资源超出授权范围或需要可信桌面 | false |
+| `outcome_unknown` | 副作用结果不确定；禁止自动重试，持久栅栏保留 | false |
+| `partial_success` | 副作用已确定但恢复或清理失败；禁止重复执行 | false |
 | `not_found` | 会话/任务/条目/订阅不存在 | false |
 | `no_host` | 前端无宿主桥（浏览器直开静态页） | false |
 | `busy` | 目标被独占（如安装进行中） | true |

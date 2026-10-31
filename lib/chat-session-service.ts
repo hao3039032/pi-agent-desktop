@@ -5,6 +5,8 @@ export interface ChatAccessState {
   folder: string | null;
   unlocked: boolean;
   available: boolean;
+  /** A previous session-file mutation has an unresolved outcome. */
+  pending?: boolean;
 }
 
 export interface ContinuedChat {

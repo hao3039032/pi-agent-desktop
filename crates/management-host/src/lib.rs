@@ -559,6 +559,11 @@ impl ManagementInstance {
         Err("exclusive management mutations are unsupported on Windows".into())
     }
 
+    /// Session-file writers must prove an orderly exit, not a forced kill.
+    fn close_session_file_writer(&self, grace: Duration) -> bool {
+        self.client.close_without_kill(grace)
+    }
+
     /// Orderly shutdown.
     pub fn shutdown(&self, grace: Duration) -> Option<i32> {
         {
@@ -773,6 +778,39 @@ fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
 ) -> Result<Arc<ManagementInstance>, String> {
+    spawn_management_with_environment(scope, config, false)
+}
+
+/// Dedicated host-owned process for the two synchronous session-file operations.
+/// Caller must pin the management asset and module tree and hold the session gate.
+/// The two operation graphs must never spawn commands or detached children.
+pub struct SessionFileWriter(Arc<ManagementInstance>);
+
+impl SessionFileWriter {
+    pub fn call(&self, op: &str, args: Value, timeout: Duration) -> Result<Value, String> {
+        if !matches!(op, "session.setOfflineChatUnlock" | "session.continueChat") {
+            return Err("operation is not a session-file writer operation".into());
+        }
+        self.0.management_call(op, args, timeout)
+    }
+    pub fn pid(&self) -> u32 { self.0.client_pid() }
+    pub fn close(&self, grace: Duration) -> bool { self.0.close_session_file_writer(grace) }
+    pub fn force_stop(&self, grace: Duration) -> Result<(), String> { self.0.force_stop(grace) }
+}
+
+pub fn spawn_session_file_writer(config: &ManagementSpawnConfig) -> Result<SessionFileWriter, String> {
+    if config.extensions.len() != 1 || config.agent_dir.is_none()
+        || config.env.len() != 1 || config.env[0].0 != "PI_WEB_MANAGED_MODULES" {
+        return Err("invalid session writer configuration".into());
+    }
+    spawn_management_with_environment("session-file-writer", config, true).map(SessionFileWriter)
+}
+
+fn spawn_management_with_environment(
+    scope: &str,
+    config: &ManagementSpawnConfig,
+    restricted: bool,
+) -> Result<Arc<ManagementInstance>, String> {
     let mut args: Vec<String> = vec![
         // The management shape: no session files, no discovery — only the
         // explicit extensions load.
@@ -792,7 +830,13 @@ fn spawn_management(
     // envelopes from anywhere in the child to the management protocol).
     // Applied AFTER the caller's env so nothing can override it.
     let nonce = format!("mgmt-{}", uuid::Uuid::new_v4());
-    let mut env = EnvPolicy::inherit();
+    let mut env = if restricted {
+        let mut env = EnvPolicy::empty();
+        for key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT", "TEMP", "TMP"] {
+            if let Ok(value) = std::env::var(key) { env = env.set(key, value); }
+        }
+        env
+    } else { EnvPolicy::inherit() };
     if let Some(agent_dir) = &config.agent_dir {
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
     }
