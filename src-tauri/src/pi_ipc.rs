@@ -3932,6 +3932,85 @@ mod tests {
     }
 
     #[test]
+    fn real_pi_scheduled_marker_requires_durable_link_before_prompt() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set"); return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap(); std::fs::create_dir_all(&project).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let until = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+                            let line = line.trim_end();
+                            if line.is_empty() { break; }
+                            if let Some((key, value)) = line.split_once(':') {
+                                if key.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap_or(0); }
+                            }
+                        }
+                        let mut body = vec![0; length];
+                        if reader.read_exact(&mut body).is_err() { return; }
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"fixture answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => return,
+                }
+            }
+        });
+        std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{"baseUrl":format!("http://{endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Test","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}).to_string()).unwrap();
+        std::fs::write(agent.join("settings.json"), r#"{"defaultProvider":"fixture","defaultModel":"test"}"#).unwrap();
+        let state = state();
+        struct Shutdown<'a>(&'a IpcHostState);
+        impl Drop for Shutdown<'_> {
+            fn drop(&mut self) { for id in self.0.registry.ids() { self.0.registry.remove(&id, Duration::from_secs(5)); } }
+        }
+        let _shutdown = Shutdown(&state);
+        *state.task_agent_dir.lock().unwrap() = Some(agent);
+        let bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        let created = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"] })).expect("start session");
+        let id = created["sessionId"].as_str().unwrap();
+        let session = state.registry.get(id).unwrap();
+        let linked = std::cell::Cell::new(false);
+        let refused = crate::scheduled_runner::run_session(&session,
+            json!({ "version": 1, "taskId": "not-a-uuid", "runId": "r1", "taskName": "fixture", "trigger": "manual" }),
+            "must never be sent", Duration::from_secs(1), |_| { linked.set(true); Ok(()) });
+        assert_eq!(refused.status, "failed");
+        assert!(!linked.get(), "the refused marker must not link or prompt");
+        let result = crate::scheduled_runner::run_session(&session,
+            json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "r1", "taskName": "fixture", "trigger": "manual" }),
+            "must never be sent", Duration::from_secs(1), |_| Err("fixture ledger failure".into()));
+        assert_eq!(result.status, "failed");
+        assert!(result.error.as_deref().unwrap().contains("ledger failure"));
+        let content = std::fs::read_to_string(&session.session_file).unwrap();
+        assert!(content.contains("pi-web:scheduled-run"), "marker must be written by the child");
+        assert!(!content.contains("must never be sent"), "unlinked session must not receive the prompt");
+        let linked = std::cell::Cell::new(false);
+        let finished = crate::scheduled_runner::run_session(&session,
+            json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "r2", "taskName": "fixture", "trigger": "manual" }),
+            "fixture prompt", Duration::from_secs(10), |_| { linked.set(true); Ok(()) });
+        assert!(linked.get());
+        assert_eq!(finished.status, "succeeded", "{finished:?}");
+        assert!(!finished.counts_as_failure);
+        assert!(finished.error_code.is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
     fn real_pi_scheduled_task_editing_roundtrip() {
         let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else {
             eprintln!("skipping: PI_CLI_BIN not set");
