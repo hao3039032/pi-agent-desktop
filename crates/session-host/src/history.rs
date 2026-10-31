@@ -23,9 +23,14 @@ pub struct SessionSummary {
     pub file: PathBuf,
     pub id: String,
     pub timestamp_ms: i64,
+    /// File mtime in epoch ms (the catalogue's `modified`).
+    pub modified_ms: i64,
     pub cwd: String,
     pub name: Option<String>,
     pub parent_session: Option<String>,
+    /// The first user message's text (the catalogue's `firstMessage`): a
+    /// single pass over the entry lines, truncated to a preview length.
+    pub first_message: Option<String>,
     /// Bytes on disk (the sidebar shows sizes for cleanup hints).
     pub size_bytes: u64,
 }
@@ -126,16 +131,39 @@ pub fn read_header_summary(file: &Path) -> Result<SessionSummary, String> {
     if cwd.is_empty() {
         return Err("header has no cwd".to_string());
     }
+    let modified_ms = std::fs::metadata(file)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(timestamp_ms);
+    // The first user message (the catalogue's preview). One pass; the
+    // session_info/model_change entries ahead of it are skipped.
+    let first_message = content.lines().find_map(|line| {
+        let entry: Value = serde_json::from_str(line.trim()).ok()?;
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            return None;
+        }
+        let role = entry.pointer("/message/role").and_then(Value::as_str)?;
+        if role != "user" {
+            return None;
+        }
+        let text = message_text(entry.pointer("/message/content").unwrap_or(&Value::Null))?;
+        let preview: String = text.chars().take(200).collect();
+        Some(preview)
+    });
     Ok(SessionSummary {
         file: file.to_path_buf(),
         id,
         timestamp_ms,
+        modified_ms,
         cwd,
         name: header.get("name").and_then(Value::as_str).map(str::to_string),
         parent_session: header
             .get("parentSession")
             .and_then(Value::as_str)
             .map(str::to_string),
+        first_message,
         size_bytes,
     })
 }
@@ -193,11 +221,39 @@ fn summary_json(summary: &SessionSummary) -> Value {
         "id": summary.id,
         "file": summary.file.display().to_string(),
         "timestampMs": summary.timestamp_ms,
+        "modifiedMs": summary.modified_ms,
         "cwd": summary.cwd,
         "name": summary.name,
         "parentSession": summary.parent_session,
+        "firstMessage": summary.first_message,
         "sizeBytes": summary.size_bytes,
     })
+}
+
+/// The text of a message content block: a plain string is itself; an array
+/// yields its text parts joined (the first-user-message preview).
+fn message_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let joined: Vec<String> = parts
+                .iter()
+                .filter_map(|part| {
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        part.get("text").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined.join("\n"))
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +332,64 @@ mod tests {
         std::fs::write(&file, "{\"type\":\"message\",\"id\":\"m\"}\n").expect("write");
         let error = read_header_summary(&file).expect_err("not a session file");
         assert!(error.contains("not a session header"));
+    }
+
+    #[test]
+    fn summaries_carry_modified_and_first_message_for_the_catalogue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = dir.path().join("sessions").join("proj");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let file = sessions.join("s.jsonl");
+        std::fs::write(
+            &file,
+            concat!(
+                r#"{"type":"session","version":3,"id":"sid","timestamp":"2026-03-01T12:30:45.000Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"model_change","id":"m1","parentId":null,"provider":"p","modelId":"m"}"#,
+                "\n",
+                r#"{"type":"message","id":"e1","parentId":null,"message":{"role":"user","content":"first question"}}"#,
+                "\n",
+                r#"{"type":"message","id":"e2","parentId":"e1","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+
+        let summary = read_header_summary(&file).expect("summary");
+        assert_eq!(summary.first_message.as_deref(), Some("first question"),
+            "the first USER message, not the assistant reply or the model_change");
+        assert!(summary.modified_ms >= summary.timestamp_ms, "modified is the file mtime");
+
+        // A session with no user message yet: the preview is absent.
+        let empty = sessions.join("empty.jsonl");
+        std::fs::write(
+            &empty,
+            r#"{"type":"session","version":3,"id":"sid2","timestamp":"2026-03-01T12:30:45.000Z","cwd":"/proj"}"#,
+        )
+        .expect("write");
+        let summary = read_header_summary(&empty).expect("summary");
+        assert!(summary.first_message.is_none());
+
+        // A structured user content block yields its text parts.
+        let structured = sessions.join("structured.jsonl");
+        std::fs::write(
+            &structured,
+            concat!(
+                r#"{"type":"session","version":3,"id":"sid3","timestamp":"2026-03-01T12:30:45.000Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"message","id":"e1","parentId":null,"message":{"role":"user","content":[{"type":"text","text":"hello "},{"type":"image","data":"x"},{"type":"text","text":"world"}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        let summary = read_header_summary(&structured).expect("summary");
+        assert_eq!(summary.first_message.as_deref(), Some("hello \nworld"));
+
+        // The index JSON carries the new fields for the IPC catalogue.
+        let index = scan_sessions(dir.path());
+        let value = index_json(&index);
+        let entry = &value["projects"][0]["sessions"][0];
+        assert!(entry.get("modifiedMs").is_some());
+        assert!(entry.get("firstMessage").is_some());
     }
 }

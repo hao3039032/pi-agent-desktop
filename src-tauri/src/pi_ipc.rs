@@ -618,6 +618,42 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
             protocol_ok(&id, data)
         }
+        // The catalogue (GET /api/sessions' projection): a flat session
+        // array, newest first. The Rust scan provides id/cwd/name/created/
+        // modified/parentSession/firstMessage/sizeBytes; the Next route's
+        // messageCount/workspaceKind/relation/running fields are NOT
+        // derivable from headers and stay pending (README's unfixed list) —
+        // the static UI must not pretend they exist.
+        "sessions.catalogue" => {
+            let agent_dir = state.agent_dir();
+            let index = session_host::scan_sessions(&agent_dir);
+            let mut sessions: Vec<Value> = index
+                .projects
+                .values()
+                .flatten()
+                .map(|summary| {
+                    json!({
+                        "id": summary.id,
+                        "path": summary.file.display().to_string(),
+                        "cwd": summary.cwd,
+                        "name": summary.name,
+                        "created": ms_to_iso(summary.timestamp_ms),
+                        "modified": ms_to_iso(summary.modified_ms),
+                        "parentSessionId": summary.parent_session,
+                        "firstMessage": summary.first_message,
+                        "sizeBytes": summary.size_bytes,
+                    })
+                })
+                .collect();
+            sessions.sort_by(|a, b| {
+                b.get("modified").and_then(Value::as_str).cmp(&a.get("modified").and_then(Value::as_str))
+            });
+            // Host-derived roots stay in step with the catalogue.
+            for (cwd, _) in index.projects.iter() {
+                state.propose_path(Path::new(cwd));
+            }
+            protocol_ok(&id, json!({ "sessions": sessions }))
+        }
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
         | "agent.eventsSnapshot" | "agent.command" | "agent.getTools" | "agent.setTools" => {
             // The resume path: an op on an on-disk session may cold-start its
@@ -957,6 +993,34 @@ pub fn pi_ipc(state: State<'_, IpcHostState>, request: Value) -> Value {
     dispatch_envelope(&state, request)
 }
 
+
+/// Epoch ms → ISO-8601 Zulu (the catalogue's created/modified strings).
+fn ms_to_iso(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400) as u32;
+    let (y, m, d) = civil_from_days_local(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, m, d, rest / 3600, (rest % 3600) / 60, rest % 60, millis
+    )
+}
+
+/// civil_from_days for the catalogue timestamps (Hinnant's algorithm).
+fn civil_from_days_local(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,6 +1070,60 @@ mod tests {
         );
         assert_eq!(response["ok"], false);
         assert_eq!(response["error"]["code"], "unknown_op");
+    }
+
+    #[test]
+    fn sessions_catalogue_lists_flat_newest_first_with_the_scan_fields() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let sessions = dir.path().join("sessions").join("encoded");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+
+        let older = sessions.join("older.jsonl");
+        std::fs::write(
+            &older,
+            concat!(
+                r#"{"type":"session","version":3,"id":"s-old","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"message","id":"e1","parentId":null,"message":{"role":"user","content":"older question"}}"#,
+                "\n",
+            ),
+        )
+        .expect("older");
+        // Give the newer file a later mtime (the catalogue sorts on it).
+        let newer = sessions.join("newer.jsonl");
+        std::fs::write(
+            &newer,
+            r#"{"type":"session","version":3,"id":"s-new","timestamp":"2026-02-01T00:00:00.000Z","cwd":"/proj","name":"Named"}"#,
+        )
+        .expect("newer");
+        // Same instant: bump mtime deterministically via a copied temp file.
+        let bumped = dir.path().join("bumped.jsonl");
+        std::fs::copy(&newer, &bumped).expect("copy");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&bumped).and_then(|handle| handle.set_modified(later)).expect("mtime");
+        std::fs::copy(&bumped, &newer).expect("copy back");
+        std::fs::remove_file(&bumped).expect("cleanup");
+
+        let catalogue = send(
+            &state,
+            json!({ "v": 1, "id": "cat1", "op": "sessions.catalogue" }),
+        );
+        assert_eq!(catalogue["ok"], true, "{catalogue}");
+        let sessions = catalogue["data"]["sessions"].as_array().expect("array");
+        assert_eq!(sessions.len(), 2, "{sessions:?}");
+        // Newest (by mtime) first.
+        assert_eq!(sessions[0]["id"], "s-new", "sorted newest first: {sessions:?}");
+        assert_eq!(sessions[0]["name"], "Named");
+        assert_eq!(sessions[1]["id"], "s-old");
+        assert_eq!(sessions[1]["firstMessage"], "older question");
+        // The catalogue carries created/modified as ISO strings and paths.
+        assert!(sessions[0]["created"].as_str().unwrap_or_default().starts_with("2026-02-01T"));
+        assert!(sessions[0]["modified"].as_str().unwrap_or_default().ends_with('Z'));
+        assert!(sessions[0]["path"].as_str().unwrap_or_default().ends_with("newer.jsonl"));
+        // The scan-derived roots still get proposed (browsability in step).
+        assert!(state.is_proposed("/proj"));
     }
 
     #[test]
