@@ -82,6 +82,29 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
             let next = next_run(state, &task)?;
             Ok(json!({ "task": view(task, next, &runs) }))
         }
+        "tasks.runs" => {
+            let task_id = id(args)?;
+            task(&repo, task_id)?;
+            let mut runs = repo.runs(task_id).map_err(|e| err("io", e))?;
+            runs.reverse();
+            let limit = args.get("limit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(50).min(200) as usize;
+            let start = args.get("before").and_then(Value::as_str).and_then(|before| runs.iter().position(|run| run["runId"] == before)).map_or(0, |i| i + 1);
+            let end = (start + limit).min(runs.len());
+            Ok(json!({ "runs": &runs[start..end], "hasMore": end < runs.len() }))
+        }
+        "tasks.markSeen" => {
+            let task_id = id(args)?;
+            let run_id = args.get("runId").and_then(Value::as_str).ok_or_else(|| err("invalid_args", "runId is required"))?;
+            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| err("io", e.to_string()))?.as_millis() as i64;
+            let seen = task_scheduler::store::ms_to_iso(ms);
+            let updated = repo.mutate_runs(task_id, |runs| {
+                let run = runs.iter_mut().find(|run| run["runId"] == run_id).ok_or("Run not found")?;
+                if run["seenAt"].as_str().is_none_or(str::is_empty) { run["seenAt"] = json!(seen); }
+                Ok(run.clone())
+            }).map_err(|e| if e == "Run not found" || e == "Task not found" { err("not_found", e) } else { err("io", e) })?;
+            Ok(json!({ "run": updated }))
+        }
         "tasks.delete" => {
             let removed = repo.delete(id(args)?).map_err(|e| err("io", e))?;
             if !removed { return Err(err("not_found", "Task not found")); }

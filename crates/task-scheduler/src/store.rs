@@ -330,7 +330,7 @@ fn iso_to_ms_impl(value: &str) -> Option<i64> {
 }
 
 /// epoch ms → ISO-8601 (Zulu, millisecond precision).
-pub(crate) fn ms_to_iso(ms: i64) -> String {
+pub fn ms_to_iso(ms: i64) -> String {
     let seconds = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     let days = seconds.div_euclid(86_400);

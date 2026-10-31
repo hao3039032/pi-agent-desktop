@@ -48,6 +48,41 @@ impl TaskRepository {
             .filter(|run| run.get("runId").is_some_and(Value::is_string) && run.get("taskId").and_then(Value::as_str) == Some(task_id)).collect())
     }
 
+    /// Update one task's history while holding the same gate as task deletion.
+    pub fn mutate_runs<T>(&self, task_id: &str, change: impl FnOnce(&mut Vec<Value>) -> Result<T, String>) -> Result<T, String> {
+        if !valid_id(task_id) { return Err("Invalid task id".into()); }
+        let _guard = TransactionLock::acquire(&self.agent_dir).map_err(|e| format!("scheduler transaction busy: {e}"))?;
+        if !tasks_from(&self.read_file()?).iter().any(|task| task["id"].as_str() == Some(task_id)) {
+            return Err("Task not found".into());
+        }
+        let mut runs = self.runs(task_id)?;
+        let result = change(&mut runs)?;
+        let dir = self.agent_dir.join("scheduled-tasks/runs");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let drop_count = runs.len().saturating_sub(200);
+        if drop_count > 0 {
+            use std::io::Write;
+            let archive = dir.join(format!("{task_id}.archive.jsonl"));
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let mut file = options.open(archive).map_err(|e| e.to_string())?;
+            for run in &runs[..drop_count] {
+                if let (Some(run_id), Some(session_id)) = (run["runId"].as_str(), run["sessionId"].as_str()) {
+                    writeln!(file, "{}", json!({ "runId": run_id, "sessionId": session_id })).map_err(|e| e.to_string())?;
+                }
+            }
+            file.flush().map_err(|e| e.to_string())?;
+        }
+        let mut lines = String::new();
+        for run in &runs[drop_count..] {
+            lines.push_str(&serde_json::to_string(run).map_err(|e| e.to_string())?);
+            lines.push('\n');
+        }
+        write_private_atomic(&dir.join(format!("{task_id}.jsonl")), lines.as_bytes())?;
+        Ok(result)
+    }
+
     pub fn mutate<T>(&self, change: impl FnOnce(&mut Vec<Value>) -> Result<T, String>) -> Result<T, String> {
         self.mutate_with_after(change, |_| Ok(()))
     }
@@ -144,6 +179,24 @@ mod tests {
         let tasks = repo.list().unwrap();
         assert_eq!(tasks.len(), 40);
         assert_eq!(tasks.iter().filter(|task| task["name"].as_str().unwrap().starts_with("ts-")).count(), 20);
+    }
+
+    #[test]
+    fn history_rotates_and_preserves_session_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = TaskRepository::new(dir.path());
+        let id = "12345678-1234-1234-1234-123456789abc";
+        repo.mutate(|tasks| { tasks.push(json!({ "id": id, "name": "x", "prompt": "p", "cwd": "/tmp", "enabled": true, "schedule": { "kind": "manual" } })); Ok(()) }).unwrap();
+        repo.mutate_runs(id, |runs| {
+            for i in 0..201 { runs.push(json!({ "runId": format!("r{i}"), "taskId": id, "sessionId": format!("s{i}") })); }
+            Ok(())
+        }).unwrap();
+        assert_eq!(repo.runs(id).unwrap().len(), 200);
+        let archive = std::fs::read_to_string(dir.path().join(format!("scheduled-tasks/runs/{id}.archive.jsonl"))).unwrap();
+        let link: Value = serde_json::from_str(archive.trim()).unwrap();
+        assert_eq!(link, json!({ "runId": "r0", "sessionId": "s0" }));
+        assert!(repo.delete(id).unwrap());
+        assert!(repo.mutate_runs(id, |_| Ok(())).is_err());
     }
 
     #[test]

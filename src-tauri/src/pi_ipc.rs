@@ -1451,7 +1451,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
-        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" => {
+        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" => {
             match crate::scheduler_host::dispatch(state, &op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err(error) => {
@@ -3969,8 +3969,14 @@ mod tests {
         assert_eq!(fetched["data"]["task"]["name"], "edited", "{fetched}");
         let run_dir = dir.path().join("agent/scheduled-tasks/runs");
         std::fs::create_dir_all(&run_dir).unwrap();
-        std::fs::write(run_dir.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(run_dir.join(format!("{id}.jsonl")), format!("{}\n", json!({ "runId": "r1", "taskId": id, "sessionId": "s1", "status": "succeeded" }))).unwrap();
         std::fs::write(run_dir.join(format!("{id}.archive.jsonl")), "{}\n").unwrap();
+        let history = call("tasks.runs", json!({ "id": id }));
+        assert_eq!(history["data"]["runs"][0]["runId"], "r1", "{history}");
+        assert_eq!(call("tasks.list", json!({}))["data"]["tasks"][0]["unreadRuns"], 1);
+        let seen = call("tasks.markSeen", json!({ "id": id, "runId": "r1" }));
+        assert!(seen["data"]["run"]["seenAt"].is_string(), "{seen}");
+        assert_eq!(call("tasks.list", json!({}))["data"]["tasks"][0]["unreadRuns"], 0);
         let removed = call("tasks.delete", json!({ "id": id }));
         assert_eq!(removed["data"]["success"], true, "{removed}");
         assert!(!run_dir.join(format!("{id}.jsonl")).exists());
