@@ -90,7 +90,7 @@ test("static mcp-service surfaces error reason from IpcFailure", async () => {
 test("static mcp-service preserves structured refusal details from IPC", async () => {
   const transport = {
     async send(request) {
-      return { v: 1, id: request.id, ok: false, error: { code: "io", message: "Name taken", reason: "name-taken", retryable: false, details: { name: "docs", suggestedName: "docs-2" } } };
+      return { v: 1, id: request.id, ok: false, error: { code: "io", message: "Name taken", reason: "name-taken", retryable: false, details: { name: "docs", suggestedName: "docs-2", trustPolicyPending: true } } };
     },
   };
   bindMcpService(new IpcClient(transport));
@@ -99,6 +99,7 @@ test("static mcp-service preserves structured refusal details from IPC", async (
   assert.equal(result.error.reason, "name-taken");
   assert.equal(result.error.name, "docs");
   assert.equal(result.error.suggestedName, "docs-2");
+  assert.equal(result.error.trustPolicyPending, true);
 });
 
 test("static MCP probe uses the typed operation", async () => {

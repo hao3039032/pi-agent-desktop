@@ -990,6 +990,19 @@ impl SessionRegistry {
         expired
     }
 
+    /// Registered sessions, including exited children whose outbox may still be unwinding.
+    pub fn registered_sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Outboxes survive closed children and must be considered by policy changes.
+    pub fn pending_composer_session_ids(&self) -> Vec<String> {
+        self.composer_outboxes.lock().unwrap().iter()
+            .filter(|(_, outbox)| outbox.has_pending_or_in_flight())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Live session ids (diagnostics/tests).
     pub fn ids(&self) -> Vec<String> {
         self.sessions

@@ -29,7 +29,7 @@ export interface ProjectTrustOverviewResult {
 export interface ProjectTrustMutationResult {
   ok: boolean;
   status: number;
-  data: Partial<ProjectTrustStatus & McpErrorResponse>;
+  data: Partial<ProjectTrustStatus & McpErrorResponse> & { trustPolicyPending?: boolean };
 }
 
 export async function fetchProjectTrustStatus(

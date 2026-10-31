@@ -118,6 +118,7 @@ export const MCP_ADD_REFUSAL_KEYS: Partial<Record<NonNullable<McpActionFailure["
 
 /** Why the route refused the last Add, in the add pane's words where the reason has them. */
 function failureText(failure: McpActionFailure, t: Translate): string {
+  if (failure.trustPolicyPending) return revealHiddenCharacters(failure.error);
   if (failure.timedOut) return t("mcp.actionTimedOut");
   if (failure.reason === "trust-too-broad" && failure.breadth) {
     return t(MCP_ADD_BREADTH_KEYS[failure.breadth.kind], { path: displayPath(failure.breadth.path) });

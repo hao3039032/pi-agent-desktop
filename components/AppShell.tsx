@@ -1855,7 +1855,7 @@ export function AppShell() {
       const data = response.data;
       if (!response.ok || data.error) {
         // The dialog translates the reason; the English error is only its diagnostic.
-        setProjectTrustError({ error: data.error ?? `HTTP ${response.status}`, ...(data.reason ? { reason: data.reason } : {}) });
+        setProjectTrustError({ error: data.error ?? `HTTP ${response.status}`, ...(data.reason ? { reason: data.reason } : {}), ...(data.trustPolicyPending ? { trustPolicyPending: true } : {}) });
         return;
       }
       setProjectTrust(data as ProjectTrustStatus);

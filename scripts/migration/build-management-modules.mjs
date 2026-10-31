@@ -93,7 +93,7 @@ export {
 } from "${ROOT}/lib/provider-auth-login.server.ts";
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
-export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
+export { projectTrustReloadOptions, getProjectTrustStatus } from "${ROOT}/lib/project-trust.ts";
 export {
   queryModelCatalog,
   discoverModels,

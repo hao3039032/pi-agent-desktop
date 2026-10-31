@@ -421,6 +421,7 @@ async function addServer(
   project: Project | undefined,
   internals: PiSdkInternals,
   body: Record<string, unknown>,
+  onBeforeTrustWrite?: () => void,
 ): Promise<McpActionResponse> {
   const request = readAddRequest(body);
   const { scope } = request;
@@ -441,7 +442,7 @@ async function addServer(
       project.cwd,
       agentDir,
       () => insertMcpServer(projectTarget, name, entry),
-      { knownFolders: project.allowedRoots },
+      { knownFolders: project.allowedRoots, onBeforeTrustWrite },
     );
     if (!result.ok) {
       switch (result.reason) {
@@ -503,6 +504,7 @@ export async function executeMcpAction(options: {
   cwd?: string | null;
   allowedRoots?: Set<string>;
   body: Record<string, unknown>;
+  onBeforeTrustWrite?: () => void;
 }): Promise<McpActionResponse> {
   const agentDir = options.agentDir ?? getAgentDir();
   const body = options.body;
@@ -552,7 +554,7 @@ export async function executeMcpAction(options: {
       return await undoRemoval(agentDir, project, body.token);
     }
     case "add":
-      return await addServer(agentDir, project, internals, body);
+      return await addServer(agentDir, project, internals, body, options.onBeforeTrustWrite);
     default:
       throw new McpServiceError(400, "invalid-request", "action must be add, enable, disable, remove, set-enabled, set-exposure, undo or sign-out");
   }
@@ -580,13 +582,14 @@ export async function getProjectMcpListing(options: {
 export async function trustProjectFolder(options: {
   agentDir?: string;
   cwd: string;
+  onBeforeTrustWrite?: () => void;
 }): Promise<ProjectTrustStatus> {
   const agentDir = options.agentDir ?? getAgentDir();
   const current = getProjectTrustStatus(options.cwd, agentDir);
   if (!current.requiresTrust) {
     throw new McpServiceError(409, "trust-not-required", "This project has no resources that require trust");
   }
-  const status = trustProject(options.cwd, agentDir);
+  const status = trustProject(options.cwd, agentDir, options.onBeforeTrustWrite);
   invalidateModelsCache();
   return status;
 }

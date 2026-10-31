@@ -224,7 +224,7 @@ impl ManagementInstance {
             "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
             "session.readHeader" | "session.readEntries" | "session.readContext" | "session.readView" |
             "session.projectSnapshot" | "chat.systemPrompt" | "session.chatOnlyPrompt" |
-            "models.list" | "models.enabledGet" | "modelsConfig.get" | "skills.search" | "skills.list" | "plugins.list" | "skills.check" | "plugins.check" | "auth.loginPoll" | "mcp.configGet" | "trust.projectListing") {
+            "models.list" | "models.enabledGet" | "modelsConfig.get" | "skills.search" | "skills.list" | "plugins.list" | "skills.check" | "plugins.check" | "auth.loginPoll" | "mcp.configGet" | "trust.projectListing" | "trust.projectStatus") {
             return Err("operation is not approved as read-only".into());
         }
         let handle = format!("task-{}", uuid::Uuid::new_v4());

@@ -153,3 +153,13 @@ test("setProjectTrust calls trust.set over IPC", async () => {
   assert.equal(calledCwd, "/tmp/repo");
   assert.equal(res.data.trusted, true);
 });
+
+test("trust.set preserves the refusal and explicitly reports a pending policy fence", async () => {
+  const transport = { async send(request) { return { v: 1, id: request.id, ok: false, error: { code: "io", message: "Trust write failed; recovery is required", reason: "trust-unreadable", retryable: false, details: { trustPolicyPending: true } } }; } };
+  bindProjectTrustClient(new IpcClient(transport));
+  const res = await setProjectTrust("/tmp/repo");
+  assert.equal(res.ok, false);
+  assert.equal(res.data.reason, "trust-unreadable");
+  assert.equal(res.data.trustPolicyPending, true);
+  assert.match(res.data.error, /recovery/);
+});
