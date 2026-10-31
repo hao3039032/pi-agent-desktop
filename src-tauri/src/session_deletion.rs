@@ -239,6 +239,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     reply({disposition:'handled'});
     return emit({type:'extension_ui_request',id:'notice',method:'notify',message:'PI_WEB_BRIDGE_V1 '+JSON.stringify({sid:'target',rid,nonce:payload.nonce,ok:true,result:{}})});
   }
+  if (r.type === 'prompt') { emit({type:'agent_start'}); return reply({}); }
+  if (r.type === 'interrupt') { emit({type:'agent_settled'}); return reply({}); }
   reply({});
 });
 "##.replace("BRIDGE_PATH", &serde_json::to_string(&bridge.to_string_lossy()).unwrap());
@@ -262,6 +264,14 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
         assert!(state.registry.get("target").is_some() && target.exists());
         std::fs::remove_file(child).unwrap();
+        live.command("prompt", json!({"message":"fixture only"}), Some(std::time::Duration::from_secs(2))).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !live.run_state().is_running() { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "busy");
+        assert!(state.registry.get("target").is_some() && target.exists());
+        live.command("interrupt", json!({}), Some(std::time::Duration::from_secs(2))).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while live.run_state().is_running() { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }
         assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
         assert!(state.registry.get("target").is_none());
         assert!(!target.exists());
