@@ -1,4 +1,11 @@
-import type { SkillsResponse, SkillToggleResult } from "@/lib/api-types";
+import type { SkillsResponse, SkillToggleResult, SkillSearchResult } from "@/lib/api-types";
+
+export async function searchSkills(_cwd: string, query: string): Promise<SkillSearchResult[]> {
+  const response = await fetch("/api/skills/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query }) });
+  const data = await response.json() as { results?: SkillSearchResult[]; error?: string };
+  if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+  return data.results ?? [];
+}
 
 export async function listSkills(cwd: string): Promise<SkillsResponse> {
   const response = await fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`);

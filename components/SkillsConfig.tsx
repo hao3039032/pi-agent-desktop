@@ -11,7 +11,7 @@ import type {
   ProjectTrustStatus,
 } from "@/lib/api-types";
 import { displayPathWithin, shortenPath } from "@/lib/display-path";
-import { listSkills, setSkillsDisabled } from "@/lib/skills-client";
+import { listSkills, searchSkills, setSkillsDisabled } from "@/lib/skills-client";
 import {
   getLastSettingsSelection,
   setLastSettingsSelection,
@@ -287,27 +287,15 @@ function AddSkillPanel({
     setSearchError(null);
     setResults([]);
     try {
-      const res = await fetch("/api/skills/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q.trim() }),
-      });
-      const d = (await res.json()) as {
-        results?: SkillSearchResult[];
-        error?: string;
-      };
-      if (d.error) {
-        setSearchError(d.error);
-        return;
-      }
-      setResults(d.results ?? []);
-      if ((d.results ?? []).length === 0) setSearchError(t("i18n.noSkills"));
+      const found = await searchSkills(cwd, q.trim());
+      setResults(found);
+      if (found.length === 0) setSearchError(t("i18n.noSkills"));
     } catch (e) {
       setSearchError(String(e));
     } finally {
       setSearching(false);
     }
-  }, [t]);
+  }, [cwd, t]);
 
   const install = useCallback(
     async (pkg: string) => {

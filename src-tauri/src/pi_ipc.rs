@@ -1394,6 +1394,20 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
+        "skills.search" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "cwd is required");
+            };
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
+            let Some(query) = args.get("query").and_then(Value::as_str).filter(|s| !s.trim().is_empty() && s.len() <= 1024) else {
+                return protocol_error(&id, "invalid_args", "query is required");
+            };
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            match management_read_scoped(state, "skills.search", &json!({"query": query, "limit": args.get("limit")}), Path::new(&cwd)) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, &error.0, &error.1),
+            }
+        }
         "plugins.list" | "skills.list" | "skills.setDisabled" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
                 return protocol_error(&id, "invalid_args", "cwd is required");
@@ -2096,6 +2110,20 @@ fn management_call_scoped(
     instance
         .management_call_sync(op, args.clone())
         .map_err(|error| management_error_code(&error))
+}
+
+fn management_read_scoped(state: &IpcHostState, op: &str, args: &Value, cwd: &Path) -> Result<Value, (String, String)> {
+    let config = state.management_config.lock().unwrap().clone().ok_or_else(|| ("management_unavailable".into(), "management instance is not configured".into()))?;
+    let instance = state.management.instance(&cwd.to_string_lossy(), &config).map_err(|e| ("management_unavailable".into(), e))?;
+    let handle = instance.start_task(op, args.clone(), std::time::Duration::from_secs(60), management_host::TaskKind::ReadOnly).map_err(|e| ("io".into(), e))?;
+    loop {
+        let snapshot = instance.task_snapshot(&handle).map_err(|e| ("io".into(), e))?;
+        match snapshot.status {
+            management_host::TaskStatus::Succeeded => return Ok(snapshot.result.unwrap_or(Value::Null)),
+            management_host::TaskStatus::Failed | management_host::TaskStatus::Cancelled | management_host::TaskStatus::Unknown => return Err(management_error_code(snapshot.error.as_deref().unwrap_or("management operation outcome unknown"))),
+            management_host::TaskStatus::Running => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 /// The extension reports failures as "[code] message"; recover the code for
@@ -5044,6 +5072,16 @@ mod tests {
         let agent = dir.path().join("agent");
         let project = dir.path().join("project");
         let managed = dir.path().join("managed");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let search_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut input = [0; 4096];
+            let _ = stream.read(&mut input).unwrap();
+            let body = r#"{"skills":[{"id":"fixture/repo","source":"fixture/repo","name":"demo","installs":1200}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
         let skill = agent.join("skills/fixture/SKILL.md");
         std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&project).unwrap();
@@ -5064,10 +5102,15 @@ mod tests {
                 ("HOME".into(), dir.path().display().to_string()),
                 ("USERPROFILE".into(), dir.path().display().to_string()),
                 ("PI_AGENT_HOME".into(), dir.path().display().to_string()),
+                ("SKILLS_API_URL".into(), search_url),
             ],
         });
         state.propose_path(&project);
         let cwd = project.to_string_lossy();
+        let search = send(&state, json!({ "v": 1, "id": "search", "op": "skills.search", "args": { "cwd": cwd, "query": "demo" } }));
+        assert_eq!(search["ok"], true, "{search}");
+        assert_eq!(search["data"]["results"][0]["package"], "fixture/repo@demo");
+        server.join().unwrap();
         let file = skill.to_string_lossy();
         let first = send(&state, json!({ "v": 1, "id": "list1", "op": "skills.list", "args": { "cwd": cwd } }));
         assert_eq!(first["ok"], true, "{first}");
