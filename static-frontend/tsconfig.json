@@ -54,6 +54,24 @@
       ],
       "@/lib/workspace-service": [
         "./static-frontend/src/data/workspace-service.ts"
+      ],
+      "@/lib/desktop-connection": [
+        "./static-frontend/src/data/desktop-connection.ts"
+      ],
+      "@/hooks/useScheduledTasks": [
+        "./static-frontend/src/data/scheduled-tasks-store.ts"
+      ],
+      "@/lib/project-trust-client": [
+        "./static-frontend/src/data/project-trust-client.ts"
+      ],
+      "@/lib/models-service": [
+        "./static-frontend/src/data/models-service.ts"
+      ],
+      "@/lib/enabled-models-service": [
+        "./static-frontend/src/data/enabled-models-service.ts"
+      ],
+      "@/lib/models-config-service": [
+        "./static-frontend/src/data/models-config-service.ts"
       ]
     }
   },

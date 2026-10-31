@@ -160,6 +160,16 @@ writeFileSync(join(agentDir, "models.json"), JSON.stringify({
       api: "openai-completions",
       models: [{ id: "fixture-model", name: "Fixture Model" }],
     },
+    // A second provider so the settings step can switch the FIRST one off
+    // without tripping the last-enabled-model guard (an empty scope means
+    // every model in pi — the switch refuses that server-side).
+    "fixture-second": {
+      name: "Fixture Second",
+      baseUrl: `http://127.0.0.1:${providerPort}/v1`,
+      apiKey: "fixture-key",
+      api: "openai-completions",
+      models: [{ id: "fixture-second-model", name: "Fixture Second Model" }],
+    },
   },
 }, null, 2));
 writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
@@ -301,14 +311,24 @@ let tornDown = false;
 async function teardown(reason) {
   if (tornDown) return;
   tornDown = true;
-  // 1. browser (bounded: a wedged renderer must not wedge the report).
+  // 1. browser (bounded: a wedged renderer must not wedge the report). The
+  // timeout note only fires when the close REALLY lost the race — the
+  // page/context closes land in milliseconds, so a hang here is the browser
+  // process itself; the run still exits (nothing below waits on it), and the
+  // harness/pi reaping below never depended on the browser.
+  let browserPhaseSettled = false;
   await Promise.race([
     (async () => {
       await page.close().catch(() => {});
       await context.close().catch(() => {});
       await browser.close();
+      browserPhaseSettled = true;
     })(),
-    delay(10_000).then(() => console.error("[acceptance] browser.close() timed out after 10s")),
+    delay(10_000).then(() => {
+      if (!browserPhaseSettled) {
+        console.error("[acceptance] browser.close() timed out after 10s (post-run cleanup only; steps and reaping already complete)");
+      }
+    }),
   ]);
   // 2. graceful harness shutdown (bounded).
   if (harnessUrl) {
@@ -669,6 +689,63 @@ try {
   const sessionDir = join(agentDir, "sessions");
   const written = readdirSafe(sessionDir);
   assert.ok(written.length >= 2, `expected the session files under ${sessionDir}, saw ${written.length}`);
+
+  // ------------------------------------------------------ settings models
+  step("settings: Models panel — the enabled switch toggles, survives a reopen, restores");
+  // The REAL settings dialog over the REAL IPC bridge: the panel's provider
+  // list loads through modelsConfig.get, its switches through
+  // models.enabledGet/models.enabledSet (a raw /api/models/* here would be a
+  // production blocker — the static app has no HTTP server).
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.locator(".settings-dialog-surface").waitFor({ timeout: 30_000 });
+  await page.locator(".settings-section-tab", { hasText: "Models" }).click();
+  // The fixture provider's row (models.json providers list) + its detail,
+  // auto-selected as the first provider.
+  const providerRow = page.locator(".config-sidebar-item", { hasText: "fixture-provider" }).first();
+  await providerRow.waitFor({ timeout: 30_000 });
+  // The whole-provider switch a models.json provider gets (ADR 0004). It
+  // only renders once the enabledModels view arrived — that IS the
+  // models.enabledGet round trip.
+  const providerSwitch = page.getByRole("switch", { name: "Enable all Fixture Provider models" });
+  await providerSwitch.waitFor({ timeout: 30_000 });
+  assert.equal(await providerSwitch.getAttribute("aria-checked"), "true", "everything starts enabled");
+  // Toggle OFF: one serialized write through the management instance.
+  await providerSwitch.click();
+  await page.waitForFunction(() => {
+    const toggle = [...document.querySelectorAll('[role="switch"]')].find(
+      (node) => node.getAttribute("aria-label") === "Enable all Fixture Provider models",
+    );
+    return toggle && toggle.getAttribute("aria-checked") === "false" && !toggle.getAttribute("aria-busy");
+  }, null, { timeout: 60_000 });
+  let settingsDisk = readFileSync(join(agentDir, "settings.json"), "utf8");
+  assert.ok(settingsDisk.includes("fixture-second"), `the write narrowed the scope to the other provider: ${settingsDisk}`);
+  assert.ok(!settingsDisk.includes("fixture-provider/"), `fixture-provider is out of the scope: ${settingsDisk}`);
+  // Close and reopen the dialog (a fresh models.enabledGet read): the
+  // switch state must come back from disk, not from stale UI state.
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector(".settings-dialog-surface"), null, { timeout: 30_000 });
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.locator(".settings-dialog-surface").waitFor({ timeout: 30_000 });
+  await page.locator(".settings-section-tab", { hasText: "Models" }).click();
+  await providerSwitch.waitFor({ timeout: 30_000 });
+  assert.equal(
+    await providerSwitch.getAttribute("aria-checked"),
+    "false",
+    "the disabled scope survived the reopen (read from disk)",
+  );
+  // Toggle back ON: the scope stops narrowing anything, so the setting is
+  // dropped again (the engine's serialize rule) — the initial state restored.
+  await providerSwitch.click();
+  await page.waitForFunction(() => {
+    const toggle = [...document.querySelectorAll('[role="switch"]')].find(
+      (node) => node.getAttribute("aria-label") === "Enable all Fixture Provider models",
+    );
+    return toggle && toggle.getAttribute("aria-checked") === "true" && !toggle.getAttribute("aria-busy");
+  }, null, { timeout: 60_000 });
+  settingsDisk = readFileSync(join(agentDir, "settings.json"), "utf8");
+  assert.ok(!settingsDisk.includes("enabledModels"), `everything enabled drops the key again: ${settingsDisk}`);
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector(".settings-dialog-surface"), null, { timeout: 30_000 });
 
   // ---------------------------------------------------------------- report
   const blocking = pageErrors.filter((message) => !message.includes("Failed to load resource"));

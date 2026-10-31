@@ -117,8 +117,10 @@ export class MockTransport implements IpcTransport {
   }
 
   /** Test seam: answer every request for an op with a protocol failure
-   *  envelope (the host's error codes, not a thrown exception). */
-  fail(op: string, error: { code: string; message: string }): this {
+   *  envelope (the host's error codes, not a thrown exception). `reason`
+   *  models the envelope's preserved business reason (the HTTP routes'
+   *  refusal bodies), e.g. the enabledModels write path's 409s. */
+  fail(op: string, error: { code: string; message: string; reason?: string }): this {
     this.handlers.set(op, () => {
       throw new MockFailure(error);
     });
@@ -135,7 +137,7 @@ export class MockTransport implements IpcTransport {
       result = handler(request.args);
     } catch (error) {
       if (error instanceof MockFailure) {
-        return Promise.resolve(failure(request.id, error.error.code as IpcError["code"], error.error.message));
+        return Promise.resolve(failure(request.id, error.error.code as IpcError["code"], error.error.message, error.error.reason));
       }
       return Promise.resolve(
         failure(request.id, "invalid_args", error instanceof Error ? error.message : String(error)),
@@ -173,12 +175,12 @@ function success(id: string, data: unknown): IpcResponse {
   return { v: IPC_PROTOCOL_VERSION, id, ok: true, data };
 }
 
-function failure(id: string, code: IpcError["code"], message: string): IpcResponse {
+function failure(id: string, code: IpcError["code"], message: string, reason?: string): IpcResponse {
   return {
     v: IPC_PROTOCOL_VERSION,
     id,
     ok: false,
-    error: { code, message, retryable: false },
+    error: { code, message, retryable: false, ...(reason === undefined ? {} : { reason }) },
   };
 }
 
@@ -188,8 +190,8 @@ function isPromise(value: unknown): value is Promise<unknown> {
 
 /** A handler's explicit protocol failure (MockTransport.fail). */
 class MockFailure extends Error {
-  public readonly error: { code: string; message: string };
-  constructor(error: { code: string; message: string }) {
+  public readonly error: { code: string; message: string; reason?: string };
+  constructor(error: { code: string; message: string; reason?: string }) {
     super(error.message);
     this.error = error;
   }

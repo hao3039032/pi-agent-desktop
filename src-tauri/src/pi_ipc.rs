@@ -1353,6 +1353,70 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
             }
         }
+        // The Models panel's `enabledModels` switches (GET/PUT
+        // /api/models/enabled's contract). The composition — the
+        // minimal-edit engine, the verified provider globs, stale-entry
+        // preservation, the resync repair — is ONE implementation in the
+        // repo's lib/enabled-models-service.server.ts (the projection
+        // bundle); the host gates the cwd and validates a CLOSED payload:
+        // the op enum and every field are checked HERE and the extension
+        // payload is rebuilt from the validated values only, so an unknown
+        // field or a wrong-typed one never reaches a management child.
+        "models.enabledGet" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "cwd is required");
+            };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            match management_call_scoped(state, "models.enabledGet", &json!({ "cwd": cwd }), Path::new(&cwd)) {
+                Ok(view) => protocol_ok(&id, view),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "models.enabledSet" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "cwd is required");
+            };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            let mut payload = match validated_enabled_models_payload(&args) {
+                Ok(payload) => payload,
+                Err(message) => return protocol_error(&id, "invalid_args", &message),
+            };
+            payload["cwd"] = Value::String(cwd.clone());
+            match management_call_scoped(state, "models.enabledSet", &payload, Path::new(&cwd)) {
+                Ok(view) => protocol_ok(&id, view),
+                Err((code, message)) => {
+                    // The write path's shaped refusals (the HTTP 409 reasons)
+                    // ride the protocol's `reason` field: the code enum stays
+                    // closed ("io" for a management refusal) and the panel's
+                    // FAILURE_KEYS map the reason exactly like they mapped
+                    // the HTTP body's.
+                    if code == "last_model" || code == "project_scope" {
+                        return protocol_error_value(&id, json!({
+                            "code": "io",
+                            "message": message,
+                            "retryable": false,
+                            "reason": code.replace('_', "-"),
+                        }));
+                    }
+                    protocol_error(&id, &code, &message)
+                }
+            }
+        }
+        // The Models panel's models.json read (GET /api/models-config's
+        // contract): the redaction lives in the ONE composition
+        // (readRedactedModelsConfig), so a stored literal apiKey can never
+        // reach the frontend. No cwd scope — models.json is a global file
+        // read, like the route's bare GET.
+        "modelsConfig.get" => match management_call(state, "modelsConfig.get", json!({})) {
+            Ok(config) => protocol_ok(&id, config),
+            Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+        },
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
@@ -1723,6 +1787,7 @@ fn management_error_code(error: &str) -> (String, String) {
                 | "op_failed"
                 | "invalid_cron"
                 | "project_scope"
+                | "last_model"
         );
         (
             if known { code } else { "io".to_string() },
@@ -1730,6 +1795,89 @@ fn management_error_code(error: &str) -> (String, String) {
         )
     } else {
         ("io".to_string(), error.to_string())
+    }
+}
+
+/// The closed payload of `models.enabledSet`: the op enum and every field
+/// the write path knows, validated host-side (the route's 400 half), with
+/// the extension payload rebuilt from the validated values only — the
+/// mirror of the TS seam's parseEnabledModelsMutation, so an unknown or
+/// wrong-typed field never reaches a management child. The field-error
+/// texts are the seam's own (one vocabulary for every client).
+fn validated_enabled_models_payload(args: &Value) -> Result<Value, String> {
+    let op = args.get("op").and_then(Value::as_str).unwrap_or("");
+    let enabled = args.get("enabled");
+    let require_enabled = || -> Result<bool, String> {
+        enabled
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "enabled must be a boolean".to_string())
+    };
+    let string_array = |key: &str| -> Option<Vec<String>> {
+        args.get(key).and_then(Value::as_array).map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        })?
+    };
+    let rename_pairs = |key: &str| -> Option<Vec<Value>> {
+        args.get(key).and_then(Value::as_array).map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let from = entry.get("from")?.as_str()?;
+                    let to = entry.get("to")?.as_str()?;
+                    if from.is_empty() || to.is_empty() {
+                        return None;
+                    }
+                    Some(json!({ "from": from, "to": to }))
+                })
+                .collect::<Option<Vec<_>>>()
+        })?
+    };
+    match op {
+        "clear" | "prune" => Ok(json!({ "op": op })),
+        "resync" => {
+            let Some(renames) = rename_pairs("renames") else {
+                return Err("Invalid resync payload".to_string());
+            };
+            // modelRenames/fullyEnabled default to empty, like the seam's parse.
+            let model_renames = match args.get("modelRenames") {
+                Some(Value::Array(_)) => rename_pairs("modelRenames")
+                    .ok_or_else(|| "Invalid resync payload".to_string())?,
+                _ => Vec::new(),
+            };
+            let fully_enabled = match args.get("fullyEnabled") {
+                Some(Value::Array(_)) => string_array("fullyEnabled")
+                    .ok_or_else(|| "Invalid resync payload".to_string())?,
+                _ => Vec::new(),
+            };
+            Ok(json!({
+                "op": "resync",
+                "renames": renames,
+                "modelRenames": model_renames,
+                "fullyEnabled": fully_enabled,
+            }))
+        }
+        "provider" => {
+            let enabled = require_enabled()?;
+            let Some(provider) = args
+                .get("provider")
+                .and_then(Value::as_str)
+                .filter(|provider| !provider.is_empty())
+            else {
+                return Err("provider is required".to_string());
+            };
+            Ok(json!({ "op": "provider", "provider": provider, "enabled": enabled }))
+        }
+        "models" => {
+            let enabled = require_enabled()?;
+            let Some(refs) = string_array("refs") else {
+                return Err("refs must be an array of strings".to_string());
+            };
+            Ok(json!({ "op": "models", "refs": refs, "enabled": enabled }))
+        }
+        _ => Err("Invalid op".to_string()),
     }
 }
 
@@ -4476,6 +4624,218 @@ mod tests {
         );
         assert_eq!(refused["ok"], false, "{refused}");
         assert_eq!(refused["error"]["code"], "not_found", "{refused}");
+
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
+    /// The enabledModels ops' HOST-side half: the cwd gate (the route's
+    /// 400/403) and the CLOSED payload (the route's 400 field validation)
+    /// both answer BEFORE a management child is ever asked — an allowed cwd
+    /// with no configured instance proves the ordering by answering
+    /// management_unavailable, never a spawned child nor a silent pass.
+    #[test]
+    fn models_enabled_ops_gate_the_cwd_and_closed_payload_before_any_instance() {
+        let state = state();
+        *state.management_config.lock().unwrap() = None;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        state.propose_path(dir.path());
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        // The op enum is closed: an unknown value never reaches an instance.
+        for (label, args) in [
+            ("unknown op", json!({ "cwd": cwd, "op": "nonsense" })),
+            (
+                "enabled missing",
+                json!({ "cwd": cwd, "op": "models", "refs": ["p/m"] }),
+            ),
+            (
+                "enabled wrong type",
+                json!({ "cwd": cwd, "op": "provider", "provider": "p", "enabled": "yes" }),
+            ),
+            (
+                "refs not strings",
+                json!({ "cwd": cwd, "op": "models", "refs": [1, 2], "enabled": true }),
+            ),
+            ("provider empty", json!({ "cwd": cwd, "op": "provider", "provider": "", "enabled": true })),
+            (
+                "resync without renames",
+                json!({ "cwd": cwd, "op": "resync" }),
+            ),
+            (
+                "resync pair missing to",
+                json!({ "cwd": cwd, "op": "resync", "renames": [{ "from": "a" }] }),
+            ),
+        ] {
+            let response = send(
+                &state,
+                json!({ "v": 1, "id": "me", "op": "models.enabledSet", "args": args }),
+            );
+            assert_eq!(response["ok"], false, "{label}: {response}");
+            assert_eq!(response["error"]["code"], "invalid_args", "{label}: {response}");
+        }
+        // The seam's own field-error texts (one vocabulary with the route).
+        let bad_op = send(
+            &state,
+            json!({ "v": 1, "id": "me2", "op": "models.enabledSet", "args": { "cwd": cwd, "op": 7 } }),
+        );
+        assert_eq!(bad_op["error"]["message"], "Invalid op", "{bad_op}");
+        let bad_refs = send(
+            &state,
+            json!({ "v": 1, "id": "me3", "op": "models.enabledSet", "args": {
+                "cwd": cwd, "op": "models", "refs": "x", "enabled": false,
+            }}),
+        );
+        assert_eq!(bad_refs["error"]["message"], "refs must be an array of strings", "{bad_refs}");
+
+        // The cwd gate answers before any instance: a missing cwd, a
+        // nonexistent directory and an out-of-roots directory all refuse
+        // (models.en enabledGet shares the gate).
+        let missing = send(
+            &state,
+            json!({ "v": 1, "id": "me4", "op": "models.enabledGet", "args": {} }),
+        );
+        assert_eq!(missing["error"]["code"], "invalid_args", "{missing}");
+        let absent = send(
+            &state,
+            json!({ "v": 1, "id": "me5", "op": "models.enabledGet", "args": {
+                "cwd": "/nonexistent-pi-web-enabled-gate",
+            }}),
+        );
+        assert_eq!(absent["error"]["code"], "invalid_args", "{absent}");
+        assert!(absent["error"]["message"].as_str().unwrap().starts_with("Directory does not exist"));
+        let outside = std::env::temp_dir().join("pi-web-enabled-gate-outside-root");
+        std::fs::create_dir_all(&outside).expect("gate dir");
+        let denied = send(
+            &state,
+            json!({ "v": 1, "id": "me6", "op": "models.enabledSet", "args": {
+                "cwd": outside.to_string_lossy(), "op": "clear",
+            }}),
+        );
+        assert_eq!(denied["error"]["code"], "access_denied", "{denied}");
+        std::fs::remove_dir(&outside).ok();
+
+        // A VALID request on an allowed cwd answers the config half
+        // (management_unavailable — never a fallback, never a lie).
+        let unconfigured = send(
+            &state,
+            json!({ "v": 1, "id": "me7", "op": "models.enabledGet", "args": { "cwd": cwd } }),
+        );
+        assert_eq!(unconfigured["ok"], false, "{unconfigured}");
+        assert_eq!(unconfigured["error"]["code"], "management_unavailable");
+    }
+
+    /// The enabledModels domain over the REAL pi management instance
+    /// (PI_CLI_BIN, sandboxed agent dir + a staged managed tree): the view,
+    /// a minimal-edit write into the real settings.json, and the shaped
+    /// refusals with the protocol's preserved `reason` field (the full
+    /// composition differential lives in
+    /// scripts/migration/management-extension.test.mjs; this pins the host's
+    /// dispatch, scope wiring and refusal envelope).
+    #[test]
+    fn real_pi_enabled_models_ops_write_settings_through_a_scoped_instance() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("work");
+        std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = stage_managed_tree(dir.path());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![
+                ("PI_WEB_MANAGED_MODULES".to_string(), managed.display().to_string()),
+            ],
+        });
+        // A fixture provider with TWO models (never a real credential, never
+        // a real network) + one unknown stored entry every edit must keep.
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{"providers":{"fixture-provider":{"name":"Fixture Provider","baseUrl":"http://127.0.0.1:9/v1","apiKey":"fixture-key","api":"openai-completions","models":[{"id":"fixture-a"},{"id":"fixture-b"}]}}}"#,
+        )
+        .expect("models.json");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"enabledModels":["ghost-provider/ghost-model"]}"#,
+        )
+        .expect("settings.json");
+        state.propose_path(&project);
+
+        // 1. The read: the exact EnabledModelsView through the cwd gate and
+        //    the cwd-SCOPED instance.
+        let read = send(
+            &state,
+            json!({ "v": 1, "id": "eg1", "op": "models.enabledGet", "args": { "cwd": project.to_string_lossy() } }),
+        );
+        assert_eq!(read["ok"], true, "{read}");
+        assert_eq!(read["data"]["scope"], "global", "{read}");
+        assert_eq!(read["data"]["editable"], true, "{read}");
+        assert_eq!(read["data"]["availableTotal"], 2, "{read}");
+        assert_eq!(read["data"]["stalePatterns"].as_array().unwrap().len(), 1, "{read}");
+        let scopes = state.management.scopes();
+        assert_eq!(scopes.len(), 1, "one cwd-scoped instance: {scopes:?}");
+
+        // 2. The write: a single-model toggle is the minimal edit, and the
+        //    unknown entry survives verbatim.
+        let off = send(
+            &state,
+            json!({ "v": 1, "id": "es1", "op": "models.enabledSet", "args": {
+                "cwd": project.to_string_lossy(), "op": "models",
+                "refs": ["fixture-provider/fixture-a"], "enabled": false,
+            }}),
+        );
+        assert_eq!(off["ok"], true, "{off}");
+        assert_eq!(off["data"]["enabledTotal"], 1, "{off}");
+        let stored = std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings.json");
+        assert!(stored.contains("ghost-provider/ghost-model"), "stale kept: {stored}");
+        assert!(stored.contains("fixture-provider/fixture-b"), "the survivor is explicit: {stored}");
+        assert!(!stored.contains("fixture-a"), "the disabled model is gone: {stored}");
+
+        // 3. The last-model refusal: code io + the preserved HTTP reason.
+        let last = send(
+            &state,
+            json!({ "v": 1, "id": "es2", "op": "models.enabledSet", "args": {
+                "cwd": project.to_string_lossy(), "op": "models",
+                "refs": ["fixture-provider/fixture-b"], "enabled": false,
+            }}),
+        );
+        assert_eq!(last["ok"], false, "{last}");
+        assert_eq!(last["error"]["reason"], "last-model", "{last}");
+        assert_eq!(last["error"]["message"], "At least one model must stay enabled", "{last}");
+
+        // 4. A project settings.json shadows the global value: read-only
+        //    view, refused write with the preserved reason.
+        std::fs::create_dir_all(project.join(".pi")).expect(".pi");
+        std::fs::write(
+            project.join(".pi").join("settings.json"),
+            r#"{"enabledModels":["fixture-provider/*"]}"#,
+        )
+        .expect("project settings");
+        let shadowed = send(
+            &state,
+            json!({ "v": 1, "id": "es3", "op": "models.enabledSet", "args": {
+                "cwd": project.to_string_lossy(), "op": "clear",
+            }}),
+        );
+        assert_eq!(shadowed["ok"], false, "{shadowed}");
+        assert_eq!(shadowed["error"]["reason"], "project-scope", "{shadowed}");
+        let scoped = send(
+            &state,
+            json!({ "v": 1, "id": "eg2", "op": "models.enabledGet", "args": { "cwd": project.to_string_lossy() } }),
+        );
+        assert_eq!(scoped["data"]["scope"], "project", "{scoped}");
+        assert_eq!(scoped["data"]["editable"], false, "{scoped}");
 
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }

@@ -4,6 +4,7 @@ import { AppSelect } from "./AppSelect";
 
 import { useState, useEffect, useCallback, useId, useRef } from "react";
 import { useI18n } from "@/hooks/useI18n";
+import { fetchModelsConfig } from "@/lib/models-config-service";
 import type { ModelCatalogPreset, ModelCatalogRecommendation } from "@/lib/model-catalog";
 import type { DiscoveredModel } from "@/lib/model-discovery";
 import {
@@ -1961,13 +1962,9 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null, onOpenMcp 
   }, []);
 
   useEffect(() => {
-    fetch("/api/models-config")
-      .then(async (r) => {
-        const d = await r.json() as ModelsJson & { error?: string };
-        if (!r.ok || d.error) throw new Error(d.error ?? `HTTP ${r.status}`);
-        return d;
-      })
-      .then((d) => {
+    fetchModelsConfig()
+      .then((loaded) => {
+        const d = loaded as ModelsJson;
         const normalized = d.providers ? d : { ...d, providers: {} };
         setConfig(normalized);
         setSavedConfig(normalized);

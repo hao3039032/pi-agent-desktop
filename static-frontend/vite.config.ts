@@ -115,6 +115,21 @@ export default defineConfig({
         find: /^@\/lib\/models-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-service.ts"),
       },
+      {
+        // The enabledModels service (the Models panel's switches) swaps
+        // GET/PUT /api/models/enabled for models.enabledGet /
+        // models.enabledSet over IPC — the same minimal-edit composition the
+        // Next route serves (lib/enabled-models-service.server.ts).
+        find: /^@\/lib\/enabled-models-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/enabled-models-service.ts"),
+      },
+      {
+        // The models-config read swaps GET /api/models-config for
+        // modelsConfig.get over IPC (the redaction stays server-side on
+        // both paths); the panel's Save keeps the HTTP route for now.
+        find: /^@\/lib\/models-config-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/models-config-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

@@ -706,3 +706,237 @@ test(
     }
   },
 );
+
+/**
+ * M3: the enabledModels domain (models.enabledGet / models.enabledSet) — the
+ * Models panel's switches over the management protocol. Differentially
+ * pinned against the repo's lib/enabled-models-service.server.ts (the ONE
+ * composition the Next /api/models/enabled route also serves) on a fixture
+ * provider in an isolated agent dir: the read view, a single-model toggle's
+ * minimal edit, pattern/pin handling, the stale-entry preservation rule (the
+ * anti-TUI-rewrite contract), the resync repair after a provider rename,
+ * and both shaped refusals (last-model, project scope) plus arg validation.
+ */
+test(
+  "the enabledModels ops answer the repo composition and edit the real settings",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-enabled-"));
+    let client = null;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(join(agentDir, "sessions"), { recursive: true });
+      const modelsJson = (providerId) => JSON.stringify({
+        providers: {
+          [providerId]: {
+            name: "Fixture Provider",
+            baseUrl: "http://127.0.0.1:9/v1",
+            apiKey: "fixture-key",
+            api: "openai-completions",
+            models: [
+              { id: "fixture-a", name: "Fixture A" },
+              { id: "fixture-b", name: "Fixture B" },
+            ],
+          },
+        },
+      }, null, 2);
+      await writeFile(join(agentDir, "models.json"), modelsJson("fixture-provider"), "utf8");
+      // An entry no available model matches (a signed-out provider, a rename,
+      // another machine's config): every edit must preserve it verbatim.
+      await writeFile(join(agentDir, "settings.json"), JSON.stringify({
+        enabledModels: ["ghost-provider/ghost-model"],
+      }, null, 2), "utf8");
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      const nonce = "mgmt-nonce-enabled";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+        },
+        onLog: () => {},
+      });
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `mgmt-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 120_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+      const readSettings = async () => JSON.parse(await (await import("node:fs/promises")).readFile(join(agentDir, "settings.json"), "utf8"));
+
+      // The repo implementation (the ONE source the bundle compiles from),
+      // loaded against the SAME agent dir the child sees.
+      const { loadEnabledModelsView } = await jiti.import("../../lib/enabled-models-service.server.ts");
+      const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        // 1. enabledGet: differentially the repo composition's answer — the
+        //    stale pattern is reported, everything else reads enabled (pi
+        //    falls back to every model when patterns resolve to nothing).
+        const read = await call("models.enabledGet", { cwd });
+        assert.equal(read.ok, true, JSON.stringify(read));
+        const expectedRead = await loadEnabledModelsView(cwd);
+        assert.deepEqual(read.result, expectedRead, "the exact GET /api/models/enabled body");
+        assert.deepEqual(read.result.stalePatterns, ["ghost-provider/ghost-model"]);
+        assert.equal(read.result.allEnabled, true);
+        const provider = read.result.providers.find((entry) => entry.id === "fixture-provider");
+        assert.ok(provider, "the fixture provider is in the view");
+        assert.equal(provider.models.length, 2);
+        assert.equal(read.result.scope, "global");
+        assert.equal(read.result.editable, true);
+
+        // 2. A single-model toggle is a minimal edit: only the covering
+        //    pattern is materialized, the unknown entry stays verbatim, and
+        //    the surviving model is written explicitly (a lone exact
+        //    reference is a deliberate pick, not collapsed).
+        const off = await call("models.enabledSet", {
+          cwd,
+          op: "models",
+          refs: ["fixture-provider/fixture-a"],
+          enabled: false,
+        });
+        assert.equal(off.ok, true, JSON.stringify(off));
+        assert.deepEqual(
+          (await readSettings()).enabledModels,
+          ["ghost-provider/ghost-model", "fixture-provider/fixture-b"],
+          "the minimal edit keeps the stale entry verbatim",
+        );
+        // The answer is the fresh view: one enabled, one stale, not all.
+        assert.equal(off.result.allEnabled, false);
+        assert.equal(off.result.enabledTotal, 1);
+        assert.equal(off.result.availableTotal, 2);
+
+        // 3. Disabling the last enabled model is refused (an empty scope
+        //    silently means every model in pi).
+        const last = await call("models.enabledSet", {
+          cwd,
+          op: "models",
+          refs: ["fixture-provider/fixture-b"],
+          enabled: false,
+        });
+        assert.equal(last.ok, false, JSON.stringify(last));
+        assert.equal(last.code, "last_model");
+
+        // 4. Re-enabling the model collapses the provider back into its
+        //    verified glob — but the stale entry keeps the setting alive.
+        const back = await call("models.enabledGet", { cwd });
+        assert.equal(back.ok, true, JSON.stringify(back));
+        const on = await call("models.enabledSet", {
+          cwd,
+          op: "models",
+          refs: ["fixture-provider/fixture-a"],
+          enabled: true,
+        });
+        assert.equal(on.ok, true, JSON.stringify(on));
+        assert.deepEqual(
+          (await readSettings()).enabledModels,
+          ["ghost-provider/ghost-model", "fixture-provider/*"],
+          "two subset entries collapse into the verified glob; stale keeps the key",
+        );
+
+        // 5. A `:level` pin survives the expansion of its covering pattern.
+        await writeFile(join(agentDir, "settings.json"), JSON.stringify({
+          enabledModels: ["ghost-provider/ghost-model", "fixture-provider/*:high"],
+        }, null, 2), "utf8");
+        const pinned = await call("models.enabledSet", {
+          cwd,
+          op: "models",
+          refs: ["fixture-provider/fixture-a"],
+          enabled: false,
+        });
+        assert.equal(pinned.ok, true, JSON.stringify(pinned));
+        assert.deepEqual(
+          (await readSettings()).enabledModels,
+          ["ghost-provider/ghost-model", "fixture-provider/fixture-b:high"],
+          "the expansion keeps the thinking pin",
+        );
+        const pinnedView = pinned.result.providers.find((entry) => entry.id === "fixture-provider");
+        const pinnedB = pinnedView.models.find((model) => model.id === "fixture-b");
+        assert.equal(pinnedB.thinkingPin, "high", "the view surfaces the pin");
+
+        // 6. resync: a provider renamed under the panel repairs the entries
+        //    (model references first, then the provider prefix) and restores
+        //    the providers that were fully enabled before the save.
+        await writeFile(join(agentDir, "models.json"), modelsJson("fixture-renamed"), "utf8");
+        const resynced = await call("models.enabledSet", {
+          cwd,
+          op: "resync",
+          renames: [{ from: "fixture-provider", to: "fixture-renamed" }],
+          modelRenames: [],
+          fullyEnabled: ["fixture-provider"],
+        });
+        assert.equal(resynced.ok, true, JSON.stringify(resynced));
+        assert.deepEqual(
+          (await readSettings()).enabledModels,
+          ["ghost-provider/ghost-model", "fixture-renamed/fixture-b:high", "fixture-renamed/fixture-a"],
+          "resync rewrites the renamed provider and re-asserts fullyEnabled",
+        );
+        const renamedProvider = resynced.result.providers.find((entry) => entry.id === "fixture-renamed");
+        assert.equal(renamedProvider.enabledCount, 2, "the renamed provider is fully enabled again");
+
+        // 7. A malformed payload refuses with the seam's own text.
+        const badOp = await call("models.enabledSet", { cwd, op: "nonsense" });
+        assert.equal(badOp.ok, false, JSON.stringify(badOp));
+        assert.equal(badOp.code, "invalid_args");
+        assert.match(badOp.error, /Invalid op/);
+        const badRefs = await call("models.enabledSet", { cwd, op: "models", refs: "not-an-array", enabled: true });
+        assert.equal(badRefs.code, "invalid_args");
+        assert.match(badRefs.error, /refs must be an array of strings/);
+
+        // 8. A project settings.json's enabledModels replaces the global
+        //    array (pi merges nothing), so reads report the project scope
+        //    read-only and writes refuse.
+        await mkdir(join(cwd, ".pi"), { recursive: true });
+        await writeFile(join(cwd, ".pi", "settings.json"), JSON.stringify({
+          enabledModels: ["fixture-renamed/*"],
+        }), "utf8");
+        const shadowedRead = await call("models.enabledGet", { cwd });
+        assert.equal(shadowedRead.ok, true, JSON.stringify(shadowedRead));
+        assert.equal(shadowedRead.result.scope, "project");
+        assert.equal(shadowedRead.result.editable, false);
+        assert.ok(shadowedRead.result.settingsPath.includes(join(cwd, ".pi", "settings.json")), shadowedRead.result.settingsPath);
+        const shadowedWrite = await call("models.enabledSet", { cwd, op: "clear" });
+        assert.equal(shadowedWrite.ok, false, JSON.stringify(shadowedWrite));
+        assert.equal(shadowedWrite.code, "project_scope");
+        assert.match(shadowedWrite.error, /Project settings override enabledModels/);
+        // The project scope never touched the global file.
+        assert.equal((await readSettings()).enabledModels[0], "ghost-provider/ghost-model");
+      } finally {
+        if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    } finally {
+      if (client) await client.close(5_000).catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

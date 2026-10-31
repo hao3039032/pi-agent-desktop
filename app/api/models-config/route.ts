@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { ModelsConfigReadError, readModelsConfig, writeModelsConfig } from "@/lib/models-config-store";
-import { mergeStoredLiteralApiKeys, redactModelsJson } from "@/lib/models-config-redaction";
+import { ModelsConfigReadError, readModelsConfig, readRedactedModelsConfig, writeModelsConfig } from "@/lib/models-config-store";
+import { mergeStoredLiteralApiKeys } from "@/lib/models-config-redaction";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +8,7 @@ export async function GET() {
   try {
     // Literal apiKey values never leave the server; shell/env references and
     // every other field are configuration the editor needs to see.
-    return NextResponse.json(redactModelsJson(readModelsConfig()));
+    return NextResponse.json(readRedactedModelsConfig());
   } catch (error) {
     if (error instanceof ModelsConfigReadError) {
       return NextResponse.json({ error: error.message }, { status: 422 });

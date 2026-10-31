@@ -2,6 +2,12 @@
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
+import {
+  applyEnabledModelsEdit,
+  EnabledModelsRefusalError,
+  fetchEnabledModelsView,
+  type EnabledModelsMutation,
+} from "@/lib/enabled-models-service";
 import type { EnabledModelsView } from "@/lib/enabled-models";
 import {
   enabledModelsBulkActions,
@@ -15,11 +21,13 @@ import { ConfigButton, ConfigSwitch } from "./SettingsUi";
 /**
  * Model switches backed by pi's `enabledModels` setting.
  *
- * Every switch writes through `/api/models/enabled` right away, like the login
- * controls in the same panel and unlike the models.json editor around them,
- * which buffers until Save. Requests are serialized: each one is a
- * read-modify-write of one settings key, so overlapping edits from the same
- * panel could otherwise lose one of them.
+ * Every switch writes through the enabledModels service seam
+ * (lib/enabled-models-service.ts — `/api/models/enabled` on Next,
+ * models.enabledGet/models.enabledSet over IPC in the static build) right
+ * away, like the login controls in the same panel and unlike the
+ * models.json editor around them, which buffers until Save. Requests are
+ * serialized: each one is a read-modify-write of one settings key, so
+ * overlapping edits from the same panel could otherwise lose one of them.
  */
 
 /** Shape of `POST /api/models/refresh`, mirroring `CatalogRefreshResult`. */
@@ -56,17 +64,7 @@ export interface EnabledModelsController {
   ) => void;
 }
 
-type MutationBody =
-  | { op: "models"; refs: string[]; enabled: boolean }
-  | { op: "provider"; provider: string; enabled: boolean }
-  | { op: "clear" }
-  | { op: "prune" }
-  | {
-      op: "resync";
-      renames: { from: string; to: string }[];
-      modelRenames: { from: string; to: string }[];
-      fullyEnabled: string[];
-    };
+type MutationBody = EnabledModelsMutation;
 
 const FAILURE_KEYS: Record<string, string> = {
   "last-model": "models.enabledLastModel",
@@ -87,11 +85,8 @@ export function useEnabledModels(cwd?: string | null): EnabledModelsController {
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
-    const query = cwd ? `?cwd=${encodeURIComponent(cwd)}` : "";
-    fetch(`/api/models/enabled${query}`, { signal: controller.signal })
-      .then(async (res) => {
-        const data = await res.json() as EnabledModelsView & { error?: string };
-        if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+    fetchEnabledModelsView(cwd, controller.signal)
+      .then((data) => {
         setView(data);
         setFailure(null);
       })
@@ -117,19 +112,13 @@ export function useEnabledModels(cwd?: string | null): EnabledModelsController {
     setFailure(null);
     void (async () => {
       try {
-        const res = await fetch("/api/models/enabled", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...body, ...(cwd ? { cwd } : {}) }),
-        });
-        const data = await res.json() as EnabledModelsView & { error?: string; reason?: string };
-        if (!res.ok || data.error) {
-          const messageKey = data.reason ? FAILURE_KEYS[data.reason] : undefined;
-          setFailure(messageKey ? { messageKey } : { message: data.error ?? `HTTP ${res.status}` });
-          return;
-        }
+        const data = await applyEnabledModelsEdit(body, cwd);
         setView(data);
       } catch (error) {
+        if (error instanceof EnabledModelsRefusalError) {
+          setFailure({ messageKey: FAILURE_KEYS[error.reason] });
+          return;
+        }
         setFailure({ message: error instanceof Error ? error.message : String(error) });
       } finally {
         pendingRef.current = null;

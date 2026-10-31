@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { writePrivateFileAtomicSync } from "./atomic-file";
+import { redactModelsJson } from "./models-config-redaction";
 import { stripJsonComments } from "./jsonc";
 import { invalidateModelsCache } from "./models-cache";
 
@@ -68,6 +69,17 @@ export class ModelsConfigReadError extends Error {
     super(message);
     this.name = "ModelsConfigReadError";
   }
+}
+
+/**
+ * GET /api/models/enabled's sibling read: models.json as the client may see
+ * it — literal apiKey values redacted, `!command` / `$ENV` references kept
+ * (lib/models-config-redaction). ONE composition both backends run (the Next
+ * route and the management instance's modelsConfig.get op), so a stored
+ * literal key can never reach any frontend.
+ */
+export function readRedactedModelsConfig(): Record<string, unknown> {
+  return redactModelsJson(readModelsConfig());
 }
 
 /**

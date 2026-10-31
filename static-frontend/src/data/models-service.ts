@@ -76,3 +76,14 @@ export async function saveDefaultPreferences(
     throw toError(caught, "Failed to save the default");
   }
 }
+
+// The client half's TYPE surface, re-exported so the aliased module answers
+// the same import surface the repo's lib/models-service.ts does (the hook's
+// `import type` from "@/lib/models-service" resolves here in the static
+// build — type-only, so no runtime graph moves).
+export type {
+  DefaultPreferencesEditRequest,
+  ModelEntry,
+  ModelsResponse,
+  SelectedModel,
+} from "../../../lib/models-service";

@@ -63,6 +63,13 @@ export {
   ModelNotAvailableError,
   EMPTY_MODELS,
 } from "${ROOT}/lib/models-service.server.ts";
+export {
+  loadEnabledModelsView,
+  applyEnabledModelsEdit,
+  parseEnabledModelsMutation,
+  EnabledModelsRefusalError,
+} from "${ROOT}/lib/enabled-models-service.server.ts";
+export { readRedactedModelsConfig } from "${ROOT}/lib/models-config-store.ts";
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
 export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
