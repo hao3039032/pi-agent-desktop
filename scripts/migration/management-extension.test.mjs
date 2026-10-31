@@ -23,12 +23,62 @@ import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
 import { resolvePiCliBin } from "../../lib/pi-rpc/test-utils.mjs";
+import { buildProjectionInto } from "./build-management-modules.mjs";
 
 const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 const { PiRpcClient } = await jiti.import("../../lib/pi-rpc/client.ts");
 
 const executable = resolvePiCliBin();
 const HERE = import.meta.dirname;
+
+/**
+ * Stage the vendored management tree (the desktop:prepare shape) into a temp
+ * dir: croner + the pi SDK graph with its dependency closure, plus the
+ * session-view projection bundle compiled from THIS repo's source.
+ */
+async function stageVendoredTree(managed) {
+  await mkdir(managed, { recursive: true });
+  const { readdirSync, existsSync, readFileSync } = await import("node:fs");
+  const vendorClosure = (entryPackage) => {
+    const seen = new Set();
+    const walk = (name) => {
+      if (seen.has(name)) return;
+      seen.add(name);
+      const dir = join(HERE, "../../node_modules", ...name.split("/"));
+      const manifest = join(dir, "package.json");
+      if (!existsSync(manifest)) return;
+      let deps = {};
+      try {
+        deps = JSON.parse(readFileSync(manifest, "utf8")).dependencies ?? {};
+      } catch {}
+      for (const dep of Object.keys(deps)) walk(dep);
+    };
+    walk(entryPackage);
+    return [...seen];
+  };
+  cpSync(join(HERE, "../../node_modules/croner"), join(managed, "croner"), { recursive: true });
+  for (const pkg of vendorClosure("@earendil-works/pi-ai")) {
+    const from = join(HERE, "../../node_modules", ...pkg.split("/"));
+    if (!existsSync(join(from, "package.json"))) continue;
+    cpSync(from, join(managed, ...pkg.split("/")), { recursive: true });
+  }
+  cpSync(
+    join(HERE, "../../node_modules/@earendil-works/pi-coding-agent"),
+    join(managed, "@earendil-works/pi-coding-agent"),
+    { recursive: true },
+  );
+  for (const pkg of vendorClosure("@earendil-works/pi-coding-agent")) {
+    const from = join(HERE, "../../node_modules", ...pkg.split("/"));
+    if (!existsSync(join(from, "package.json"))) continue;
+    const target = join(managed, ...pkg.split("/"));
+    if (!existsSync(join(target, "package.json"))) {
+      cpSync(from, target, { recursive: true });
+    }
+  }
+  // The projection bundle: compiled from this checkout's lib/ source, the
+  // same code the Next server runs (never a hand-maintained copy).
+  await buildProjectionInto(managed);
+}
 
 test(
   "the management extension answers over the vendored tree inside a real pi child",
@@ -47,48 +97,8 @@ test(
       // The tree root holds node_modules/ so dependency resolution from the
       // vendored packages finds their closure (the desktop:prepare shape).
       const managed = join(root, "managed", "node_modules");
-      await mkdir(managed, { recursive: true });
-      const { readdirSync, existsSync, readFileSync } = await import("node:fs");
-      const vendorClosure = (entryPackage) => {
-        const seen = new Set();
-        const walk = (name) => {
-          if (seen.has(name)) return;
-          seen.add(name);
-          const dir = join(HERE, "../../node_modules", ...name.split("/"));
-          const manifest = join(dir, "package.json");
-          if (!existsSync(manifest)) return;
-          let deps = {};
-          try {
-            deps = JSON.parse(readFileSync(manifest, "utf8")).dependencies ?? {};
-          } catch {}
-          for (const dep of Object.keys(deps)) walk(dep);
-        };
-        walk(entryPackage);
-        return [...seen];
-      };
-      cpSync(join(HERE, "../../node_modules/croner"), join(managed, "croner"), { recursive: true });
-      for (const pkg of vendorClosure("@earendil-works/pi-ai")) {
-        const from = join(HERE, "../../node_modules", ...pkg.split("/"));
-        if (!existsSync(join(from, "package.json"))) continue;
-        cpSync(from, join(managed, ...pkg.split("/")), { recursive: true });
-      }
-      // The SDK package itself (its config/utils/messages graph resolves
-      // against the same closure).
-      cpSync(
-        join(HERE, "../../node_modules/@earendil-works/pi-coding-agent"),
-        join(managed, "@earendil-works/pi-coding-agent"),
-        { recursive: true },
-      );
-      // The closure for the SDK's own external imports (pi-ai covered
-      // above; anything else the session-manager graph reaches).
-      for (const pkg of vendorClosure("@earendil-works/pi-coding-agent")) {
-        const from = join(HERE, "../../node_modules", ...pkg.split("/"));
-        if (!existsSync(join(from, "package.json"))) continue;
-        const target = join(managed, ...pkg.split("/"));
-        if (!existsSync(join(target, "package.json"))) {
-          cpSync(from, target, { recursive: true });
-        }
-      }
+      await stageVendoredTree(managed);
+      const { readdirSync } = await import("node:fs");
 
       // A session file the read ops open (the host authors the header).
       const sessions = join(root, "sessions");
@@ -235,19 +245,249 @@ test(
 
         // 5. No session files were created by the management child itself.
         const agentSessions = join(agentDir, "sessions");
-        const created =
-          !readdirSync ? 0 : (() => {
-            try {
-              return readdirSync(agentSessions).length;
-            } catch {
-              return 0;
-            }
-          })();
+        const created = (() => {
+          try {
+            return readdirSync(agentSessions).length;
+          } catch {
+            return 0;
+          }
+        })();
         assert.equal(created, 0, "management instances write no session files");
       } finally {
         await client.close(5_000);
       }
     } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+/**
+ * M2: the session-view projection ops (session.readView / readContext /
+ * projectSnapshot) — the mgmt-extension half of GET /api/sessions/[id] and
+ * /api/sessions/[id]/context.
+ *
+ * The projection bundle is compiled from THIS checkout's
+ * lib/session-projection.ts; the test differentially asserts the ops apply
+ * the very same functions with the same arguments by running
+ * buildSessionContext in-process (jiti, the repo source) and comparing the
+ * op's answer entry for entry — a stale or hand-edited bundle cannot pass.
+ */
+test(
+  "the session-view projection ops differentially match the repo projection",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-view-"));
+    let client = null;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(agentDir, { recursive: true });
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      // A session with a branch point, a compaction divider, model and
+      // thinking changes, a tool pin and a deferred-able image tool result.
+      const sessionFile = join(root, "sessions", "20260201T100000_proj.jsonl");
+      await mkdir(join(root, "sessions"), { recursive: true });
+      const lines = [
+        { type: "session", version: 3, id: "proj-s1", timestamp: "2026-02-01T10:00:00.000Z", cwd },
+        { type: "message", id: "u1", parentId: null, timestamp: "2026-02-01T10:00:01.000Z", message: { role: "user", content: "first question" } },
+        {
+          type: "message", id: "a1", parentId: "u1", timestamp: "2026-02-01T10:00:02.000Z",
+          message: {
+            role: "assistant", provider: "p", model: "m1",
+            content: [
+              { type: "thinking", thinking: "a long hidden reasoning trace that deferThinking replaces with a preview" },
+              { type: "text", text: "answer one" },
+            ],
+          },
+        },
+        { type: "message", id: "u2", parentId: "a1", timestamp: "2026-02-01T10:00:03.000Z", message: { role: "user", content: "the abandoned branch" } },
+        { type: "message", id: "u2b", parentId: "a1", timestamp: "2026-02-01T10:00:04.000Z", message: { role: "user", content: "the kept branch" } },
+        { type: "message", id: "a2", parentId: "u2b", timestamp: "2026-02-01T10:00:05.000Z", message: { role: "assistant", content: [{ type: "text", text: "answer two" }] } },
+        { type: "model_change", id: "mc1", parentId: "a2", timestamp: "2026-02-01T10:00:06.000Z", provider: "prov", modelId: "model-x" },
+        { type: "thinking_level_change", id: "tl1", parentId: "mc1", timestamp: "2026-02-01T10:00:07.000Z", thinkingLevel: "high" },
+        { type: "compaction", id: "cp1", parentId: "tl1", timestamp: "2026-02-01T10:00:08.000Z", summary: "earlier turns compacted", firstKeptEntryId: "u2b", tokensBefore: 4096 },
+        { type: "message", id: "u3", parentId: "cp1", timestamp: "2026-02-01T10:00:09.000Z", message: { role: "user", content: "after compaction" } },
+        {
+          type: "message", id: "tr1", parentId: "u3", timestamp: "2026-02-01T10:00:10.000Z",
+          message: {
+            role: "toolResult", toolCallId: "tc1",
+            content: [{ type: "image", data: "aGk=".repeat(64), mimeType: "image/png" }],
+          },
+        },
+        { type: "custom", id: "ts1", parentId: "tr1", timestamp: "2026-02-01T10:00:11.000Z", customType: "pi-web:tool-selection", data: { version: 1, tools: ["read", "bash"] } },
+        { type: "message", id: "a3", parentId: "ts1", timestamp: "2026-02-01T10:00:12.000Z", message: { role: "assistant", content: [{ type: "text", text: "final" }] } },
+      ];
+      await writeFile(sessionFile, lines.map((line) => JSON.stringify(line)).join("\n") + "\n", "utf8");
+      const entries = lines.slice(1);
+
+      const nonce = "mgmt-view-nonce";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+        },
+        onLog: () => {},
+      });
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `view-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 120_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+
+      // The repo's own projection, run in-process: the differential oracle.
+      const projection = await jiti.import("../../lib/session-projection.ts");
+      const stats = await jiti.import("../../lib/session-stats.ts");
+
+      // 1. readView: the disk half of GET /api/sessions/[id].
+      const view = await call("session.readView", {
+        file: sessionFile,
+        summaryTree: true,
+        deferThinking: true,
+        deferMedia: true,
+        tail: 50,
+        wholeTurns: true,
+      });
+      assert.equal(view.ok, true, JSON.stringify(view));
+      assert.equal(view.result.header.id, "proj-s1");
+      assert.equal(view.result.leafId, "a3");
+      assert.equal(view.result.treeFormat, "summary");
+      assert.ok(JSON.stringify(view.result.tree).includes("u2b"), "the branch point survives the summary tree");
+      assert.equal(view.result.toolNames.length, 2);
+      assert.deepEqual(view.result.toolNames, ["read", "bash"]);
+      // Differential: the context IS the repo projection's answer.
+      const expectedContext = projection.buildSessionContext(entries, "a3", {
+        deferThinking: true,
+        deferToolResultImages: true,
+        tail: 50,
+        wholeTurns: true,
+      });
+      assert.deepEqual(view.result.context, expectedContext);
+      // The projection's contract held: thinking deferred, image omitted.
+      const assistantOne = view.result.context.messages.find(
+        (message) => message.role === "assistant" && message.content?.some((block) => block.type === "text" && block.text === "answer one"),
+      );
+      const thinking = assistantOne.content.find((block) => block.type === "thinking");
+      assert.equal(thinking.deferred, true, "deferThinking previewed the trace");
+      const toolResult = view.result.context.messages.find((message) => message.role === "toolResult");
+      assert.equal(toolResult.content.some((block) => block.type === "image"), false, "no sessionId: the image is omitted, not a URL");
+      assert.ok(
+        toolResult.content.some((block) => block.type === "text" && /omitted from initial history payload/.test(block.text)),
+        "the omission note is present",
+      );
+      // Settings from the branch: model_change + thinking_level_change.
+      assert.deepEqual(view.result.context.model, { provider: "prov", modelId: "model-x" });
+      assert.equal(view.result.context.thinkingLevel, "high");
+      assert.deepEqual(view.result.stats, stats.computeSessionStats(entries));
+
+      // 2. readContext: an explicit branch leaf (BranchNavigator paging).
+      const branchView = await call("session.readContext", {
+        file: sessionFile,
+        leafId: "a2",
+        deferThinking: true,
+        deferMedia: true,
+        wholeTurns: true,
+      });
+      assert.equal(branchView.ok, true, JSON.stringify(branchView));
+      const expectedBranch = projection.buildSessionContext(entries, "a2", {
+        deferThinking: true,
+        deferToolResultImages: true,
+        tail: 50,
+        excludeLeaf: false,
+        wholeTurns: true,
+      });
+      assert.deepEqual(branchView.result.context, expectedBranch);
+      // The abandoned sibling never renders on this branch.
+      assert.ok(!JSON.stringify(branchView.result.context.messages).includes("the abandoned branch"));
+      // No model_change on this branch: the assistant response metadata is the fallback.
+      assert.deepEqual(branchView.result.context.model, { provider: "p", modelId: "m1" });
+
+      // 3. readContext: `before` pagination excludes the cursor entry.
+      const page = await call("session.readContext", {
+        file: sessionFile,
+        before: "u3",
+        tail: 2,
+        deferThinking: true,
+        deferMedia: true,
+      });
+      assert.equal(page.ok, true, JSON.stringify(page));
+      const expectedPage = projection.buildSessionContext(entries, "u3", {
+        deferThinking: true,
+        deferToolResultImages: true,
+        tail: 2,
+        excludeLeaf: true,
+      });
+      assert.deepEqual(page.result.context, expectedPage);
+      assert.equal(page.result.before, "u3");
+
+      // 4. projectSnapshot: the LIVE half — the host's one-shot child
+      //    snapshot (entries + the in-memory branch pointer) handed over as
+      //    a file. The leaf here is NOT the file's tail: navigateTree moved
+      //    it in memory while the file keeps the abandoned branch's tail.
+      const snapshotFile = join(root, "snapshot.json");
+      const tree = [
+        {
+          entry: entries[0],
+          children: [
+            {
+              entry: entries[1],
+              children: [ { entry: entries[2], children: [] }, { entry: entries[3], children: [ { entry: entries[4], children: [] } ] } ],
+            },
+          ],
+        },
+      ];
+      await writeFile(snapshotFile, JSON.stringify({ entries, leafId: "a2", tree }), "utf8");
+      const live = await call("session.projectSnapshot", {
+        snapshotFile,
+        summaryTree: true,
+        deferThinking: true,
+        deferMedia: true,
+        tail: 50,
+        wholeTurns: true,
+      });
+      assert.equal(live.ok, true, JSON.stringify(live));
+      assert.equal(live.result.leafId, "a2", "the in-memory leaf, not the file tail");
+      assert.deepEqual(live.result.context, expectedBranch);
+      assert.ok(JSON.stringify(live.result.tree).includes("u2"));
+
+      // 5. A bad snapshot refuses with a code (never a half projection).
+      const badSnapshot = join(root, "bad-snapshot.json");
+      await writeFile(badSnapshot, JSON.stringify({ entries: [], leafId: "x" }), "utf8");
+      const bad = await call("session.projectSnapshot", { snapshotFile: badSnapshot });
+      assert.equal(bad.ok, false);
+      assert.equal(bad.code, "invalid_args");
+    } finally {
+      if (client) await client.close(5_000).catch(() => {});
       await rm(root, { recursive: true, force: true });
     }
   },

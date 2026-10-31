@@ -1,0 +1,111 @@
+/**
+ * Build the management-instance module bundle (M2/M3): the session-view
+ * projection the management extension's session.readContext /
+ * session.projectSnapshot ops run, compiled from THIS REPO's source into
+ * one self-contained ESM file the vendored management tree loads by
+ * absolute path (PI_WEB_MANAGED_MODULES).
+ *
+ * The point is ONE implementation: the Next server imports
+ * lib/session-projection.ts (re-exported through lib/session-reader.ts);
+ * the management instance loads the same code bundled here. A drift
+ * between the two is a contract break, so the bundle is rebuilt from
+ * source — never hand-edited, never vendored as a copy.
+ *
+ * Usage:
+ *   node scripts/migration/build-management-modules.mjs --out <dir>
+ *     writes <dir>/pi-web-session-projection.mjs
+ *   node scripts/migration/build-management-modules.mjs --check --out <dir>
+ *     exits non-zero when the existing file differs from a fresh build
+ *
+ * The entry is generated (not a tracked file) so the exported surface
+ * stays next to the ops that consume it.
+ */
+
+import { build } from "esbuild";
+import { mkdir, writeFile, rm } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(HERE, "../..");
+
+// The exported surface the management extension consumes. Keep in step with
+// the ops in lib/pi-rpc/assets/pi-web-management.mjs.
+const ENTRY = `
+export {
+  buildSessionContext,
+  sliceActiveBranch,
+  getLatestModelChange,
+  getLatestResponseModel,
+} from "${ROOT}/lib/session-projection.ts";
+export { projectTreeForResponse, toSummaryTree } from "${ROOT}/lib/project-tree.ts";
+export { computeSessionStats } from "${ROOT}/lib/session-stats.ts";
+export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";
+export {
+  readSessionToolSelection,
+  validateSessionToolSelection,
+} from "${ROOT}/lib/session-tool-selection.ts";
+`;
+
+export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
+
+/** Bundle the projection entry; returns the output contents. */
+export async function bundleProjectionModules() {
+  const result = await build({
+    stdin: {
+      contents: ENTRY,
+      resolveDir: ROOT,
+      loader: "ts",
+      sourcefile: "management-projection-entry.ts",
+    },
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    target: "node20",
+    write: false,
+    legalComments: "none",
+  });
+  return result.outputFiles[0].text;
+}
+
+/** Build into a directory (creates it). Returns the written path. */
+export async function buildProjectionInto(outDir) {
+  const contents = await bundleProjectionModules();
+  await mkdir(outDir, { recursive: true });
+  const target = resolve(outDir, PROJECTION_MODULE_NAME);
+  await writeFile(target, contents, "utf8");
+  return target;
+}
+
+// --- CLI ---------------------------------------------------------------------
+
+const args = process.argv.slice(2);
+const check = args.includes("--check");
+const outIndex = args.indexOf("--out");
+const outDir = outIndex >= 0 ? args[outIndex + 1] : null;
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (!outDir) {
+    console.error("usage: node scripts/migration/build-management-modules.mjs [--check] --out <dir>");
+    process.exit(2);
+  }
+  let previous = null;
+  if (check) {
+    previous = await import("node:fs/promises")
+      .then((fs) => fs.readFile(resolve(outDir, PROJECTION_MODULE_NAME), "utf8"))
+      .catch(() => null);
+  }
+  const target = await buildProjectionInto(outDir);
+  if (check) {
+    const { readFile } = await import("node:fs/promises");
+    const fresh = await readFile(target, "utf8");
+    if (previous !== null && previous !== fresh) {
+      console.error(`[build-management-modules] ${target} is stale (differs from a fresh build)`);
+      await rm(target, { force: true });
+      process.exit(1);
+    }
+    console.error(`[build-management-modules] ${target} up to date`);
+  } else {
+    console.error(`[build-management-modules] wrote ${target}`);
+  }
+}
