@@ -352,6 +352,9 @@ mod linux {
                 assert!(response["error"]["message"].as_str().unwrap().contains("exclusive maintenance"));
                 assert!(!source.exists());
             }
+            let empty = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"empty","op":"sessions.search","args":{"query":""}}));
+            assert_eq!(empty["error"]["code"], "busy", "{empty}");
+            assert!(!source.exists());
             state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
             let _policy = state.policy_gate.try_read().unwrap();
             let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();

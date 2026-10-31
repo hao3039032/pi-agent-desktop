@@ -13,6 +13,22 @@ const SNAPSHOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 type Failure = (String, String);
 fn io(error: impl ToString) -> Failure { ("io".into(), error.to_string()) }
 
+fn check_empty_query(state: &IpcHostState) -> Result<(), Failure> {
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
+    let agent = state.agent_dir();
+    if crate::trust_policy_fence::is_pending(&agent) { return Err(("busy".into(), "Trust policy outcome is unresolved".into())); }
+    let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
+        .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
+    match std::fs::symlink_metadata(agent.join("session-deletion-journal")) {
+        Ok(_) => {
+            let root = agent.join("sessions").canonicalize().map_err(io)?;
+            crate::session_deletion_journal::recover(state, &root)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io(error)),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn open_beneath(root: &Path, path: &Path) -> Result<std::fs::File, Failure> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -163,7 +179,7 @@ pub(crate) fn search(state: &IpcHostState, args: &Value) -> Result<Value, Failur
 fn search_with_management(state: &IpcHostState, args: &Value, call: impl FnOnce(Value) -> Result<Value, Failure>) -> Result<Value, Failure> {
     let query = args.get("query").and_then(Value::as_str).ok_or_else(|| ("invalid_args".into(), "query is required".into()))?.trim();
     if query.encode_utf16().count() > 200 { return Err(("invalid_args".into(), "Search query exceeds 200 characters".into())); }
-    if query.is_empty() { return Ok(json!({"results": [], "truncated": false})); }
+    if query.is_empty() { check_empty_query(state)?; return Ok(json!({"results": [], "truncated": false})); }
     let agent = state.agent_dir();
     let snapshot = snapshot(state)?;
     let mut result = call(json!({"query":query,"sessions":snapshot.candidates}))?;
@@ -187,7 +203,7 @@ fn session_file_within_root(file: &Path, root: &Path) -> Option<PathBuf> {
 pub(crate) fn search(state: &IpcHostState, args: &Value) -> Result<Value, Failure> {
     let query = args.get("query").and_then(Value::as_str).ok_or_else(|| ("invalid_args".into(), "query is required".into()))?.trim();
     if query.encode_utf16().count() > 200 { return Err(("invalid_args".into(), "Search query exceeds 200 characters".into())); }
-    if query.is_empty() { return Ok(json!({"results": [], "truncated": false})); }
+    if query.is_empty() { check_empty_query(state)?; return Ok(json!({"results": [], "truncated": false})); }
     let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
     let agent = state.agent_dir();
     if crate::trust_policy_fence::is_pending(&agent) { return Err(("busy".into(), "Trust policy outcome is unresolved".into())); }
