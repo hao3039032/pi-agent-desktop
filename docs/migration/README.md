@@ -28,25 +28,46 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 
 所有真实 pi 测试都跑在隔离沙箱（临时 `PI_CODING_AGENT_DIR`、临时 cwd），不碰真实 `~/.pi/agent` 数据。
 
-## 当前状态（M0–M2 进行中；审计修复已落地）
+## 当前状态（M0–M2 进行中；两轮审计修复已落地）
 
-| 项 | 状态 | 工件 |
-|---|---|---|
-| 传输层真实接线（唯一接线点 + 真 Channel + 宿主退订） | ✅ 落地 | `lib/desktop-native.ts`（唯一底层接线：hasTauriHostBridge/tauriHostInvoke/tauriHostChannel）+ `static-frontend/src/data/transport.ts`（取消型超时、`agent.unsubscribeEvents` 宿主退订、MissingHostTransport 显式失败——不再默认 mock） |
-| 会话事件流帧→AgentEvent 适配 | ✅ 落地 | `static-frontend/src/data/session-event-source.ts`：快照帧合成 `connected` AgentEvent（AgentEventConnection 的握手要求）、epoch 重基、陈旧 seq 丢弃、reset→error、close 退订 |
-| agent-client IPC 版对齐 | ✅ 落地 | 构造参数序（message, status, code, accepted, instanceId）与原版一致；spawn/handshake 失败→prompt_rejected+accepted:false；AbortSignal 停等待不重发 |
-| pi-ipc capability 隔离 | ✅ 落地 | `capabilities/desktop-pi-ipc.json`（仅可信 WebView，无 loopback remote）；旧 wildcard 不再暴露 pi_ipc/订阅命令 |
-| 文件边界收紧 | ✅ 落地 | 前端无 `files.allowRoot`（根由宿主从会话索引派生，`propose_path`）；`resources.grantFile` 仅确认宿主提出过的路径；写走解析后父目录包含（symlink 逃逸/`..` 拒绝）；终端 cwd 校验；sessions.list agentDir 宿主解析 |
-| pi-host 泄漏/竞态修复 | ✅ 落地 | Bridge Drop 退订 notify（router/exit 线程终止）；重复 in-flight id 拒绝；64MiB stdout 上限；退出等待管道排空（有界 2s）后再 fail_all（"先答后死"回归测试） |
-| agent.command 封闭载荷 | ✅ 落地 | 按命令重建子进程载荷（session/type/未知字段不透传）；枚举=真实子命令面（lib/pi-rpc/session.ts）；主机层命令（fork/get_tools/navigate_tree…）→`not_supported` 不盲转发 |
-| 会话冷启动恢复 | ✅ 落地 | spawn/management 配置启动时解析（PI_CLI_BIN→打包→dev）；磁盘会话的 agent 操作冷启动子进程（POST /api/agent/[id] 契约）；真实 pi 测试断言 get_state 回文件 sessionId |
-| 管理实例加固 + cron.countSlots | ✅ 落地 | nonce 宿主每次 spawn 生成；scope 规范化；并发同 scope 共享一次 spawn；`cron.countSlots`（(since,until] 语义、一年窗口上限）真实 pi 实测 |
-| 调度器修复 | ✅ 落地 | finish_run 以认领者身份释放租约；运行账本 task id 消毒（路径穿越拒绝）；once 调度解析 ISO |
-| 状态镜像跨桥 | ✅ 落地 | `desktop.stateMirror`/`desktop.writeStateMirror`（严格递增 revision、0600 原子写、一层 .bak）；静态端 React 挂载前导入（仅缺失键，不回滚新值）；静态构建的 useStateMirror 别名到 IPC 版 |
-| M2/M3 其余数据域（models/MCP/插件技能/文件树/git/scheduled 目录） | ⬜ 逐域迁移 | 44 个文件 121 处 fetch 仍待迁移（生产合规检查未过）；文件树 files.list、模型面板经管理实例、MCP 面板等是主体 |
-| 主机层命令语义（fork/clone/get_tools/navigate_tree 的 Rust 实现） | ⬜ M2 主体 | 现回答 not_supported；状态机已就位 |
-| 定时器接线（宿主 30s tick + 执行器） | ⬜ M4 | 引擎/存储/账本已就位 |
-| 打包验收（真实 standalone 布局、四平台） | ⬜ M5 | 本机 PI_CLI_BIN 是本地托管安装，非打包验收 |
+> **准确边界**：下表只对**已实现且有测试证据**的项打勾。整体迁移远未完成：
+> 数据域大部分仍走 HTTP、主机层命令未实现、调度器未接产、打包未验收。
+> 第一轮修复曾把「7 个风险领域」整体标为已修——不准确；本表按项重列。
+
+### 已修（带测试证据）
+
+| 项 | 证据 |
+|---|---|
+| 传输层接线（真 Channel/取消型超时/宿主退订/无桥显式失败） | `lib/desktop-native.ts` 唯一接线点 + `static-frontend/src/data/transport.ts`；transport.test.mjs |
+| 事件流适配（快照→connected、seq 单调、世代语义、reset→重连、close 退订） | session-event-source.ts；transport.test.mjs（世代/seq/connected 契约） |
+| agent-client IPC 版（参数序/prompt_rejected/AbortSignal） | transport.test.mjs |
+| pi-ipc capability 仅可信 WebView | `capabilities/desktop-pi-ipc.json`（无 remote）；旧 wildcard 不再含 pi_ipc |
+| 前端无 files.allowRoot；根由宿主派生；grantFile 仅确认宿主提出路径 | pi_ipc.rs（propose_path）+ 测试 |
+| **写路径加固**（最终分量 symlink 拒绝 O_NOFOLLOW openat、悬空 symlink 攻击、检查/打开 TOCTOU 关闭） | file_access.rs `write_through_allowed_parent`；4 个攻击/回归测试（悬空/切换/父换链/正常路径+mode 保留） |
+| pi-host：Bridge Drop 退订、重复 in-flight id、64MiB stdout 上限、退出前排空管道 | mock_protocol.rs（先答后死/超长行/重复 id/bridge drop） |
+| **会话事件订阅生命周期**（fan 线程持有订阅；握手失败回收子进程） | lifecycle.rs `real_pi_events_flow_after_the_handshake_returns`（真实 pi；注入旧 bug 验证测试确实失败）+ `real_pi_handshake_failure_shuts_the_child_down` |
+| agent.command 封闭载荷（按命令重建；枚举=真实子命令面；主机层命令→not_supported） | session-host dispatch 测试 + pi_ipc 测试 |
+| 会话冷启动（spawn 配置解析 + 磁盘会话 agent 操作拉起子进程） | pi_ipc.rs `real_pi_agent_op_cold_starts_an_on_disk_session` |
+| 管理实例（nonce 宿主生成/scope 规范化/并发同 scope 单 spawn）+ cron.countSlots | management-host 真实 pi 测试 + management-extension.test.mjs |
+| 调度器局部修复（租约按认领者释放、账本 task id 消毒、ISO once 解析） | task-scheduler 测试 |
+| PTY 并发创建单子进程（open→spawn→insert 全程持锁） | pty-host `concurrent_creates_for_one_id_spawn_exactly_one_child` |
+| 状态镜像跨桥（读/写/备份/严格递增/挂载前导入） | pi_ipc.rs 测试 + state-mirror.test.mjs |
+| 构建产物契约（frontend-static 目录被 ignore；跟踪的 launcher 占位符还原） | git（index.html 回占位符；assets/ 不再入库） |
+
+### 未修/未完成（明确列出，不越级打勾）
+
+| 项 | 现状 |
+|---|---|
+| 数据域迁移主体（models/MCP/插件技能/文件树/git/worktree/scheduled/appearance/desktop 的 121 处 fetch） | 未开始逐域替换；生产合规检查未过 |
+| 主机层命令（fork/fork_branch/clone/get_tools/navigate_tree/get_state 丰富化/extension_ui_response 输入） | agent.command 回 not_supported；状态机已就位但无实现 |
+| 会话事件流 ACK/背压（有界队列、工具中间更新合并、超限 reset） | 未实现；当前无界转发 |
+| 子 UI 请求转发（agent.respondUi 等）与 pendingExtensionUiIds 权威来源 | 快照带机器视角列表（事件观测）；子进程 UI 未接入转发 |
+| 调度器生产集成（宿主 30s tick、RunSpawner、marker 确认、隐藏窗口运行） | 引擎/存储/账本就位，未接线 |
+| OAuth loopback | M0 PoC 已有（state 不匹配绝不成、取消、PKCE）；未接入宿主真实登录流 |
+| 资源协议 TOCTOU（授予后锚点被换） | 授予绑定解析后目标已实现；请求时重校验路径未系统测试 |
+| PTY UTF8 分片/UTF16 窗口 | 已有实现（M0）；分片边界回归测试覆盖不全 |
+| 终端租约（120s 连接租约）与 M4 生命周期 | 未接线 |
+| 打包验收（standalone 布局、四平台、desktop:prepare/verify 重做） | 未开始；本机 PI_CLI_BIN 是本地托管安装 |
 
 ### 里程碑补充（历史条目，按域划分）
 

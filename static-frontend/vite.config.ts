@@ -2,9 +2,16 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { resolve } from "node:path";
 
-// The migration plan fixes the output: the production Tauri shell loads the
-// app-embedded index.html from ../desktop/frontend. `base: "./"` keeps every
-// asset reference relative.
+// The migration plan fixes a GIT-IGNORED build target: the static app is
+// built into ../desktop/frontend-static (a full, self-contained bundle —
+// `emptyOutDir: true` keeps it exactly one build, no stale hashed assets).
+// The TRACKED ../desktop/frontend/index.html stays the launcher placeholder
+// the production Tauri shell ships today (frontendDist needs it to resolve;
+// the window still loads the packaged Next server until the M5 switch).
+// When M5 flips the shell to the static app, desktop:prepare stages
+// frontend-static into the package's frontend dir — a deliberate, reviewed
+// step, never an accidental commit of half a build. `base: "./"` keeps
+// every asset reference relative.
 //
 // The UI migration reuses the EXISTING component tree (plan §四: 保留现有组件/
 // hooks 分层、CSS 加载顺序和菜单体系): `@/` aliases to the repo root, and the
@@ -52,8 +59,10 @@ export default defineConfig({
     ],
   },
   build: {
-    outDir: resolve(import.meta.dirname, "../desktop/frontend"),
-    emptyOutDir: false, // never delete the launcher placeholder until M5
+    outDir: resolve(import.meta.dirname, "../desktop/frontend-static"),
+    // A build owns its output dir completely: stale hashed chunks from an
+    // earlier build must never ship next to the new ones.
+    emptyOutDir: true,
     target: "es2022",
     // The app tree is large; chunk warnings are expected during the
     // migration. Chunking is tuned with the real bundle at M2's end.

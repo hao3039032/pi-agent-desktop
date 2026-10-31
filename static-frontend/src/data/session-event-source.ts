@@ -25,6 +25,9 @@ const CLOSED = 2;
 interface SnapshotPayload {
   epoch?: number;
   settledEpoch?: number;
+  /** Outstanding child UI requests at subscription time (the SSE `connected`
+   * contract: the client drops dialogs the session no longer holds). */
+  pendingExtensionUiIds?: unknown[];
   state?: {
     sessionId?: string;
     isStreaming?: boolean;
@@ -71,20 +74,38 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
     { session: sessionId },
     (frame: IpcStreamMessage) => {
       if (disposed) return;
-      // Ordering: per subscription the seq is monotonic. A frame from an
-      // older epoch or a replayed seq is stale; a NEW epoch re-baselines.
+      // The frame epoch is the STREAM GENERATION (protocol doc: 宿主纪元
+      // ——宿主重启/重置后递增). Within one subscription the host never
+      // changes it; a frame that does is a RESET signal, never a reason to
+      // quietly re-base the sequence numbers (an epoch bump means the
+      // stream identity changed — the consumer's incremental view is
+      // unreliable and must re-snapshot, which the connection layer's
+      // reconnect models). A frame from an OLDER epoch is stale: drop it.
       if (frame.epoch !== epoch) {
-        epoch = frame.epoch;
-        seenSeq = 0;
+        if (epoch === 0) {
+          // The first frame establishes the generation.
+          epoch = frame.epoch;
+        } else if (frame.epoch < epoch) {
+          return; // stale frame from a previous generation
+        } else {
+          // A NEW generation mid-stream: the stream identity changed, the
+          // incremental view is unreliable — surface as an error → close →
+          // reconnect (the new subscription's snapshot re-synchronizes).
+          source.onerror?.(new Event("error"));
+          return;
+        }
       }
+      // Same generation: the seq is monotonic per subscription. A replayed
+      // or older seq is a hole/gap — never deliver out of order.
       if (frame.seq <= seenSeq) return;
       seenSeq = frame.seq;
 
       if (frame.kind === "snapshot") {
         // The snapshot is NOT an event: it opens the stream with the
         // `connected` AgentEvent the connection layer's handshake waits for
-        // (never surface the host's frame as an AgentEvent — the UI would
-        // treat an unknown record as a protocol event and drop it noisily).
+        // (lib/agent-event-stream.ts's first data event carried exactly
+        // this shape — the UI's dialog reconciliation reads
+        // pendingExtensionUiIds and the streaming flag here).
         const snapshot = (frame.payload ?? {}) as SnapshotPayload;
         const state = snapshot.state ?? {};
         readyState = OPEN;
@@ -92,6 +113,9 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
           type: "connected",
           sessionId: typeof state.sessionId === "string" ? state.sessionId : sessionId,
           isStreaming: state.isStreaming === true,
+          ...(Array.isArray(snapshot.pendingExtensionUiIds)
+            ? { pendingExtensionUiIds: snapshot.pendingExtensionUiIds }
+            : {}),
         });
         return;
       }

@@ -41,6 +41,11 @@ pub struct SessionRunState {
     pub follow_up_queue: Vec<String>,
     pub model: Option<Value>,
     pub thinking_level: Option<String>,
+    /// Outstanding child extension-UI request ids seen on the event stream
+    /// (the SSE `connected` contract's pendingExtensionUiIds — the client
+    /// drops dialogs the session no longer holds). The authoritative holder
+    /// is the child; this is the host's view from the records it saw.
+    pub pending_ui_request_ids: Vec<String>,
 }
 
 impl SessionRunState {
@@ -181,6 +186,25 @@ impl SessionMachine {
             "compaction_end" => {
                 self.state.is_compacting = false;
                 FollowUp::RefreshStats
+            }
+            // Child extension-UI requests: track the outstanding ids for
+            // the snapshot contract (pendingExtensionUiIds). A request seen
+            // again with `cancelled`/answered semantics leaves the set; the
+            // authoritative holder is the child, this is the host's view.
+            "extension_ui_request" => {
+                if let Some(id) = record.get("id").and_then(Value::as_str) {
+                    let id = id.to_string();
+                    if !self.state.pending_ui_request_ids.contains(&id) {
+                        self.state.pending_ui_request_ids.push(id);
+                    }
+                }
+                FollowUp::None
+            }
+            "extension_ui_cancelled" | "extension_ui_closed" => {
+                if let Some(id) = record.get("id").and_then(Value::as_str) {
+                    self.state.pending_ui_request_ids.retain(|seen| seen != id);
+                }
+                FollowUp::None
             }
             "queue_update" | "steering_queued" | "follow_up_queued" => {
                 if let Some(steering) = record.get("steering").and_then(Value::as_array) {

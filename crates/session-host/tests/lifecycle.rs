@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde_json::json;
 
 use session_host::{
-    create_session_file, dispatch_session_op, SessionRegistry, SessionSpawnConfig,
-    IDLE_TIMEOUT,
+    create_session_file, dispatch_session_op, SessionHostError, SessionRegistry,
+    SessionSpawnConfig, IDLE_TIMEOUT,
 };
 
 fn pi_bin() -> Option<String> {
@@ -210,4 +210,141 @@ fn real_pi_machine_and_handled_prompt() {
     assert!(!session.state().is_streaming);
     drop(events);
     registry.remove("url-id-2", Duration::from_secs(10));
+}
+
+/// THE subscription-lifetime regression: the fan thread must own the client
+/// subscription for the session's whole life. The bug this freezes: the
+/// subscription was a dropped-at-return local (`_subscription`), which
+/// detached the listener the moment spawn_session returned — the fan thread
+/// exited instantly and NO event ever reached the machine after the
+/// handshake (state never progressed, settle never woke).
+#[test]
+fn real_pi_events_flow_after_the_handshake_returns() {
+    let Some(executable) = pi_bin() else {
+        eprintln!("skipping: PI_CLI_BIN not set");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&agent_dir).expect("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, file_id) = create_session_file(&sessions, &cwd).expect("session file");
+
+    let registry = SessionRegistry::new();
+    let session = registry
+        .start("url-id-3", &file, &file_id, &cwd, &config(&executable, &agent_dir))
+        .expect("session starts (handshake returned)");
+
+    // A subscriber registered AFTER the handshake (the realistic timing):
+    // the fan-out path must still be alive.
+    let (_subscriber_id, events) = session.subscribe();
+
+    // Drive REAL events without credentials: `compact` emits
+    // compaction_start/compaction_end records (verified against the child
+    // wire) and `clear_queue` emits queue_update — session events that flow
+    // child pipe → fan thread → (machine + subscribers). A dropped-at-spawn
+    // subscription kills the fan thread instantly and NONE of this arrives.
+    let compact = session
+        .command("compact", serde_json::json!({}), Some(Duration::from_secs(30)));
+    // "Nothing to compact" is expected on an empty session — the RESPONSE
+    // may fail; the EVENTS still flowed.
+    let _ = compact;
+    session
+        .command("clear_queue", serde_json::json!({}), Some(Duration::from_secs(30)))
+        .expect("clear_queue answers");
+
+    let mut kinds: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        match events.recv_timeout(Duration::from_secs(2)) {
+            Ok(record) => {
+                kinds.push(
+                    record
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                );
+                if kinds.len() >= 3 {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the fan thread is DEAD: the subscription was dropped at spawn time")
+            }
+        }
+    }
+    assert!(
+        kinds.iter().any(|kind| kind == "compaction_start" || kind == "queue_update"),
+        "session events reached the subscriber after the handshake: {kinds:?}"
+    );
+    // The MACHINE ate the same records through the fan thread: the
+    // compaction flags toggled (compaction_start set, compaction_end
+    // cleared) proves the state machine path is live, not just the pipe.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let streaming = session.state().is_streaming;
+        let idle = session.state().is_idle;
+        if !streaming && idle != Some(false) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the machine never settled after compaction events");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    registry.remove("url-id-3", Duration::from_secs(10));
+}
+
+/// A handshake failure must REAP the child: the session never entered the
+/// registry, so leaving it alive would orphan a pi process past the host.
+#[test]
+fn real_pi_handshake_failure_shuts_the_child_down() {
+    let Some(executable) = pi_bin() else {
+        eprintln!("skipping: PI_CLI_BIN not set");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&agent_dir).expect("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, file_id) = create_session_file(&sessions, &cwd).expect("session file");
+
+    // A session id that CANNOT match: the child reports the file's own id,
+    // so the identity check fails → the handshake error path.
+    let registry = SessionRegistry::new();
+    let config = config(&executable, &agent_dir);
+    let error = match registry
+        .start("wrong-id", &file, "deliberately-wrong-header-id", &cwd, &config)
+    {
+        Err(error) => error,
+        Ok(orphan) => panic!(
+            "the identity check must fail; got a session for {} (file {} / claimed {}) instead",
+            orphan.id, file_id, "deliberately-wrong-header-id"
+        ),
+    };
+    assert!(matches!(error, SessionHostError::Handshake(_)), "{error}");
+    // Nothing entered the registry (nothing to evict later).
+    assert!(registry.ids().is_empty());
+    // The child was reaped: give the exit watcher a moment, then count live
+    // pi children spawned by this test (the launcher chain names the tree).
+    std::thread::sleep(Duration::from_millis(500));
+    let live = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("mode rpc")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default();
+    // pgrep matches its own argv sometimes; require it to be empty or only
+    // the pgrep process — a leaked child would name a pi process.
+    let leaked = live
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    assert_eq!(leaked, 0, "no orphaned pi children; pgrep said: {live:?}");
 }

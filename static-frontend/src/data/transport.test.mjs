@@ -109,23 +109,60 @@ test("the snapshot frame becomes the connected AgentEvent, never a raw frame", (
   source.close();
 });
 
-test("stale seq and re-based epochs are dropped, resets surface as errors", () => {
+test("seq ordering, stale generations, and generation bumps", () => {
   const { source, deliver } = framedSource();
   const events = [];
   const errors = [];
   source.onmessage = (message) => events.push(JSON.parse(message.data));
   source.onerror = () => errors.push("error");
+  // The FIRST frame establishes the generation (no error, no drop).
   deliver({ subscriptionId: "sub", epoch: 2, seq: 5, kind: "event", payload: { type: "a" } });
+  assert.equal(events.length, 1, "the first frame adopts its epoch");
+  // Replayed/older seq within the generation never deliver.
   deliver({ subscriptionId: "sub", epoch: 2, seq: 5, kind: "event", payload: { type: "dup" } });
   deliver({ subscriptionId: "sub", epoch: 2, seq: 4, kind: "event", payload: { type: "old" } });
   assert.equal(events.length, 1, "replayed/older seq frames never deliver");
-  // A new epoch re-baselines the seq.
+  // A frame from an OLDER generation is stale: silently dropped.
+  deliver({ subscriptionId: "sub", epoch: 1, seq: 99, kind: "event", payload: { type: "stale" } });
+  assert.equal(events.length, 1, "stale-generation frames never deliver");
+  assert.equal(errors.length, 0, "stale frames are not errors");
+  // A NEW generation mid-stream is a RESET: the consumer must re-snapshot
+  // (error → reconnect), never quietly re-base and continue.
   deliver({ subscriptionId: "sub", epoch: 3, seq: 1, kind: "event", payload: { type: "fresh" } });
-  assert.equal(events.length, 2);
-  assert.equal(events[1].type, "fresh");
-  // A reset is an error → the connection layer reconnects.
-  deliver({ subscriptionId: "sub", epoch: 3, seq: 2, kind: "reset", payload: null });
-  assert.equal(errors.length, 1);
+  assert.equal(errors.length, 1, "a generation bump surfaces as an error");
+  assert.equal(events.length, 1, "the bumped frame itself never delivers");
+  // A reset frame is an error → the connection layer reconnects.
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 6, kind: "reset", payload: null });
+  assert.equal(errors.length, 2);
+  source.close();
+});
+
+test("the connected event carries pendingExtensionUiIds (the SSE contract)", () => {
+  const { source, deliver } = framedSource();
+  const events = [];
+  source.onmessage = (message) => events.push(JSON.parse(message.data));
+  deliver({
+    subscriptionId: "sub", epoch: 1, seq: 1, kind: "snapshot",
+    payload: {
+      epoch: 1, settledEpoch: 0,
+      pendingExtensionUiIds: ["ui-1", "ui-2"],
+      state: { sessionId: "file-id", isStreaming: false },
+    },
+  });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, "connected");
+  assert.deepEqual(events[0].pendingExtensionUiIds, ["ui-1", "ui-2"],
+    "the dialog reconciliation set survives the adaptation");
+  // Without the field the event omits it (the UI treats absent as unknown).
+  const second = framedSource();
+  const seen = [];
+  second.source.onmessage = (message) => seen.push(JSON.parse(message.data));
+  second.deliver({
+    subscriptionId: "s2", epoch: 1, seq: 1, kind: "snapshot",
+    payload: { epoch: 1, state: { sessionId: "x" } },
+  });
+  assert.equal("pendingExtensionUiIds" in seen[0], false);
+  second.source.close();
   source.close();
 });
 

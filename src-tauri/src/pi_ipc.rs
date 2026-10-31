@@ -311,6 +311,9 @@ pub fn pi_ipc_subscribe_events(
                 "epoch": session_handle.epoch(),
                 "settledEpoch": session_handle.machine_settled_epoch(),
                 "state": session_run_state_json(&session_handle),
+                // The SSE `connected` contract: the client reconciles its
+                // dialog queue against what the session still holds.
+                "pendingExtensionUiIds": session_handle.run_state().pending_ui_request_ids,
             });
             seq += 1;
             if on_event.send(stream_frame(&subscription_id, epoch, seq, "snapshot", snapshot)).is_err() {
@@ -853,24 +856,24 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 return protocol_error(&id, "invalid_args", "path and base64 data are required");
             };
             let target = PathBuf::from(path);
-            // An existing file authorizes through its RESOLVED self (a
-            // symlink pointing outside is refused); a new file through its
-            // resolved PARENT (never a lexical pass — the write would follow
-            // a symlinked final component outside the roots).
-            let allowed = {
+            // ONE authorization+write path: the parent resolves and must sit
+            // inside the roots; the final component opens O_NOFOLLOW against
+            // the FIXED parent descriptor (a dangling or swapped symlink can
+            // never redirect the write outside, and there is no check→open
+            // window — see file_access::write_through_allowed_parent).
+            let outcome = {
                 let roots = state.file_roots.lock().unwrap();
-                if target.exists() {
-                    roots.is_existing_path_allowed(&target)
-                } else {
-                    roots.is_new_path_allowed(&target)
-                }
+                crate::file_access::write_through_allowed_parent(&roots, &target, &data)
             };
-            if !allowed {
-                return protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots");
-            }
-            match std::fs::write(&target, data) {
+            match outcome {
                 Ok(()) => protocol_ok(&id, json!({ "written": path })),
-                Err(error) => protocol_error(&id, "io", &error.to_string()),
+                Err(refusal) => {
+                    let code = match refusal {
+                        crate::file_access::WriteRefusal::Io(_) => "io",
+                        _ => "unauthorized_scope",
+                    };
+                    protocol_error(&id, code, &refusal.to_string())
+                }
             }
         }
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
@@ -1092,6 +1095,153 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn writes_refuse_a_dangling_symlink_final_component() {
+        // THE attack the old exists()-based check missed: a symlink INSIDE
+        // an allowed root pointing at a NOT-YET-EXISTING file OUTSIDE it.
+        // target.exists() FOLLOWS the link → false → the old code took the
+        // new-file branch (parent-only authorization) and fs::write then
+        // FOLLOWED the link, creating the file outside the roots.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        let victim = outside.join("created-by-attack.txt");
+        assert!(!victim.exists());
+        // project/leak → outside/created-by-attack.txt (dangling: the victim
+        // does not exist yet).
+        std::os::unix::fs::symlink(&victim, project.join("leak")).expect("leak");
+        state.propose_path(&project);
+
+        let evil = send(
+            &state,
+            json!({
+                "v": 1, "id": "d1", "op": "files.write",
+                "args": {
+                    "path": project.join("leak").display().to_string(),
+                    "data": base64::engine::general_purpose::STANDARD.encode("escaped"),
+                },
+            }),
+        );
+        assert_eq!(evil["error"]["code"], "unauthorized_scope", "{evil}");
+        assert!(evil["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("symbolic link"), "the refusal names the cause: {evil}");
+        assert!(!victim.exists(), "NOTHING was created outside the roots");
+        // The symlink itself is untouched (no write-through).
+        assert!(std::fs::symlink_metadata(project.join("leak")).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_refuse_a_symlink_final_component_switched_in_flight() {
+        // The check→open race: authorize a PLAIN new file, swap the final
+        // component for a symlink before the open. The O_NOFOLLOW openat
+        // against the FIXED parent descriptor refuses atomically — there is
+        // no window in which the swapped link is followed.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        state.propose_path(&project);
+
+        let roots = state.file_roots.lock().unwrap();
+        let target = project.join("swapme.txt");
+        // The parent authorizes (plain directory inside the root)...
+        let parent = roots
+            .resolved_write_parent(&target)
+            .expect("the plain parent authorizes");
+        // ...then the attacker swaps the final component for a symlink out.
+        std::os::unix::fs::symlink(outside.join("hijacked.txt"), &target).expect("swap");
+        // The write primitive re-resolves through openat + O_NOFOLLOW on the
+        // FIXED parent: the swapped link refuses, nothing lands outside.
+        let refusal = crate::file_access::write_through_allowed_parent(&roots, &target, b"x")
+            .expect_err("the swapped symlink refuses");
+        assert!(matches!(refusal, crate::file_access::WriteRefusal::FinalComponentSymlink));
+        assert_eq!(parent, project.canonicalize().unwrap());
+        assert!(!outside.join("hijacked.txt").exists(), "nothing escaped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_refuse_a_parent_swapped_to_a_symlink_after_authorization() {
+        // The parent-side race: the parent authorized as a real directory,
+        // then a path component above is replaced by a symlink pointing out.
+        // The directory descriptor opens O_NOFOLLOW|O_DIRECTORY on the
+        // CANONICALIZED spelling — a component that no longer resolves as
+        // that directory fails the open instead of following the swap.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).expect("sub");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        state.propose_path(&project);
+
+        let roots = state.file_roots.lock().unwrap();
+        let target = sub.join("file.txt");
+        assert!(roots.resolved_write_parent(&target).is_some(), "authorizes before the swap");
+        // Swap the intermediate directory for a symlink to outside.
+        std::fs::remove_dir(&sub).expect("remove sub");
+        std::os::unix::fs::symlink(&outside, &sub).expect("swap sub");
+        // Now the parent resolves to OUTSIDE: authorization refuses before
+        // any open (the canonicalized parent left the roots).
+        assert!(
+            roots.resolved_write_parent(&target).is_none(),
+            "the swapped parent no longer authorizes"
+        );
+        let refusal = crate::file_access::write_through_allowed_parent(&roots, &target, b"x")
+            .expect_err("refuses after the swap");
+        assert!(matches!(refusal, crate::file_access::WriteRefusal::OutsideRoots));
+        assert!(!outside.join("file.txt").exists(), "nothing escaped");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writes_through_a_real_file_still_work_and_keep_modes() {
+        // The hardening must not break the honest paths: a new plain file,
+        // an overwrite of a plain file (content replaced), and an existing
+        // mode is preserved (O_CREAT is a no-op on an existing file).
+        use std::os::unix::fs::PermissionsExt;
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        state.propose_path(&project);
+        let write = |name: &str, data: &str| {
+            send(
+                &state,
+                json!({
+                    "v": 1, "id": format!("w-{name}"), "op": "files.write",
+                    "args": {
+                        "path": project.join(name).display().to_string(),
+                        "data": base64::engine::general_purpose::STANDARD.encode(data),
+                    },
+                }),
+            )
+        };
+        assert_eq!(write("new.txt", "first")["ok"], true);
+        assert_eq!(std::fs::read_to_string(project.join("new.txt")).unwrap(), "first");
+        assert_eq!(write("new.txt", "second")["ok"], true);
+        assert_eq!(std::fs::read_to_string(project.join("new.txt")).unwrap(), "second");
+        std::fs::set_permissions(project.join("new.txt"), std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+        assert_eq!(write("new.txt", "third")["ok"], true);
+        assert_eq!(
+            std::fs::metadata(project.join("new.txt")).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the existing file's mode survives the overwrite"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn writes_refuse_a_symlinked_final_component() {
         let state = state();
         let dir = tempfile::tempdir().expect("tempdir");

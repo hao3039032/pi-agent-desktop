@@ -512,8 +512,14 @@ fn spawn_session(
     )
     .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
 
-    // Event fan-out thread: child records → subscribers.
-    let (events, _subscription) = client.on_event();
+    // Event fan-out thread: child records → subscribers. The thread OWNS the
+    // client subscription (moved into the closure): dropping it at the end
+    // of spawn_session — the bug this fixed — detached the listener at once,
+    // the fan thread's recv failed immediately and the session received NO
+    // events after the handshake (no state machine, no settle wakeups).
+    // Ownership here keeps the subscription alive exactly as long as the
+    // fan thread lives, which ends when the child's transport closes.
+    let (events, subscription) = client.on_event();
     let state = Arc::new(Session {
         id: id.to_string(),
         session_file_id: session_file_id.to_string(),
@@ -536,6 +542,10 @@ fn spawn_session(
         std::thread::Builder::new()
             .name(format!("session-events-{id}"))
             .spawn(move || {
+                // The subscription dies WITH this thread: dropping it at the
+                // loop's end detaches the listener only once the child's
+                // transport has closed (recv failed) — the session is over.
+                let _subscription_guard = subscription;
                 while let Ok(record) = events.recv() {
                     fan.fan_out(record);
                 }
@@ -543,24 +553,36 @@ fn spawn_session(
             .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
     }
 
-    // Handshake: session identity, commands, bridge attribution.
-    let child_state = state
-        .get_state()
-        .map_err(|error| SessionHostError::Handshake(error.to_string()))?;
-    if child_state.get("sessionId").and_then(Value::as_str) != Some(session_file_id) {
-        return Err(SessionHostError::Handshake(format!(
-            "the child reported session {} instead of the file's {session_file_id}",
-            child_state.get("sessionId").map(Value::to_string).unwrap_or_else(|| "?".into())
-        )));
-    }
-    let commands = client
-        .command("get_commands", json!({}), Some(Duration::from_secs(60)))
-        .map_err(|error| SessionHostError::Handshake(error.to_string()))?;
-    let bridge_commands = find_bridge_commands(&commands, &config.bridge_asset);
-    if !bridge_commands.iter().any(|name| name == "pi-web:bridge") {
-        return Err(SessionHostError::Handshake(
-            "the shipped bridge asset did not register pi-web:bridge in the child".to_string(),
-        ));
+    // Handshake: session identity, commands, bridge attribution. Every
+    // failure path SHUTS THE CHILD DOWN — the session is not in the registry
+    // yet, so nobody else would reap it (an orphaned pi child would outlive
+    // the host process that spawned it).
+    let handshake = || -> Result<(), SessionHostError> {
+        let child_state = state
+            .get_state()
+            .map_err(|error| SessionHostError::Handshake(error.to_string()))?;
+        if child_state.get("sessionId").and_then(Value::as_str) != Some(session_file_id) {
+            return Err(SessionHostError::Handshake(format!(
+                "the child reported session {} instead of the file's {session_file_id}",
+                child_state.get("sessionId").map(Value::to_string).unwrap_or_else(|| "?".into())
+            )));
+        }
+        let commands = client
+            .command("get_commands", json!({}), Some(Duration::from_secs(60)))
+            .map_err(|error| SessionHostError::Handshake(error.to_string()))?;
+        let bridge_commands = find_bridge_commands(&commands, &config.bridge_asset);
+        if !bridge_commands.iter().any(|name| name == "pi-web:bridge") {
+            return Err(SessionHostError::Handshake(
+                "the shipped bridge asset did not register pi-web:bridge in the child".to_string(),
+            ));
+        }
+        Ok(())
+    };
+    if let Err(error) = handshake() {
+        // stdin EOF then grace kill (the orderly path); the fan thread ends
+        // with the transport; the bridge's threads end on the child's exit.
+        state.shutdown(Duration::from_secs(5));
+        return Err(error);
     }
     Ok(state)
 }
@@ -850,6 +872,7 @@ fn run_state_json(state: &crate::machine::SessionRunState) -> Value {
         "followUpQueue": state.follow_up_queue,
         "model": state.model,
         "thinkingLevel": state.thinking_level,
+        "pendingExtensionUiIds": state.pending_ui_request_ids,
         "running": state.is_running(),
     })
 }

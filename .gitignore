@@ -81,7 +81,10 @@ crates/pty-host/target/
 crates/oauth-loopback/target/
 crates/resource-protocol/target/
 
-# static-frontend build output (M1: rebuilt by `npm run build` in static-frontend)
+# static-frontend build output (rebuilt by `npm run build` in static-frontend;
+# the TRACKED desktop/frontend/index.html stays the launcher placeholder until
+# the M5 flip — desktop:prepare stages frontend-static into the package then)
+desktop/frontend-static/
 desktop/frontend/assets/
 crates/session-host/target/
 crates/management-host/target/

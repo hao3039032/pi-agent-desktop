@@ -235,14 +235,16 @@ impl PtyHost {
     /// same id is returned as-is — including a different cwd: the original
     /// terminal keeps its folder (the id is the identity).
     pub fn create(&self, id: &str, cwd: Option<&std::path::Path>, options: PtyOptions) -> Result<Arc<Pty>, String> {
-        {
-            let map = self.inner.lock().unwrap();
-            if let Some(existing) = map.get(id) {
-                if existing.exit.lock().unwrap().is_none() {
-                    return Ok(Arc::clone(existing));
-                }
-                // Exited: fall through and replace the dead entry.
+        // The whole open→spawn→insert runs under ONE lock: without it, two
+        // concurrent creates for the same id both pass the existence check,
+        // both spawn a shell, and the loser's child is orphaned (it is in no
+        // registry, so close() can never reach it).
+        let mut map = self.inner.lock().unwrap();
+        if let Some(existing) = map.get(id) {
+            if existing.exit.lock().unwrap().is_none() {
+                return Ok(Arc::clone(existing));
             }
+            // Exited: fall through and replace the dead entry.
         }
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
@@ -360,8 +362,17 @@ impl PtyHost {
                 .map_err(|error| format!("exit thread failed: {error}"))?;
         }
 
-        let mut map = self.inner.lock().unwrap();
-        Ok(map.entry(id.to_string()).or_insert_with(|| Arc::clone(&pty)).clone())
+        let mut map_guard = map;
+        let inserted = map_guard.entry(id.to_string()).or_insert_with(|| Arc::clone(&pty)).clone();
+        // If the registry already held a live entry (it cannot — the whole
+        // open→spawn→insert ran under the lock — but entry() stays the
+        // authority), the just-spawned loser must not leak: hang up its
+        // master so the child's group gets SIGHUP and the exit watcher ends.
+        if !Arc::ptr_eq(&inserted, &pty) {
+            *pty.master.lock().unwrap() = None;
+            *pty.writer.lock().unwrap() = None;
+        }
+        Ok(inserted)
     }
 
     /// An existing live PTY by id.
@@ -504,4 +515,39 @@ mod tests {
         host.close("close");
         assert!(pty.write_input(b"ls\n").is_err(), "input after close fails, never auto-retries");
     }
+}
+
+#[test]
+fn concurrent_creates_for_one_id_spawn_exactly_one_child() {
+    // The race this freezes: create() used to check the map, DROP the lock,
+    // spawn, then re-lock to insert — two concurrent calls both spawned and
+    // the loser's shell was orphaned (in no registry, unreachable by close).
+    let host = std::sync::Arc::new(PtyHost::new());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let host = std::sync::Arc::clone(&host);
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            host.create("race-id", None, PtyOptions::default())
+        }));
+    }
+    let mut first: Option<Arc<Pty>> = None;
+    for handle in handles {
+        let pty = handle.join().expect("create").expect("pty");
+        match &first {
+            None => first = Some(Arc::clone(&pty)),
+            Some(existing) => {
+                assert!(
+                    Arc::ptr_eq(existing, &pty),
+                    "every concurrent create returns the SAME live PTY"
+                );
+            }
+        }
+    }
+    // One registry entry, closable.
+    assert_eq!(host.ids(), vec!["race-id".to_string()]);
+    assert!(host.close("race-id"));
+    assert!(host.ids().is_empty());
 }

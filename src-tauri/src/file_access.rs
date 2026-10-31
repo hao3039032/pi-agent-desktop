@@ -97,7 +97,7 @@ impl AllowedRoots {
         };
         let Some(authorize) = authorize else { return false };
         let Ok(resolved_target) = std::fs::canonicalize(&authorize) else {
-            return false;
+            return false
         };
         for root in &self.roots {
             let root_path = PathBuf::from(root);
@@ -110,6 +110,175 @@ impl AllowedRoots {
         }
         false
     }
+
+    /// The canonical, resolved PARENT of a write target, authorized against
+    /// the resolved roots. Returns None when the parent does not resolve or
+    /// escapes the roots. This is the ONE authorization point for writes:
+    /// the final component is never resolved here (that is the open's job,
+    /// symlink-refusing — see write_through_allowed_parent).
+    pub fn resolved_write_parent(&self, target: &Path) -> Option<PathBuf> {
+        if has_parent_segment(target) {
+            return None;
+        }
+        if !self.is_path_allowed(target) {
+            return None;
+        }
+        let parent = target.parent()?;
+        let resolved = std::fs::canonicalize(parent).ok()?;
+        for root in &self.roots {
+            let Ok(resolved_root) = std::fs::canonicalize(PathBuf::from(root)) else {
+                continue;
+            };
+            if resolved.starts_with(&resolved_root) {
+                return Some(resolved);
+            }
+        }
+        None
+    }
+}
+
+/// Why a checked write was refused (the protocol error's details).
+#[derive(Debug)]
+pub enum WriteRefusal {
+    /// The path (parent) is not inside the allowed roots.
+    OutsideRoots,
+    /// The final component is a symlink: the write would follow it.
+    FinalComponentSymlink,
+    /// The filesystem refused the open/write.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for WriteRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteRefusal::OutsideRoots => write!(f, "the path is outside the allowed roots"),
+            WriteRefusal::FinalComponentSymlink => {
+                write!(f, "the final path component is a symbolic link")
+            }
+            WriteRefusal::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Write `data` at `target`, refusing to follow a symlinked FINAL component
+/// and closing the authorization→open TOCTOU window:
+///
+/// - the parent is canonicalized and authorized INSIDE this function (the
+///   caller passes the roots, never a pre-computed verdict);
+/// - Unix: the open happens `openat(dirfd, name, O_NOFOLLOW)` on a directory
+///   descriptor opened O_NOFOLLOW itself — the name resolves atomically
+///   against the FIXED directory, so swapping the parent for a symlink (or
+///   the final component between check and open) cannot redirect the write;
+/// - Windows (untested here): the canonicalized parent is prefixed `\\?\`
+///   (no reparse resolution) and the final component is checked as a
+///   reparse point, refusing known link types before the write.
+pub fn write_through_allowed_parent(
+    roots: &AllowedRoots,
+    target: &Path,
+    data: &[u8],
+) -> Result<(), WriteRefusal> {
+    use std::io::Write;
+    let Some(resolved_parent) = roots.resolved_write_parent(target) else {
+        return Err(WriteRefusal::OutsideRoots);
+    };
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return Err(WriteRefusal::OutsideRoots);
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(WriteRefusal::OutsideRoots);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW on the directory: a parent swapped to a symlink between
+        // the canonicalize above and this open refuses rather than resolving
+        // through the link.
+        let parent_fd = std::fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&resolved_parent)
+            .map_err(WriteRefusal::Io)?;
+        // openat against the fixed descriptor with O_NOFOLLOW: a symlinked
+        // final component is ELOOP, atomically — no window between an
+        // lstat check and the open.
+        let file = openat_no_follow(&parent_fd, name).map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                WriteRefusal::FinalComponentSymlink
+            } else {
+                WriteRefusal::Io(error)
+            }
+        })?;
+        let mut file = file;
+        file.write_all(data).map_err(WriteRefusal::Io)?;
+        file.flush().map_err(WriteRefusal::Io)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The canonicalized parent with the NT prefix keeps the path from
+        // being re-resolved through intermediate reparse points.
+        let full = std::path::PathBuf::from(format!(
+            "\\\\?\\{}\\{}",
+            resolved_parent.to_string_lossy().replace('/', "\\"),
+            name
+        ));
+        // A reparse-point final component (symlink/junction) is REFUSED:
+        // probe with FILE_FLAG_OPEN_REPARSE_POINT (which opens the link
+        // itself instead of following it) and inspect the file type.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&full);
+        match probe {
+            Ok(handle) => {
+                let meta = handle.metadata().map_err(WriteRefusal::Io)?;
+                drop(handle);
+                if meta.file_type().is_symlink() {
+                    return Err(WriteRefusal::FinalComponentSymlink);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A new file: no reparse point to refuse.
+            }
+            Err(error) => return Err(WriteRefusal::Io(error)),
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&full)
+            .map_err(WriteRefusal::Io)?;
+        file.write_all(data).map_err(WriteRefusal::Io)?;
+        file.flush().map_err(WriteRefusal::Io)?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn openat_no_follow(
+    parent: &std::fs::File,
+    name: &str,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // A file name must not carry an embedded NUL (it cannot on a real
+    // filesystem, but the string came over IPC).
+    let c_name = CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // 0644 for new files (the /api/files write behavior); an existing file
+    // keeps its own mode because O_CREAT on an existing file is a no-op.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd comes from a successful openat; File takes sole ownership
+    // and closes it on drop.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Whether the path carries a `..` segment (Windows separators included —
