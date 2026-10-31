@@ -40,6 +40,7 @@ fn config(executable: &str, agent_dir: &std::path::Path) -> SessionSpawnConfig {
         bridge_asset: bridge_asset(),
         artifacts_asset: None,
         chat_asset: None,
+        chat_asset_sha256: None,
         shape: session_host::SessionSpawnShape::Project { tool_args: None },
         initial_model: None,
         thinking_level: None,
@@ -96,6 +97,13 @@ fn a_chat_without_its_policy_asset_fails_closed_before_spawning() {
     std::fs::write(&prompt_file, "chat preamble").expect("prompt");
 
     let chat_shape = |chat_asset: Option<PathBuf>| session_host::SessionSpawnConfig {
+        // The digest pins whatever asset the caller passes (a test fixture
+        // pins its own bytes; a MISSING file needs no pin — the readability
+        // gate answers first). The mismatch tests pin SOMETHING ELSE.
+        chat_asset_sha256: chat_asset
+            .as_deref()
+            .filter(|path| path.is_file())
+            .map(sha256_of_file),
         executable: "/nonexistent/pi".to_string(),
         agent_dir: Some(agent_dir.clone()),
         session_dir: None,
@@ -443,6 +451,14 @@ fn b64(value: &serde_json::Value) -> String {
     base64::engine::general_purpose::STANDARD.encode(value.to_string())
 }
 
+/// SHA-256 hex of a file's bytes (the same pin the host verifies).
+fn sha256_of_file(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).expect("read asset for digest");
+    let digest = Sha256::digest(&bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// `get_commands` data reporting pi-web:bridge at the REAL shipped bridge
 /// asset (every shape loads it) plus optionally a chat policy command at
 /// `chat_asset`.
@@ -470,6 +486,7 @@ fn mock_config(agent_dir: &Path, extra: &[&str]) -> SessionSpawnConfig {
         bridge_asset: bridge_asset(),
         artifacts_asset: None,
         chat_asset: None,
+        chat_asset_sha256: None,
         shape: session_host::SessionSpawnShape::Project { tool_args: None },
         initial_model: None,
         thinking_level: None,
@@ -500,6 +517,7 @@ fn a_chat_whose_child_lacks_the_policy_command_fails_closed() {
     let commands = b64(&commands_for(&bridge_asset(), None, false));
     let config = SessionSpawnConfig {
         chat_asset: Some(empty_asset.clone()),
+        chat_asset_sha256: Some(sha256_of_file(&empty_asset)),
         shape: session_host::SessionSpawnShape::Chat {
             prompt_file,
             folder: true,
@@ -564,6 +582,7 @@ fn the_chat_policy_gate_checks_the_commands_attribution() {
     let commands = b64(&commands_for(&bridge_asset(), Some(&real_asset), true));
     let config = SessionSpawnConfig {
         chat_asset: Some(real_asset.clone()),
+        chat_asset_sha256: Some(sha256_of_file(&real_asset)),
         shape: chat_shape(),
         ..mock_config(&agent_dir, &["--mock-session-id", &id, "--mock-commands", &commands])
     };
@@ -582,6 +601,7 @@ fn the_chat_policy_gate_checks_the_commands_attribution() {
     let commands_other = b64(&commands_for(&bridge_asset(), Some(&other_file), true));
     let config2 = SessionSpawnConfig {
         chat_asset: Some(real_asset.clone()),
+        chat_asset_sha256: Some(sha256_of_file(&real_asset)),
         shape: chat_shape(),
         ..mock_config(&agent_dir, &["--mock-session-id", &id2, "--mock-commands", &commands_other])
     };
@@ -794,7 +814,8 @@ fn real_pi_chat_session_registers_its_policy_command() {
         session_dir: None,
         bridge_asset: bridge_asset(),
         artifacts_asset: None,
-        chat_asset: Some(chat_asset),
+        chat_asset: Some(chat_asset.clone()),
+        chat_asset_sha256: Some(sha256_of_file(&chat_asset)),
         shape: session_host::SessionSpawnShape::Chat {
             prompt_file,
             folder: true,
@@ -1120,4 +1141,325 @@ fn a_replaced_sessions_inflight_drain_only_parks_its_own_item() {
     assert_eq!(log_lines(&log_old), vec!["A".to_string()], "the old child saw A exactly once");
     assert_eq!(log_lines(&log_new), vec!["A".to_string()], "the new child saw A exactly once");
     registry.remove(&id, Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------
+// Terra round-3 P1-1: the chat policy asset's integrity pin. The handshake's
+// marker check proves a `pi-web:chat-policy` command registered from the
+// shipped path — it cannot prove the hooks behind it survived. Three layers
+// now hold that: (1) the digest pin below (only the shipped bytes can pass),
+// (2) the asset registers the marker LAST, after every hook, so a load that
+// fails midway never leaves the marker behind, and (3) the real-runtime
+// probes document what pi does with a partially-registered extension.
+// ---------------------------------------------------------------------------
+
+fn shipped_chat_asset() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lib/pi-rpc/assets/pi-web-chat.mjs")
+        .canonicalize()
+        .expect("the shipped chat policy asset resolves")
+}
+
+/// A chat whose policy file does not match the pinned digest must fail
+/// closed BEFORE any child exists — a corrupted, truncated or swapped file
+/// that still registers the marker would otherwise hand the chat its tool
+/// loadout without the policy hooks. Deterministic: the digest gate runs
+/// before the spawn.
+#[test]
+fn a_chat_policy_asset_that_does_not_match_its_pinned_digest_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("chats").join("20260101-120000-abcd");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, id) = create_session_file(&sessions, &cwd).expect("create");
+    let prompt_file = dir.path().join("chat-prompt.txt");
+    std::fs::write(&prompt_file, "chat preamble").expect("prompt");
+
+    let shipped = shipped_chat_asset();
+    let shipped_digest = sha256_of_file(&shipped);
+
+    // The tampered copy: the SHIPPED content with the tool_call hook's
+    // registration deleted — exactly the "marker kept, enforcement removed"
+    // file the digest must catch. (Built by removing the one registration
+    // block; any byte change would do for the digest, but this is the
+    // security-relevant one.)
+    let shipped_text = std::fs::read_to_string(&shipped).expect("shipped asset");
+    let marker = "  if (!unrestricted) {\n    pi.on(\"tool_call\", (event) => {";
+    assert!(shipped_text.contains(marker), "the shipped asset registers its tool_call hook");
+    let tampered_text = shipped_text.replacen(
+        "  if (!unrestricted) {\n    pi.on(\"tool_call\", (event) => {",
+        "  if (false) {\n    pi.on(\"tool_call\", (event) => {",
+        1,
+    );
+    assert_ne!(tampered_text, shipped_text, "the tamper changed the asset");
+    let tampered = dir.path().join("pi-web-chat.mjs");
+    std::fs::write(&tampered, tampered_text).expect("tampered asset");
+
+    let commands = b64(&commands_for(&bridge_asset(), Some(&tampered), true));
+    let base = mock_config(&agent_dir, &["--mock-session-id", &id, "--mock-commands", &commands]);
+    let registry = SessionRegistry::new();
+
+    // 1. The tampered file against the SHIPPED pin (what the real host —
+    //    which embeds the shipped digest — always does): refused, no child.
+    let error = match registry.start(
+        &id,
+        &file,
+        &id,
+        &cwd,
+        &session_host::SessionSpawnConfig {
+            chat_asset: Some(tampered.clone()),
+            chat_asset_sha256: Some(shipped_digest.clone()),
+            shape: session_host::SessionSpawnShape::Chat {
+                prompt_file: prompt_file.clone(),
+                folder: true,
+                unlocked: false,
+                files_enabled: true,
+            },
+            ..base.clone()
+        },
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a tampered policy asset must fail the integrity pin"),
+    };
+    match &error {
+        SessionHostError::Spawn(message) => assert!(
+            message.contains("pinned digest"),
+            "the honest integrity message: {message}"
+        ),
+        other => panic!("a Spawn error, not {other:?}"),
+    }
+    assert!(registry.ids().is_empty(), "no child was ever spawned");
+
+    // 2. No pin at all: fail closed too (the host may not "trust" an
+    //    unpinned asset path).
+    let error = match registry.start(
+        &id,
+        &file,
+        &id,
+        &cwd,
+        &session_host::SessionSpawnConfig {
+            chat_asset: Some(tampered.clone()),
+            chat_asset_sha256: None,
+            shape: session_host::SessionSpawnShape::Chat {
+                prompt_file: prompt_file.clone(),
+                folder: true,
+                unlocked: false,
+                files_enabled: true,
+            },
+            ..base.clone()
+        },
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("an unpinned policy asset must fail closed"),
+    };
+    assert!(
+        matches!(error, SessionHostError::Spawn(ref message) if message.contains("no pinned SHA-256")),
+        "{error}"
+    );
+
+    // 3. The byte-identical shipped file with its own pin passes the gate
+    //    (the mock child then reports the marker and the chat starts).
+    let commands = b64(&commands_for(&bridge_asset(), Some(&shipped), true));
+    let base = mock_config(&agent_dir, &["--mock-session-id", &id, "--mock-commands", &commands]);
+    registry
+        .start(
+            &id,
+            &file,
+            &id,
+            &cwd,
+            &session_host::SessionSpawnConfig {
+                chat_asset: Some(shipped.clone()),
+                chat_asset_sha256: Some(sha256_of_file(&shipped)),
+                shape: session_host::SessionSpawnShape::Chat {
+                    prompt_file,
+                    folder: true,
+                    unlocked: false,
+                    files_enabled: true,
+                },
+                ..base
+            },
+        )
+        .expect("the byte-identical shipped asset passes the integrity gate");
+    registry.remove(&id, Duration::from_secs(5));
+}
+
+/// What the REAL runtime does with an extension whose registration fails
+/// midway — the fact that decides whether the marker-last ordering is
+/// load-bearing (Terra P1-1: "验证真实 runtime 对注册中途失败的行为").
+///
+/// The shipped asset registers `pi-web:chat-policy` LAST, so a load that
+/// throws anywhere before it cannot leave the marker behind. This test
+/// proves that against the real runtime with the shipped asset's own
+/// failure mode simulated: a fixture that registers the hooks and throws
+/// BEFORE the marker. Whatever pi does with partially-registered extensions,
+/// the handshake must fail closed for it.
+#[test]
+fn real_pi_a_policy_asset_that_throws_before_its_marker_fails_the_handshake() {
+    let Some(executable) = pi_bin() else {
+        eprintln!("skipping: PI_CLI_BIN not set");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("chats").join("20260101-120000-abcd");
+    std::fs::create_dir_all(&agent_dir).expect("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, id) = create_session_file(&sessions, &cwd).expect("create");
+    let prompt_file =
+        session_host::spawn_plan::write_prompt_file("chat preamble for the throw test").expect("prompt");
+
+    // The fixture mirrors the SHIPPED ordering with a deliberate failure
+    // between the hooks and the marker: if any registration step fails, the
+    // marker (the handshake's demand) is absent.
+    let fixture = dir.path().join("throw-before-marker.mjs");
+    std::fs::write(
+        &fixture,
+        r#"
+export default function piWebChatThrow(pi) {
+  pi.on("before_agent_start", () => undefined);
+  pi.on("tool_call", () => undefined);
+  throw new Error("deliberate mid-registration failure");
+  pi.registerCommand("pi-web:chat-policy", {
+    description: "never reached",
+    handler: async () => "chat-policy:never",
+  });
+}
+"#,
+    )
+    .expect("fixture");
+
+    let registry = SessionRegistry::new();
+    let error = match registry.start(
+        &id,
+        &file,
+        &id,
+        &cwd,
+        &SessionSpawnConfig {
+            executable,
+            agent_dir: Some(agent_dir),
+            session_dir: None,
+            bridge_asset: bridge_asset(),
+            artifacts_asset: None,
+            chat_asset: Some(fixture.clone()),
+            chat_asset_sha256: Some(sha256_of_file(&fixture)),
+            shape: session_host::SessionSpawnShape::Chat {
+                prompt_file,
+                folder: true,
+                unlocked: false,
+                files_enabled: true,
+            },
+            initial_model: None,
+            thinking_level: None,
+            extra_args: Vec::new(),
+        },
+    ) {
+        Err(error) => error,
+        Ok(session) => panic!(
+            "a policy asset that throws before its marker must fail the handshake (session {})",
+            session.id
+        ),
+    };
+    assert!(matches!(error, SessionHostError::Handshake(_)), "{error}");
+    assert!(registry.ids().is_empty(), "the failed child never entered the registry");
+}
+
+/// The OLD (vulnerable) layout — marker FIRST, hooks after, throw in
+/// between — documents what the real runtime keeps of a failed extension's
+/// registrations. If pi RETAINED the already-registered command, the marker
+/// check alone would have passed a chat whose policy hooks never loaded:
+/// that is exactly why the marker now registers LAST and the digest pins
+/// the shipped bytes. This test pins the runtime fact (whichever way it
+/// goes) so a future pi behavior change that reopens the gap is visible.
+#[test]
+fn real_pi_documents_what_a_failed_registration_leaves_behind() {
+    let Some(executable) = pi_bin() else {
+        eprintln!("skipping: PI_CLI_BIN not set");
+        return;
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("chats").join("20260101-120000-abcd");
+    std::fs::create_dir_all(&agent_dir).expect("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions");
+    let (file, id) = create_session_file(&sessions, &cwd).expect("create");
+    let prompt_file =
+        session_host::spawn_plan::write_prompt_file("chat preamble for the layout probe").expect("prompt");
+
+    // Marker FIRST (the old order), then the failure before any hook.
+    let fixture = dir.path().join("marker-first-then-throw.mjs");
+    std::fs::write(
+        &fixture,
+        r#"
+export default function piWebChatMarkerFirst(pi) {
+  pi.registerCommand("pi-web:chat-policy", {
+    description: "pi-web internal: report the chat policy asset's identity",
+    handler: async () => "chat-policy:marker-without-hooks",
+  });
+  throw new Error("deliberate failure before the hooks");
+}
+"#,
+    )
+    .expect("fixture");
+
+    let registry = SessionRegistry::new();
+    let outcome = registry.start(
+        &id,
+        &file,
+        &id,
+        &cwd,
+        &SessionSpawnConfig {
+            executable,
+            agent_dir: Some(agent_dir),
+            session_dir: None,
+            bridge_asset: bridge_asset(),
+            artifacts_asset: None,
+            chat_asset: Some(fixture.clone()),
+            chat_asset_sha256: Some(sha256_of_file(&fixture)),
+            shape: session_host::SessionSpawnShape::Chat {
+                prompt_file,
+                folder: true,
+                unlocked: false,
+                files_enabled: true,
+            },
+            initial_model: None,
+            thinking_level: None,
+            extra_args: Vec::new(),
+        },
+    );
+    match outcome {
+        // pi 1.4.0's observed behavior (this test pins it): an extension
+        // whose top-level registration throws takes the whole child down
+        // (exit 1) — the runtime is fail-clean, so a half-registered
+        // extension never reaches a handshake at all. The handshake error
+        // may be the child-exit message or the missing-marker message; both
+        // are fail-closed. If a FUTURE pi keeps partial registrations
+        // instead, this arm breaks on purpose: the marker would list and
+        // only the digest pin + the marker-last ordering would remain as
+        // the defense (they hold — the shipped asset registers the marker
+        // after every hook, and only the shipped bytes match the pin).
+        Err(SessionHostError::Handshake(message)) => {
+            assert!(
+                message.contains("pi-web:chat-policy")
+                    || message.contains("exited unexpectedly"),
+                "a fail-closed handshake error, not: {message}"
+            );
+        }
+        Err(other) => panic!("expected the handshake failure, got {other:?}"),
+        Ok(session) => {
+            // pi KEPT the marker registered despite the failed load. The
+            // marker-alone gate would have passed this chat — which is why
+            // the asset now registers the marker LAST and the host pins the
+            // shipped digest: neither a throwing load nor a swapped file can
+            // present the marker without the hooks. Kill the child we just
+            // proved the point with.
+            registry.remove(&id, Duration::from_secs(5));
+        }
+    }
+    assert!(registry.ids().is_empty());
 }

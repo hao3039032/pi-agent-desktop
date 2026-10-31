@@ -203,6 +203,31 @@ fn resolve_chat_asset() -> Option<PathBuf> {
     resolve_asset("pi-web-chat.mjs", "PI_WEB_CHAT_EXTENSION")
 }
 
+/// The shipped chat policy asset's BYTES, embedded at build time: the
+/// integrity pin the session host verifies the resolved asset file against
+/// (Terra P1-1). A chat's security is the policy INSIDE this file (the
+/// before_agent_start / tool_call enforcement); a swapped, corrupted or
+/// truncated bundle copy that still registers the readiness marker would
+/// otherwise hand the chat its tool loadout with no enforcement. Pinning
+/// the digest to bytes compiled INTO this binary — never hashing the file
+/// being checked — means only the exact shipped content can start a chat,
+/// and the marker (which the shipped content registers LAST, after every
+/// hook) implies the hooks loaded.
+static SHIPPED_CHAT_ASSET_BYTES: &[u8] =
+    include_bytes!("../../lib/pi-rpc/assets/pi-web-chat.mjs");
+
+/// The pinned digest (computed once; lowercase hex).
+fn shipped_chat_asset_sha256() -> &'static str {
+    static PINNED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PINNED.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(SHIPPED_CHAT_ASSET_BYTES)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    })
+}
+
 /// A shipped extension asset next to the server code (bridge, artifacts,
 /// chat policy): env override, the packaged resources tree, the dev
 /// checkout.
@@ -1911,6 +1936,11 @@ fn build_spawn_plan(
             bridge_asset: base.bridge_asset.clone(),
             artifacts_asset: base.artifacts_asset.clone(),
             chat_asset: base.chat_asset.clone(),
+            // The pinned digest of the SHIPPED asset (embedded bytes) — the
+            // session host fails a chat closed when the resolved file does
+            // not match it. No pin without an asset: only the Chat shape
+            // requires one.
+            chat_asset_sha256: base.chat_asset.as_ref().map(|_| shipped_chat_asset_sha256().to_string()),
             shape,
             initial_model: model,
             thinking_level: thinking,
@@ -1972,6 +2002,11 @@ fn build_spawn_plan(
             bridge_asset: base.bridge_asset.clone(),
             artifacts_asset: base.artifacts_asset.clone(),
             chat_asset: base.chat_asset.clone(),
+            // The pinned digest of the SHIPPED asset (embedded bytes) — the
+            // session host fails a chat closed when the resolved file does
+            // not match it. No pin without an asset: only the Chat shape
+            // requires one.
+            chat_asset_sha256: base.chat_asset.as_ref().map(|_| shipped_chat_asset_sha256().to_string()),
             shape,
             initial_model: model,
             thinking_level: thinking,
@@ -4402,6 +4437,239 @@ mod tests {
         );
         assert_eq!(rejected["error"]["details"]["code"], "prompt_rejected", "{rejected}");
         assert_eq!(rejected["error"]["details"]["accepted"], false);
+    }
+
+    /// Terra round-3 P1-1's runtime half: a REAL folder chat (real pi child,
+    /// the shipped chat policy asset, the real handshake) must refuse a
+    /// `read` that points OUTSIDE its folder — and still serve one INSIDE
+    /// it. The "model" is a fixture provider that answers with a
+    /// deterministic `tool_calls` delta: the attack is not prompt-driven
+    /// (naming the path in the user's message would legitimately GRANT it),
+    /// it is the tool call itself, which only the policy hook can stop.
+    #[test]
+    fn real_pi_folder_chat_blocks_an_out_of_folder_read_and_serves_one_inside() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        // The secret OUTSIDE every chat folder, created before the provider
+        // starts so its absolute path is fixed for the attack round.
+        let outside_dir = tempfile::tempdir().expect("tempdir");
+        let secret = outside_dir.path().join("secret.txt");
+        std::fs::write(&secret, "SECRET-CONTENT-NEVER-IN-A-CHAT-9f3c1a").expect("secret");
+        let secret_path = secret.display().to_string();
+        let secret_json = serde_json::to_string(&json!({ "path": secret_path })).expect("arguments json");
+
+        // The fixture provider: a request whose body carries the round's
+        // marker answers a deterministic `read` tool_call (OUTSIDE-ATTACK →
+        // the secret outside the folder, INSIDE-CONTROL → a RELATIVE path
+        // inside it); the rounds after a tool result answer plain text. The
+        // attack is the tool call itself, never the prompt (naming a path in
+        // the user's own message would legitimately GRANT it).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = listener.local_addr().expect("addr");
+        let secret_json_for_thread = secret_json.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let secret_json = secret_json_for_thread.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Read, Write};
+                    let sse_chunk = |payload: &Value| -> String {
+                        serde_json::to_string(payload).expect("chunk json")
+                    };
+                    let tool_call_chunk = |call_id: &str, arguments: &str| -> String {
+                        // OpenAI's function.arguments is a JSON STRING that
+                        // PARSES to the argument object — the raw text goes
+                        // on the wire once, never re-stringified (double
+                        // encoding makes pi reject the arguments as
+                        // "must be a JSON object").
+                        sse_chunk(&json!({
+                            "choices": [{ "delta": { "tool_calls": [{
+                                "index": 0, "id": call_id, "type": "function",
+                                "function": { "name": "read", "arguments": arguments },
+                            }] } }]
+                        }))
+                    };
+                    let Ok(clone) = stream.try_clone() else { return };
+                    let mut reader = BufReader::new(clone);
+                    let mut content_length = 0usize;
+                    let mut body = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = trimmed.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    if content_length > 0 {
+                        let mut bytes = vec![0u8; content_length];
+                        if reader.read_exact(&mut bytes).is_err() {
+                            return;
+                        }
+                        body = String::from_utf8_lossy(&bytes).into_owned();
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    );
+                    // The dispatcher works on the history AFTER the last
+                    // user message: markers stay in earlier turns forever,
+                    // and a naive `contains` would re-issue the tool call
+                    // every round (the attack never settles). A pending tool
+                    // result in that tail means the current run's tool round
+                    // completed — answer text so the run settles.
+                    let tail = &body[body.rfind("\"role\":\"user\"").map(|i| i).unwrap_or(0)..];
+                    let attack_here = tail.contains("OUTSIDE-ATTACK") && !tail.contains("\"role\":\"tool\"");
+                    let control_here = tail.contains("INSIDE-CONTROL") && !tail.contains("\"role\":\"tool\"");
+                    let mut chunks: Vec<String> = vec![sse_chunk(&json!({
+                        "choices": [{ "delta": { "role": "assistant" } }]
+                    }))];
+                    if attack_here {
+                        chunks.push(tool_call_chunk("call-out", &secret_json));
+                        chunks.push(sse_chunk(&json!({
+                            "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
+                        })));
+                    } else if control_here {
+                        chunks.push(tool_call_chunk("call-in", "{\"path\":\"inside.txt\"}"));
+                        chunks.push(sse_chunk(&json!({
+                            "choices": [{ "delta": {}, "finish_reason": "tool_calls" }]
+                        })));
+                    } else {
+                        chunks.push(sse_chunk(&json!({ "choices": [{ "delta": { "content": "done" } }] })));
+                        chunks.push(sse_chunk(&json!({
+                            "choices": [{ "delta": {}, "finish_reason": "stop" }]
+                        })));
+                    }
+                    chunks.push("[DONE]".to_string());
+                    for chunk in chunks {
+                        let _ = stream.write_all(format!("data: {chunk}\n\n").as_bytes());
+                    }
+                    let _ = stream.flush();
+                });
+            }
+        });
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent");
+        let managed = stage_managed_tree(dir.path());
+
+        let models = json!({
+            "providers": {
+                "attack": {
+                    "baseUrl": format!("http://{endpoint}"),
+                    "apiKey": "attack-not-a-credential",
+                    "api": "openai-completions",
+                    "models": [{
+                        "id": "attacky", "name": "Attack fixture", "reasoning": false,
+                        "input": ["text"], "contextWindow": 200000, "maxTokens": 4096,
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+                    }]
+                }
+            }
+        });
+        std::fs::write(agent_dir.join("models.json"), models.to_string()).expect("models");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProvider":"attack","defaultModel":"attacky"}"#,
+        )
+        .expect("settings");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![("PI_WEB_MANAGED_MODULES".to_string(), managed.display().to_string())],
+        });
+
+        // The folder chat (the ROOT request creates a folder of its own).
+        let chat_root = crate::session_view::chat_workspace_dir(&agent_dir);
+        let created = send(
+            &state,
+            json!({ "v": 1, "id": "at-c0", "op": "agent.create", "args": {
+                "cwd": chat_root.display().to_string(), "type": "ensure_session",
+            }}),
+        );
+        assert_eq!(created["ok"], true, "the chat session created: {created}");
+        let chat_id = created["data"]["sessionId"].as_str().expect("the chat id").to_string();
+        let summary = session_host::history::find_session_by_id(&agent_dir, &chat_id).expect("the chat session");
+        let folder = std::path::PathBuf::from(&summary.cwd);
+        assert!(
+            crate::session_view::is_chat_folder_path(&folder, &agent_dir),
+            "a folder chat: {}",
+            folder.display()
+        );
+        // The control file INSIDE the folder, with unique content.
+        let inside = folder.join("inside.txt");
+        std::fs::write(&inside, "INSIDE-CONTENT-SERVED-BY-THE-POLICY-77aa").expect("inside");
+
+        let wait_for_transcript = |needle: &str, limit: Duration| -> bool {
+            let deadline = std::time::Instant::now() + limit;
+            while std::time::Instant::now() < deadline {
+                if let Ok(text) = std::fs::read_to_string(&summary.file) {
+                    if text.contains(needle) {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            false
+        };
+
+        // ATTACK: the model tries to read the OUTSIDE secret. The user's
+        // message deliberately does NOT name the path (naming it would be a
+        // legitimate user grant) — only the tool call does.
+        let attacked = send(
+            &state,
+            json!({ "v": 1, "id": "at-p1", "op": "agent.command", "args": {
+                "session": chat_id, "type": "prompt", "message": "OUTSIDE-ATTACK now",
+            }}),
+        );
+        assert_eq!(attacked["ok"], true, "the prompt was accepted: {attacked}");
+        assert!(
+            wait_for_transcript("only works inside this chat's own folder", Duration::from_secs(30))
+                || wait_for_transcript("Chats can read files in their own folder", Duration::from_secs(30)),
+            "the policy hook's refusal reached the transcript"
+        );
+        // The secret never did (the read never executed).
+        assert!(
+            !wait_for_transcript("SECRET-CONTENT-NEVER-IN-A-CHAT-9f3c1a", Duration::from_secs(3)),
+            "the out-of-folder read executed despite the policy"
+        );
+
+        // CONTROL: the same tool pointed INSIDE the folder is served.
+        let served = send(
+            &state,
+            json!({ "v": 1, "id": "at-p2", "op": "agent.command", "args": {
+                "session": chat_id, "type": "prompt", "message": "INSIDE-CONTROL now",
+                // The composer's active-run behavior: the message queues as
+                // a follow-up instead of colliding with the run in flight.
+                "streamingBehavior": "followUp",
+            }}),
+        );
+        assert_eq!(served["ok"], true, "the control prompt was accepted: {served}");
+        assert!(
+            wait_for_transcript("INSIDE-CONTENT-SERVED-BY-THE-POLICY-77aa", Duration::from_secs(30)),
+            "the in-folder read was served (the policy scopes, it does not brick the chat)"
+        );
+        state.registry.remove(&chat_id, std::time::Duration::from_secs(5));
     }
 
     /// A rename changes the catalogue every holder displays: the list

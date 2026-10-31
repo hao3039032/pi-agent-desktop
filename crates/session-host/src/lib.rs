@@ -459,6 +459,15 @@ pub struct SessionSpawnConfig {
     pub artifacts_asset: Option<PathBuf>,
     /// The chat policy asset (`pi-web-chat.mjs`) a chat session loads.
     pub chat_asset: Option<PathBuf>,
+    /// The pinned SHA-256 (hex) of [`SessionSpawnConfig::chat_asset`]'s
+    /// bytes — REQUIRED for the Chat shape: the host verifies the file the
+    /// child will load against it before spawning (a swapped, corrupted or
+    /// truncated asset that still registers the readiness marker must fail
+    /// closed, never hand a chat its tool loadout without the policy hooks
+    /// — Terra P1-1). The pin is the CALLER's compile-time constant
+    /// (src-tauri embeds the shipped bytes); it is never derived from the
+    /// file being checked.
+    pub chat_asset_sha256: Option<String>,
     /// What kind of session to spawn (args, discovery, prompt, tools).
     pub shape: SessionSpawnShape,
     /// The model the child must run: the file's saved model, else the
@@ -724,6 +733,35 @@ fn spawn_session(
             if !chat_asset.is_file() {
                 return Err(SessionHostError::Spawn(format!(
                     "the chat policy asset is not readable: {}; a chat cannot start without it",
+                    chat_asset.display()
+                )));
+            }
+            // The integrity pin (Terra P1-1): the file must be BYTE-IDENTICAL
+            // to the asset the host shipped. The handshake's marker check
+            // proves a `pi-web:chat-policy` command registered from this
+            // path — but a corrupted, truncated or swapped file can still
+            // register the marker while missing the hooks that follow it in
+            // the (correct) asset, and a registration that fails midway can
+            // leave an already-registered command behind. The pin closes
+            // that whole class: only the shipped content can pass BOTH
+            // checks, and in the shipped content the marker registers LAST,
+            // after every hook.
+            let expected = config.chat_asset_sha256.as_deref().ok_or_else(|| {
+                SessionHostError::Spawn(
+                    "the chat policy asset has no pinned SHA-256; a chat cannot start without it".to_string(),
+                )
+            })?;
+            let bytes = std::fs::read(chat_asset).map_err(|error| {
+                SessionHostError::Spawn(format!(
+                    "the chat policy asset could not be read for its integrity check ({}): {error}",
+                    chat_asset.display()
+                ))
+            })?;
+            let digest = sha256_hex(&bytes);
+            if !digest.eq_ignore_ascii_case(expected) {
+                return Err(SessionHostError::Spawn(format!(
+                    "the chat policy asset does not match its pinned digest ({}: expected {expected}, found {digest}); \
+                     a chat cannot start with a policy asset the host did not ship",
                     chat_asset.display()
                 )));
             }
@@ -1393,6 +1431,13 @@ impl std::fmt::Display for DispatchError {
 }
 
 // --- time helpers (header formats) -------------------------------------------
+
+/// SHA-256 as lowercase hex (the chat policy asset's integrity pin).
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// `20260131T093000`-style compact stamp for the file name.
 fn iso_now_compact() -> String {

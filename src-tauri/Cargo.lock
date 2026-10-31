@@ -2886,6 +2886,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session-host",
+ "sha2",
  "task-scheduler",
  "tauri",
  "tauri-build",
@@ -3749,6 +3750,7 @@ dependencies = [
  "base64 0.22.1",
  "pi-host",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 
