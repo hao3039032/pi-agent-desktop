@@ -81,7 +81,7 @@ impl History {
         // Trim to the cap, on a char boundary, counting dropped UTF-16 units.
         let units: usize = self.text.encode_utf16().count();
         if units > HISTORY_LIMIT_UNITS {
-            let mut keep_units = HISTORY_LIMIT_UNITS;
+            let keep_units = HISTORY_LIMIT_UNITS;
             // Never split a surrogate pair or a multi-byte char.
             let mut char_indices: Vec<usize> = self.text.char_indices().map(|(i, _)| i).collect();
             char_indices.push(self.text.len());
@@ -92,7 +92,7 @@ impl History {
             while idx + 1 < char_indices.len() {
                 let c = self.text[char_indices[idx]..char_indices[idx + 1]].chars().next().unwrap();
                 let c_units = c.len_utf16();
-                if units - dropped - c_units >= keep_units {
+                if units - dropped > keep_units {
                     dropped += c_units;
                     drop_bytes = char_indices[idx + 1];
                 } else {
@@ -100,7 +100,6 @@ impl History {
                 }
                 idx += 1;
             }
-            let _ = &mut keep_units;
             self.dropped_units += dropped as u64;
             self.text.replace_range(0..drop_bytes, "");
         }
@@ -131,11 +130,37 @@ impl History {
                 byte_index = i;
                 break;
             }
+            if unit_index + c.len_utf16() > offset_units {
+                return ReadOutcome::Reset { cursor: end, text: self.text.clone() };
+            }
             unit_index += c.len_utf16();
-            byte_index = i + c.len_utf16();
+            byte_index = i + c.len_utf8();
         }
         ReadOutcome::Suffix { cursor: end, text: self.text[byte_index..].to_string() }
     }
+}
+
+// Preserve incomplete UTF-8 across reads; malformed sequences use replacement characters.
+fn decode_utf8(pending: &mut Vec<u8>, eof: bool) -> String {
+    let mut output = String::new();
+    let mut offset = 0;
+    while offset < pending.len() {
+        match std::str::from_utf8(&pending[offset..]) {
+            Ok(text) => { output.push_str(text); offset = pending.len(); }
+            Err(error) => {
+                let valid_end = offset + error.valid_up_to();
+                output.push_str(std::str::from_utf8(&pending[offset..valid_end]).unwrap());
+                offset = valid_end;
+                match error.error_len() {
+                    Some(len) => { output.push('\u{fffd}'); offset += len; }
+                    None if eof => { output.push('\u{fffd}'); offset = pending.len(); }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..offset);
+    output
 }
 
 /// One running PTY.
@@ -148,6 +173,7 @@ pub struct Pty {
     exit_cv: Condvar,
     master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     log: LogFn,
+    cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,21 +257,23 @@ impl PtyHost {
         Self { inner: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    /// Create (or return the existing) PTY with this id. A live PTY with the
-    /// same id is returned as-is — including a different cwd: the original
-    /// terminal keeps its folder (the id is the identity).
+    /// Create (or return the existing) PTY with this id and cwd.
+    /// A live id cannot be reused for a different cwd.
     pub fn create(&self, id: &str, cwd: Option<&std::path::Path>, options: PtyOptions) -> Result<Arc<Pty>, String> {
         // The whole open→spawn→insert runs under ONE lock: without it, two
         // concurrent creates for the same id both pass the existence check,
         // both spawn a shell, and the loser's child is orphaned (it is in no
         // registry, so close() can never reach it).
-        let map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap();
         if let Some(existing) = map.get(id) {
             if existing.exit.lock().unwrap().is_none() {
+                if existing.cwd.as_deref() != cwd {
+                    return Err("terminal id is already in use for another cwd".to_string());
+                }
                 return Ok(Arc::clone(existing));
             }
-            // Exited: fall through and replace the dead entry.
         }
+        map.remove(id);
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
             .openpty(portable_pty::PtySize {
@@ -286,6 +314,7 @@ impl PtyHost {
             exit_cv: Condvar::new(),
             master: Mutex::new(Some(pair.master)),
             log: Arc::clone(&log),
+            cwd: cwd.map(std::path::Path::to_path_buf),
         });
 
         // Reader thread: chunks land in the history as they arrive (UTF-8 is
@@ -296,31 +325,14 @@ impl PtyHost {
                 .name(format!("pty-reader-{id}"))
                 .spawn(move || {
                     let mut buf = [0u8; 8192];
+                    let mut pending = Vec::new();
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                // Buffer partial UTF-8: push only complete
-                                // sequences, keep the tail for the next chunk.
-                                let valid = match std::str::from_utf8(&buf[..n]) {
-                                    Ok(text) => text.to_string(),
-                                    Err(error) => {
-                                        let valid_up_to = error.valid_up_to();
-                                        // Very defensive: replace invalid bytes
-                                        // (the child emitted garbage) but never
-                                        // lose the rest of the stream.
-                                        let mut text =
-                                            String::from_utf8_lossy(&buf[..valid_up_to]).into_owned();
-                                        let tail_start = error.error_len().map_or(n, |len| valid_up_to + len);
-                                        text.push('\u{fffd}');
-                                        let mut carried = text;
-                                        if tail_start < n {
-                                            carried.push_str(&String::from_utf8_lossy(&buf[tail_start..n]));
-                                        }
-                                        carried
-                                    }
-                                };
-                                pty.history.lock().unwrap().push(&valid);
+                                pending.extend_from_slice(&buf[..n]);
+                                let text = decode_utf8(&mut pending, false);
+                                pty.history.lock().unwrap().push(&text);
                             }
                             Err(error) => {
                                 (pty.log)(format!("pty read failed: {error}"));
@@ -328,6 +340,8 @@ impl PtyHost {
                             }
                         }
                     }
+                    let text = decode_utf8(&mut pending, true);
+                    pty.history.lock().unwrap().push(&text);
                     // EOF: the child side closed. The EXIT WATCHER alone
                     // records the exit state (EOF is not exit code 0 — the
                     // shell may still be flushing an `exit 7`).
@@ -506,6 +520,56 @@ mod tests {
             }
             other => panic!("expected reset, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn utf8_decoder_carries_incomplete_sequences_and_recovers_invalid_bytes() {
+        let mut pending = Vec::new();
+        let mut output = String::new();
+        for byte in "中🚀!".as_bytes() {
+            pending.push(*byte);
+            output.push_str(&decode_utf8(&mut pending, false));
+        }
+        assert_eq!(output, "中🚀!");
+        pending.extend_from_slice(&[0xff, b'x', 0xe4]);
+        assert_eq!(decode_utf8(&mut pending, false), "�x");
+        assert_eq!(decode_utf8(&mut pending, true), "�");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn history_respects_surrogate_boundaries_and_byte_offsets() {
+        let mut history = History::new();
+        history.push("中🚀x");
+        assert_eq!(history.read_since(1), ReadOutcome::Suffix { cursor: 4, text: "🚀x".into() });
+        assert_eq!(history.read_since(2), ReadOutcome::Reset { cursor: 4, text: "中🚀x".into() });
+        let mut history = History::new();
+        history.push(&format!("🚀{}", "x".repeat(HISTORY_LIMIT_UNITS - 1)));
+        assert!(history.text.encode_utf16().count() <= HISTORY_LIMIT_UNITS);
+        assert_eq!(history.dropped_units, 2);
+    }
+
+    #[test]
+    fn exited_entry_is_replaced_by_new_terminal() {
+        let host = PtyHost::new();
+        let dir = tempfile::tempdir().unwrap();
+        let first = host.create("restart", Some(dir.path()), PtyOptions::default()).unwrap();
+        first.write_input(b"exit 0\n").unwrap();
+        assert_eq!(first.wait_exit(Duration::from_secs(10)), Some(Some(0)));
+        let second = host.create("restart", Some(dir.path()), PtyOptions::default()).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&host.get("restart").unwrap(), &second));
+        host.close("restart");
+    }
+
+    #[test]
+    fn same_id_rejects_different_cwd() {
+        let host = PtyHost::new();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        host.create("same", Some(a.path()), PtyOptions::default()).unwrap();
+        assert!(host.create("same", Some(b.path()), PtyOptions::default()).is_err());
+        host.close("same");
     }
 
     #[test]
