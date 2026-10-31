@@ -844,8 +844,10 @@ impl SessionRegistry {
     }
 
     /// Hold ordered session start gates and check their persistent fences for a
-    /// bounded read snapshot. Live sessions remain searchable; callers must
-    /// detect concurrent in-place writes while copying and never mutate files.
+    /// bounded read snapshot. The caller holds the host policy read gate first,
+    /// then any scheduler transaction, and must not wait on a child or network.
+    /// Live sessions remain searchable; callers must detect concurrent in-place
+    /// writes while copying and never mutate files.
     pub fn with_session_snapshot_gates<T, E>(
         &self, ids: &[String], operation: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, SessionWriterError<E>> {
