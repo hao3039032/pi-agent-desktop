@@ -53,6 +53,15 @@ export async function stageManagedTree(managed) {
     cpSync(from, join(managed, ...name.split("/")), { recursive: true });
   };
   copyPackage("croner");
+  copyPackage("mammoth");
+  for (const pkg of vendorClosure("mammoth")) {
+    const from = join(ROOT, "node_modules", ...pkg.split("/"));
+    if (!existsSync(join(from, "package.json"))) continue;
+    const target = join(managed, ...pkg.split("/"));
+    if (!existsSync(join(target, "package.json"))) {
+      cpSync(from, target, { recursive: true });
+    }
+  }
   // The pi SDK and both closure walks (its own imports and pi-ai's) — the
   // session-manager's module graph must resolve entirely inside this tree.
   for (const pkg of vendorClosure("@earendil-works/pi-ai")) {

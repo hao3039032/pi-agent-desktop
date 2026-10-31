@@ -10,7 +10,6 @@
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -579,7 +578,7 @@ pub fn handle_desktop_save_file(state: &IpcHostState, id: &str, args: &Value) ->
 // chats.extractAttachmentText
 // ---------------------------------------------------------------------------
 
-pub fn handle_chats_extract_attachment_text(id: &str, args: &Value) -> Value {
+pub fn handle_chats_extract_attachment_text(state: &IpcHostState, id: &str, args: &Value) -> Value {
     let data_b64 = args.get("data").and_then(Value::as_str).unwrap_or("");
     if data_b64.is_empty() {
         return protocol_error(id, "invalid_args", "not-text");
@@ -594,77 +593,43 @@ pub fn handle_chats_extract_attachment_text(id: &str, args: &Value) -> Value {
         return protocol_error(id, "payload_too_large", "too-large");
     }
 
-    // Spawn short-lived node mammoth worker.
-    let script = r#"
-const mammoth = require('mammoth');
-const chunks = [];
-process.stdin.on('data', c => chunks.push(c));
-process.stdin.on('end', async () => {
-  try {
-    const buffer = Buffer.concat(chunks);
-    const { value } = await mammoth.extractRawText({ buffer });
-    const text = value.replace(/\r\n?/g, '\n').trim();
-    if (!text) {
-      process.stdout.write(JSON.stringify({ error: 'not-text' }));
-      return;
-    }
-    if (Buffer.byteLength(text, 'utf8') > 256 * 1024) {
-      process.stdout.write(JSON.stringify({ error: 'too-large' }));
-      return;
-    }
-    process.stdout.write(JSON.stringify({ text }));
-  } catch (err) {
-    process.stdout.write(JSON.stringify({ error: 'not-text' }));
-  }
-});
-"#;
-
-    let mut child = match std::process::Command::new("node")
-        .arg("-e")
-        .arg(script)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            return protocol_error(id, "io", &format!("failed to spawn docx extractor: {err}"));
-        }
+    // Binary input path is host-created, authorized, and cleaned up in a temp directory.
+    let tmp_dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(err) => return protocol_error(id, "io", &format!("failed to create temp directory: {err}")),
     };
+    let tmp_file = tmp_dir.path().join("attachment.docx");
+    if let Err(err) = std::fs::write(&tmp_file, &bytes) {
+        return protocol_error(id, "io", &format!("failed to write temp file: {err}"));
+    }
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(&bytes).is_err() {
-            let _ = child.kill();
-            return protocol_error(id, "unprocessable", "not-text");
+    let call_args = json!({
+        "path": tmp_file.display().to_string(),
+    });
+
+    let res = crate::pi_ipc::management_call(state, "docx.extractText", call_args);
+    // tmp_dir is automatically dropped and deleted here upon return
+
+    match res {
+        Ok(val) => {
+            if let Some(text) = val.get("text").and_then(Value::as_str) {
+                protocol_ok(id, json!({ "text": text }))
+            } else {
+                protocol_error(id, "unprocessable", "not-text")
+            }
+        }
+        Err((code, message)) => {
+            if code == "management_unavailable" {
+                protocol_error(id, "management_unavailable", &message)
+            } else if message.contains("too-large") {
+                protocol_error(id, "payload_too_large", "too-large")
+            } else if message.contains("not-text") {
+                protocol_error(id, "unprocessable", "not-text")
+            } else {
+                protocol_error(id, &code, &message)
+            }
         }
     }
-
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(_) => return protocol_error(id, "unprocessable", "not-text"),
-    };
-
-    let Ok(res_str) = std::str::from_utf8(&output.stdout) else {
-        return protocol_error(id, "unprocessable", "not-text");
-    };
-
-    let Ok(res_json) = serde_json::from_str::<Value>(res_str) else {
-        return protocol_error(id, "unprocessable", "not-text");
-    };
-
-    if let Some(err) = res_json.get("error").and_then(Value::as_str) {
-        if err == "too-large" {
-            return protocol_error(id, "payload_too_large", "too-large");
-        }
-        return protocol_error(id, "unprocessable", "not-text");
-    }
-
-    if let Some(text) = res_json.get("text").and_then(Value::as_str) {
-        return protocol_ok(id, json!({ "text": text }));
-    }
-
-    protocol_error(id, "unprocessable", "not-text")
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,22 +978,19 @@ mod tests {
 
     #[test]
     fn test_chats_extract_attachment_text() {
-        // 1. Empty data rejected
-        let res_empty = handle_chats_extract_attachment_text("e1", &json!({ "data": "" }));
+        let tmp = tempdir().unwrap();
+        let state = setup_state(tmp.path());
+
+        // 1. Empty data rejected before management invocation
+        let res_empty = handle_chats_extract_attachment_text(&state, "e1", &json!({ "data": "" }));
         assert_eq!(res_empty["ok"], false);
         assert_eq!(res_empty["error"]["message"], "not-text");
 
-        // 2. Corrupted data rejected with not-text
+        // 2. Unconfigured management answers management_unavailable
         let bad_b64 = base64::engine::general_purpose::STANDARD.encode(b"not a docx at all");
-        let res_bad = handle_chats_extract_attachment_text("e2", &json!({ "data": bad_b64 }));
-        assert_eq!(res_bad["ok"], false);
-        assert_eq!(res_bad["error"]["message"], "not-text");
-
-        // 3. Valid minimal docx extraction
-        let valid_b64 = "UEsDBBQAAAAAAI4dYV0CxKfsSwEAAEsBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz48VHlwZXMgeG1sbnM9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wYWNrYWdlLzIwMDYvY29udGVudC10eXBlcyI+PERlZmF1bHQgRXh0ZW5zaW9uPSJ4bWwiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi94bWwiLz48T3ZlcnJpZGUgUGFydE5hbWU9Ii93b3JkL2RvY3VtZW50LnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC53b3JkcHJvY2Vzc2luZ21sLmRvY3VtZW50Lm1haW4reG1sIi8+PC9UeXBlcz5QSwMEFAAAAAAAjh1hXSEVZ+ffAAAA3wAAABEAAAB3b3JkL2RvY3VtZW50LnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz48dzpkb2N1bWVudCB4bWxuczp3PSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvd29yZHByb2Nlc3NpbmdtbC8yMDA2L21haW4iPjx3OmJvZHk+PHc6cD48dzpyPjx3OnQ+SGVsbG8gd29ybGQgYXR0YWNobWVudDwvdzp0PjwvdzpyPjwvdzpwPjwvdzpib2R5Pjwvdzpkb2N1bWVudD5QSwECFAMUAAAAAACOHWFdAsSn7EsBAABLAQAAEwAAAAAAAAAAAAAAgAEAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAxQAAAAAAI4dYV0hFWfn3wAAAN8AAAARAAAAAAAAAAAAAACAAXwBAAB3b3JkL2RvY3VtZW50LnhtbFBLBQYAAAAAAgACAIAAAACKAgAAAAA=";
-        let res_valid = handle_chats_extract_attachment_text("e3", &json!({ "data": valid_b64 }));
-        assert_eq!(res_valid["ok"], true);
-        assert_eq!(res_valid["data"]["text"], "Hello world attachment");
+        let res_unconfigured = handle_chats_extract_attachment_text(&state, "e2", &json!({ "data": bad_b64 }));
+        assert_eq!(res_unconfigured["ok"], false);
+        assert_eq!(res_unconfigured["error"]["code"], "management_unavailable");
     }
 
     #[test]

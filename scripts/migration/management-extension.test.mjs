@@ -202,6 +202,22 @@ test(
         assert.equal(unknown.ok, false);
         assert.equal(unknown.code, "unknown_op");
 
+        // 4b. docx.extractText on the vendored mammoth module tree.
+        const validDocxB64 = "UEsDBBQAAAAAAI4dYV0CxKfsSwEAAEsBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz48VHlwZXMgeG1sbnM9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wYWNrYWdlLzIwMDYvY29udGVudC10eXBlcyI+PERlZmF1bHQgRXh0ZW5zaW9uPSJ4bWwiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi94bWwiLz48T3ZlcnJpZGUgUGFydE5hbWU9Ii93b3JkL2RvY3VtZW50LnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC53b3JkcHJvY2Vzc2luZ21sLmRvY3VtZW50Lm1haW4reG1sIi8+PC9UeXBlcz5QSwMEFAAAAAAAjh1hXSEVZ+ffAAAA3wAAABEAAAB3b3JkL2RvY3VtZW50LnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz48dzpkb2N1bWVudCB4bWxuczp3PSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvd29yZHByb2Nlc3NpbmdtbC8yMDA2L21haW4iPjx3OmJvZHk+PHc6cD48dzpyPjx3OnQ+SGVsbG8gd29ybGQgYXR0YWNobWVudDwvdzp0PjwvdzpyPjwvdzpwPjwvdzpib2R5Pjwvdzpkb2N1bWVudD5QSwECFAMUAAAAAACOHWFdAsSn7EsBAABLAQAAEwAAAAAAAAAAAAAAgAEAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAxQAAAAAAI4dYV0hFWfn3wAAAN8AAAARAAAAAAAAAAAAAACAAXwBAAB3b3JkL2RvY3VtZW50LnhtbFBLBQYAAAAAAgACAIAAAACKAgAAAAA=";
+        const extracted = await call("docx.extractText", { data: validDocxB64 });
+        assert.equal(extracted.ok, true);
+        assert.equal(extracted.result.text, "Hello world attachment");
+
+        const corrupted = await call("docx.extractText", { data: Buffer.from("bad docx").toString("base64") });
+        assert.equal(corrupted.ok, false);
+        assert.equal(corrupted.error, "not-text");
+
+        const tempDocxPath = join(root, "temp_test.docx");
+        await writeFile(tempDocxPath, Buffer.from(validDocxB64, "base64"));
+        const extractedFromPath = await call("docx.extractText", { path: tempDocxPath });
+        assert.equal(extractedFromPath.ok, true);
+        assert.equal(extractedFromPath.result.text, "Hello world attachment");
+
         // 5. No session files were created by the management child itself.
         const agentSessions = join(agentDir, "sessions");
         const created = (() => {

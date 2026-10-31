@@ -1881,7 +1881,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         "desktop.readImages" => crate::file_resources::handle_desktop_read_images(&id, &args),
         "desktop.saveFile" => crate::file_resources::handle_desktop_save_file(state, &id, &args),
         "chats.extractAttachmentText" => {
-            crate::file_resources::handle_chats_extract_attachment_text(&id, &args)
+            crate::file_resources::handle_chats_extract_attachment_text(state, &id, &args)
         }
         "chats.revealFolder" => crate::file_resources::handle_chats_reveal_folder(state, &id, &args),
         "chats.revealDownload" => crate::file_resources::handle_chats_reveal_download(&id, &args),
@@ -1967,7 +1967,7 @@ pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
 /// One management-op call: the instance is per-scope on demand (60 s idle
 /// recycle), and every failure is (code, message) — never a fallback that
 /// would present a disk tail as a live view or an empty context as success.
-fn management_call(
+pub(crate) fn management_call(
     state: &IpcHostState,
     op: &str,
     args: Value,
