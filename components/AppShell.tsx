@@ -31,6 +31,7 @@ import { SettingsPanel } from "./SettingsPanel";
 import { keepDocumentTitle } from "@/lib/document-title";
 import { fetchSessionView } from "@/lib/session-view-service";
 import { fetchSessionList } from "@/lib/session-list-service";
+import { viewSessionHistory } from "@/lib/session-actions-service";
 import { fetchChatWorkspaceRoot, validateWorkspaceCwd } from "@/lib/workspace-service";
 import { ProjectTrustDialog, type ProjectTrustFailure } from "./ProjectTrustDialog";
 import { BranchNavigator, hasSessionBranches } from "./BranchNavigator";
@@ -1745,16 +1746,9 @@ export function AppShell() {
 
   const handleViewFullHistory = useCallback(() => {
     if (!selectedSession) return;
-    // Absolute URL so Tauri's open_external_url (http/https only) can hand the
-    // page to the system browser for inline viewing — not a save dialog.
-    const exportUrl = new URL(
-      `/api/sessions/${encodeURIComponent(selectedSession.id)}/export?inline=1`,
-      window.location.origin,
-    ).href;
-    void import("@/lib/desktop-native").then(({ openExternal }) => {
-      void openExternal(exportUrl).catch((error) => {
-        console.error("Failed to open full history:", error);
-      });
+    void viewSessionHistory(selectedSession.id).catch((error) => {
+      console.error("Failed to open full history:", error);
+      appNotify.error({ message: error instanceof Error ? error.message : String(error) });
     });
   }, [selectedSession]);
 

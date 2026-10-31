@@ -3,6 +3,13 @@ import { IpcClient, IpcFailure } from "../ipc/client.ts";
 let client: IpcClient | null = null;
 export function bindSessionActionsService(bound: IpcClient): void { client = bound; }
 
+export async function viewSessionHistory(sessionId: string): Promise<void> {
+  if (!client) throw new Error("the session-actions IPC bridge is not configured");
+  const result = await client.request<{ path: string }>("sessions.export", { session: sessionId }, { timeoutMs: 70_000 });
+  const { openPathNative } = await import("@/lib/desktop-native");
+  await openPathNative(result.path);
+}
+
 export async function renameSession(sessionId: string, name: string): Promise<void> {
   if (!client) throw new Error("the session-actions IPC bridge is not configured");
   try {

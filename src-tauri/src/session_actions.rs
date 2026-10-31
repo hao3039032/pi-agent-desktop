@@ -4,6 +4,33 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use crate::pi_ipc::{dispatch_with_resume, management_call, IpcHostState};
 
+pub(crate) fn export(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let id = args.get("session").and_then(Value::as_str).filter(|id| !id.is_empty())
+        .ok_or_else(|| ("invalid_args".into(), "session is required".into()))?;
+    dispatch_with_resume(state, "agent.command", &json!({"session": id, "type": "get_state"}))?;
+    let session = state.registry.get(id).ok_or_else(|| ("not_found".into(), "session not found".into()))?;
+    let _guard = session.try_branch_activity().map_err(|message| ("busy".into(), message.into()))?;
+    if session.run_state().is_running() || !session.composer_outbox.snapshot().0.is_empty() {
+        return Err(("busy".into(), "Wait for the current response and queued messages before exporting.".into()));
+    }
+    session.bridge_request("tree.assertIdle", None, Some(Duration::from_secs(30)))
+        .map_err(|error| ("op_failed".into(), error.to_string()))?;
+    let root = state.agent_dir().join("sessions").canonicalize().map_err(|error| ("io".into(), error.to_string()))?;
+    let file = session.session_file.canonicalize().map_err(|error| ("io".into(), error.to_string()))?;
+    if !file.starts_with(root) { return Err(("access_denied".into(), "Session file is outside the session storage directory.".into())); }
+    let directory = tempfile::Builder::new().prefix("pi-session-export-").tempdir()
+        .map_err(|error| ("io".into(), error.to_string()))?;
+    let output = directory.path().join("session.html");
+    // The management instance receives only host-resolved paths; the private
+    // temp directory is retained until eviction or host shutdown.
+    management_call(state, "session.export", json!({"file": file.to_string_lossy(), "output": output.to_string_lossy()}))?;
+    if !output.is_file() { return Err(("op_failed".into(), "Exporter produced no HTML file".into())); }
+    let mut exports = state.session_exports.lock().unwrap();
+    exports.push_back(directory);
+    while exports.len() > 20 { exports.pop_front(); }
+    Ok(json!({"path": output.to_string_lossy()}))
+}
+
 pub(crate) fn rename(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
     let id = args.get("session").and_then(Value::as_str).filter(|id| !id.is_empty())
         .ok_or_else(|| ("invalid_args".into(), "session is required".into()))?;
@@ -155,6 +182,15 @@ mod tests {
         assert_eq!(named["data"]["info"]["name"], "fixture title", "{named}");
         let cleared = call("sessions.rename", json!({"session":"branch-source","name":""}));
         assert_eq!(cleared["ok"], true, "clearing the title is supported: {cleared}");
+        let exported = call("sessions.export", json!({"session":"branch-source"}));
+        assert_eq!(exported["ok"], true, "{exported}");
+        let export_path = Path::new(exported["data"]["path"].as_str().unwrap());
+        let html = std::fs::read_to_string(export_path).unwrap();
+        use base64::Engine;
+        let payload = html.split("<script id=\"session-data\" type=\"application/json\">").nth(1).unwrap().split("</script>").next().unwrap();
+        let transcript = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(payload).unwrap()).unwrap();
+        assert!(transcript.contains("branch A") && transcript.contains("branch B"));
+        assert!(!html.contains("node.children.forEach(sortChildren)"));
         let nav = call("agent.command", json!({"session":"branch-source","type":"navigate_tree","targetId":"aa"}));
         assert_eq!(nav["ok"], true, "{nav}");
         let live = call("sessions.get", json!({"session":"branch-source"}));
@@ -206,6 +242,8 @@ mod tests {
         assert!(state.registry.get("branch-source").unwrap().run_state().is_running(), "fixture run did not start");
         let busy_rename = call("sessions.rename", json!({"session":"branch-source","name":"should not write"}));
         assert_eq!(busy_rename["error"]["code"], "busy", "{busy_rename}");
+        let busy_export = call("sessions.export", json!({"session":"branch-source"}));
+        assert_eq!(busy_export["error"]["code"], "busy", "{busy_export}");
         for kind in ["fork", "fork_branch", "clone", "navigate_tree"] {
             let blocked = call("agent.command", json!({"session":"branch-source","type":kind,"entryId":"aa","targetId":"aa"}));
             assert_eq!(blocked["error"]["code"], "busy", "{kind}: {blocked}");
