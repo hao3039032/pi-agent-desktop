@@ -19,6 +19,7 @@ const {
 } = await jiti.import("./ProjectTrustDialog.tsx");
 const { englishMessages } = await jiti.import("@/lib/i18n/locale-plugins.ts");
 const source = (await readFile(new URL("./ProjectTrustDialog.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
+const trustClientSource = (await readFile(new URL("../lib/project-trust-client.ts", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const apiTypesSource = (await readFile(new URL("../lib/api-types.ts", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const settingsCss = (await readFile(new URL("../app/settings.css", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const appShellSource = (await readFile(new URL("./AppShell.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
@@ -248,6 +249,8 @@ test("the trust error stays outside the scrolling body, translated from its reas
   assert.match(internal, /<div role="alert" class="project-trust-error">Could not trust this project\.<code class="project-trust-error-detail">Lock file is already being held<\/code><\/div>/);
   const network = view({ error: { error: "Failed to fetch" } });
   assert.match(network, /Could not trust this project\.<code class="project-trust-error-detail">Failed to fetch<\/code>/);
+  const pending = view({ error: { error: "trust policy outcome is unresolved and recovery is required", reason: "trust-unreadable", trustPolicyPending: true } });
+  assert.match(pending, /trust policy outcome is unresolved and recovery is required/);
 });
 
 test("a folder trusted meanwhile, or no longer needing trust, is not offered Trust", () => {
@@ -319,7 +322,8 @@ test("a listing that failed names why, or gives its diagnostic when there is not
 test("the dialog fetches the listing when it opens, and gives up after a timeout", () => {
   assert.equal(MCP_LISTING_TIMEOUT_MS, 10_000);
   const effect = source.slice(source.indexOf("useEffect(() => {"), source.indexOf("}, [cwd]);"));
-  assert.match(effect, /fetch\(`\/api\/project-trust\?cwd=\$\{encodeURIComponent\(cwd\)\}`, \{ signal: controller\.signal, cache: "no-store" \}\)/);
+  assert.match(effect, /fetchProjectTrustOverview\(cwd, controller\.signal\)/);
+  assert.match(trustClientSource, /fetch\(`\/api\/project-trust\?cwd=\$\{encodeURIComponent\(cwd\)\}`, \{\s*cache: "no-store",\s*\.\.\.\(signal \? \{ signal \} : \{\}\)/);
   assert.match(effect, /window\.setTimeout\(\(\) => \{\s*timedOut = true;\s*controller\.abort\(\);\s*\}, MCP_LISTING_TIMEOUT_MS\)/);
   // A late answer for a closed dialog or an earlier cwd is dropped.
   assert.match(effect, /return \(\) => \{\s*active = false;\s*window\.clearTimeout\(timer\);\s*controller\.abort\(\);\s*\};/);
@@ -394,6 +398,7 @@ test("the dialog body scrolls inside a safe-area-aware backdrop", () => {
 
 test("the page keeps a refusal's reason for the dialog and follows the status the dialog read", () => {
   const trust = appShellSource.slice(appShellSource.indexOf("const handleTrustProject"), appShellSource.indexOf("const activeFileTab ="));
-  assert.match(trust, /setProjectTrustError\(\{ error: data\.error \?\? `HTTP \$\{response\.status\}`, \.\.\.\(data\.reason \? \{ reason: data\.reason \} : \{\}\) \}\);/);
+  assert.match(trust, /setProjectTrustError\(\{ error: data\.error \?\? `HTTP \$\{response\.status\}`, \.\.\.\(data\.reason \? \{ reason: data\.reason \} : \{\}\)/);
+  assert.match(trust, /data\.trustPolicyPending/);
   assert.match(appShellSource, /<ProjectTrustDialog[\s\S]*?onStatus=\{setProjectTrust\}[\s\S]*?\/>/);
 });

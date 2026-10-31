@@ -41,6 +41,7 @@ mod session_search;
 mod session_fleet;
 mod session_actions;
 mod trust_policy_fence;
+mod trust_policy_mutation;
 mod chat_sessions;
 mod session_writer_fence;
 mod session_deletion;

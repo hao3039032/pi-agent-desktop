@@ -504,6 +504,26 @@ fn mock_session_exe() -> &'static str {
     env!("CARGO_BIN_EXE_mock_pi_session")
 }
 
+#[test]
+fn offline_writer_refuses_child_busy_after_prompt_ack_before_start_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&agent, &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-assert-busy-after-prompt"]);
+    let registry = SessionRegistry::new();
+    let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let ack = session.command("prompt", json!({"message":"hello"}), Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(ack["disposition"], "started");
+    assert!(!session.run_state().is_running(), "the projected agent_start is deliberately missing");
+    let result = registry.with_offline_session_writer(&id, Duration::from_secs(3), || -> Result<(), ()> { panic!("must not run writer") });
+    assert!(matches!(result, Err(session_host::SessionWriterError::Busy(_))));
+    assert!(registry.get(&id).is_some());
+    registry.remove(&id, Duration::from_secs(3));
+}
+
 use base64::Engine as _;
 
 fn b64(value: &serde_json::Value) -> String {

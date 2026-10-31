@@ -97,7 +97,7 @@ export async function setProjectTrust(
     return {
       ok: false,
       status: 409,
-      data: { error: msg, ...(reason ? { reason } : {}) },
+      data: { error: msg, ...(reason ? { reason } : {}), ...(error instanceof IpcFailure && error.error.details?.trustPolicyPending === true ? { trustPolicyPending: true } : {}) },
     };
   }
 }

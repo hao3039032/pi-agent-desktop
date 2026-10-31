@@ -63,6 +63,7 @@ struct Config {
     stay_after_eof: bool,
     prompt_events: Vec<serde_json::Value>,
     prompt_disposition: String,
+    assert_busy_after_prompt: bool,
     prompt_log: Option<std::path::PathBuf>,
 }
 
@@ -75,6 +76,7 @@ fn parse_args() -> Config {
         stay_after_eof: false,
         prompt_events: Vec::new(),
         prompt_disposition: "started".into(),
+        assert_busy_after_prompt: false,
         prompt_log: None,
     };
     let mut args = std::env::args().skip(1);
@@ -93,6 +95,7 @@ fn parse_args() -> Config {
                 }
             }
             "--mock-prompt-hold" => config.prompt_hold = true,
+            "--mock-assert-busy-after-prompt" => config.assert_busy_after_prompt = true,
             "--mock-stay-after-eof" => config.stay_after_eof = true,
             "--mock-prompt-hold-past-eof" => {
                 config.prompt_hold = true;
@@ -130,6 +133,7 @@ fn main() {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     let mut buf = Vec::new();
+    let mut prompt_admitted = false;
 
     loop {
         buf.clear();
@@ -175,7 +179,11 @@ fn main() {
                                     if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload) {
                                         if payload["op"] == "tree.assertIdle" {
                                             respond(&mut out, &id, "prompt", serde_json::json!({"disposition":"handled"}));
-                                            let envelope = serde_json::json!({"sid":config.session_id,"rid":parts[1],"nonce":payload["nonce"],"ok":true,"result":{}});
+                                            let envelope = if config.assert_busy_after_prompt && prompt_admitted {
+                                                serde_json::json!({"sid":config.session_id,"rid":parts[1],"nonce":payload["nonce"],"ok":false,"error":"session is busy"})
+                                            } else {
+                                                serde_json::json!({"sid":config.session_id,"rid":parts[1],"nonce":payload["nonce"],"ok":true,"result":{}})
+                                            };
                                             emit(&mut out, serde_json::json!({"type":"extension_ui_request","id":"fixture-notify","method":"notify","message":format!("PI_WEB_BRIDGE_V1 {envelope}")}));
                                             continue;
                                         }
@@ -183,6 +191,7 @@ fn main() {
                                 }
                             }
                         }
+                        prompt_admitted = true;
                         if let Some(log) = &config.prompt_log {
                             use std::io::Write as _;
                             // The host's command record is FLAT: the

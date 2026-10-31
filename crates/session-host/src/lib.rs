@@ -815,7 +815,7 @@ impl SessionRegistry {
         &self, id: &str, operation: impl FnOnce(Option<&Arc<Session>>) -> Result<T, E>,
     ) -> Result<T, SessionWriterError<E>> {
         let lock = self.start_lock_for(id);
-        let _start = lock.lock().unwrap();
+        let _start = lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))?;
         (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         // Include exited entries: their in-flight delivery can still restore an
         // unknown message to the persistent outbox after the process exits.
@@ -841,7 +841,9 @@ impl SessionRegistry {
         ids.sort();
         ids.dedup();
         let locks: Vec<_> = ids.iter().map(|id| self.start_lock_for(id)).collect();
-        let _starts: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+        let _starts: Vec<_> = locks.iter().map(|lock| {
+            lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))
+        }).collect::<Result<_, _>>()?;
         let sessions: Vec<_> = {
             let registry = self.sessions.lock().unwrap();
             ids.iter().map(|id| registry.get(id).cloned()).collect()
@@ -1011,6 +1013,19 @@ impl SessionRegistry {
             self.remove(id, Duration::from_secs(5));
         }
         expired
+    }
+
+    /// Registered sessions, including exited children whose outbox may still be unwinding.
+    pub fn registered_sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Outboxes survive closed children and must be considered by policy changes.
+    pub fn pending_composer_session_ids(&self) -> Vec<String> {
+        self.composer_outboxes.lock().unwrap().iter()
+            .filter(|(_, outbox)| outbox.has_pending_or_in_flight())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Live session ids (diagnostics/tests).
@@ -2047,6 +2062,28 @@ mod dispatch_tests {
             release_tx.send(()).unwrap();
             writer.join().unwrap().unwrap();
             assert!(start.join().unwrap().err().unwrap().to_string().contains("session file no longer exists"));
+        });
+    }
+
+    #[test]
+    fn idle_writer_admission_never_waits_on_an_in_progress_start() {
+        let registry = SessionRegistry::new();
+        let locked = registry.start_lock_for("b");
+        let held = locked.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let single = registry.with_idle_session_writer("b", |_| Ok::<_, ()>(()));
+                let multi = registry.with_idle_session_writers(&["a".into(), "b".into()], |_| Ok::<_, ()>(()));
+                tx.send((matches!(single, Err(SessionWriterError::Busy(_))), matches!(multi, Err(SessionWriterError::Busy(_))))).unwrap();
+            });
+            let answer = rx.recv_timeout(Duration::from_secs(2));
+            // Release before joining even on failure, so a regression cannot
+            // strand the test thread on the very lock under test.
+            drop(held);
+            worker.join().unwrap();
+            assert_eq!(answer.unwrap(), (true, true));
+            assert!(registry.start_lock_for("a").try_lock().is_ok());
         });
     }
 

@@ -1442,17 +1442,19 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             if current.get("requiresTrust").and_then(Value::as_bool) != Some(true) {
                 return protocol_error(&id, "trust-not-required", "This project has no resources that require trust");
             }
-            for sid in state.registry.ids() {
-                if let Some(session) = state.registry.get(&sid) {
-                    if session.run_state().is_running() {
-                        return protocol_error(&id, "session-busy", "Wait for the active session to finish before trusting this project");
-                    }
-                }
+            if crate::trust_policy_fence::is_pending(&agent_dir) {
+                return protocol_error(&id, "busy", "Trust policy outcome is unresolved; recovery is required");
+            }
+            if !cfg!(unix) {
+                return protocol_error(&id, "not_supported", "Durable trust policy fencing is unavailable on this platform");
+            }
+            if let Err(error) = crate::trust_policy_mutation::close_affected_sessions(state, Path::new(cwd)) {
+                return protocol_error_value(&id, json!({"code":"busy", "reason":"session-busy", "message":error, "retryable":false}));
             }
             let call_args = json!({ "cwd": cwd, "agentDir": agent_dir.to_string_lossy() });
-            match management_call(state, "trust.set", call_args) {
+            match crate::trust_policy_mutation::run(state, Path::new(cwd), "trust.setFenced", call_args) {
                 Ok(new_status) => mcp_management_response(&id, new_status),
-                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                Err(error) => protocol_error(&id, "io", &error),
             }
         }
         // POST /api/agent/new: a brand-new session (the factory + the
@@ -2141,6 +2143,27 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             if let Some(cwd) = cwd {
                 if let Err(error) = validate_scoped_cwd(state, cwd) {
                     return mcp_cwd_error(&id, &error);
+                }
+                if args.get("action").and_then(Value::as_str) == Some("add")
+                    && args.get("scope").and_then(Value::as_str) == Some("project")
+                    && args.get("trustFolder").and_then(Value::as_bool) == Some(true) {
+                    let _policy = match state.policy_gate.try_write() {
+                        Ok(guard) => guard,
+                        Err(_) => return protocol_error(&id, "busy", "Session admission is in progress"),
+                    };
+                    if crate::trust_policy_fence::is_pending(&agent_dir) {
+                        return protocol_error(&id, "busy", "Trust policy outcome is unresolved; recovery is required");
+                    }
+                    if !cfg!(unix) {
+                        return protocol_error(&id, "not_supported", "Durable trust policy fencing is unavailable on this platform");
+                    }
+                    if let Err(error) = crate::trust_policy_mutation::close_affected_sessions(state, Path::new(cwd)) {
+                        return protocol_error_value(&id, json!({"code":"busy", "reason":"session-busy", "message":error, "retryable":false}));
+                    }
+                    return match crate::trust_policy_mutation::run(state, Path::new(cwd), "mcp.trustFolderAdd", payload) {
+                        Ok(result) => mcp_management_response(&id, result),
+                        Err(error) => protocol_error(&id, "io", &error),
+                    };
                 }
                 match management_call(state, "mcp.configAction", payload) {
                     Ok(result) => mcp_management_response(&id, result),
@@ -6391,8 +6414,10 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(project.join(".pi/mcp.json"), json!({"mcpServers": {"local": {"command": "node", "args": [fixture]}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         state.propose_path(&project);
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
-            executable, agent_dir: Some(agent),
+            executable, agent_dir: Some(agent.clone()),
             extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
         });
@@ -6400,8 +6425,52 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
         let listed = call("trust.status", json!({"cwd":cwd}));
         assert_eq!(listed["data"]["mcpServers"][0]["name"], "local", "{listed}");
+        let created = call("agent.create", json!({"cwd":cwd,"type":"ensure_session"}));
+        assert_eq!(created["ok"], true, "{created}");
+        let sid = created["data"]["sessionId"].as_str().unwrap().to_string();
+        let session = state.registry.get(&sid).unwrap();
+        let child_folder = project.join("child");
+        std::fs::create_dir_all(&child_folder).unwrap();
+        let child = call("agent.create", json!({"cwd":child_folder,"type":"ensure_session"}));
+        assert_eq!(child["ok"], true, "{child}");
+        let child_id = child["data"]["sessionId"].as_str().unwrap().to_string();
+        let child_session = state.registry.get(&child_id).unwrap();
+        let child_queued = child_session.composer_outbox.enqueue("descendant pending", None).unwrap();
+        let unrelated = dir.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        state.propose_path(&unrelated);
+        let other = call("agent.create", json!({"cwd":unrelated,"type":"ensure_session"}));
+        assert_eq!(other["ok"], true, "{other}");
+        let other_id = other["data"]["sessionId"].as_str().unwrap().to_string();
+        let other_session = state.registry.get(&other_id).unwrap();
+        let other_queued = other_session.composer_outbox.enqueue("unrelated pending", None).unwrap();
+        let queued = session.composer_outbox.enqueue("not delivered", None).unwrap();
+        let blocked = call("trust.set", json!({"cwd":cwd}));
+        assert_eq!(blocked["error"]["reason"], "session-busy", "{blocked}");
+        assert!(state.registry.get(&sid).is_some(), "preflight leaves all affected sessions open");
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
+        session.composer_outbox.take(&queued.id);
+        child_session.composer_outbox.take(&child_queued.id);
+        let dormant = call("agent.create", json!({"cwd":cwd,"type":"ensure_session"}));
+        assert_eq!(dormant["ok"], true, "{dormant}");
+        let dormant_id = dormant["data"]["sessionId"].as_str().unwrap().to_string();
+        let dormant_outbox = state.registry.composer_outbox_for(&dormant_id);
+        let dormant_queued = dormant_outbox.enqueue("pending after close", None).unwrap();
+        state.registry.remove(&dormant_id, Duration::from_secs(5));
+        let blocked = call("trust.set", json!({"cwd":cwd}));
+        assert_eq!(blocked["error"]["reason"], "session-busy", "{blocked}");
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
+        dormant_outbox.take(&dormant_queued.id);
         let trusted = call("trust.set", json!({"cwd":cwd}));
         assert_eq!(trusted["data"]["trusted"], true, "{trusted}");
+        assert!(state.registry.get(&sid).is_none(), "old session must actually exit");
+        assert!(state.registry.get(&child_id).is_none(), "inheriting descendant must exit");
+        assert!(state.registry.get(&other_id).is_some(), "an unrelated queued session must stay open");
+        other_session.composer_outbox.take(&other_queued.id);
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
+        let resumed = call("agent.command", json!({"session":sid,"type":"get_state"}));
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert!(state.registry.get(&sid).is_some());
         let action = json!({"cwd":cwd,"action":"add","scope":"global","text":"node fixture.js","name":"fixture"});
         let added = call("mcp.configAction", action.clone());
         assert_eq!(added["data"]["added"]["name"], "fixture", "{added}");
@@ -6415,7 +6484,19 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let probe = call("mcp.test", json!({"cwd":cwd,"scope":"project","name":"local"}));
         assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
         assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        state.propose_path(&fresh);
+        let invalid = call("mcp.configAction", json!({"cwd":fresh,"action":"add","scope":"project","text":"","trustFolder":true}));
+        assert_eq!(invalid["error"]["reason"], "import-failed", "{invalid}");
+        assert!(!crate::trust_policy_fence::is_pending(&agent), "pre-write refusal releases the fence");
+        let added = call("mcp.configAction", json!({"cwd":fresh,"action":"add","scope":"project","text":"node fixture.js","name":"fresh","trustFolder":true}));
+        assert_eq!(added["data"]["added"]["name"], "fresh", "{added}");
+        assert_eq!(added["data"]["trustedFolder"], true, "{added}");
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
         assert_eq!(state.management.scopes(), vec!["global".to_string()]);
+        state.registry.remove(&sid, Duration::from_secs(5));
+        state.registry.remove(&other_id, Duration::from_secs(5));
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
