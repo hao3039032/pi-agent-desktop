@@ -135,6 +135,10 @@ export default defineConfig({
         find: /^@\/lib\/skills-client$/,
         replacement: resolve(import.meta.dirname, "src/data/skills-client.ts"),
       },
+      {
+        find: /^@\/lib\/plugins-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/plugins-client.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

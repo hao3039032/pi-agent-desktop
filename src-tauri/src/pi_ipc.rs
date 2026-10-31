@@ -1312,7 +1312,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
-        "skills.list" | "skills.setDisabled" => {
+        "plugins.list" | "skills.list" | "skills.setDisabled" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
                 return protocol_error(&id, "invalid_args", "cwd is required");
             };
@@ -4640,6 +4640,41 @@ mod tests {
         }
         let response = send(&state, json!({ "v": 1, "id": "valid", "op": "skills.list", "args": { "cwd": cwd } }));
         assert_eq!(response["error"]["code"], "management_unavailable", "{response}");
+    }
+
+    #[test]
+    fn real_pi_plugins_list_refreshes_from_settings() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let package = dir.path().join("fixture");
+        for path in [&agent, &project, &package] { std::fs::create_dir_all(path).unwrap(); }
+        std::fs::write(package.join("package.json"), r#"{"name":"fixture","version":"1.0.0"}"#).unwrap();
+        std::fs::write(agent.join("settings.json"), json!({"packages": [package]}).to_string()).unwrap();
+        let managed = dir.path().join("managed");
+        assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable,
+            agent_dir: Some(agent.clone()),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("PI_AGENT_HOME".into(), dir.path().display().to_string())],
+        });
+        state.propose_path(&project);
+        let cwd = project.to_string_lossy();
+        let first = send(&state, json!({"v": 1, "id": "first", "op": "plugins.list", "args": {"cwd": cwd}}));
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["data"]["packages"][0]["disabled"], false);
+        std::fs::write(agent.join("settings.json"), json!({"packages": [{"source": package, "extensions": [], "skills": [], "prompts": [], "themes": []}]}).to_string()).unwrap();
+        let second = send(&state, json!({"v": 1, "id": "second", "op": "plugins.list", "args": {"cwd": cwd}}));
+        assert_eq!(second["ok"], true, "{second}");
+        assert_eq!(second["data"]["packages"][0]["disabled"], true);
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
     #[test]

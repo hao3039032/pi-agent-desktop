@@ -23,6 +23,7 @@ import { bindFileService } from "./data/file-service.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindSkillsClient } from "./data/skills-client.ts";
+import { bindPluginsClient } from "./data/plugins-client.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
@@ -41,6 +42,7 @@ async function boot(): Promise<void> {
   bindFileService(client);
   bindModelsService(client);
   bindSkillsClient(client);
+  bindPluginsClient(client);
   bindEnabledModelsService(client);
   bindModelsConfigService(client);
   bindSessionViewService(client);
