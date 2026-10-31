@@ -26,7 +26,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -78,8 +77,6 @@ struct Grant {
 /// The registry of grants. `create` picks the handle; nothing else does.
 pub struct ResourceRegistry {
     grants: Mutex<HashMap<Handle, Grant>>,
-    counter: AtomicU64,
-    entropy: Mutex<u64>,
 }
 
 impl Default for ResourceRegistry {
@@ -92,31 +89,13 @@ impl ResourceRegistry {
     pub fn new() -> Self {
         Self {
             grants: Mutex::new(HashMap::new()),
-            counter: AtomicU64::new(0),
-            entropy: Mutex::new(0),
         }
     }
 
-    fn random_handle(&self) -> Handle {
-        // 128 bits from the OS entropy pool (getrandom/OsRng equivalent via
-        // /dev/urandom on unix, RtlGenRandom on windows) — the crate keeps
-        // zero dependencies, so read the platform source directly.
+    fn random_handle(&self) -> Result<Handle, DenyReason> {
         let mut seed = [0u8; 16];
-        let filled = fill_entropy(&mut seed);
-        if !filled {
-            // Fall back to a time+counter token; still unguessable to a
-            // sandboxed iframe (which cannot read the clock source either).
-            let count = self.counter.fetch_add(1, Ordering::Relaxed);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos() as u64)
-                .unwrap_or(0);
-            let mut state = self.entropy.lock().unwrap();
-            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15).rotate_left(17) ^ now ^ count;
-            seed[..8].copy_from_slice(&state.to_le_bytes());
-            seed[8..].copy_from_slice(&count.to_le_bytes());
-        }
-        seed.iter().map(|byte| format!("{byte:02x}")).collect()
+        getrandom::fill(&mut seed).map_err(|_| DenyReason::IoError)?;
+        Ok(seed.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Grant access to one file. `path` is host-picked (a dialog result, an
@@ -140,7 +119,7 @@ impl ResourceRegistry {
         if !matches_scope {
             return Err(DenyReason::InvalidPath);
         }
-        let handle = self.random_handle();
+        let handle = self.random_handle()?;
         self.grants.lock().unwrap().insert(
             handle.clone(),
             Grant {
@@ -275,31 +254,6 @@ pub fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-#[cfg(unix)]
-fn fill_entropy(buf: &mut [u8]) -> bool {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(buf))
-        .is_ok()
-}
-
-#[cfg(windows)]
-fn fill_entropy(buf: &mut [u8]) -> bool {
-    // RtlGenRandom via the BCryptGenRandom path without extra crates.
-    use std::os::windows::io::AsRawHandle;
-    let ok = unsafe {
-        windows_gen_random(buf.as_mut_ptr(), buf.len() as u32)
-    };
-    ok == 1
-}
-
-#[cfg(windows)]
-#[link(name = "bcrypt")]
-extern "system" {
-    #[link_name = "BCryptGenRandom"]
-    fn windows_gen_random(buffer: *mut u8, length: u32) -> i32;
-}
-
 // Shared test helper: an Arc<Registry> is not needed (no interior threads),
 // but tests exercise the public API exactly as Tauri commands will call it.
 #[cfg(test)]
@@ -353,6 +307,21 @@ mod tests {
             registry.read(&handle, "other.png", None),
             ResourceResponse::Denied(DenyReason::InvalidPath)
         ));
+    }
+
+    #[test]
+    fn each_grant_has_a_distinct_128_bit_hex_handle() {
+        let dir = setup_dir();
+        let file = dir.path().join("x.txt");
+        fs::write(&file, b"x").unwrap();
+        let registry = ResourceRegistry::new();
+        let mut handles = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let handle = registry.grant_file(&file, TTL).unwrap();
+            assert_eq!(handle.len(), 32);
+            assert!(handle.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(handles.insert(handle));
+        }
     }
 
     #[test]
