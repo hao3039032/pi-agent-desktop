@@ -3382,11 +3382,11 @@ pub(crate) fn create_session(
         .clone()
         .ok_or_else(|| ("not_found".to_string(), "no pi executable resolved".to_string(), None))?;
     let request = SpawnRequest { tool_names, initial_model, thinking_level };
-    let config = build_spawn_plan(state, &base, &session_cwd, &session_file, &request, true)
-        .map_err(|message| ("op_failed".to_string(), message, None))?;
     let session = state
         .registry
-        .start(&session_id, &session_file, &session_id, &session_cwd, &config)
+        .start_with_plan(&session_id, &session_file, &session_id, &session_cwd, || {
+            build_spawn_plan(state, &base, &session_cwd, &session_file, &request, true)
+        })
         .map_err(|error| {
             let rejected = command_type.as_deref() == Some("prompt");
             (
