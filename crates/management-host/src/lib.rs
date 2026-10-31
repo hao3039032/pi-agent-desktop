@@ -82,6 +82,10 @@ pub enum TaskStatus { Running, Unknown, Succeeded, Failed, Cancelled }
 struct TaskRecord {
     snapshot: TaskSnapshot,
     finished_at: Option<Instant>,
+    serial_scope: bool,
+    exclusive: bool,
+    operation: String,
+    runner: Option<Arc<ManagementInstance>>,
 }
 
 struct PendingTask {
@@ -186,6 +190,28 @@ impl ManagementInstance {
     /// Start a task. `kind` and `deadline` are trusted host policy, never frontend input.
     /// Operations must redact secrets before reporting a result or progress.
     pub fn start_task(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind) -> Result<String, String> {
+        self.start_task_inner(op, args, deadline, kind, false, None, None)
+    }
+
+    /// Reserve the same scope task capacity and unknown isolation used by ordinary tasks.
+    pub fn start_serial_task(&self, op: &str, args: Value, deadline: Duration) -> Result<String, String> {
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, None)
+    }
+
+    /// Reserve this scope while executing in an existing cwd-scoped child.
+    pub fn start_serial_task_on(&self, runner: Arc<ManagementInstance>, op: &str, args: Value, deadline: Duration) -> Result<String, String> {
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, Some(runner))
+    }
+
+    /// A killable child owned by one task; never reuse it for reads or other mutations.
+    pub fn start_exclusive_task(&self, op: &str, args: Value, deadline: Duration, config: ManagementSpawnConfig) -> Result<String, String> {
+        #[cfg(windows)]
+        { let _ = (op, args, deadline, config); return Err("exclusive management mutations are unsupported on Windows".into()); }
+        #[cfg(unix)]
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, Some(config), None)
+    }
+
+    fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>) -> Result<String, String> {
         if deadline.is_zero() || deadline > Duration::from_secs(600) { return Err("invalid management task deadline".into()); }
         if kind == TaskKind::ReadOnly && !matches!(op,
             "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
@@ -197,12 +223,15 @@ impl ManagementInstance {
         let handle = format!("task-{}", uuid::Uuid::new_v4());
         let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
             status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
-        }, finished_at: None }));
+        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), runner: None }));
         let activity = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
             if state.closing || self.client.has_exited() { return Err("management instance is closing".into()); }
             if state.tasks.len() >= 128 { return Err("management task capacity reached".into()); }
+            if serial_scope && state.tasks.values().any(|task| { let task = task.lock().unwrap(); task.serial_scope && task.finished_at.is_none() }) {
+                return Err("management configuration scope is busy".into());
+            }
             if kind == TaskKind::Mutation && state.tasks.values().any(|task| task.lock().unwrap().snapshot.status == TaskStatus::Unknown) {
                 return Err("management scope has an unknown outcome".into());
             }
@@ -215,8 +244,40 @@ impl ManagementInstance {
         let operation = op.to_string();
         let worker_task = Arc::clone(&task);
         if let Err(error) = std::thread::Builder::new().name("mgmt-task".into()).spawn(move || {
-            let result = instance.management_call_wait(&operation, args, &id, Arc::clone(&worker_task));
+            let result = if let Some(mut config) = exclusive_config {
+                config.env.push(("PI_WEB_EXCLUSIVE_MUTATION".into(), "1".into()));
+                match spawn_management(&instance.scope, &config) {
+                    Ok(runner) => {
+                        let cancelled = {
+                            let mut record = worker_task.lock().unwrap();
+                            record.runner = Some(Arc::clone(&runner));
+                            record.snapshot.cancel_requested
+                        };
+                        let result = if cancelled { Err("management operation outcome unknown".into()) } else {
+                            runner.management_call_wait(&operation, args, &id, Arc::clone(&worker_task))
+                        };
+                        if cancelled { let _ = runner.force_stop(Duration::from_secs(5)); }
+                        else { runner.shutdown(Duration::from_secs(5)); }
+                        result
+                    }
+                    Err(error) => Err(format!("[op_failed] {error}")),
+                }
+            } else if let Some(runner) = shared_runner {
+                worker_task.lock().unwrap().runner = Some(Arc::clone(&runner));
+                match runner.admit() {
+                    Ok(_activity) => runner.management_call_wait(&operation, args, &id, Arc::clone(&worker_task)),
+                    Err(error) => Err(format!("[op_failed] {error}")),
+                }
+            } else {
+                instance.management_call_wait(&operation, args, &id, Arc::clone(&worker_task))
+            };
             let mut record = worker_task.lock().unwrap();
+            record.runner = None;
+            if record.exclusive && record.snapshot.status == TaskStatus::Unknown {
+                drop(record);
+                drop(activity);
+                return;
+            }
             match result {
                 Ok(value) => { record.snapshot.status = TaskStatus::Succeeded; record.snapshot.result = Some(value); record.finished_at = Some(Instant::now()); }
                 Err(error) if error.starts_with('[') => {
@@ -259,6 +320,18 @@ impl ManagementInstance {
         Ok(handle)
     }
 
+    pub fn exclusive_task_snapshot(&self, handle: &str) -> Result<TaskSnapshot, String> {
+        let state = self.state.lock().unwrap();
+        let task = state.tasks.get(handle).ok_or("management task not found")?.lock().unwrap();
+        if !task.exclusive || task.operation != "plugins.install" { return Err("management task not found".into()); }
+        Ok(task.snapshot.clone())
+    }
+
+    pub fn cancel_exclusive_task(&self, handle: &str) -> Result<(), String> {
+        self.exclusive_task_snapshot(handle)?;
+        self.cancel_task(handle)
+    }
+
     pub fn task_snapshot(&self, handle: &str) -> Result<TaskSnapshot, String> {
         let state = self.state.lock().unwrap();
         let task = state.tasks.get(handle).ok_or("management task not found")?;
@@ -267,15 +340,23 @@ impl ManagementInstance {
     }
 
     pub fn cancel_task(&self, handle: &str) -> Result<(), String> {
-        {
+        let (exclusive, runner) = {
             let state = self.state.lock().unwrap();
             let task = state.tasks.get(handle).ok_or("management task not found")?;
             let mut task = task.lock().unwrap();
             if task.finished_at.is_some() { return Err("management task is terminal".into()); }
             if task.snapshot.cancel_requested { return Ok(()); }
             task.snapshot.cancel_requested = true;
-        }
-        self.send_cancel(handle)
+            if task.exclusive {
+                task.snapshot.status = TaskStatus::Unknown;
+                task.snapshot.error = Some("operation cancelled; outcome unknown".into());
+            }
+            (task.exclusive, task.runner.clone())
+        };
+        if exclusive {
+            if let Some(runner) = runner { let _ = runner.force_stop(Duration::from_secs(5)); }
+            Ok(())
+        } else if let Some(runner) = runner { runner.send_cancel(handle) } else { self.send_cancel(handle) }
     }
 
     fn send_cancel(&self, handle: &str) -> Result<(), String> {
@@ -348,6 +429,30 @@ impl ManagementInstance {
         let result = self.client.command("prompt", json!({ "message": message }), Some(timeout))?;
         self.touch();
         Ok(result)
+    }
+
+    /// Stop a host-owned exclusive instance. A successful wait confirms only
+    /// the leader's exit, not descendant cleanup or a mutation's outcome.
+    #[cfg(unix)]
+    pub fn force_stop(&self, limit: Duration) -> Result<(), String> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.closing = true;
+            for task in state.tasks.values() {
+                let mut task = task.lock().unwrap();
+                if task.finished_at.is_none() { task.snapshot.status = TaskStatus::Unknown; }
+            }
+        }
+        if !self.client.force_kill() {
+            return Err("management leader was already reaped; descendant state is unknown".into());
+        }
+        if self.client.wait_exit(Some(limit)) { Ok(()) } else { Err("management leader did not exit".into()) }
+    }
+
+    /// Windows requires a Job object to guarantee descendant cleanup.
+    #[cfg(windows)]
+    pub fn force_stop(&self, _limit: Duration) -> Result<(), String> {
+        Err("exclusive management mutations are unsupported on Windows".into())
     }
 
     /// Orderly shutdown.
@@ -751,7 +856,7 @@ mod tests {
         let pending = Mutex::new(HashMap::new());
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None }));
+        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), runner: None }));
         let task_a = task();
         pending.lock().unwrap().insert("a".to_string(), PendingTask { tx: a_tx, task: Arc::clone(&task_a), nonce: "good".into() });
         pending.lock().unwrap().insert("b".to_string(), PendingTask { tx: b_tx, task: task(), nonce: "good".into() });
