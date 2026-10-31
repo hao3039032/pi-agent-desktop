@@ -71,7 +71,7 @@ fn read(path: &Path) -> Result<Option<Value>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let value: Value = serde_json::from_str(&text).map_err(|error| format!("invalid scheduler lease: {error}"))?;
-            if value.get("pid").and_then(Value::as_u64).is_none()
+            if !value.get("pid").and_then(Value::as_u64).is_some_and(|pid| pid > 0 && u32::try_from(pid).is_ok())
                 || value.get("heartbeatAt").and_then(Value::as_str).and_then(crate::store::iso_to_ms).is_none() {
                 return Err("invalid scheduler lease fields".into());
             }
@@ -112,7 +112,11 @@ mod tests {
         std::fs::write(&path, "{broken").unwrap();
         assert!(acquire(dir.path(), 456, 1000, |_| true).is_err());
         assert!(release(dir.path(), 456).is_err());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "{broken");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        for pid in [0_u64, u32::MAX as u64 + 1] {
+            std::fs::write(&path, json!({ "pid": pid, "heartbeatAt": "2026-03-01T05:17:00.000Z" }).to_string()).unwrap();
+            assert!(acquire(dir.path(), 456, 1_772_342_220_000, |_| true).is_err());
+        }
     }
 
     #[test]

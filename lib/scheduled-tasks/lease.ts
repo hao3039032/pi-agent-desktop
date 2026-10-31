@@ -46,7 +46,7 @@ function readLease(path: string): Lease | null {
     throw error;
   }
   const parsed = JSON.parse(content) as Partial<Lease>;
-  if (!Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0 || typeof parsed.heartbeatAt !== "string"
+  if (!Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0 || (parsed.pid ?? 0) > 0xffff_ffff || typeof parsed.heartbeatAt !== "string"
     || Number.isNaN(new Date(parsed.heartbeatAt).getTime())) {
     throw new Error("Invalid scheduler lease");
   }
