@@ -63,7 +63,7 @@ ksni = "0.2.2"
 # Native startup-failure dialog: the setup hook runs before the Tauri event
 # loop, so a plain MessageBoxW is the only thing that can be shown there.
 # 0.52 is already in the tree via tauri/wry; this only declares it.
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 [dev-dependencies]
 # The guarded installer's retry state machine is async; its tests drive it with

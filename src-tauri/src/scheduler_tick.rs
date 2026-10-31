@@ -11,7 +11,25 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     let result = unsafe { libc::kill(pid, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process == 0 {
+            // Access denied means the process may still exist; only the OS's
+            // invalid-PID result proves it is gone.
+            return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32);
+        }
+        let mut exit_code = 0;
+        let queried = GetExitCodeProcess(process, &mut exit_code);
+        CloseHandle(process);
+        queried == 0 || exit_code == STILL_ACTIVE
+    }
+}
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn pid_alive(_pid: u32) -> bool { true }
 
 pub fn tick(state: &Arc<IpcHostState>, now_ms: i64) -> Result<bool, String> {
@@ -165,6 +183,12 @@ mod tests {
         }
         state.stop_scheduler();
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn pid_liveness_recognizes_self_and_impossible_pid() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(u32::MAX));
     }
 
     #[test]
