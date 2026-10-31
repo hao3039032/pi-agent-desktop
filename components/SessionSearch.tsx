@@ -5,6 +5,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { formatRelativeTime } from "@/lib/i18n/format";
 import type { SessionInfo } from "@/lib/types";
 import type { SessionSearchResponse } from "@/lib/session-search";
+import { searchSessions } from "@/lib/session-list-service";
 
 export function SessionSearch({ open, query, children, selectedSessionId, onSelectSession }: {
   open: boolean;
@@ -29,9 +30,7 @@ export function SessionSearch({ open, query, children, selectedSessionId, onSele
     setState({ query: search });
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/sessions/search?${new URLSearchParams({ q: search })}`, { signal: controller.signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json() as SessionSearchResponse;
+        const data = await searchSessions(search, controller.signal);
         if (!controller.signal.aborted) setState({ query: search, response: data });
       } catch {
         if (!controller.signal.aborted) setState({ query: search, failed: true });
