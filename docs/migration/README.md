@@ -43,7 +43,7 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | agent-client IPC 版（参数序/prompt_rejected/AbortSignal） | transport.test.mjs |
 | pi-ipc capability 仅可信 WebView | `capabilities/desktop-pi-ipc.json`（无 remote）；旧 wildcard 不再含 pi_ipc |
 | 前端无 files.allowRoot；根由宿主派生；grantFile 仅确认宿主提出路径 | pi_ipc.rs（propose_path）+ 测试 |
-| **写路径加固**（最终分量 symlink 拒绝 O_NOFOLLOW openat、悬空 symlink 攻击、检查/打开 TOCTOU 关闭） | file_access.rs `write_through_allowed_parent`；4 个攻击/回归测试（悬空/切换/父换链/正常路径+mode 保留） |
+| **读写列目录 beneath-walk**（从授权根 fd 逐分量 openat O_NOFOLLOW：祖先换链/最终分量换链/悬空 symlink 全部拒绝；检查→打开竞态可用陈旧授权对确定性测试） | file_access.rs `write_beneath_root`/`read_beneath_root`/`open_directory_beneath_root` + resource-protocol `read_beneath_anchor`；7 个攻击/竞态测试（含 root/a/b 中 a 被替换）。残留：组件被合法 RENAME（非链接）的竞态为路径 API 固有，文档化未声称关闭 |
 | pi-host：Bridge Drop 退订、重复 in-flight id、64MiB stdout 上限、退出前排空管道 | mock_protocol.rs（先答后死/超长行/重复 id/bridge drop） |
 | **会话事件订阅生命周期**（fan 线程持有订阅；握手失败回收子进程） | lifecycle.rs `real_pi_events_flow_after_the_handshake_returns`（真实 pi；注入旧 bug 验证测试确实失败）+ `real_pi_handshake_failure_shuts_the_child_down` |
 | agent.command 封闭载荷（按命令重建；枚举=真实子命令面；主机层命令→not_supported） | session-host dispatch 测试 + pi_ipc 测试 |
@@ -71,6 +71,7 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | 资源协议 TOCTOU（授予后锚点被换） | 授予绑定解析后目标已实现；请求时重校验路径未系统测试 |
 | PTY UTF8 分片/UTF16 窗口 | 已有实现（M0）；分片边界回归测试覆盖不全 |
 | 终端租约（120s 连接租约）与 M4 生命周期 | 未接线 |
+| Windows 句柄级文件访问（NtCreateFile 相对打开）：files.write/read/list 目前 fail-closed，资源读回退为已重校验路径读 | Unix 已 beneath-walk；Windows 未实现，静态前端在 Windows 发布前必须完成 |
 | 打包验收（standalone 布局、四平台、desktop:prepare/verify 重做） | 未开始；本机 PI_CLI_BIN 是本地托管安装 |
 
 ### 里程碑补充（历史条目，按域划分）
