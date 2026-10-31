@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync } from "fs";
 import path from "path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { SkillToggleResult } from "@/lib/api-types";
 import { loadSkillsWithInstallInfo } from "@/lib/skills-service";
-import { setDisableModelInvocation } from "@/lib/skill-frontmatter";
+import { toggleSkillFile } from "@/lib/skills-toggle.server";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
 import { userHome } from "@/lib/user-home";
 
@@ -39,26 +39,6 @@ async function getSkillEditRoots(): Promise<Set<string>> {
   const globalSkillsDir = path.join(userHome(), ".agents", "skills");
   if (existsSync(globalSkillsDir)) allowedRoots.add(globalSkillsDir);
   return allowedRoots;
-}
-
-/** Edits one SKILL.md, or returns the status and message that refused it. */
-function toggleSkillFile(
-  filePath: string,
-  disableModelInvocation: boolean,
-  allowedRoots: Set<string>,
-): { status: number; error: string } | null {
-  // Skills are SKILL.md or *.md files. The allowed roots also hold settings,
-  // auth.json and project files, whose top a frontmatter edit would break.
-  if (path.extname(filePath).toLowerCase() !== ".md") return { status: 400, error: "Not a skill file" };
-  if (!existsSync(filePath)) return { status: 404, error: "file not found" };
-  if (!isExistingFilePathAllowed(filePath, allowedRoots)) {
-    return { status: 403, error: "Access denied" };
-  }
-  const content = readFileSync(filePath, "utf8");
-  const updated = setDisableModelInvocation(content, disableModelInvocation);
-  // A skill already in the requested state keeps its file and mtime.
-  if (updated !== content) writeFileSync(filePath, updated, "utf8");
-  return null;
 }
 
 // PATCH /api/skills — toggle disable-model-invocation on SKILL.md files.
