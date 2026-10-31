@@ -1312,6 +1312,30 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
+        "skills.list" | "skills.setDisabled" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "cwd is required");
+            };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            let mut payload = json!({ "cwd": cwd });
+            if op == "skills.setDisabled" {
+                let Some(paths) = args.get("filePaths").and_then(Value::as_array).filter(|paths| !paths.is_empty() && paths.len() <= 512 && paths.iter().all(|p| p.as_str().is_some_and(|s| !s.is_empty()))) else {
+                    return protocol_error(&id, "invalid_args", "filePaths must be a nonempty list of paths");
+                };
+                let Some(disabled) = args.get("disableModelInvocation").and_then(Value::as_bool) else {
+                    return protocol_error(&id, "invalid_args", "disableModelInvocation must be a boolean");
+                };
+                payload["filePaths"] = json!(paths);
+                payload["disableModelInvocation"] = json!(disabled);
+            }
+            match management_call_scoped(state, op, &payload, Path::new(&cwd)) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
         "models.list" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
                 return protocol_error(&id, "invalid_args", "cwd is required");
@@ -4596,6 +4620,25 @@ mod tests {
             source.contains("dispatch_envelope_gated(state, request).await"),
             "pi_ipc must delegate to dispatch_envelope_gated (the harness's dispatch path)"
         );
+    }
+
+    #[test]
+    fn skills_ops_validate_cwd_and_toggle_payload_before_management() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        state.propose_path(dir.path());
+        *state.management_config.lock().unwrap() = None;
+        let cwd = dir.path().to_string_lossy();
+        for args in [
+            json!({ "cwd": cwd, "filePaths": [], "disableModelInvocation": true }),
+            json!({ "cwd": cwd, "filePaths": ["/skill.md"], "disableModelInvocation": "true" }),
+            json!({ "cwd": cwd, "filePaths": [42], "disableModelInvocation": true }),
+        ] {
+            let response = send(&state, json!({ "v": 1, "id": "invalid", "op": "skills.setDisabled", "args": args }));
+            assert_eq!(response["error"]["code"], "invalid_args", "{response}");
+        }
+        let response = send(&state, json!({ "v": 1, "id": "valid", "op": "skills.list", "args": { "cwd": cwd } }));
+        assert_eq!(response["error"]["code"], "management_unavailable", "{response}");
     }
 
     /// The models domain over the REAL pi management instance (PI_CLI_BIN,

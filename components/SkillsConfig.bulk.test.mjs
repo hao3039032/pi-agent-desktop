@@ -39,7 +39,7 @@ test("a bulk result switches the skills that succeeded and keeps the failures as
 
 test("a group switch sends one batch request for its group and waits for other switches", () => {
   assert.match(source, /const targets = skillsToSwitch\(groupSkills, enabled\);/);
-  assert.match(source, /body: JSON\.stringify\(\{ filePaths, disableModelInvocation \}\)/);
+  assert.match(source, /await setSkillsDisabled\(cwd, filePaths, disableModelInvocation\)/);
   assert.match(source, /const bulkBusy = loading \|\| toggling\.size > 0 \|\| updatingSkill !== null;/);
   assert.match(source, /disabled=\{bulkBusy\}\s+loading=\{bulkGroup === grpLabel\}/);
   // Every targeted switch shows the loading state while the batch runs.

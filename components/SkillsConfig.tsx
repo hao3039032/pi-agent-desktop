@@ -6,12 +6,12 @@ import type {
   SkillInfo as Skill,
   SkillInstallScope,
   SkillSearchResult,
-  SkillsResponse,
   SkillToggleResult,
   SkillUpdateResult,
   ProjectTrustStatus,
 } from "@/lib/api-types";
 import { displayPathWithin, shortenPath } from "@/lib/display-path";
+import { listSkills, setSkillsDisabled } from "@/lib/skills-client";
 import {
   getLastSettingsSelection,
   setLastSettingsSelection,
@@ -557,9 +557,7 @@ export function SkillsConfig({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`);
-      const d = (await res.json()) as Partial<SkillsResponse> & { error?: string };
-      if (!res.ok || d.error) throw new Error(d.error ?? `HTTP ${res.status}`);
+      const d = await listSkills(cwd);
       const list = d.skills ?? [];
       setSkills(list);
       setProjectResourcesLoaded(d.projectResourcesLoaded ?? true);
@@ -693,17 +691,9 @@ export function SkillsConfig({
     setSaveError(null);
     setGroupStatus(null);
     try {
-      const res = await fetch("/api/skills", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filePath: skill.filePath,
-          disableModelInvocation: next,
-        }),
-      });
-      const d = (await res.json()) as { success?: boolean; error?: string };
-      if (!res.ok || d.error) {
-        setSaveError(d.error ?? `HTTP ${res.status}`);
+      const [result] = await setSkillsDisabled(cwd, [skill.filePath], next);
+      if (!result || result.error) {
+        setSaveError(result?.error ?? "Skill toggle returned no result");
         return;
       }
       setSkills((prev) =>
@@ -722,7 +712,7 @@ export function SkillsConfig({
         return n;
       });
     }
-  }, []);
+  }, [cwd]);
 
   // One PATCH for the whole group: each file is edited on its own and
   // reported separately, so the skills the route refuses keep their state and
@@ -737,14 +727,7 @@ export function SkillsConfig({
     setSaveError(null);
     setGroupStatus(null);
     try {
-      const res = await fetch("/api/skills", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filePaths, disableModelInvocation }),
-      });
-      const d = (await res.json()) as { results?: SkillToggleResult[]; error?: string };
-      if (!res.ok || d.error || !d.results) throw new Error(d.error ?? `HTTP ${res.status}`);
-      const results = d.results;
+      const results = await setSkillsDisabled(cwd, filePaths, disableModelInvocation);
       setSkills((prev) => applySkillToggleResults(prev, results, disableModelInvocation));
       const failures = results.filter((result) => result.error);
       if (failures.length > 0) {
@@ -767,7 +750,7 @@ export function SkillsConfig({
         return next;
       });
     }
-  }, [t]);
+  }, [cwd, t]);
 
   const selectedSkill = skills.find((s) => s.filePath === selected) ?? null;
   const bulkBusy = loading || toggling.size > 0 || updatingSkill !== null;

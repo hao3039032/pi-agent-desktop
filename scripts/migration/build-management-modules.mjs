@@ -74,6 +74,8 @@ export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-conf
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
 export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
+export { loadSkillsWithInstallInfo } from "${ROOT}/lib/skills-service.ts";
+export { setVisibleSkillsDisabled } from "${ROOT}/lib/skills-management.server.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";

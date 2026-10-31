@@ -131,6 +131,10 @@ export default defineConfig({
         find: /^@\/lib\/models-config-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-config-service.ts"),
       },
+      {
+        find: /^@\/lib\/skills-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/skills-client.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],
