@@ -55,7 +55,9 @@ fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> boo
         && left.mtime() == right.mtime() && left.mtime_nsec() == right.mtime_nsec()
 }
 #[cfg(not(unix))]
-fn same_file_version(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool { false }
+fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
 
 pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
     let _policy = state.policy_gate.try_read().map_err(|_| error("busy", "Session policy change is in progress"))?;
@@ -127,7 +129,7 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
     let mut files = Vec::new();
     files_in(&root, &mut files)?;
-    let mut target: Option<(PathBuf, std::fs::File)> = None;
+    let mut target: Option<(PathBuf, std::fs::File, std::fs::Metadata)> = None;
     let mut target_cwd: Option<PathBuf> = None;
     let mut session_cwds = Vec::new();
     let mut references = Vec::new();
@@ -170,13 +172,16 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
             target_cwd = cwd.clone();
-            target = Some((file.clone(), reader.into_inner()));
+            target = Some((file.clone(), reader.into_inner(), after));
         }
         session_cwds.push((child_id.to_string(), cwd));
         references.push((child_id.to_string(), parent, subagent_parent));
     }
-    let (target, target_handle) = target.ok_or_else(|| error("not_found", "Session not found"))?;
-    let target_metadata = target_handle.metadata().map_err(|e| error("io", e))?;
+    let (target, target_handle, target_metadata) = target.ok_or_else(|| error("not_found", "Session not found"))?;
+    let current_metadata = target_handle.metadata().map_err(|e| error("io", e))?;
+    if !same_file_version(&target_metadata, &current_metadata) {
+        return Err(error("busy", "Session changed after reference scan"));
+    }
     let canonical_target = target.canonicalize().map_err(|e| error("io", e))?;
     if !canonical_target.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
     if let Some(proof) = proof {
@@ -323,6 +328,21 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert_eq!(delete_with_index(&state, &args, &index, false, Some(&proof)).unwrap_err().0, "busy");
         assert!(std::fs::read_to_string(&target).unwrap().contains("replacement"));
         assert!(root.join("original.saved").exists());
+    }
+    #[test]
+    fn deletion_preflight_refuses_post_scan_append() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let args = json!({"session":"target"});
+        let index = FixtureIndex(Vec::new());
+        let proof = match delete_with_index(&state, &args, &index, true, None).unwrap() {
+            DeleteOutcome::Preflight(proof) => proof,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&target).unwrap(), "{}", json!({"type":"custom","customType":"new"})).unwrap();
+        assert_eq!(delete_with_index(&state, &args, &index, false, Some(&proof)).unwrap_err().0, "busy");
+        assert!(std::fs::read_to_string(&target).unwrap().contains("new"));
     }
     #[test]
     fn production_delete_rejects_policy_and_unresolved_writer_fences() {
