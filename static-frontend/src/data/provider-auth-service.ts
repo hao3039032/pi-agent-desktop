@@ -18,6 +18,7 @@ import type {
   AuthProviderLists,
   OAuthProvider,
 } from "../../../lib/provider-auth-service";
+export type { ApiKeyProvider, AuthProviderLists, OAuthProvider } from "../../../lib/provider-auth-service";
 
 let client: IpcClient | null = null;
 

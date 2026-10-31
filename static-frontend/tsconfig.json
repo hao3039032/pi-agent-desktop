@@ -108,6 +108,12 @@
       ],
       "@/lib/skills-client": [
         "./static-frontend/src/data/skills-client.ts"
+      ],
+      "@/lib/provider-auth-service": [
+        "./static-frontend/src/data/provider-auth-service.ts"
+      ],
+      "@/lib/provider-auth-login": [
+        "./static-frontend/src/data/provider-auth-login.ts"
       ]
     }
   },
