@@ -1176,6 +1176,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
+        "sessions.autoName" => protocol_error(&id, "not_supported", "Automatic session naming is unavailable until the live provider's request semantics can be preserved."),
         "sessions.delete" => match crate::session_deletion::delete(state, &args) {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
             Err((code, message)) => protocol_error(&id, &code, &message),
