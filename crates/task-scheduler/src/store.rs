@@ -144,8 +144,30 @@ impl TaskStore {
             }
             list.push(raw.clone());
         }
-        let serialized = serde_json::to_string_pretty(&json!({ "tasks": list })).map_err(|error| error.to_string())?;
         let file = self.tasks_file();
+        // Keep root-level extensions and entries this engine cannot interpret.
+        // Never replace an unreadable or malformed existing file with a new one.
+        let mut root = match std::fs::read_to_string(&file) {
+            Ok(content) => {
+                let value: Value = serde_json::from_str(&content)
+                    .map_err(|error| format!("corrupt tasks file: {error}"))?;
+                value.as_object().cloned().ok_or("corrupt tasks file: expected object")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Map::new(),
+            Err(error) => return Err(format!("unreadable: {error}")),
+        };
+        if let Some(existing) = root.get("tasks") {
+            let entries = existing.as_array().ok_or("corrupt tasks file: no tasks array")?;
+            let mut foreign: Vec<Value> = entries.iter().filter(|entry| {
+                entry.get("id").and_then(Value::as_str).is_none()
+                    || !matches!(entry.pointer("/schedule/kind").and_then(Value::as_str), Some("manual" | "once" | "cron"))
+            }).cloned().collect();
+            foreign.extend(list);
+            list = foreign;
+        }
+        root.insert("version".into(), json!(1));
+        root.insert("tasks".into(), Value::Array(list));
+        let serialized = serde_json::to_string_pretty(&Value::Object(root)).map_err(|error| error.to_string())?;
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("mkdir failed: {error}"))?;
         }
@@ -379,6 +401,35 @@ mod tests {
             raw2.get("lastScheduledFor").and_then(Value::as_str).map(String::from),
             Some(ms_to_iso(task.since_ms))
         );
+    }
+
+    #[test]
+    fn task_write_preserves_root_and_unrecognized_entries_and_rejects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scheduled-tasks.json");
+        let original = json!({
+            "version": 1,
+            "futureRoot": { "keep": true },
+            "tasks": [
+                { "id": "foreign", "schedule": { "kind": "future" }, "data": 42 },
+                "unrecognized",
+                { "id": "t1", "enabled": true, "schedule": { "kind": "manual" } }
+            ]
+        });
+        std::fs::write(&path, original.to_string()).unwrap();
+        let store = TaskStore::new(dir.path());
+        let tasks: Vec<_> = store.read_tasks().unwrap().into_values().collect();
+        store.write_tasks(&tasks).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["futureRoot"], original["futureRoot"]);
+        assert_eq!(saved["version"], 1);
+        assert_eq!(saved["tasks"][0], original["tasks"][0]);
+        assert_eq!(saved["tasks"][1], original["tasks"][1]);
+        assert_eq!(saved["tasks"][2]["id"], "t1");
+
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(store.write_tasks(&tasks).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
     }
 
     #[test]
