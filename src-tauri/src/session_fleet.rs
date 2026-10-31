@@ -43,7 +43,9 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, (
     let tools = session.bridge_request("tools.list", None, Some(Duration::from_secs(10)));
     let commands = session.command("get_commands", json!({}), Some(Duration::from_secs(10)));
     let detected = source_state(tools.as_ref().unwrap_or(&Value::Null), commands.as_ref().unwrap_or(&Value::Null));
-    let source = if detected != "loaded" && (tools.is_err() || commands.is_err()) { "unknown" } else { detected };
+    let complete = tools.as_ref().ok().and_then(|v| v.get("tools")).is_some_and(Value::is_array)
+        && commands.as_ref().ok().and_then(|v| v.get("commands")).is_some_and(Value::is_array);
+    let source = if detected != "loaded" && !complete { "unknown" } else { detected };
     if source != "loaded" {
         if op == "agent.subagentsStatus" { return Ok(json!({"available":false,"reason":source})); }
         return Err(fail(source, "pi-subagents source is not confirmed for this session"));
