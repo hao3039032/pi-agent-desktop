@@ -572,3 +572,137 @@ test(
     }
   },
 );
+
+/**
+ * M3: the models domain (models.list / models.setDefault) — the selector's
+ * data and the selectors' star over the management protocol. Differentially
+ * pinned against the repo's lib/models-service.server.ts (the ONE composition the
+ * Next /api/models route also serves), on a fixture provider in an isolated
+ * agent dir: the composed scope, the default write's persistence, and both
+ * shaped refusals (a shadowing project settings.json, an out-of-scope model).
+ */
+test(
+  "the models ops answer the repo composition and write the real defaults",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-models-"));
+    let client = null;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(join(agentDir, "sessions"), { recursive: true });
+      // A fixture provider (never a real credential, never a real network).
+      await writeFile(join(agentDir, "models.json"), JSON.stringify({
+        providers: {
+          "fixture-provider": {
+            name: "Fixture Provider",
+            baseUrl: "http://127.0.0.1:9/v1",
+            apiKey: "fixture-key",
+            api: "openai-completions",
+            models: [{ id: "fixture-model", name: "Fixture Model" }],
+          },
+        },
+      }, null, 2), "utf8");
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      const nonce = "mgmt-nonce-models";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+        },
+        onLog: () => {},
+      });
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `mgmt-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 60_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+
+      // The repo implementation (the ONE source the bundle compiles from),
+      // loaded against the SAME agent dir the child sees.
+      const { loadScopedModelsData } = await jiti.import("../../lib/models-service.server.ts");
+      const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        // 1. models.list differentially matches the repo composition.
+        const answered = await call("models.list", { cwd });
+        assert.equal(answered.ok, true, JSON.stringify(answered));
+        const expected = await loadScopedModelsData(cwd);
+        assert.deepEqual(answered.result, expected, "the exact /api/models body");
+
+        // 2. The default write persists (the selectors' star).
+        const saved = await call("models.setDefault", { cwd, thinkingLevel: "medium" });
+        assert.equal(saved.ok, true, JSON.stringify(saved));
+        assert.equal(saved.result.defaultThinkingLevel, "medium");
+        const settings = JSON.parse(await (await import("node:fs/promises")).readFile(join(agentDir, "settings.json"), "utf8"));
+        assert.equal(settings.defaultThinkingLevel, "medium", "settings.json carries the write");
+
+        // 3. An out-of-scope model refuses with the route's 404 shape.
+        const refused = await call("models.setDefault", { cwd, provider: "nope", modelId: "nope" });
+        assert.equal(refused.ok, false, JSON.stringify(refused));
+        assert.equal(refused.code, "not_found");
+        assert.match(refused.error, /Model not available: nope\/nope/);
+
+        // 4. A half pair refuses with the route's 400 shape.
+        const half = await call("models.setDefault", { cwd, provider: "fixture-provider" });
+        assert.equal(half.ok, false);
+        assert.equal(half.code, "invalid_args");
+
+        // 5. A shadowing project settings.json refuses with the 409 shape.
+        //    Like a real user's project, the folder is TRUSTED first — an
+        //    untrusted project's `.pi/settings.json` is exactly what the
+        //    trust-gated resource loader must never load (the same flow the
+        //    Next route ran), so without trust there is no shadow to refuse.
+        const { ProjectTrustStore } = await jiti.import("@earendil-works/pi-coding-agent");
+        new ProjectTrustStore(agentDir).set(cwd, true);
+        await mkdir(join(cwd, ".pi"), { recursive: true });
+        await writeFile(join(cwd, ".pi", "settings.json"), JSON.stringify({ defaultModel: "other" }), "utf8");
+        const shadowed = await call("models.setDefault", { cwd, provider: "fixture-provider", modelId: "fixture-model" });
+        assert.equal(shadowed.ok, false, JSON.stringify(shadowed));
+        assert.equal(shadowed.code, "project_scope");
+        assert.match(shadowed.error, /sets defaultModel for this project/);
+
+        // 6. The refreshed scope reflects the saved default (cache invalidated).
+        const refreshed = await call("models.list", { cwd });
+        assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+        assert.equal(refreshed.result.defaultThinkingLevel, "medium", "the saved level is the new default");
+      } finally {
+        if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    } finally {
+      if (client) await client.close(5_000).catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

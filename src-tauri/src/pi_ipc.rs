@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{Manager, State};
 
 use management_host::{ManagementHost, ManagementSpawnConfig};
 use session_host::SessionRegistry;
@@ -73,6 +73,10 @@ pub struct IpcHostState {
     /// changes the list a client holds (a create, a rename). Clients compare
     /// and refetch — the cross-window staleness contract.
     session_list_version: Arc<AtomicU64>,
+    /// The bounded dispatch gate for the async entry
+    /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
+    /// hold owned permits, never borrows of this state.
+    dispatch_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// Handle that ends one event-stream relay thread on unsubscribe.
@@ -108,6 +112,7 @@ impl IpcHostState {
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
             session_list_version: Arc::new(AtomicU64::new(1)),
+            dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
         }
     }
 
@@ -395,7 +400,7 @@ fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &str, payload
 /// detaches — a dropped channel alone must not leak a thread.
 #[tauri::command]
 pub fn pi_ipc_subscribe_events(
-    state: State<'_, IpcHostState>,
+    state: State<'_, Arc<IpcHostState>>,
     session: String,
     on_event: Channel<Value>,
 ) -> Value {
@@ -541,7 +546,7 @@ impl Drop for RunningRelayAlive {
 /// probe on a dead channel.
 #[tauri::command]
 pub fn pi_ipc_subscribe_running(
-    state: State<'_, IpcHostState>,
+    state: State<'_, Arc<IpcHostState>>,
     on_frame: Channel<Value>,
 ) -> Value {
     subscribe_running(&state, on_frame, RUNNING_CHANNEL_PROBE)
@@ -727,7 +732,7 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
 /// window demands), then new output follows. A closed channel detaches.
 #[tauri::command]
 pub fn pi_ipc_subscribe_terminal(
-    state: State<'_, IpcHostState>,
+    state: State<'_, Arc<IpcHostState>>,
     id: String,
     cursor: u64,
     on_output: Channel<Value>,
@@ -1299,20 +1304,53 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
         }
         // The models domain runs through a management instance
-        // (crates/management-host). Without the packaged spawn config the
-        // answer is management_unavailable — never a fallback, never a lie.
+        // (crates/management-host) scoped to the cwd — the same scope split
+        // the plan fixes (a trusted project's extension providers enumerate
+        // only from that project's instance). The composition itself is ONE
+        // implementation: the management extension's models.list op runs the
+        // repo's own lib/models-service.ts (the projection bundle), the exact
+        // function the Next /api/models route serves. Without the packaged
+        // spawn config the answer is management_unavailable — never a
+        // fallback, never a lie.
         "models.list" => {
-            let config = state.management_config.lock().unwrap().clone();
-            let Some(config) = config else {
-                return protocol_error(&id, "management_unavailable", "the management instance is not configured yet (M3 wiring)");
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "cwd is required");
             };
-            let scope = args.get("scope").and_then(Value::as_str).unwrap_or("global");
-            match state.management.instance(scope, &config) {
-                Ok(instance) => match instance.available_models() {
-                    Ok(models) => protocol_ok(&id, models),
-                    Err(error) => protocol_error(&id, "io", &error.to_string()),
-                },
-                Err(error) => protocol_error(&id, "management_unavailable", &error),
+            if let Err(error) = validate_scoped_cwd(&state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            match management_call_scoped(state, "models.list", &json!({ "cwd": cwd }), Path::new(&cwd)) {
+                Ok(models) => protocol_ok(&id, models),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        // The selectors' star: the ONLY writer of the global default
+        // model / thinking level (PUT /api/models/default's contract). The
+        // shared write path (same models-service projection) refuses a
+        // shadowing project settings.json with `project_scope` (the route's
+        // 409) and an out-of-scope model with `not_found` (the 404).
+        "models.setDefault" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "cwd is required");
+            };
+            if let Err(error) = validate_scoped_cwd(&state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            let mut payload = json!({ "cwd": cwd });
+            if let Some(provider) = args.get("provider").and_then(Value::as_str) {
+                payload["provider"] = Value::String(provider.to_string());
+            }
+            if let Some(model_id) = args.get("modelId").and_then(Value::as_str) {
+                payload["modelId"] = Value::String(model_id.to_string());
+            }
+            if let Some(level) = args.get("thinkingLevel").and_then(Value::as_str) {
+                payload["thinkingLevel"] = Value::String(level.to_string());
+            }
+            match management_call_scoped(state, "models.setDefault", &payload, Path::new(&cwd)) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
             }
         }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
@@ -1521,11 +1559,77 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
     }
 }
 
+/// The request envelope's id, for error envelopes built after the request
+/// itself has moved into the blocking task ("?" for anything not shaped
+/// like an envelope — dispatch already refuses that shape).
+fn envelope_id(raw: &Value) -> String {
+    raw.get("id").and_then(Value::as_str).unwrap_or("?").to_string()
+}
+
+/// The concurrency cap for envelope dispatches through the async entry:
+/// headroom for the page's bursts (state probes beside a slow management
+/// op) while a flooding page cannot grow the blocking pool unbounded.
+/// Excess requests QUEUE on the gate — backpressure the frontend already
+/// handles, since every invoke is an awaited request/response.
+pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
+
+/// The product dispatch path the async `pi_ipc` command AND the static-UI
+/// acceptance harness share — one gate, one blocking pool, the same caps.
+/// The harness must never grow a dispatch path the product lacks (nor
+/// serialize what the product runs concurrently).
+///
+/// Why not run envelopes inline: a SYNC command runs inline on the
+/// WebView's IPC protocol thread — the platform UI thread (wry's
+/// webkitgtk URI-scheme handler is not `Send` and runs on the GTK main
+/// loop; WebView2 raises WebResourceRequested on the UI thread) — so ONE
+/// slow op (a management child spawn, a big session scan) froze every
+/// later invoke, asset load and the window itself. The async command moves
+/// the wrapper off that thread; `spawn_blocking` keeps the blocking
+/// envelope work off the async workers.
+///
+/// Cancellation/shutdown contract: the webview abandoning its invoke does
+/// NOT cancel an in-flight envelope (Tauri has no mid-command cancel);
+/// every op keeps its own timeout, and children die by their existing
+/// stdin-EOF/grace-kill paths when the process exits — the gate never
+/// blocks process exit.
+pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -> Value {
+    let id = envelope_id(&request);
+    let gate = Arc::clone(&state.dispatch_gate);
+    let permit = match gate.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return protocol_error(&id, "host_error", "the dispatch gate is closed");
+        }
+    };
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _held = permit;
+        dispatch_envelope(&state, request)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => protocol_error(
+            &id,
+            "host_error",
+            &format!("the dispatch task failed: {error}"),
+        ),
+    }
+}
+
 /// The IPC entry point. The static frontend invokes this with the request
 /// envelope; the response envelope is protocol version 1.
+///
+/// Async BY DESIGN (see [`dispatch_envelope_gated`]): the sync variant ran
+/// every envelope inline on the WebView's protocol/UI thread, where one
+/// slow management op froze every other invoke and the window itself. The
+/// body only hands an owned state handle to the gated entry. The state
+/// comes from the `AppHandle` (not a `State<'_, _>` argument) because an
+/// async command must return a `Result` to carry borrowed arguments — the
+/// envelope is the reply shape, so the handle is the honest input.
 #[tauri::command]
-pub fn pi_ipc(state: State<'_, IpcHostState>, request: Value) -> Value {
-    dispatch_envelope(&state, request)
+pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
+    let state = app.state::<Arc<IpcHostState>>().inner().clone();
+    dispatch_envelope_gated(state, request).await
 }
 
 // --- the session view (sessions.get / sessions.context / sessions.state) ---
@@ -1554,6 +1658,58 @@ fn management_call(
         .map_err(|error| management_error_code(&error))
 }
 
+/// The cwd gate every models op shares — the Next routes' 400/403 half:
+/// an existing directory inside the host's allowed roots. The composition
+/// and write paths live behind the seam; access control stays host-side.
+fn validate_scoped_cwd(
+    state: &IpcHostState,
+    cwd: &str,
+) -> Result<(), (String, String)> {
+    let folded = lexical_fold(cwd, cfg!(windows));
+    let path = Path::new(&folded);
+    if !path.is_dir() {
+        return Err((
+            "invalid_args".to_string(),
+            format!("Directory does not exist: {cwd}"),
+        ));
+    }
+    let roots = state.file_roots.lock().unwrap();
+    if !roots.is_existing_path_allowed(path) {
+        return Err((
+            "access_denied".to_string(),
+            "Access denied".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `management_call` for a cwd-scoped instance: the models domain (and any
+/// future op a trusted project's resources must load for) partitions by the
+/// caller's cwd — the plan's global/verified-project split. The scope key is
+/// the FOLDED absolute cwd so one project shares one child across spellings.
+fn management_call_scoped(
+    state: &IpcHostState,
+    op: &str,
+    args: &Value,
+    scope_cwd: &Path,
+) -> Result<Value, (String, String)> {
+    let config = state.management_config.lock().unwrap().clone();
+    let Some(config) = config else {
+        return Err((
+            "management_unavailable".to_string(),
+            "the management instance is not configured (the vendored module tree is missing)".to_string(),
+        ));
+    };
+    let scope = scope_cwd.to_string_lossy().into_owned();
+    let instance = state
+        .management
+        .instance(&scope, &config)
+        .map_err(|error| ("management_unavailable".to_string(), error))?;
+    instance
+        .management_call_sync(op, args.clone())
+        .map_err(|error| management_error_code(&error))
+}
+
 /// The extension reports failures as "[code] message"; recover the code for
 /// the protocol envelope (unknown codes stay io, never success).
 fn management_error_code(error: &str) -> (String, String) {
@@ -1561,7 +1717,12 @@ fn management_error_code(error: &str) -> (String, String) {
         let code = code.to_string();
         let known = matches!(
             code.as_str(),
-            "unknown_op" | "invalid_args" | "not_found" | "op_failed" | "invalid_cron"
+            "unknown_op"
+                | "invalid_args"
+                | "not_found"
+                | "op_failed"
+                | "invalid_cron"
+                | "project_scope"
         );
         (
             if known { code } else { "io".to_string() },
@@ -4097,12 +4258,226 @@ mod tests {
     fn models_ops_answer_management_unavailable_until_configured() {
         let state = state();
         // Deterministic: never depend on whether this machine's resources/pi
-        // happened to be staged (release CI stages it).
+        // happened to be staged (release CI stages it). The cwd is allowed
+        // (the gate must pass) so the refusal proves the CONFIG half.
         *state.management_config.lock().unwrap() = None;
-        let response = send(&state, json!({ "v": 1, "id": "m1", "op": "models.list" }));
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        state.propose_path(dir.path());
+        let response = send(
+            &state,
+            json!({ "v": 1, "id": "m1", "op": "models.list", "args": { "cwd": dir.path().to_string_lossy() } }),
+        );
         assert_eq!(response["ok"], false, "{response}");
         assert_eq!(response["error"]["code"], "management_unavailable");
         assert_eq!(response["error"]["retryable"], false);
+    }
+
+    #[test]
+    fn models_ops_gate_the_cwd_before_any_management_instance() {
+        // The routes' 400/403 half stays HOST-side: the cwd must exist and
+        // sit inside the allowed roots BEFORE a management child spawns (a
+        // refused request must never pay for an instance, and an arbitrary
+        // directory must never scope a management child).
+        let state = state();
+        *state.management_config.lock().unwrap() = None;
+        // A missing cwd argument.
+        let missing = send(&state, json!({ "v": 1, "id": "m2", "op": "models.list", "args": {} }));
+        assert_eq!(missing["ok"], false, "{missing}");
+        assert_eq!(missing["error"]["code"], "invalid_args");
+        // A directory that does not exist (the route's 400 text).
+        let absent = send(
+            &state,
+            json!({ "v": 1, "id": "m3", "op": "models.list", "args": { "cwd": "/nonexistent-pi-web-models-gate" } }),
+        );
+        assert_eq!(absent["ok"], false, "{absent}");
+        assert_eq!(absent["error"]["code"], "invalid_args");
+        assert!(absent["error"]["message"].as_str().unwrap().starts_with("Directory does not exist"));
+        // An existing directory OUTSIDE the allowed roots (the route's 403).
+        let outside = std::env::temp_dir().join("pi-web-models-gate-outside-root");
+        std::fs::create_dir_all(&outside).expect("gate dir");
+        let denied = send(
+            &state,
+            json!({ "v": 1, "id": "m4", "op": "models.setDefault", "args": {
+                "cwd": outside.to_string_lossy(), "thinkingLevel": "high",
+            }}),
+        );
+        assert_eq!(denied["ok"], false, "{denied}");
+        assert_eq!(denied["error"]["code"], "access_denied");
+        std::fs::remove_dir(&outside).ok();
+    }
+
+    /// The gated entry the async `pi_ipc` command delegates to: while a
+    /// slow management op (a real child that takes seconds before its pipe
+    /// closes) holds a dispatch slot, other envelopes through the SAME
+    /// entry must answer. The SYNC command variant ran every envelope
+    /// inline on the WebView's protocol/UI thread, where one slow
+    /// management spawn froze every later invoke and the window itself —
+    /// this is that product regression, kept deterministic with a stub
+    /// child (sleep, then exit: stdin EOF fails the pending prompt, so the
+    /// slow op always resolves; the test never hangs nor leaks a slot).
+    #[test]
+    #[cfg(unix)]
+    fn slow_models_dispatch_does_not_block_other_envelopes() {
+        let state = Arc::new(state());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("work");
+        std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let stub = dir.path().join("slow-mgmt-pi.sh");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 3\n").expect("the stub script writes");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("the stub script is executable");
+        }
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: stub.to_string_lossy().into_owned(),
+            agent_dir: Some(agent_dir),
+            extensions: vec![],
+            env: vec![],
+        });
+        state.propose_path(&project);
+
+        let slow = tauri::async_runtime::spawn(dispatch_envelope_gated(
+            Arc::clone(&state),
+            json!({ "v": 1, "id": "slow", "op": "models.list", "args": { "cwd": project.to_string_lossy() } }),
+        ));
+        // Settle onto the slow call's child wait (spawn + prompt write); the
+        // settle is a small fraction of the 3 s window, so the probe runs
+        // while the slot is held — whenever the wait actually starts.
+        std::thread::sleep(Duration::from_millis(400));
+        let start = std::time::Instant::now();
+        let probe = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state),
+            json!({ "v": 1, "id": "probe", "op": "desktop.identity" }),
+        ));
+        assert_eq!(probe["ok"], true, "{probe}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the identity probe waited {} ms — a slow models op is blocking dispatch",
+            start.elapsed().as_millis()
+        );
+        // The slow envelope itself always resolves (the stub's exit fails
+        // its prompt): no leaked slot, and the real failure proves the probe
+        // really ran beside the blocked management wait.
+        let slow = tauri::async_runtime::block_on(slow).expect("the slow dispatch joins");
+        assert_eq!(slow["ok"], false, "the stub child exits: models.list answers its real failure");
+        assert_eq!(slow["error"]["code"], "io", "{slow}");
+    }
+
+    /// The async `pi_ipc` command is the product boundary. This pins the
+    /// delegation (a cheap tripwire, NOT the only evidence — the behavioral
+    /// test above and the static-UI acceptance run are): a revert to a sync
+    /// command would put envelopes back on the WebView's UI thread, the
+    /// freeze this dispatch layer exists to prevent.
+    #[test]
+    fn pi_ipc_command_stays_the_async_gated_entry() {
+        let source = include_str!("pi_ipc.rs");
+        assert!(
+            source.contains("pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value"),
+            "pi_ipc must stay an async command (a sync command runs envelopes on the WebView's UI thread)"
+        );
+        assert!(
+            source.contains("app.state::<Arc<IpcHostState>>().inner().clone()"),
+            "pi_ipc must run over the shared Arc state"
+        );
+        assert!(
+            source.contains("dispatch_envelope_gated(state, request).await"),
+            "pi_ipc must delegate to dispatch_envelope_gated (the harness's dispatch path)"
+        );
+    }
+
+    /// The models domain over the REAL pi management instance (PI_CLI_BIN,
+    /// sandboxed agent dir + a staged managed tree): models.list answers the
+    /// full /api/models contract through the host's cwd gate and the
+    /// cwd-SCOPED instance, and models.setDefault writes the real global
+    /// default (the differential-vs-repo half lives in
+    /// scripts/migration/management-extension.test.mjs; this is the host's
+    /// dispatch + scope wiring).
+    #[test]
+    fn real_pi_models_ops_answer_the_contract_through_a_scoped_instance() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("work");
+        std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
+        std::fs::create_dir_all(&project).expect("project dir");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = stage_managed_tree(dir.path());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![
+                ("PI_WEB_MANAGED_MODULES".to_string(), managed.display().to_string()),
+            ],
+        });
+        // A fixture provider (never a real credential, never a real network).
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{"providers":{"fixture-provider":{"name":"Fixture Provider","baseUrl":"http://127.0.0.1:9/v1","apiKey":"fixture-key","api":"openai-completions","models":[{"id":"fixture-model","name":"Fixture Model"}]}}}"#,
+        )
+        .expect("models.json");
+        // The project must sit inside the allowed roots (the cwd gate).
+        state.propose_path(&project);
+
+        // 1. models.list: the /api/models contract for the project cwd.
+        let listed = send(
+            &state,
+            json!({ "v": 1, "id": "ml1", "op": "models.list", "args": { "cwd": project.to_string_lossy() } }),
+        );
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert_eq!(listed["data"]["models"]["fixture-provider:fixture-model"], "Fixture Model", "{listed}");
+        assert_eq!(listed["data"]["modelList"][0]["provider"], "fixture-provider", "{listed}");
+        assert_eq!(listed["data"]["modelList"][0]["input"][0], "text", "{listed}");
+        assert!(listed["data"]["thinkingLevels"]["fixture-provider:fixture-model"].is_array(), "{listed}");
+
+        // 2. The scoped instance exists for the project cwd (one scope key).
+        let scopes = state.management.scopes();
+        assert_eq!(scopes.len(), 1, "one cwd-scoped instance: {scopes:?}");
+        assert!(scopes[0].contains("work"), "the scope is the project cwd: {scopes:?}");
+
+        // 3. models.setDefault: the star writes the global default.
+        let saved = send(
+            &state,
+            json!({ "v": 1, "id": "md1", "op": "models.setDefault", "args": {
+                "cwd": project.to_string_lossy(), "thinkingLevel": "medium",
+            }}),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        let settings = std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings.json");
+        assert!(settings.contains("\"defaultThinkingLevel\": \"medium\""), "{settings}");
+
+        // 4. The refreshed list carries the saved default (cache invalidated).
+        let refreshed = send(
+            &state,
+            json!({ "v": 1, "id": "ml2", "op": "models.list", "args": { "cwd": project.to_string_lossy() } }),
+        );
+        assert_eq!(refreshed["ok"], true, "{refreshed}");
+        assert_eq!(refreshed["data"]["defaultThinkingLevel"], "medium", "{refreshed}");
+
+        // 5. An out-of-scope model refuses with the route's 404 shape.
+        let refused = send(
+            &state,
+            json!({ "v": 1, "id": "md2", "op": "models.setDefault", "args": {
+                "cwd": project.to_string_lossy(), "provider": "nope", "modelId": "nope",
+            }}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "not_found", "{refused}");
+
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
     #[test]

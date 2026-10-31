@@ -6,7 +6,9 @@
 //! What it replaces is ONLY Tauri's own invoke/Channel plumbing:
 //!
 //! - `POST /__harness__/invoke {cmd, args}` → the real `pi_ipc` dispatch
-//!   (`dispatch_envelope`) or the real `pi_ipc_subscribe_events` /
+//!   (`dispatch_envelope_gated` — the SAME bounded gate + blocking pool the
+//!   product's async `pi_ipc` command runs, never a harness-invented thread
+//!   scheme) or the real `pi_ipc_subscribe_events` /
 //!   `pi_ipc_subscribe_running` commands with a `Channel` built from
 //!   `Channel::new` (exactly the construction pi_ipc's own unit tests use);
 //! - `GET /__harness__/events` (SSE) → channel frames `{cb, payload}` where
@@ -48,14 +50,18 @@ use tauri::App;
 use tauri::Manager;
 
 use pi_agent_desktop_lib::pi_ipc::{
-    dispatch_envelope, pi_ipc_subscribe_events, pi_ipc_subscribe_running, IpcHostState,
+    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, IpcHostState,
 };
 
 /// One call the host thread (which owns the `App` and therefore the
-/// `State<'_, IpcHostState>` the real commands take) executes for an HTTP
-/// thread, answering on the reply channel.
+/// `State<'_, Arc<IpcHostState>>` the real subscribe commands take) executes
+/// for an HTTP thread, answering on the reply channel. Pi requests do NOT
+/// come through here: they run the product's own gated dispatch
+/// (`dispatch_envelope_gated`, the same gate + blocking pool + caps the
+/// async `pi_ipc` command runs) directly from the connection thread — the
+/// harness must not serialize what the product runs concurrently, and must
+/// not grow a dispatch path the product lacks either.
 enum HostCall {
-    Pi(Value),
     SubscribeEvents { session: String, cb: u32 },
     SubscribeRunning { cb: u32 },
     /// Orderly teardown of everything the host owns children-wise (sessions,
@@ -341,10 +347,15 @@ fn main() {
         }
     }
 
-    // The host thread owns the mock-runtime app (App is Send but not Sync,
-    // so calls funnel through it one at a time — exactly what an acceptance
-    // run needs). `State<'_, IpcHostState>` for the real #[tauri::command]
-    // functions only exists there; nothing else runs on the app.
+    // The host thread owns the mock-runtime app (`App` is Send but not
+    // Sync) — only the fast subscribe REGISTRATIONS and shutdown funnel
+    // through it, mirroring the product where those are quick sync commands
+    // on the UI thread. `State<'_, Arc<IpcHostState>>` only exists there.
+    // Envelope requests share the state Arc directly and dispatch through
+    // the product's gated entry from their connection threads.
+    let host_state = Arc::new(IpcHostState::new());
+    let host_state_for_host = Arc::clone(&host_state);
+    let host_state_for_http = Arc::clone(&host_state);
     let (host_tx, host_rx) = std::sync::mpsc::channel::<(HostCall, std::sync::mpsc::Sender<Value>)>();
     let bridge = Arc::new(Bridge::default());
     let bridge_for_host = Arc::clone(&bridge);
@@ -352,23 +363,22 @@ fn main() {
         let app: App<MockRuntime> = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("the mock app builds");
-        app.manage(IpcHostState::new());
+        app.manage(host_state_for_host);
         for (call, reply) in host_rx {
             let value = match call {
-                HostCall::Pi(request) => dispatch_envelope(&app.state::<IpcHostState>(), request),
                 HostCall::SubscribeEvents { session, cb } => pi_ipc_subscribe_events(
-                    app.state::<IpcHostState>(),
+                    app.state::<Arc<IpcHostState>>(),
                     session,
                     bridge_for_host.channel(cb),
                 ),
                 HostCall::SubscribeRunning { cb } => {
-                    pi_ipc_subscribe_running(app.state::<IpcHostState>(), bridge_for_host.channel(cb))
+                    pi_ipc_subscribe_running(app.state::<Arc<IpcHostState>>(), bridge_for_host.channel(cb))
                 }
                 HostCall::Shutdown => {
                     // Orderly teardown, the same paths the product uses per
                     // child (stdin EOF + grace kill of the child's process
                     // group), so no pi process is orphaned by this exit.
-                    let state = app.state::<IpcHostState>();
+                    let state = app.state::<Arc<IpcHostState>>();
                     for id in state.registry.ids() {
                         let _ = state.registry.remove(&id, std::time::Duration::from_secs(5));
                     }
@@ -393,6 +403,7 @@ fn main() {
         let Ok(stream) = stream else { continue };
         let static_dir = static_dir.clone();
         let host_tx = host_tx.clone();
+        let host_state = Arc::clone(&host_state_for_http);
         let bridge = Arc::clone(&bridge);
         let token = token.clone();
         thread::spawn(move || {
@@ -420,7 +431,7 @@ fn main() {
                             }
                             continue;
                         }
-                        let body = handle_invoke(&bridge, &host_tx, &request.body);
+                        let body = handle_invoke(&bridge, &host_tx, &host_state, &request.body);
                         let text = serde_json::to_string(&body).expect("the invoke reply serializes");
                         if write_response(&mut stream, "200 OK", "application/json", text.as_bytes()).is_err() {
                             return;
@@ -535,15 +546,19 @@ fn serve_static(stream: &mut TcpStream, root: &Path, raw_path: &str) -> bool {
     }
 }
 
-/// One invoke: forwarded to the host thread (the real command functions,
-/// nothing else) and awaited here. The Tauri-CORE stand-ins (the event
-/// plugin, the window plugin's maximized query and the app's own
+/// One invoke: the real command paths, nothing else. `pi_ipc` runs the
+/// product's gated dispatch (`dispatch_envelope_gated`) from THIS thread —
+/// the same bounded blocking pool and caps the product's async command
+/// runs, so the acceptance run observes the product's dispatch semantics,
+/// not a harness-invented thread scheme. The Tauri-CORE stand-ins (the
+/// event plugin, the window plugin's maximized query and the app's own
 /// `set_close_quits`) answer here — they are WebView plumbing the real
 /// shell provides, not product logic; the acceptance harness fakes only
 /// their observable answer, never a pi_ipc result.
 fn handle_invoke(
     bridge: &Bridge,
     host_tx: &std::sync::mpsc::Sender<(HostCall, std::sync::mpsc::Sender<Value>)>,
+    host_state: &Arc<IpcHostState>,
     body: &[u8],
 ) -> Value {
     let parsed: Value = match serde_json::from_slice(body) {
@@ -602,7 +617,21 @@ fn handle_invoke(
         _ => {}
     }
     let call = match cmd {
-        "pi_ipc" => HostCall::Pi(args.get("request").cloned().unwrap_or(Value::Null)),
+        "pi_ipc" => {
+            let request = args.get("request").cloned().unwrap_or(Value::Null);
+            let value =
+                tauri::async_runtime::block_on(dispatch_envelope_gated(Arc::clone(host_state), request));
+            let outcome = if value.get("ok") == Some(&Value::Bool(true)) {
+                "ok".to_string()
+            } else {
+                format!(
+                    "error {}",
+                    value.get("error").and_then(|e| e.get("code")).and_then(Value::as_str).unwrap_or("?")
+                )
+            };
+            eprintln!("[harness] invoke {op} -> {outcome}");
+            return value;
+        }
         "pi_ipc_subscribe_events" => {
             let Some(session) = args.get("session").and_then(Value::as_str) else {
                 return json!({ "harnessError": "pi_ipc_subscribe_events needs a session" });
@@ -625,20 +654,7 @@ fn handle_invoke(
         return json!({ "harnessError": "the host thread is gone" });
     }
     match reply_rx.recv_timeout(std::time::Duration::from_secs(180)) {
-        Ok(value) => {
-            if cmd == "pi_ipc" {
-                let outcome = if value.get("ok") == Some(&Value::Bool(true)) {
-                    "ok".to_string()
-                } else {
-                    format!(
-                        "error {}",
-                        value.get("error").and_then(|e| e.get("code")).and_then(Value::as_str).unwrap_or("?")
-                    )
-                };
-                eprintln!("[harness] invoke {op} -> {outcome}");
-            }
-            value
-        }
+        Ok(value) => value,
         Err(_) => json!({ "harnessError": "the host thread did not answer in time" }),
     }
 }

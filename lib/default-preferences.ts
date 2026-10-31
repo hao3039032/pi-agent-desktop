@@ -3,11 +3,9 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { displaySettingsPath } from "./enabled-models-runtime";
 
-const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-
-export function isThinkingLevel(value: unknown): value is ThinkingLevel {
-  return typeof value === "string" && THINKING_LEVELS.has(value as ThinkingLevel);
-}
+// One spelling of the level check (client-safe home: lib/thinking-levels.ts;
+// re-exported here so the write path's existing import surface is unchanged).
+export { THINKING_LEVELS, isThinkingLevel } from "./thinking-levels";
 
 /** What the model and reasoning selectors' "save as default" action writes. */
 export interface DefaultPreferencesEdit {

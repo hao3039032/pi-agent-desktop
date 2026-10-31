@@ -54,6 +54,18 @@ export {
   contextFilesSystemPrompt,
   CHAT_ONLY_RESOURCE_LOADER_OPTIONS,
 } from "${ROOT}/lib/chat-only.ts";
+export {
+  composeModelsData,
+  loadScopedModelsData,
+  saveScopedDefaultPreferences,
+  parseDefaultPreferencesEdit,
+  ProjectScopeShadowError,
+  ModelNotAvailableError,
+  EMPTY_MODELS,
+} from "${ROOT}/lib/models-service.server.ts";
+export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
+export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
+export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
@@ -73,6 +85,16 @@ export async function bundleProjectionModules() {
     target: "node20",
     write: false,
     legalComments: "none",
+    // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph
+    // (createAgentSessionServices → utils/child-process → cross-spawn), and
+    // bundled CJS keeps its `require("child_process")` calls. In an ESM
+    // output esbuild routes those to a shim that throws — so give the bundle
+    // a real require bound to its own URL (the esbuild-documented pattern):
+    // node builtins then load through the child's own runtime, which is the
+    // same environment the pi SDK already runs in.
+    banner: {
+      js: `import { createRequire as __piWebProjectionCreateRequire } from "node:module";\nconst require = __piWebProjectionCreateRequire(import.meta.url);`,
+    },
   });
   return result.outputFiles[0].text;
 }

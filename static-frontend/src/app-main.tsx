@@ -19,6 +19,7 @@ import { DistroSetupGate } from "../../components/distro";
 import { bindAgentClient } from "./data/agent-client.ts";
 import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindFileService } from "./data/file-service.ts";
+import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
@@ -35,6 +36,7 @@ async function boot(): Promise<void> {
   const client = new IpcClient(transport);
   bindAgentClient(transport);
   bindFileService(client);
+  bindModelsService(client);
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);

@@ -106,6 +106,15 @@ export default defineConfig({
         find: /^@\/lib\/project-trust-client$/,
         replacement: resolve(import.meta.dirname, "src/data/project-trust-client.ts"),
       },
+      {
+        // The models service (selector data + the selectors' star) swaps
+        // /api/models and /api/models/default for models.list /
+        // models.setDefault over IPC — the host routes them to a cwd-scoped
+        // management instance whose extension op runs the repo's own
+        // lib/models-service.ts (the same function the Next route serves).
+        find: /^@\/lib\/models-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/models-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

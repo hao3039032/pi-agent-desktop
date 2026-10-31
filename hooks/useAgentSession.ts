@@ -24,6 +24,13 @@ import {
   renewSessionLease,
 } from "@/lib/session-view-service";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
+import {
+  fetchModelsData,
+  saveDefaultPreferences as saveDefaultPreferencesImpl,
+  type ModelEntry,
+  type ModelsResponse,
+  type SelectedModel,
+} from "@/lib/models-service";
 import { rememberScrollPosition, sessionScrollTops } from "@/lib/scroll-memory";
 import {
   deleteSessionViewSnapshot,
@@ -340,21 +347,6 @@ export interface AttachedImage {
   mimeType: string;
   previewUrl: string;
 }
-
-type SelectedModel = { provider: string; modelId: string };
-type ModelEntry = { id: string; name: string; provider: string };
-type ModelsResponse = {
-  models: Record<string, string>;
-  modelList?: ModelEntry[];
-  defaultModel?: SelectedModel | null;
-  defaultThinkingLevel?: string | null;
-  savedDefaultThinkingLevel?: string | null;
-  thinkingLevels?: Record<string, string[]>;
-  thinkingLevelMaps?: Record<string, Record<string, string | null>>;
-  thinkingLevelPins?: Record<string, string>;
-  modelError?: string;
-  modelScopeWarnings?: ModelScopeWarning[];
-};
 
 type SlashCommandsResponse = {
   commands?: SlashCommandInfo[];
@@ -2443,26 +2435,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const loadModels = useCallback(async (signal?: AbortSignal) => {
     const modelCwd = newSessionCwd ?? session?.cwd ?? "";
-    const modelsUrl = modelCwd ? `/api/models?cwd=${encodeURIComponent(modelCwd)}` : "/api/models";
     let d: ModelsResponse;
     try {
-      const res = await fetch(modelsUrl, signal ? { signal } : undefined);
-      if (!res.ok) {
-        let detail = "";
-        try {
-          const body: unknown = await res.json();
-          if (body && typeof body === "object" && "error" in body && typeof body.error === "string") {
-            detail = body.error;
-          }
-        } catch (e) {
-          if (e instanceof DOMException && e.name === "AbortError") throw e;
-          // Non-JSON error responses fall back to the HTTP status.
-        }
-        throw new Error(detail || `Failed to load models (HTTP ${res.status})`);
-      }
-      d = await res.json() as ModelsResponse;
-      // Older macOS WebViews lack throwIfAborted; still discard cancelled responses.
-      if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+      d = await fetchModelsData(modelCwd, signal);
     } catch (e) {
       if (!signal?.aborted && !(e instanceof DOMException && e.name === "AbortError")) {
         setModelError(e instanceof Error ? e.message : String(e));
@@ -2505,20 +2480,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     edit: { provider: string; modelId: string } | { thinkingLevel: ConcreteThinkingLevel },
   ) => {
     const cwd = newSessionCwd ?? session?.cwd;
-    const res = await fetch("/api/models/default", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...(cwd ? { cwd } : {}), ...edit }),
-    });
-    if (res.ok) return;
-    let detail = "";
-    try {
-      const body: unknown = await res.json();
-      if (body && typeof body === "object" && "error" in body && typeof body.error === "string") detail = body.error;
-    } catch {
-      // Non-JSON error responses fall back to the HTTP status.
-    }
-    throw new Error(detail || `HTTP ${res.status}`);
+    await saveDefaultPreferencesImpl(edit, cwd ?? null);
   }, [newSessionCwd, session?.cwd]);
 
   const reloadModelsQuietly = useCallback(() => {

@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -21,9 +21,11 @@ mod file_access;
 mod logging;
 mod native_prefs;
 // `pi_ipc` is pub for the static-UI acceptance harness bin (same crate,
-// feature-gated): it drives the REAL command functions (`dispatch_envelope`,
-// the `pi_ipc_subscribe_*` streams) over a browser bridge instead of the
-// Tauri WebView plumbing. No other module needs the exposure.
+// feature-gated): it drives the REAL command functions
+// (`dispatch_envelope_gated` — the same gated dispatch the async `pi_ipc`
+// command runs — and the `pi_ipc_subscribe_*` streams) over a browser
+// bridge instead of the Tauri WebView plumbing. No other module needs the
+// exposure.
 pub mod pi_ipc;
 mod session_view;
 mod shell;
@@ -1386,7 +1388,7 @@ pub fn run() {
             }
         })
         .manage(CloseQuits(Mutex::new(false)))
-        .manage(pi_ipc::IpcHostState::new())
+        .manage(Arc::new(pi_ipc::IpcHostState::new()))
         .manage(PopupMenuSelection::default())
         .manage(DesktopApiToken(desktop_api_token))
         .invoke_handler(tauri::generate_handler![
