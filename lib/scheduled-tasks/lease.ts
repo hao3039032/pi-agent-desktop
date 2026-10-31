@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, rmSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { writePrivateFileAtomicSync } from "../atomic-file";
+import { withScheduledTasksTransaction } from "./transaction-lock";
 
 /**
  * Only one process may fire scheduled tasks. A dev server and the desktop app
@@ -71,25 +72,26 @@ export function acquireLease(
   const now = options.now ?? new Date();
   const alive = options.alive ?? isPidAlive;
   const path = leasePath(dir);
-  const current = readLease(path);
-
-  if (current && current.pid !== pid) {
-    const fresh = now.getTime() - new Date(current.heartbeatAt).getTime() < LEASE_STALE_MS;
-    if (fresh && alive(current.pid)) return false;
-  }
-  mkdirSync(dir, { recursive: true });
-  const lease: Lease = {
-    pid,
-    startedAt: current && current.pid === pid ? current.startedAt : now.toISOString(),
-    heartbeatAt: now.toISOString(),
-  };
-  writePrivateFileAtomicSync(path, `${JSON.stringify(lease)}\n`);
-  // Two processes can take over a dead owner's lease in the same instant;
-  // the one whose write landed last keeps it, and the other sees that here.
-  return readLease(path)?.pid === pid;
+  return withScheduledTasksTransaction(dirname(dir), () => {
+    const current = readLease(path);
+    if (current && current.pid !== pid) {
+      const fresh = now.getTime() - new Date(current.heartbeatAt).getTime() < LEASE_STALE_MS;
+      if (fresh && alive(current.pid)) return false;
+    }
+    mkdirSync(dir, { recursive: true });
+    const lease: Lease = {
+      pid,
+      startedAt: current && current.pid === pid ? current.startedAt : now.toISOString(),
+      heartbeatAt: now.toISOString(),
+    };
+    writePrivateFileAtomicSync(path, `${JSON.stringify(lease)}\n`);
+    return true;
+  });
 }
 
 export function releaseLease(dir: string, pid = process.pid): void {
   const path = leasePath(dir);
-  if (readLease(path)?.pid === pid) rmSync(path, { force: true });
+  withScheduledTasksTransaction(dirname(dir), () => {
+    if (readLease(path)?.pid === pid) rmSync(path, { force: true });
+  });
 }
