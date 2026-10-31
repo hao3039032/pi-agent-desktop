@@ -222,6 +222,8 @@ pub struct Session {
     pub(crate) composer_generation: u64,
     /// One drain at a time (the wrapper's `delivering` flag).
     composer_delivering: Mutex<bool>,
+    /// Serializes host branch changes against prompt admission and outbox delivery.
+    activity_gate: Mutex<()>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
     /// The registry-wide running-set signal (shared with the relay).
@@ -243,9 +245,17 @@ impl Session {
         data: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
+        let _admission = if matches!(command, "prompt" | "bash" | "compact") {
+            Some(self.activity_gate.try_lock().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
+        } else { None };
         let result = self.client.command(command, data, timeout);
         self.touch();
         result
+    }
+
+    /// Hold across branch validation and mutation so admissions cannot race it.
+    pub fn try_branch_activity(&self) -> Result<std::sync::MutexGuard<'_, ()>, &'static str> {
+        self.activity_gate.try_lock().map_err(|_| "session is busy")
     }
 
     /// One bridge request (nonce/session-verified by pi-host).
@@ -985,6 +995,7 @@ fn spawn_session(
         composer_outbox,
         composer_generation,
         composer_delivering: Mutex::new(false),
+        activity_gate: Mutex::new(()),
         settle_cv: std::sync::Condvar::new(),
         running_signal,
     });

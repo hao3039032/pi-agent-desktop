@@ -187,7 +187,8 @@ test("only the session-mount load probes disk for external appends", () => {
     source.indexOf("// Load session on mount"),
     source.indexOf("sessionHookMountedRef.current = false"),
   );
-  assert.match(loadSessionSource, /options\?: \{ force\?: boolean \}/);
+  assert.match(loadSessionSource, /options\?: \{ force\?: boolean; fresh\?: boolean \}/);
+  assert.match(loadSessionSource, /options\?\.force \|\| options\?\.fresh \? undefined/);
   // force flows through the session-view service seam now; the invariant is
   // that ONLY the mount load passes it (never a background refresh).
   assert.match(loadSessionSource, /force: options\?\.force/);
@@ -237,7 +238,7 @@ test("first user messages expose both branch actions and edit before their own e
   assert.doesNotMatch(chatWindowSource, /idx === 0 && msg\.role === "user"/);
   assert.doesNotMatch(chatWindowSource, /prevAssistantEntryId/);
   assert.match(navigateSource, /type: "navigate_tree",\s*targetId: entryId/);
-  assert.match(navigateSource, /await loadSession\(sid\)/);
+  assert.match(navigateSource, /await loadSession\(sid, false, false, \{ fresh: true \}\)/);
 });
 
 test("history edits move the branch only when sent, so cancel or reload keeps it", () => {
