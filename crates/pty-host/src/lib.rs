@@ -239,7 +239,7 @@ impl PtyHost {
         // concurrent creates for the same id both pass the existence check,
         // both spawn a shell, and the loser's child is orphaned (it is in no
         // registry, so close() can never reach it).
-        let mut map = self.inner.lock().unwrap();
+        let map = self.inner.lock().unwrap();
         if let Some(existing) = map.get(id) {
             if existing.exit.lock().unwrap().is_none() {
                 return Ok(Arc::clone(existing));

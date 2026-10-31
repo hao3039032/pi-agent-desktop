@@ -443,3 +443,263 @@ mod tests {
         assert!(!roots.is_path_allowed(&dir.path().join("pi-cwd-not-a-date")));
     }
 }
+
+// ============================================================================
+// Directory listing (the /api/files type=list contract)
+// ============================================================================
+
+/// Conventionally generated names hidden where no Git work tree covers the
+/// directory (lib/file-tree-visibility.ts HIDDEN_NAMES).
+const HIDDEN_NAMES: [&str; 13] = [
+    "node_modules", ".git", ".next", "dist", "build", "__pycache__", ".turbo",
+    ".cache", "coverage", ".pytest_cache", ".mypy_cache", "target", "vendor",
+];
+/// Hidden whatever a repository says about them.
+const ALWAYS_HIDDEN_NAMES: [&str; 2] = [".git", ".DS_Store"];
+const HIDDEN_SUFFIXES: [&str; 1] = [".pyc"];
+
+/// The name-based rule for directories no Git work tree covers.
+fn is_hidden_outside_git(name: &str) -> bool {
+    HIDDEN_NAMES.contains(&name)
+        || ALWAYS_HIDDEN_NAMES.contains(&name)
+        || HIDDEN_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+}
+
+/// Run git in `directory`; None when it is missing, fails or times out (the
+/// TS rules: never stall the tree on a slow git, degrade to the name list).
+fn run_git(directory: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        // A repository-configured fsmonitor hook must not run (expanding a
+        // folder must never execute repo-configured commands).
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let output = output.ok()?;
+    let code = output.status.code()?;
+    if code != 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// One listed entry (the wire shape FileExplorer consumes).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: String,
+    /// A directory entry that is a symlink resolving OUTSIDE the roots: the
+    /// explorer offers "browse the link target" (an explicit, confirmed
+    /// grant) instead of silently refusing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outside_link_target: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub outside_link_encloses: bool,
+}
+
+/// List one directory inside the allowed roots (the /api/files type=list
+/// contract): visibility by Git where it has a view of the directory (a
+/// tracked `build/` stays visible, #677), the name list otherwise; dirs
+/// first then files, both alphabetically; a directory symlink resolving
+/// outside the roots carries `outsideLinkTarget` for the confirmation flow.
+pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<ListedEntry>, String> {
+    if !roots.is_existing_path_allowed(directory) {
+        return Err("the path is outside the allowed roots".to_string());
+    }
+    let meta = std::fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+    if !meta.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+    let dirents: Vec<std::fs::DirEntry> = std::fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .flatten()
+        .collect();
+    let names: Vec<String> = dirents.iter().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+
+    // Visibility: Git's view first (tracked wins over ignored), the fixed
+    // name list where git has no view (missing, outside a work tree, failed).
+    let visibility = directory_visibility(directory, &names);
+
+    let mut entries: Vec<ListedEntry> = Vec::new();
+    for entry in &dirents {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !visibility(&name) {
+            continue;
+        }
+        // Avoid per-entry stat where the dirent type is known; symlinks and
+        // filesystems without type info fall back to metadata.
+        let file_type = entry.file_type().ok();
+        let is_dir = match file_type {
+            Some(kind) if kind.is_dir() => true,
+            Some(kind) if kind.is_file() => false,
+            _ => match std::fs::metadata(entry.path()) {
+                Ok(meta) => meta.is_dir(),
+                Err(_) => continue, // raced away: skip, not an error
+            },
+        };
+        // A directory whose dirent says "file" is a SYMLINK to a directory
+        // (the TS resolveDirentIsDirectory fallback): report it as a dir and
+        // resolve whether it lands outside the roots.
+        let mut outside_link_target = None;
+        let mut outside_link_encloses = false;
+        let is_symlink_dir = is_dir && file_type.map(|kind| !kind.is_dir()).unwrap_or(false);
+        if is_symlink_dir || (is_dir && std::fs::symlink_metadata(entry.path()).map(|m| m.file_type().is_symlink()).unwrap_or(false)) {
+            if let Ok(resolved) = std::fs::canonicalize(entry.path()) {
+                if !roots.is_existing_path_allowed(&resolved) {
+                    outside_link_target = Some(resolved.to_string_lossy().into_owned());
+                    outside_link_encloses = encloses_home_or_root(&resolved);
+                }
+            }
+        }
+        entries.push(ListedEntry {
+            name,
+            is_dir,
+            size: 0,      // the TS shape carries 0 (no per-entry stat)
+            modified: String::new(), // ditto
+            outside_link_target,
+            outside_link_encloses,
+        });
+    }
+    entries.sort_by(|a, b| {
+        if a.is_dir != b.is_dir {
+            return if a.is_dir { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
+        }
+        a.name.cmp(&b.name)
+    });
+    Ok(entries)
+}
+
+/// Whether allowing `target` would also open the project or the home folder
+/// (a link to `/`, `~` or a parent of the project — lib/linked-directory.ts
+/// enclosesProjectOrHome): the explorer confirms harder for these.
+fn encloses_home_or_root(target: &Path) -> bool {
+    let target = target.to_string_lossy().into_owned();
+    let target = target.trim_end_matches('/');
+    if target.is_empty() {
+        return true; // "/"
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().into_owned();
+        let home = home.trim_end_matches('/');
+        if home == target || target.len() < home.len() {
+            // A target above (or equal to) the home folder encloses it.
+            return home.starts_with(target) && !target.is_empty();
+        }
+    }
+    false
+}
+
+/// Build the visibility predicate for one directory listing: Git's tracked
+/// set overrides its ignore matches (a tracked `build/` stays visible);
+/// outside a work tree the fixed name list applies.
+fn directory_visibility<'a>(
+    directory: &'a Path,
+    names: &'a [String],
+) -> impl Fn(&str) -> bool + 'a {
+    let tracked = read_tracked_names(directory, names);
+    let ignored = read_ignored_names(directory, names);
+    let have_git_view = tracked.is_some();
+    let tracked = tracked.unwrap_or_default();
+    let ignored = ignored.unwrap_or_default();
+    move |name: &str| {
+        if ALWAYS_HIDDEN_NAMES.contains(&name) {
+            return false;
+        }
+        if !have_git_view {
+            return !is_hidden_outside_git(name);
+        }
+        if tracked.contains(name) {
+            return true;
+        }
+        !ignored.contains(name)
+    }
+}
+
+/// Names Git tracks at or below (the first path segment of every ls-files
+/// record). None when git has no view of the directory.
+fn read_tracked_names(directory: &Path, names: &[String]) -> Option<std::collections::HashSet<String>> {
+    let mut tracked = std::collections::HashSet::new();
+    // Pathspec batches keep the command line well inside the OS limit.
+    let mut batch: Vec<&str> = Vec::new();
+    let mut size = 0usize;
+    let flush = |batch: &mut Vec<&str>, tracked: &mut std::collections::HashSet<String>| -> Option<()> {
+        if batch.is_empty() {
+            return Some(());
+        }
+        let mut args: Vec<&str> = vec!["--literal-pathspecs", "ls-files", "-z", "--cached", "--"];
+        args.extend(batch.iter().copied());
+        let stdout = run_git(directory, &args)?;
+        for record in stdout.split('\0') {
+            if !record.is_empty() {
+                tracked.insert(record.split('/').next().unwrap_or(record).to_string());
+            }
+        }
+        batch.clear();
+        Some(())
+    };
+    for name in names {
+        if !batch.is_empty() && size + name.len() + 1 > 16_000 {
+            flush(&mut batch, &mut tracked)?;
+        }
+        batch.push(name);
+        size += name.len() + 1;
+    }
+    flush(&mut batch, &mut tracked)?;
+    Some(tracked)
+}
+
+/// Names Git ignores (check-ignore --no-index: one process for every name,
+/// no index read). None when git has no view.
+fn read_ignored_names(directory: &Path, names: &[String]) -> Option<std::collections::HashSet<String>> {
+    if names.is_empty() {
+        return Some(std::collections::HashSet::new());
+    }
+    // Feed the names on stdin (no command-line length limit). With -z the
+    // INPUT is NUL-separated too (verified against git: a newline-fed -z
+    // stdin matches nothing and exits 1).
+    let stdin_data = {
+        let mut data = names.join("\u{0}");
+        data.push('\u{0}');
+        data
+    };
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(stdin_data.as_bytes());
+            }
+            drop(child.stdin.take());
+            child.wait_with_output().ok()
+        })?;
+    // 1 = at least one name ignored (success for our purpose), 128 = not a
+    // repository, 129 = bad usage: only 0/1 carry a view.
+    let code = output.status.code()?;
+    if code != 0 && code != 1 {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut ignored = std::collections::HashSet::new();
+    for record in stdout.split('\0') {
+        if !record.is_empty() {
+            ignored.insert(record.split('/').next().unwrap_or(record).to_string());
+        }
+    }
+    Some(ignored)
+}

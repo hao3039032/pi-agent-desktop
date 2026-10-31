@@ -816,6 +816,27 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // index scan, default-cwd layouts, later: dialog picks and validated
         // cwds) — there is deliberately NO frontend-facing allowRoot op: the
         // WebView must not be able to widen its own file access.
+        "files.list" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            let directory = PathBuf::from(path);
+            let listed = {
+                let roots = state.file_roots.lock().unwrap();
+                crate::file_access::list_directory(&roots, &directory)
+            };
+            match listed {
+                Ok(entries) => protocol_ok(
+                    &id,
+                    json!({
+                        "entries": entries,
+                        "path": path,
+                    }),
+                ),
+                Err(message) => {
+                    let code = if message == "Not a directory" { "invalid_args" } else { "unauthorized_scope" };
+                    protocol_error(&id, code, &message)
+                }
+            }
+        }
         "files.read" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             let target = PathBuf::from(path);
@@ -1543,7 +1564,7 @@ mod tests {
         std::fs::create_dir_all(&sessions).expect("sessions");
         std::fs::create_dir_all(&cwd).expect("cwd");
         // One on-disk session file with a real header.
-        let (file, file_id) = session_host::create_session_file(&sessions, &cwd).expect("create");
+        let (_file, file_id) = session_host::create_session_file(&sessions, &cwd).expect("create");
 
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
@@ -1573,5 +1594,125 @@ mod tests {
         assert_eq!(again["ok"], true, "{again}");
         // Cleanup: shut the child down.
         state.registry.remove(&file_id, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn files_list_shows_the_wire_shape_and_refuses_outside_roots() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("sub")).expect("sub");
+        std::fs::write(project.join("a.txt"), b"1").expect("a");
+        std::fs::write(project.join("z.txt"), b"2").expect("z");
+        // Conventionally hidden names (no git repo here: the fallback list).
+        std::fs::create_dir_all(project.join("node_modules")).expect("nm");
+        std::fs::write(project.join("keep.pyc"), b"").expect("pyc");
+
+        // Outside the roots: refused.
+        let refused = send(
+            &state,
+            json!({ "v": 1, "id": "l0", "op": "files.list", "args": { "path": project.display().to_string() } }),
+        );
+        assert_eq!(refused["error"]["code"], "unauthorized_scope");
+
+        state.propose_path(&project);
+        let listed = send(
+            &state,
+            json!({ "v": 1, "id": "l1", "op": "files.list", "args": { "path": project.display().to_string() } }),
+        );
+        assert_eq!(listed["ok"], true, "{listed}");
+        let entries = listed["data"]["entries"].as_array().expect("entries");
+        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap_or("")).collect();
+        // Hidden names stay out; the rest is dirs-first alphabetical.
+        assert_eq!(names, vec!["sub", "a.txt", "z.txt"], "dirs first, then files");
+        assert_eq!(entries[0]["isDir"], true);
+        assert_eq!(entries[1]["isDir"], false);
+        assert_eq!(listed["data"]["path"], project.display().to_string());
+        // A file path is not a directory.
+        let not_dir = send(
+            &state,
+            json!({ "v": 1, "id": "l2", "op": "files.list", "args": { "path": project.join("a.txt").display().to_string() } }),
+        );
+        assert_eq!(not_dir["error"]["code"], "invalid_args", "{not_dir}");
+    }
+
+    #[test]
+    fn files_list_git_tracked_names_win_over_ignores() {
+        // #677: a repository decides inside a work tree — a TRACKED build/
+        // stays visible even though the fallback list would hide it, and an
+        // ignored name stays hidden. Requires git on PATH (the test skips
+        // honestly where git is absent, like the TS suite's environment).
+        if !std::process::Command::new("git").arg("--version").output().is_ok() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["config", "user.email", "t@t"]).status.success());
+        assert!(git(&["config", "user.name", "t"]).status.success());
+        // build/ is tracked; cache/ is ignored via .gitignore; .git always hides.
+        std::fs::create_dir_all(repo.join("build")).expect("build");
+        std::fs::create_dir_all(repo.join("cache")).expect("cache");
+        std::fs::write(repo.join("build").join("out.txt"), "x").expect("out");
+        std::fs::write(repo.join(".gitignore"), "cache/\n").expect("ignore");
+        assert!(git(&["add", "."]).status.success());
+        assert!(git(&["commit", "-qm", "init"]).status.success());
+
+        state.propose_path(&repo);
+        let listed = send(
+            &state,
+            json!({ "v": 1, "id": "gl1", "op": "files.list", "args": { "path": repo.display().to_string() } }),
+        );
+        assert_eq!(listed["ok"], true, "{listed}");
+        let names: Vec<&str> = listed["data"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|e| e["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"build"), "a tracked build/ stays visible (#677): {names:?}");
+        assert!(!names.contains(&"cache"), "an ignored directory hides: {names:?}");
+        assert!(!names.contains(&".git"), ".git always hides: {names:?}");
+        assert!(names.contains(&".gitignore"), "a tracked file lists: {names:?}");
+    }
+
+    #[test]
+    fn files_list_marks_a_directory_symlink_pointing_outside() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, project.join("linked")).expect("linked");
+        state.propose_path(&project);
+        let listed = send(
+            &state,
+            json!({ "v": 1, "id": "sl1", "op": "files.list", "args": { "path": project.display().to_string() } }),
+        );
+        assert_eq!(listed["ok"], true, "{listed}");
+        let entry = listed["data"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|e| e["name"] == "linked")
+            .expect("the link lists as a directory");
+        assert_eq!(entry["isDir"], true);
+        assert_eq!(
+            entry["outsideLinkTarget"].as_str().unwrap_or(""),
+            outside.canonicalize().unwrap().to_string_lossy(),
+            "the explorer gets the target for its confirmation flow"
+        );
     }
 }
