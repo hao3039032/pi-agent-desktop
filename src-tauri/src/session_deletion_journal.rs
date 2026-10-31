@@ -364,6 +364,33 @@ mod linux {
             assert!(source.exists());
         }
         #[test]
+        fn replacement_between_preflight_and_isolation_is_not_deleted() {
+            let (dir, _state, root, source) = fixture();
+            let handle = File::open(&source).unwrap();
+            let metadata = handle.metadata().unwrap();
+            let result = remove_with_hook(&root, dir.path(), "a", &source, &metadata, |phase| {
+                if phase == "prepared" {
+                    std::fs::rename(&source, source.with_extension("saved")).unwrap();
+                    std::fs::write(&source, "replacement").unwrap();
+                }
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err().0, "busy");
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "replacement");
+            assert!(source.with_extension("saved").exists());
+        }
+        #[test]
+        fn replacement_after_isolation_is_not_deleted() {
+            let (dir, _state, root, source) = fixture();
+            let handle = File::open(&source).unwrap();
+            let metadata = handle.metadata().unwrap();
+            remove_with_hook(&root, dir.path(), "a", &source, &metadata, |phase| {
+                if phase == "isolated" { std::fs::write(&source, "replacement").unwrap(); }
+                Ok(())
+            }).unwrap();
+            assert_eq!(std::fs::read_to_string(&source).unwrap(), "replacement");
+        }
+        #[test]
         fn changed_source_is_restored_not_deleted() {
             let (dir, _state, root, source) = fixture();
             let metadata = std::fs::metadata(&source).unwrap();
