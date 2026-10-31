@@ -121,6 +121,14 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   }
 }
 
+export async function checkProjectUploadTargets(directory: string, fileNames: string[]): Promise<{ conflicts: string[]; nonReplaceable: string[] }> {
+  return ensureClient().request("files.uploadCheck", { directory, fileNames }, { timeoutMs: 15_000 });
+}
+
+export async function uploadProjectFile(directory: string, name: string, data: string, conflict: string): Promise<{ outcome: "uploaded" | "skipped" | "conflict" }> {
+  return ensureClient().request("files.uploadFile", { directory, name, data, conflict }, { timeoutMs: 120_000 });
+}
+
 export async function fetchRevealSupport(): Promise<{ supported: boolean; reason: string | null; platform: string }> {
   return ensureClient().request("files.revealSupport", {}, { timeoutMs: 15_000 });
 }

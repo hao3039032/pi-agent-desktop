@@ -4,7 +4,7 @@ import {
   PROJECT_UPLOAD_MAX_TOTAL_BYTES,
   uploadProjectFiles,
   type ProjectUploadResponse,
-} from "./project-file-upload-client";
+} from "@/lib/project-file-upload-client";
 
 export interface ChatDroppedFilePartition {
   images: File[];

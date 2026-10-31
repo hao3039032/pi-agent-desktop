@@ -2296,6 +2296,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
         "files.importDropped" => crate::native_import::import_dropped(state, &id, &args),
+        "files.uploadCheck" => crate::project_upload::check(state, &id, &args),
+        "files.uploadFile" => crate::project_upload::upload_one(state, &id, &args),
         "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(state, &id, &args),
         "desktop.readImages" => crate::file_resources::handle_desktop_read_images(state, &id, &args),
         "desktop.saveFile" => crate::file_resources::handle_desktop_save_file(state, &id, &args),

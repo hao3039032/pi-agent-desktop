@@ -51,6 +51,12 @@ try {
   await frame.locator("#fixture").waitFor({ timeout: 20_000 });
   await page.waitForFunction(() => { const f = document.querySelector('.file-viewer-content iframe'); return f?.contentDocument?.querySelector('#fixture') && getComputedStyle(f.contentDocument.querySelector('#fixture')).color === 'rgb(12, 34, 56)'; });
   assert.equal(await page.evaluate(() => window.__previewScriptRan), undefined);
+  await page.locator('input[type="file"]').setInputFiles({ name: "uploaded.txt", mimeType: "text/plain", buffer: Buffer.from("browser fixture") });
+  for (let attempts = 0; attempts < 100; attempts++) {
+    try { if ((await readFile(join(project, "uploaded.txt"), "utf8")) === "browser fixture") break; } catch {}
+    await delay(50);
+  }
+  assert.equal(await readFile(join(project, "uploaded.txt"), "utf8"), "browser fixture");
   const checks = await page.evaluate(async ({ project, outside }) => {
     const call = async (id, op, args) => window.__TAURI_INTERNALS__.invoke("pi_ipc", { request: { v: 1, id, op, args } });
     const denied = await call("outside", "resources.grantFile", { path: outside });

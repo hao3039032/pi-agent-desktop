@@ -26,6 +26,7 @@ mod logging;
 mod native_prefs;
 mod native_drop;
 mod native_import;
+mod project_upload;
 mod resource_save;
 #[cfg(feature = "harness")]
 pub mod resource_handler;
