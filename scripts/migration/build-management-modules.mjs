@@ -74,6 +74,13 @@ export {
 export { getTerminalSettings, setTerminalShell, resolveTerminalShell } from "${ROOT}/lib/terminal-settings.ts";
 export { readRedactedModelsConfig } from "${ROOT}/lib/models-config-store.ts";
 export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-config-service.server.ts";
+export {
+  composeProviderLists,
+  storeProviderApiKey,
+  removeProviderApiKey,
+  logoutProvider,
+  ProviderAuthRefusalError,
+} from "${ROOT}/lib/provider-auth-service.server.ts";
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
 export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";

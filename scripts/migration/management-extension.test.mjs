@@ -1322,3 +1322,189 @@ test(
     }
   },
 );
+
+/**
+ * M3: the provider-auth domain (auth.providers / auth.apiKeyStore /
+ * auth.apiKeyDelete / auth.logout) — the Models panel's sign-in surface over
+ * the management protocol. Differentially pinned against the repo's
+ * lib/provider-auth-service.server.ts (the ONE composition the Next
+ * /api/auth/* routes also serve) on a fixture auth.json in an isolated agent
+ * dir: the capability-driven listing (no secrets cross the wire), the
+ * API-key store through the provider's own headless login, the type-gated
+ * deletes (an OAuth credential never removed as an API key and vice versa)
+ * and the shaped refusals with the routes' exact messages.
+ */
+test(
+  "the provider-auth ops answer the repo composition over a real pi child",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-provider-auth-"));
+    let client = null;
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const previousOffline = process.env.PI_OFFLINE;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(join(agentDir, "sessions"), { recursive: true });
+      const authPath = join(agentDir, "auth.json");
+      const readAuth = async () => JSON.parse(await (await import("node:fs/promises")).readFile(authPath, "utf8"));
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      const nonce = "mgmt-nonce-provider-auth";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_OFFLINE: "1",
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+        },
+        onLog: () => {},
+      });
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `mgmt-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 120_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+
+      // The repo composition in-process (the Next route's own code path).
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      process.env.PI_OFFLINE = "1";
+      const { composeProviderLists } = await jiti.import("../../lib/provider-auth-service.server.ts");
+
+      // The fixture credentials (never a real account, never a real secret).
+      const STORED_KEY = "sk-mgmt-fixture-key-4f7a91c3";
+      await writeFile(authPath, JSON.stringify({
+        openai: { type: "api_key", key: STORED_KEY },
+        anthropic: { type: "oauth", access: "oauth-access-fixture", refresh: "oauth-refresh-fixture", expires: Date.now() + 3_600_000 },
+      }, null, 2), "utf8");
+
+      try {
+        // 1. The capability table carries the auth ops.
+        const capabilities = await call("sys.capabilities", {});
+        assert.equal(capabilities.ok, true, JSON.stringify(capabilities));
+        for (const op of ["auth.providers", "auth.apiKeyStore", "auth.apiKeyDelete", "auth.logout"]) {
+          assert.ok(capabilities.result.ops.includes(op), `${op} in the capability table`);
+        }
+
+        // 2. auth.providers answers EXACTLY the repo composition's listing
+        //    (the differential: same agent dir, both sides).
+        const listed = await call("auth.providers", {});
+        assert.equal(listed.ok, true, JSON.stringify(listed));
+        const inProcess = await composeProviderLists();
+        assert.deepEqual(listed.result, JSON.parse(JSON.stringify(inProcess)), "the GET /api/auth/providers body");
+        const serialized = JSON.stringify(listed);
+        assert.equal(serialized.includes(STORED_KEY), false, "no stored key crosses the wire");
+        assert.equal(serialized.includes("oauth-refresh-fixture"), false, "no OAuth secret crosses the wire");
+        const oauthById = Object.fromEntries(listed.result.oauthProviders.map((p) => [p.id, p]));
+        const apiKeyById = Object.fromEntries(listed.result.apiKeyProviders.map((p) => [p.id, p]));
+        assert.equal(oauthById.anthropic.loggedIn, true, "anthropic's oauth credential reads signed in");
+        assert.equal(apiKeyById.openai.configured, true, "openai's stored key reads configured");
+
+        // 3. The type-gated delete: an OAuth credential refuses with the
+        //    route's 409 message, and nothing is removed.
+        const wrongType = await call("auth.apiKeyDelete", { provider: "anthropic" });
+        assert.equal(wrongType.ok, false, JSON.stringify(wrongType));
+        assert.equal(wrongType.code, "credential_type_mismatch");
+        assert.equal(wrongType.error, "anthropic is authenticated with OAuth, not an API key");
+        assert.equal((await readAuth()).anthropic.type, "oauth");
+
+        // 4. The API-key store runs the provider's own headless login and
+        //    stores the trimmed key beside the untouched OAuth credential.
+        const stored = await call("auth.apiKeyStore", { provider: "openai", apiKey: `  ${STORED_KEY}-new  ` });
+        assert.equal(stored.ok, true, JSON.stringify(stored));
+        const auth = await readAuth();
+        assert.equal(auth.openai.type, "api_key");
+        assert.equal(auth.openai.key, `${STORED_KEY}-new`, "the headless login stored the trimmed key");
+        assert.equal(auth.anthropic.type, "oauth", "other credentials untouched");
+        const afterStore = await call("auth.providers", {});
+        assert.equal(
+          Object.fromEntries(afterStore.result.apiKeyProviders.map((p) => [p.id, p])).openai.configured,
+          true,
+          "the refreshed list reports the new key (status only, never the key)"
+        );
+        assert.equal(JSON.stringify(afterStore).includes(`${STORED_KEY}-new`), false);
+
+        // 5. A missing key and an unknown provider refuse with the
+        //    composition's own messages.
+        const emptyKey = await call("auth.apiKeyStore", { provider: "openai", apiKey: "   " });
+        assert.equal(emptyKey.ok, false, JSON.stringify(emptyKey));
+        assert.equal(emptyKey.code, "invalid_args");
+        assert.equal(emptyKey.error, "apiKey is required");
+        const noLogin = await call("auth.apiKeyStore", { provider: "not-a-real-provider", apiKey: "sk-x" });
+        assert.equal(noLogin.ok, false, JSON.stringify(noLogin));
+        assert.equal(noLogin.code, "api_key_unsupported");
+        assert.equal(noLogin.error, "not-a-real-provider does not support API key login");
+
+        // 6. logout: unknown provider and the wrong credential type refuse;
+        //    the OAuth credential itself is removed.
+        const unknown = await call("auth.logout", { provider: "not-a-real-provider" });
+        assert.equal(unknown.ok, false, JSON.stringify(unknown));
+        assert.equal(unknown.code, "unknown_provider");
+        assert.equal(unknown.error, "Unknown provider: not-a-real-provider");
+        const wrongWay = await call("auth.logout", { provider: "openai" });
+        assert.equal(wrongWay.ok, false, JSON.stringify(wrongWay));
+        assert.equal(wrongWay.code, "credential_type_mismatch");
+        assert.equal(wrongWay.error, "openai is authenticated with an API key, not OAuth");
+        assert.equal((await readAuth()).openai.type, "api_key", "the key survived the refused logout");
+        const loggedOut = await call("auth.logout", { provider: "anthropic" });
+        assert.equal(loggedOut.ok, true, JSON.stringify(loggedOut));
+        assert.equal("anthropic" in (await readAuth()), false, "the OAuth credential is gone");
+        assert.equal((await readAuth()).openai.type, "api_key");
+        const afterLogout = await call("auth.providers", {});
+        assert.equal(
+          Object.fromEntries(afterLogout.result.oauthProviders.map((p) => [p.id, p])).anthropic.loggedIn,
+          false,
+          "the refreshed OAuth list reports signed out"
+        );
+
+        // 7. The API-key delete (the right type this time) removes the key.
+        const removed = await call("auth.apiKeyDelete", { provider: "openai" });
+        assert.equal(removed.ok, true, JSON.stringify(removed));
+        assert.equal("openai" in (await readAuth()), false);
+
+        // 8. A malformed envelope (no provider) refuses; the instance stays usable.
+        const noProvider = await call("auth.apiKeyDelete", {});
+        assert.equal(noProvider.ok, false, JSON.stringify(noProvider));
+        assert.equal(noProvider.code, "invalid_args");
+        const stillUsable = await call("auth.providers", {});
+        assert.equal(stillUsable.ok, true, "usable after refused ops");
+      } finally {
+        if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+        if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+        else process.env.PI_OFFLINE = previousOffline;
+      }
+    } finally {
+      if (client) await client.close(5_000).catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

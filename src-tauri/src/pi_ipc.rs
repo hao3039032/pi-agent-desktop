@@ -838,6 +838,8 @@ impl Default for IpcHostState {
 }
 
 /// The response envelope for a protocol-level rejection.
+// The domain modules (crate::provider_auth) build envelopes from the same
+// helpers, so every arm answers the identical envelope shape.
 pub(crate) fn protocol_error(id: &str, code: &str, message: &str) -> Value {
     protocol_error_value(
         id,
@@ -1757,6 +1759,17 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
             }
         }
+        // Provider authentication (crate::provider_auth — the Models panel's
+        // sign-in surface): the envelope gate and the global-instance routing
+        // live in the domain module; the compositions themselves run in the
+        // management instance (the same lib/provider-auth-service.server.ts
+        // the Next /api/auth/* routes serve).
+        "auth.providers" | "auth.apiKeyStore" | "auth.apiKeyDelete" | "auth.logout" => {
+            match crate::provider_auth::dispatch(state, op, &id, &args) {
+                Some(answer) => answer,
+                None => protocol_error(&id, "unknown_op", &format!("unknown operation: {op}")),
+            }
+        }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
@@ -2222,7 +2235,7 @@ fn management_read_scoped(state: &IpcHostState, op: &str, args: &Value, cwd: &Pa
 
 /// The extension reports failures as "[code] message"; recover the code for
 /// the protocol envelope (unknown codes stay io, never success).
-fn management_error_code(error: &str) -> (String, String) {
+pub(crate) fn management_error_code(error: &str) -> (String, String) {
     if let Some((code, rest)) = error.strip_prefix('[').and_then(|body| body.split_once(']')) {
         let code = code.to_string();
         let known = matches!(
@@ -2235,6 +2248,11 @@ fn management_error_code(error: &str) -> (String, String) {
                 | "project_scope"
                 | "last_model"
                 | "models_config_read"
+                // the provider-auth refusals (crate::provider_auth): the
+                // routes' 400/409 answers, carried by reason + message
+                | "credential_type_mismatch"
+                | "api_key_unsupported"
+                | "unknown_provider"
         );
         (
             if known { code } else { "io".to_string() },

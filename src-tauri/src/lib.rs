@@ -24,6 +24,10 @@ mod worktrees;
 pub mod file_resources;
 mod logging;
 mod native_prefs;
+// The provider sign-in domain's host wiring (auth.* IPC arms + the OAuth
+// login stream relay). A standalone module so the auth domain's logic does
+// not grow inside the shared dispatcher; pi_ipc only routes to it.
+mod provider_auth;
 // `pi_ipc` is pub for the static-UI acceptance harness bin (same crate,
 // feature-gated): it drives the REAL command functions
 // (`dispatch_envelope_gated` — the same gated dispatch the async `pi_ipc`
