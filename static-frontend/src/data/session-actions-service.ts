@@ -10,6 +10,16 @@ export async function viewSessionHistory(sessionId: string): Promise<void> {
   await openPathNative(result.path);
 }
 
+export async function deleteSession(sessionId: string, trashChatFolder: boolean): Promise<void> {
+  if (!client) throw new Error("the session-actions IPC bridge is not configured");
+  try {
+    await client.request("sessions.delete", { session: sessionId, trashChatFolder }, { timeoutMs: 40_000 });
+  } catch (error) {
+    if (error instanceof IpcFailure) throw new Error(error.error.message);
+    throw error;
+  }
+}
+
 export async function renameSession(sessionId: string, name: string): Promise<void> {
   if (!client) throw new Error("the session-actions IPC bridge is not configured");
   try {

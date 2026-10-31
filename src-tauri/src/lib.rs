@@ -30,6 +30,7 @@ pub mod pi_ipc;
 mod session_view;
 mod session_search;
 mod session_actions;
+mod session_deletion;
 mod shell;
 mod update_install;
 

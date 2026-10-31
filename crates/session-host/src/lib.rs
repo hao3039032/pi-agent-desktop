@@ -223,7 +223,7 @@ pub struct Session {
     /// One drain at a time (the wrapper's `delivering` flag).
     composer_delivering: Mutex<bool>,
     /// Serializes host branch changes against prompt admission and outbox delivery.
-    activity_gate: Mutex<()>,
+    activity_gate: std::sync::RwLock<()>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
     /// The registry-wide running-set signal (shared with the relay).
@@ -246,7 +246,7 @@ impl Session {
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
         let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
-            Some(self.activity_gate.try_lock().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
+            Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
         let result = self.client.command(command, data, timeout);
         self.touch();
@@ -254,8 +254,8 @@ impl Session {
     }
 
     /// Hold across branch validation and mutation so admissions cannot race it.
-    pub fn try_branch_activity(&self) -> Result<std::sync::MutexGuard<'_, ()>, &'static str> {
-        self.activity_gate.try_lock().map_err(|_| "session is busy")
+    pub fn try_branch_activity(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, &'static str> {
+        self.activity_gate.try_write().map_err(|_| "session is busy")
     }
 
     /// One bridge request (nonce/session-verified by pi-host).
@@ -675,7 +675,8 @@ impl SessionRegistry {
         Arc::clone(outboxes.entry(id.to_string()).or_insert_with(|| Arc::new(composer_outbox::ComposerOutbox::new())))
     }
 
-    fn start_lock_for(&self, id: &str) -> Arc<Mutex<()>> {
+    /// Serialize file mutation with start and real child shutdown for this id.
+    pub fn start_lock_for(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.start_locks.lock().unwrap();
         Arc::clone(locks.entry(id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
     }
@@ -706,10 +707,18 @@ impl SessionRegistry {
                 // duplicate a queued delivery the new child should own. The
                 // shutdown is synchronous — stdin EOF, then a grace kill —
                 // and its drain observes the exit and stops.
-                let _ = self.remove(id, Duration::from_secs(5));
+                let _ = self.remove_locked(id, Duration::from_secs(5));
+                if !existing.client.has_exited() {
+                    return Err(SessionHostError::Spawn("previous session writer has not exited".to_string()));
+                }
             } else {
                 return Ok(existing);
             }
+        }
+        // A deletion may have completed while this start waited for the id lock.
+        // Never let a stale catalogue result recreate the removed session.
+        if !session_file.is_file() {
+            return Err(SessionHostError::Spawn("session file no longer exists".to_string()));
         }
         // The composer outbox comes from the session-id store: a resumed
         // session inherits the queue an evicted child left behind.
@@ -742,9 +751,23 @@ impl SessionRegistry {
     /// wherever that drain is parked — so it cannot wake into the queue the
     /// next owner (or the user) holds (Terra round-4).
     pub fn remove(&self, id: &str, grace: Duration) -> Option<Option<i32>> {
-        let session = self.sessions.lock().unwrap().remove(id)?;
+        let lock = self.start_lock_for(id);
+        let _guard = lock.lock().unwrap();
+        self.remove_locked(id, grace)
+    }
+
+    fn remove_locked(&self, id: &str, grace: Duration) -> Option<Option<i32>> {
+        let session = self.sessions.lock().unwrap().get(id).cloned()?;
         self.composer_outbox_for(id).invalidate_delivery_generation();
         let exit = session.shutdown(grace);
+        // A timeout does not prove the writer exited. Retain the closing
+        // session so a start or deletion cannot race its final append.
+        if !session.client.has_exited() { return Some(exit); }
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.get(id).is_some_and(|current| Arc::ptr_eq(current, &session)) {
+            sessions.remove(id);
+        }
+        drop(sessions);
         // The session left the registry: it is out of the running set
         // whatever the child's state was — record the transition so a
         // blocked relay still replays the removal.
@@ -995,7 +1018,7 @@ fn spawn_session(
         composer_outbox,
         composer_generation,
         composer_delivering: Mutex::new(false),
-        activity_gate: Mutex::new(()),
+        activity_gate: std::sync::RwLock::new(()),
         settle_cv: std::sync::Condvar::new(),
         running_signal,
     });
@@ -1717,6 +1740,22 @@ mod running_signal_tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    #[test]
+    fn a_stale_start_cannot_recreate_a_deleted_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted.jsonl");
+        let config = SessionSpawnConfig {
+            executable: "not-a-real-executable".into(), agent_dir: Some(dir.path().to_path_buf()),
+            session_dir: Some(dir.path().to_path_buf()), bridge_asset: dir.path().join("bridge"),
+            artifacts_asset: None, chat_asset: None, chat_asset_sha256: None,
+            shape: SessionSpawnShape::Project { tool_args: None }, initial_model: None,
+            thinking_level: None, extra_args: Vec::new(),
+        };
+        let error = SessionRegistry::new().start("deleted", &path, "deleted", dir.path(), &config).err().unwrap();
+        assert!(error.to_string().contains("session file no longer exists"));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn the_agent_command_enum_is_closed_and_shape_checked() {

@@ -7,6 +7,14 @@ export async function viewSessionHistory(sessionId: string): Promise<void> {
   await openExternal(url);
 }
 
+export async function deleteSession(sessionId: string, trashChatFolder: boolean): Promise<void> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}${trashChatFolder ? "?chatFolder=trash" : ""}`, { method: "DELETE" });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(body.error ?? `HTTP ${response.status}`);
+  }
+}
+
 export async function renameSession(sessionId: string, name: string): Promise<void> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
