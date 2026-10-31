@@ -1228,6 +1228,23 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "sessions.thinking" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
+            let index = args.get("blockIndex").and_then(Value::as_u64);
+            if sid.is_empty() || entry.is_empty() || entry.len() > 256 || index.is_none() || index.is_some_and(|n| n > 9_007_199_254_740_991) {
+                return protocol_error(&id, "invalid_args", "session, entryId and a valid blockIndex are required");
+            }
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            match file {
+                Some(file) => match management_call(state, "session.readThinking", json!({"file":file.display().to_string(),"entryId":entry,"blockIndex":index})) {
+                    Ok(data) => protocol_ok(&id, data),
+                    Err((code, message)) => protocol_error(&id, &code, &message),
+                },
+                None => protocol_error(&id, "not_found", "session not found"),
+            }
+        }
         "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
@@ -4036,8 +4053,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         state.registry.remove(&id, Duration::from_secs(5));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn real_pi_system_prompt_uses_active_leaf_projection() {
+    fn real_pi_active_prompt_and_deferred_thinking() {
         use std::io::Write;
         let Ok(executable) = std::env::var("PI_CLI_BIN") else { eprintln!("skipping: PI_CLI_BIN not set"); return };
         // Under the checkout solely so the generated bundle resolves the shared,
@@ -4050,11 +4068,14 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&agent).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
+        std::fs::create_dir_all(managed.join("@earendil-works")).unwrap();
+        std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works/pi-coding-agent").canonicalize().unwrap(), managed.join("@earendil-works/pi-coding-agent")).unwrap();
         let (file, id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
         let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
         for (entry, parent, text) in [("root", Value::Null, "ROOT"), ("a", json!("root"), "BRANCH A"), ("b", json!("root"), "BRANCH B")] {
             writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
         }
+        writeln!(writer, "{}", json!({"type":"message","id":"think","parentId":"b","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"fixture hidden reasoning"}]}})).unwrap();
         drop(writer);
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
@@ -4075,6 +4096,10 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let before = read();
         assert_eq!(before["data"]["state"]["systemPromptStatus"], "recorded", "{before}");
         assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
+        let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
+        assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
+        let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
+        assert_eq!(missing["ok"], false, "{missing}");
         session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
         let after = read();
         assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
