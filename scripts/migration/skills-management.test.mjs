@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
@@ -13,6 +14,11 @@ const executable = resolvePiCliBin();
 test("real management instance lists, toggles, and reloads isolated skills", { skip: executable ? false : "PI_CLI_BIN not set" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-skills-management-"));
   let client;
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ skills: [{ id: "fixture/repo", source: "fixture/repo", name: "demo", installs: 1200 }] }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
     const cwd = join(root, "project"), agentDir = join(root, "agent"), managed = join(root, "managed");
     const dir = join(agentDir, "skills", "fixture");
@@ -30,7 +36,7 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
     client = new PiRpcClient(executable, {
       cwd,
       args: ["--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", join(import.meta.dirname, "../../lib/pi-rpc/assets/pi-web-management.mjs")],
-      env: { ...process.env, HOME: root, USERPROFILE: root, PI_AGENT_HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce },
+      env: { ...process.env, HOME: root, USERPROFILE: root, PI_AGENT_HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce, SKILLS_API_URL: `http://127.0.0.1:${server.address().port}` },
       onLog: () => {},
     });
     const replies = [];
@@ -50,6 +56,10 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
       }
       throw new Error(`no reply for ${op}`);
     };
+    const search = await call("skills.search", { query: "demo" });
+    assert.equal(search.ok, true, JSON.stringify(search));
+    assert.equal(search.result.results[0].package, "fixture/repo@demo");
+    assert.equal(search.result.results[0].installs, "1.2K installs");
     const first = await call("skills.list", { cwd });
     assert.equal(first.ok, true, JSON.stringify(first));
     assert.ok(first.result.skills.some((entry) => entry.filePath === skill));
@@ -66,6 +76,7 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
     assert.equal(second.result.skills.find((entry) => entry.filePath === skill).disableModelInvocation, true);
   } finally {
     if (client) await client.close(5_000);
+    await new Promise((resolve) => server.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
 });

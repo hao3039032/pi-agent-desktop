@@ -77,6 +77,7 @@ export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
 export { loadSkillsWithInstallInfo } from "${ROOT}/lib/skills-service.ts";
 export { setVisibleSkillsDisabled } from "${ROOT}/lib/skills-management.server.ts";
 export { readPlugins } from "${ROOT}/lib/plugins-service.server.ts";
+export { searchSkills } from "${ROOT}/lib/skills-search.server.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
