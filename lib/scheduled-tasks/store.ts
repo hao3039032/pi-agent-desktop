@@ -75,6 +75,9 @@ function readStored(path: string): StoredFile {
   }
   const extra = { ...(parsed as Record<string, unknown>) };
   const rawTasks = extra.tasks;
+  if (rawTasks !== undefined && !Array.isArray(rawTasks)) {
+    throw new Error("Invalid scheduled tasks file: tasks is not an array");
+  }
   delete extra.version;
   delete extra.tasks;
   const list = Array.isArray(rawTasks) ? rawTasks : [];

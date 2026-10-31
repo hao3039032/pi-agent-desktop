@@ -29,6 +29,7 @@ mod native_prefs;
 pub mod pi_ipc;
 mod session_view;
 mod scheduler_host;
+mod scheduler_tick;
 mod scheduled_runner;
 mod scheduled_events;
 pub mod scheduled_session_index;

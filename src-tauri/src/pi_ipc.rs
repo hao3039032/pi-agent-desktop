@@ -4013,12 +4013,12 @@ mod tests {
         let linked = std::cell::Cell::new(false);
         let refused = crate::scheduled_runner::run_session(&session,
             json!({ "version": 1, "taskId": "not-a-uuid", "runId": "r1", "taskName": "fixture", "trigger": "manual" }),
-            "must never be sent", Duration::from_secs(1), |_| { linked.set(true); Ok(()) });
+            "must never be sent", Duration::from_secs(1), |_| { linked.set(true); Ok(()) }, || {});
         assert_eq!(refused.status, "failed");
         assert!(!linked.get(), "the refused marker must not link or prompt");
         let result = crate::scheduled_runner::run_session(&session,
             json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "r1", "taskName": "fixture", "trigger": "manual" }),
-            "must never be sent", Duration::from_secs(1), |_| Err("fixture ledger failure".into()));
+            "must never be sent", Duration::from_secs(1), |_| Err("fixture ledger failure".into()), || {});
         assert_eq!(result.status, "failed");
         assert!(result.error.as_deref().unwrap().contains("ledger failure"));
         let content = std::fs::read_to_string(&session.session_file).unwrap();
@@ -4027,7 +4027,7 @@ mod tests {
         let linked = std::cell::Cell::new(false);
         let finished = crate::scheduled_runner::run_session(&session,
             json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "r2", "taskName": "fixture", "trigger": "manual" }),
-            "fixture prompt", Duration::from_secs(10), |_| { linked.set(true); Ok(()) });
+            "fixture prompt", Duration::from_secs(10), |_| { linked.set(true); Ok(()) }, || {});
         assert!(linked.get());
         assert_eq!(finished.status, "succeeded", "{finished:?}");
         assert!(!finished.counts_as_failure);
@@ -4063,6 +4063,66 @@ mod tests {
         assert!(types.iter().any(|kind| kind == "run_finished"));
         state.scheduled_events.unsubscribe(&subscription);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn real_pi_scheduler_tick_claims_one_due_slot_with_controlled_clock() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { eprintln!("skipping: PI_CLI_BIN not set"); return; };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent"); let project = dir.path().join("project"); let managed = dir.path().join("managed");
+        std::fs::create_dir_all(&agent).unwrap(); std::fs::create_dir_all(&project).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        assert!(std::process::Command::new("node").current_dir(&root).arg(root.join("scripts/migration/build-management-modules.mjs")).arg("--out").arg(&managed).status().unwrap().success());
+        let state = Arc::new(state());
+        struct Shutdown<'a>(&'a IpcHostState);
+        impl Drop for Shutdown<'_> { fn drop(&mut self) { self.0.management.shutdown_all(Duration::from_secs(5)); } }
+        let _shutdown = Shutdown(&state);
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.spawn_base.lock().unwrap() = None;
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent.clone()), extensions: vec![root.join("lib/pi-rpc/assets/pi-web-management.mjs")],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string())],
+        });
+        let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
+        let task_id = "12345678-1234-1234-1234-123456789abc";
+        let now = 1_772_342_220_000_i64;
+        let before = task_scheduler::store::ms_to_iso(now - 120_000);
+        let at = task_scheduler::store::ms_to_iso(now - 30_000);
+        let catchup_id = "22222222-2222-2222-2222-222222222222";
+        let dropped_id = "33333333-3333-3333-3333-333333333333";
+        repo.mutate(|tasks| {
+            for (id, due, since) in [
+                (task_id, at.clone(), before.clone()),
+                (catchup_id, task_scheduler::store::ms_to_iso(now - 3 * 86_400_000), task_scheduler::store::ms_to_iso(now - 4 * 86_400_000)),
+                (dropped_id, task_scheduler::store::ms_to_iso(now - 8 * 86_400_000), task_scheduler::store::ms_to_iso(now - 9 * 86_400_000)),
+            ] {
+                tasks.push(json!({ "id": id, "name": id, "prompt": "must not execute", "cwd": project, "enabled": true,
+                    "schedule": {"kind":"once", "at": due}, "createdAt": since, "lastScheduledFor": since, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 }));
+            }
+            Ok(())
+        }).unwrap();
+        crate::scheduler_tick::tick(&state, now).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = repo.runs(task_id).unwrap();
+            if runs.first().is_some_and(|run| run["status"] == "failed") { assert_eq!(runs[0]["trigger"], "schedule"); break; }
+            assert!(std::time::Instant::now() < deadline, "run did not finish after spawn refusal");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = repo.runs(catchup_id).unwrap();
+            if runs.first().is_some_and(|run| run["status"] == "failed") { assert_eq!(runs[0]["trigger"], "catch-up"); break; }
+            assert!(std::time::Instant::now() < deadline, "catch-up did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let dropped = repo.runs(dropped_id).unwrap();
+        assert_eq!(dropped[0]["status"], "skipped");
+        assert_eq!(dropped[0]["skipReason"], "app-asleep");
+        assert!(repo.list().unwrap().iter().all(|task| task["enabled"] == false));
+        crate::scheduler_tick::tick(&state, now + 30_000).unwrap();
+        assert_eq!(repo.runs(task_id).unwrap().len(), 1);
+        task_scheduler::lease::release(&agent, std::process::id()).unwrap();
     }
 
     #[test]

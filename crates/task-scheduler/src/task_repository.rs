@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 pub struct TaskRepository { agent_dir: PathBuf }
 
+#[derive(Debug, PartialEq)]
+pub enum SlotClaim { Fired(Value), Skipped(Value), Deferred, Lost }
+
 fn valid_id(id: &str) -> bool {
     id.len() == 36 && id.bytes().enumerate().all(|(i, b)| {
         if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
@@ -24,8 +27,14 @@ impl TaskRepository {
 
     fn read_file(&self) -> Result<Map<String, Value>, String> {
         match std::fs::read_to_string(self.agent_dir.join("scheduled-tasks.json")) {
-            Ok(text) => serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())?
-                .as_object().cloned().ok_or_else(|| "Invalid scheduled tasks file: expected an object".into()),
+            Ok(text) => {
+                let object = serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())?
+                    .as_object().cloned().ok_or_else(|| "Invalid scheduled tasks file: expected an object".to_string())?;
+                if object.get("tasks").is_some_and(|value| !value.is_array()) {
+                    return Err("Invalid scheduled tasks file: tasks is not an array".into());
+                }
+                Ok(object)
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
             Err(error) => Err(error.to_string()),
         }
@@ -57,6 +66,11 @@ impl TaskRepository {
         }
         let mut runs = self.runs(task_id)?;
         let result = change(&mut runs)?;
+        self.write_runs_locked(task_id, &runs)?;
+        Ok(result)
+    }
+
+    fn write_runs_locked(&self, task_id: &str, runs: &[Value]) -> Result<(), String> {
         let dir = self.agent_dir.join("scheduled-tasks/runs");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let drop_count = runs.len().saturating_sub(200);
@@ -80,7 +94,51 @@ impl TaskRepository {
             lines.push('\n');
         }
         write_private_atomic(&dir.join(format!("{task_id}.jsonl")), lines.as_bytes())?;
-        Ok(result)
+        Ok(())
+    }
+
+    /// Claim a previously calculated slot only while the scheduler still
+    /// owns the lease and the task snapshot still matches. The watermark
+    /// is durable before the run record, as in the transitional TS engine.
+    pub fn claim_slot(&self, snapshot: &Value, slot: &str, run: Value, drop_slot: bool, now_ms: i64, pid: u32) -> Result<SlotClaim, String> {
+        let task_id = snapshot["id"].as_str().ok_or("Invalid task id")?;
+        let _guard = TransactionLock::acquire(&self.agent_dir).map_err(|e| format!("scheduler transaction busy: {e}"))?;
+        let lease: Value = serde_json::from_str(&std::fs::read_to_string(self.agent_dir.join("scheduled-tasks/scheduler.lock")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let heartbeat = lease["heartbeatAt"].as_str().and_then(crate::store::iso_to_ms).ok_or("Invalid scheduler lease")?;
+        if lease["pid"].as_u64() != Some(pid as u64) || now_ms.saturating_sub(heartbeat) >= crate::LEASE_STALE_MS as i64 { return Ok(SlotClaim::Lost); }
+        let mut root = self.read_file()?;
+        let mut tasks = tasks_from(&root);
+        let Some(index) = tasks.iter().position(|task| task["id"] == task_id) else { return Ok(SlotClaim::Lost) };
+        if tasks[index] != *snapshot || tasks[index]["enabled"] != true { return Ok(SlotClaim::Lost); }
+        let mut active = 0usize;
+        let mut overlap = false;
+        for task in &tasks {
+            let Some(id) = task["id"].as_str() else { continue };
+            for current in self.runs(id)? {
+                if current["status"] == "running" { active += 1; if id == task_id { overlap = true; } }
+            }
+        }
+        if !drop_slot && !overlap && active >= crate::MAX_CONCURRENT_RUNS { return Ok(SlotClaim::Deferred); }
+        tasks[index]["lastScheduledFor"] = json!(slot);
+        if tasks[index]["schedule"]["kind"] == "once" { tasks[index]["enabled"] = json!(false); }
+        let mut combined: Vec<Value> = root.get("tasks").and_then(Value::as_array).into_iter().flatten().filter(|v| !is_task(v)).cloned().collect();
+        combined.extend(tasks);
+        root.insert("version".into(), json!(1));
+        root.insert("tasks".into(), Value::Array(combined));
+        let content = format!("{}\n", serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?);
+        write_private_atomic(&self.agent_dir.join("scheduled-tasks.json"), content.as_bytes())?;
+        let mut record = run;
+        if overlap || drop_slot {
+            record["status"] = json!("skipped");
+            record["trigger"] = json!("schedule");
+            record["skipReason"] = json!(if drop_slot { "app-asleep" } else { "overlap" });
+            record.as_object_mut().ok_or("Invalid run record")?.remove("pid");
+            record.as_object_mut().unwrap().remove("startedAt");
+        }
+        let mut runs = self.runs(task_id)?;
+        runs.push(record.clone());
+        self.write_runs_locked(task_id, &runs)?;
+        Ok(if overlap || drop_slot { SlotClaim::Skipped(record) } else { SlotClaim::Fired(record) })
     }
 
     pub fn mutate<T>(&self, change: impl FnOnce(&mut Vec<Value>) -> Result<T, String>) -> Result<T, String> {
@@ -179,6 +237,26 @@ mod tests {
         let tasks = repo.list().unwrap();
         assert_eq!(tasks.len(), 40);
         assert_eq!(tasks.iter().filter(|task| task["name"].as_str().unwrap().starts_with("ts-")).count(), 20);
+    }
+
+    #[test]
+    fn slot_claim_fences_owner_snapshot_overlap_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = TaskRepository::new(dir.path());
+        let now = 1_772_342_220_000_i64;
+        let ids = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"];
+        repo.mutate(|tasks| { for id in ids { tasks.push(json!({"id":id,"name":id,"prompt":"p","cwd":"/tmp","enabled":true,"schedule":{"kind":"cron","expr":"0 * * * *","timezone":"UTC"},"createdAt":"2026-03-01T04:00:00.000Z"})); } Ok(()) }).unwrap();
+        assert!(crate::lease::acquire(dir.path(), 99, now, |_| true).unwrap());
+        let record = |id: &str| json!({"runId":format!("run-{id}"),"taskId":id,"status":"running","trigger":"schedule","pid":99});
+        let tasks = repo.list().unwrap();
+        let slot = "2026-03-01T05:00:00.000Z";
+        assert_eq!(repo.claim_slot(&tasks[0], slot, record(ids[0]), false, now, 100).unwrap(), SlotClaim::Lost);
+        assert!(matches!(repo.claim_slot(&tasks[0], slot, record(ids[0]), false, now, 99).unwrap(), SlotClaim::Fired(_)));
+        assert_eq!(repo.claim_slot(&tasks[0], slot, record(ids[0]), false, now, 99).unwrap(), SlotClaim::Lost);
+        let updated = repo.list().unwrap();
+        assert!(matches!(repo.claim_slot(&updated[0], "2026-03-01T06:00:00.000Z", record(ids[0]), false, now, 99).unwrap(), SlotClaim::Skipped(_)));
+        assert!(matches!(repo.claim_slot(&updated[1], slot, record(ids[1]), false, now, 99).unwrap(), SlotClaim::Fired(_)));
+        assert_eq!(repo.claim_slot(&updated[2], slot, record(ids[2]), false, now, 99).unwrap(), SlotClaim::Deferred);
     }
 
     #[test]
