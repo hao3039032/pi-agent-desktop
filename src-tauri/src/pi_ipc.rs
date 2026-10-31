@@ -4066,7 +4066,7 @@ mod tests {
         });
         std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{"baseUrl":format!("http://{endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Test","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]},"stall":{"baseUrl":format!("http://{stalled_endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Stall","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}).to_string()).unwrap();
         std::fs::write(agent.join("settings.json"), r#"{"defaultProvider":"fixture","defaultModel":"test"}"#).unwrap();
-        let state = state();
+        let state = Arc::new(state());
         struct Shutdown<'a>(&'a IpcHostState);
         impl Drop for Shutdown<'_> {
             fn drop(&mut self) { for id in self.0.registry.ids() { self.0.registry.remove(&id, Duration::from_secs(5)); } }
@@ -4114,9 +4114,13 @@ mod tests {
         let denied = send(&state, json!({ "v": 1, "id": "denied", "op": "tasks.run", "args": { "id": task_id } }));
         assert_eq!(denied["error"]["code"], "busy");
         assert!(repo.runs(task_id).unwrap().is_empty());
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-        assert!(task_scheduler::lease::acquire(&agent, std::process::id(), now, |_| true).unwrap());
-        state.scheduler_owner.store(true, Ordering::SeqCst);
+        state.start_scheduler().unwrap();
+        state.start_scheduler().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !state.scheduler_owner.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "scheduler did not become owner");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let channel = Channel::new(move |body| {
             if let tauri::ipc::InvokeResponseBody::Json(text) = body { let _ = event_tx.send(text); }
@@ -4144,8 +4148,8 @@ mod tests {
         assert!(types.iter().any(|kind| kind == "run_started"));
         assert!(types.iter().any(|kind| kind == "run_finished"));
         state.scheduled_events.unsubscribe(&subscription);
-        task_scheduler::lease::release(&agent, std::process::id()).unwrap();
-        state.scheduler_owner.store(false, Ordering::SeqCst);
+        state.shutdown_scheduler().unwrap();
+        assert!(!agent.join("scheduled-tasks/scheduler.lock").exists());
         server.join().unwrap();
     }
 
