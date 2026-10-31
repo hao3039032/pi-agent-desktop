@@ -60,6 +60,7 @@ struct Config {
     commands: serde_json::Value,
     prompt_hold: bool,
     prompt_hold_past_eof: bool,
+    stay_after_eof: bool,
     prompt_events: Vec<serde_json::Value>,
     prompt_disposition: String,
     prompt_log: Option<std::path::PathBuf>,
@@ -71,6 +72,7 @@ fn parse_args() -> Config {
         commands: serde_json::json!({ "commands": [] }),
         prompt_hold: false,
         prompt_hold_past_eof: false,
+        stay_after_eof: false,
         prompt_events: Vec::new(),
         prompt_disposition: "started".into(),
         prompt_log: None,
@@ -91,6 +93,7 @@ fn parse_args() -> Config {
                 }
             }
             "--mock-prompt-hold" => config.prompt_hold = true,
+            "--mock-stay-after-eof" => config.stay_after_eof = true,
             "--mock-prompt-hold-past-eof" => {
                 config.prompt_hold = true;
                 config.prompt_hold_past_eof = true;
@@ -131,6 +134,7 @@ fn main() {
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
+            Ok(0) if config.stay_after_eof => std::thread::sleep(std::time::Duration::from_millis(20)),
             Ok(0) => break,
             Ok(_) => {
                 if buf.last() == Some(&b'\n') {
@@ -163,6 +167,22 @@ fn main() {
                         respond(&mut out, &id, "interrupt", serde_json::Value::Null);
                     }
                     "prompt" => {
+                        if let Some(message) = record.get("message").and_then(|value| value.as_str()).filter(|message| message.starts_with("/pi-web:bridge ")) {
+                            use base64::Engine as _;
+                            let parts: Vec<_> = message.split_whitespace().collect();
+                            if parts.len() == 3 {
+                                if let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]) {
+                                    if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                        if payload["op"] == "tree.assertIdle" {
+                                            respond(&mut out, &id, "prompt", serde_json::json!({"disposition":"handled"}));
+                                            let envelope = serde_json::json!({"sid":config.session_id,"rid":parts[1],"nonce":payload["nonce"],"ok":true,"result":{}});
+                                            emit(&mut out, serde_json::json!({"type":"extension_ui_request","id":"fixture-notify","method":"notify","message":format!("PI_WEB_BRIDGE_V1 {envelope}")}));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(log) = &config.prompt_log {
                             use std::io::Write as _;
                             // The host's command record is FLAT: the

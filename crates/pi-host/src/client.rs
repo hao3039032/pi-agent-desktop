@@ -563,6 +563,20 @@ impl PiRpcClient {
         self.exit_code()
     }
 
+    /// Request orderly exit without terminating the child on timeout. A false
+    /// result does not prove exit; callers must retain the writer fence.
+    pub fn close_without_kill(&self, grace: Duration) -> bool {
+        {
+            let mut inner = self.shared.inner.lock().unwrap();
+            if inner.exited { return true; }
+            inner.exiting = true;
+            self.shared.exiting.store(true, Ordering::SeqCst);
+            end_ui_attach_window_locked(&self.shared, &mut inner);
+        }
+        *self.shared.stdin.lock().unwrap() = None;
+        self.wait_exit(Some(grace))
+    }
+
     /// Immediate termination for shutdown deadlines.
     pub fn kill(&self) {
         self.force_kill();

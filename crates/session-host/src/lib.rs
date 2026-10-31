@@ -712,6 +712,35 @@ impl SessionRegistry {
         operation(session.as_ref()).map_err(SessionWriterError::Operation)
     }
 
+    /// Stop an idle child without force-killing it, prove its actual exit,
+    /// then run an offline writer while the same id and activity gates remain
+    /// held. A timeout leaves the child registered and fails closed. The
+    /// operation must not call start/remove or re-enter this writer gate.
+    pub fn with_offline_session_writer<T, E>(
+        &self, id: &str, grace: Duration, operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, SessionWriterError<E>> {
+        match self.with_idle_session_writer(id, |session| {
+            if let Some(session) = session {
+                if !session.client.has_exited() {
+                    session.bridge_request("tree.assertIdle", None, Some(grace))
+                        .map_err(|_| SessionWriterError::Busy("could not confirm that the session is idle"))?;
+                    if !session.client.close_without_kill(grace) {
+                        return Err(SessionWriterError::Busy("session process has not exited"));
+                    }
+                }
+                self.remove_locked(id, Duration::ZERO);
+                if !session.client.has_exited() {
+                    return Err(SessionWriterError::Busy("session process has not exited"));
+                }
+            }
+            operation().map_err(SessionWriterError::Operation)
+        }) {
+            Ok(value) => Ok(value),
+            Err(SessionWriterError::Busy(message)) => Err(SessionWriterError::Busy(message)),
+            Err(SessionWriterError::Operation(error)) => Err(error),
+        }
+    }
+
     /// Start (or return the running) session for an id. Concurrent starts
     /// for the same id share ONE spawn.
     pub fn start(
@@ -721,6 +750,16 @@ impl SessionRegistry {
         session_file_id: &str,
         cwd: &Path,
         config: &SessionSpawnConfig,
+    ) -> Result<Arc<Session>, SessionHostError> {
+        self.start_with_plan(id, session_file, session_file_id, cwd, || Ok(config.clone()))
+    }
+
+    /// Derive disk-dependent spawn policy only after acquiring the id writer
+    /// gate. In particular a chat unlock written by an offline writer must be
+    /// observed by every later spawn, even one requested before that write.
+    pub fn start_with_plan(
+        &self, id: &str, session_file: &Path, session_file_id: &str, cwd: &Path,
+        plan: impl FnOnce() -> Result<SessionSpawnConfig, String>,
     ) -> Result<Arc<Session>, SessionHostError> {
         if let Some(existing) = self.get(id) {
             if !existing.is_idle_expired() {
@@ -751,6 +790,7 @@ impl SessionRegistry {
         if !session_file.is_file() {
             return Err(SessionHostError::Spawn("session file no longer exists".to_string()));
         }
+        let config = plan().map_err(SessionHostError::Spawn)?;
         // The composer outbox comes from the session-id store: a resumed
         // session inherits the queue an evicted child left behind.
         let composer_outbox = self.composer_outbox_for(id);
@@ -759,7 +799,7 @@ impl SessionRegistry {
             session_file,
             session_file_id,
             cwd,
-            config,
+            &config,
             composer_outbox,
             Arc::clone(&self.running_signal),
         )?;
@@ -1215,15 +1255,13 @@ pub fn dispatch_session_op(
         let Some(summary) = crate::history::find_session_by_id(resume.agent_dir, session_id) else {
             return Err(DispatchError::not_found(session_id));
         };
-        let config = (resume.plan)(&summary)
-            .map_err(|message| DispatchError::Spawn(SessionHostError::Spawn(message), registry_op.to_string()))?;
         registry
-            .start(
+            .start_with_plan(
                 session_id,
                 &summary.file,
                 &summary.id,
                 Path::new(&summary.cwd),
-                &config,
+                || (resume.plan)(&summary),
             )
             .map_err(|error| DispatchError::Spawn(error, registry_op.to_string()))
     };
@@ -1771,6 +1809,73 @@ mod running_signal_tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    #[test]
+    fn idle_writer_rejects_unknown_queue_and_serializes_stale_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(&file, "fixture").unwrap();
+        let registry = SessionRegistry::new();
+        let outbox = registry.composer_outbox_for("s");
+        let item = outbox.enqueue("pending", None).unwrap();
+        outbox.take(&item.id);
+        outbox.park_unknown(item.clone());
+        let denied = registry.with_idle_session_writer("s", |_| Ok::<_, ()>(()));
+        assert!(matches!(denied, Err(SessionWriterError::Busy(_))));
+        outbox.take(&item.id);
+        let config = SessionSpawnConfig {
+            executable: "not-a-real-executable".into(), agent_dir: Some(dir.path().to_path_buf()),
+            session_dir: Some(dir.path().to_path_buf()), bridge_asset: dir.path().join("bridge"),
+            artifacts_asset: None, chat_asset: None, chat_asset_sha256: None,
+            shape: SessionSpawnShape::Project { tool_args: None }, initial_model: None,
+            thinking_level: None, extra_args: Vec::new(),
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer_registry = &registry;
+            let writer_file = &file;
+            let writer = scope.spawn(move || writer_registry.with_idle_session_writer("s", |_| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::fs::remove_file(writer_file).unwrap();
+                Ok::<_, ()>(())
+            }));
+            held_rx.recv().unwrap();
+            let start = scope.spawn(|| registry.start("s", &file, "s", dir.path(), &config));
+            release_tx.send(()).unwrap();
+            writer.join().unwrap().unwrap();
+            assert!(start.join().unwrap().err().unwrap().to_string().contains("session file no longer exists"));
+        });
+    }
+
+    #[test]
+    fn queued_start_derives_policy_after_offline_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(&file, "old policy").unwrap();
+        let registry = SessionRegistry::new();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer_registry = &registry;
+            let writer_file = &file;
+            let writer = scope.spawn(move || writer_registry.with_offline_session_writer("s", Duration::from_secs(1), || {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::fs::write(writer_file, "new policy").unwrap();
+                Ok::<_, ()>(())
+            }));
+            held_rx.recv().unwrap();
+            let start = scope.spawn(|| registry.start_with_plan("s", &file, "s", dir.path(), || {
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "new policy");
+                Err("fixture did not spawn".into())
+            }));
+            release_tx.send(()).unwrap();
+            writer.join().unwrap().unwrap();
+            assert!(start.join().unwrap().err().unwrap().to_string().contains("fixture did not spawn"));
+        });
+    }
 
     #[test]
     fn a_stale_start_cannot_recreate_a_deleted_session_file() {
