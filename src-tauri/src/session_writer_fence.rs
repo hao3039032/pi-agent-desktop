@@ -1,0 +1,97 @@
+//! Persistent fail-closed barriers for session-file operations with unknown outcomes.
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use serde_json::{json, Value};
+
+pub(crate) fn fence_path(agent_dir: &Path, session_id: &str) -> PathBuf {
+    let hash = Sha256::digest(session_id.as_bytes());
+    let name = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    agent_dir.join("pi-web").join("session-writer-fences").join(format!("{name}.json"))
+}
+
+/// Presence of a fence, including a corrupt or non-regular entry, refuses all writers.
+pub(crate) fn assert_session_writable(agent_dir: &Path, session_id: &str) -> Result<(), String> {
+    let path = fence_path(agent_dir, session_id);
+    for ancestor in [agent_dir.join("pi-web"), agent_dir.join("pi-web/session-writer-fences")] {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {},
+            Ok(_) => return Err("Session writer fence directory is not safe".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("Cannot inspect session writer fence: {error}")),
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Cannot inspect session writer fence: {error}")),
+        Ok(_) => Err("Session has an unresolved writer outcome; do not retry".into()),
+    }
+}
+
+/// Caller holds the session offline-writer gate. A failed or interrupted write
+/// deliberately leaves a refusing fence, never a falsely clean state.
+pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>) -> Result<(), String> {
+    assert_session_writable(agent_dir, session_id)?;
+    let path = fence_path(agent_dir, session_id);
+    let dir = path.parent().ok_or("Invalid fence path")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    assert_session_writable(agent_dir, session_id)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|e| format!("Cannot create session writer fence: {e}"))?;
+    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":operation,"source":source,"target":target});
+    file.write_all(record.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(dir).and_then(|directory| directory.sync_all()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Remove only the operation's own valid fence after its writer has terminated
+/// and its result is known. This does not recover unknown outcomes.
+pub(crate) fn finish(agent_dir: &Path, session_id: &str, operation_id: &str) -> Result<(), String> {
+    let path = fence_path(agent_dir, session_id);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_file() || metadata.len() > 65536 { return Err("Invalid session writer fence".into()); }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if value.get("version").and_then(Value::as_u64) != Some(1)
+        || value.get("sessionId").and_then(Value::as_str) != Some(session_id)
+        || value.get("operationId").and_then(Value::as_str) != Some(operation_id) {
+        return Err("Session writer fence identity mismatch".into());
+    }
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().ok_or("Invalid fence path")?).and_then(|directory| directory.sync_all()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unresolved_or_corrupt_fence_survives_new_host_and_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path();
+        let file = fence_path(agent, "session");
+        assert!(assert_session_writable(agent, "session").is_ok());
+        begin(agent, "session", "op-1", "continue", Path::new("/source"), Some(Path::new("/project"))).unwrap();
+        assert!(begin(agent, "session", "op-2", "continue", Path::new("/source"), None).is_err());
+        assert!(finish(agent, "session", "op-2").is_err());
+        assert!(assert_session_writable(agent, "session").is_err());
+        finish(agent, "session", "op-1").unwrap();
+        std::fs::write(&file, b"damaged").unwrap();
+        assert!(assert_session_writable(agent, "session").is_err());
+        assert!(assert_session_writable(agent, "other").is_ok());
+        assert!(assert_session_writable(&PathBuf::from(agent), "session").is_err());
+        for _ in 0..2 {
+            let host = crate::pi_ipc::IpcHostState::new();
+            *host.task_agent_dir.lock().unwrap() = Some(agent.to_path_buf());
+            let result = host.registry.with_offline_session_writer("session", std::time::Duration::from_millis(1), || Ok::<_, ()>(()));
+            assert!(matches!(result, Err(session_host::SessionWriterError::Busy(_))));
+        }
+    }
+}

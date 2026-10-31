@@ -40,6 +40,7 @@ pub mod settings_extras;
 mod session_search;
 mod session_actions;
 mod chat_sessions;
+mod session_writer_fence;
 mod session_deletion;
 mod terminal_host;
 mod scheduler_host;

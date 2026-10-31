@@ -63,7 +63,7 @@ pub struct IpcHostState {
     pub management: ManagementHost,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     /// The scheduled-task store root (the agent dir the host runs against).
-    pub task_agent_dir: Mutex<Option<PathBuf>>,
+    pub task_agent_dir: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
@@ -119,8 +119,21 @@ struct EventRelayHandle {
 impl IpcHostState {
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
+        let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
+        let fence_agent_dir = Arc::clone(&task_agent_dir);
+        let admitted_agent_dir = Mutex::new(None::<PathBuf>);
+        let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
+            let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
+                .clone().ok_or_else(|| "Agent directory unavailable".to_string())?;
+            let mut admitted = admitted_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?;
+            if admitted.as_ref().is_some_and(|previous| previous != &agent) {
+                return Err("Agent directory changed after session admission".into());
+            }
+            *admitted = Some(agent.clone());
+            crate::session_writer_fence::assert_session_writable(&agent, id)
+        });
         Self {
-            registry: Arc::new(SessionRegistry::new()),
+            registry: Arc::new(SessionRegistry::with_fence_checker(checker)),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -133,7 +146,7 @@ impl IpcHostState {
             terminal_test_shell: Mutex::new(None),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
-            task_agent_dir: Mutex::new(None),
+            task_agent_dir,
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),

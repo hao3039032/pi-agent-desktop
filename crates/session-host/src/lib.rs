@@ -192,7 +192,10 @@ impl RunningSignal {
     }
 }
 
+pub type SessionFenceChecker = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 pub struct Session {
+    fence_checker: SessionFenceChecker,
     /// The registry key (the URL-facing session id).
     pub id: String,
     /// The session file's own header id (the child's sessionId).
@@ -248,6 +251,9 @@ impl Session {
         let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
+        if _admission.is_some() {
+            (self.fence_checker)(&self.id).map_err(pi_host::PiRpcError::invalid)?;
+        }
         let result = self.client.command(command, data, timeout);
         self.touch();
         result
@@ -255,7 +261,9 @@ impl Session {
 
     /// Hold across branch validation and mutation so admissions cannot race it.
     pub fn try_branch_activity(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, &'static str> {
-        self.activity_gate.try_write().map_err(|_| "session is busy")
+        let guard = self.activity_gate.try_write().map_err(|_| "session is busy")?;
+        (self.fence_checker)(&self.id).map_err(|_| "session has an unresolved writer outcome")?;
+        Ok(guard)
     }
 
     /// One bridge request (nonce/session-verified by pi-host).
@@ -639,6 +647,7 @@ pub enum SessionWriterError<E> {
 
 /// The registry: one child per active session id, shared concurrent starts.
 pub struct SessionRegistry {
+    fence_checker: SessionFenceChecker,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// One in-flight spawn per id (rpc-manager's `__piStartLocks`): the
     /// first caller spawns, the rest wait on the mutex and read the result
@@ -661,7 +670,12 @@ impl Default for SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
+        Self::with_fence_checker(Arc::new(|_| Err("session fence checker is not configured".into())))
+    }
+
+    pub fn with_fence_checker(fence_checker: SessionFenceChecker) -> Self {
         Self {
+            fence_checker,
             sessions: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
             composer_outboxes: Mutex::new(HashMap::new()),
@@ -698,6 +712,7 @@ impl SessionRegistry {
     ) -> Result<T, SessionWriterError<E>> {
         let lock = self.start_lock_for(id);
         let _start = lock.lock().unwrap();
+        (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         // Include exited entries: their in-flight delivery can still restore an
         // unknown message to the persistent outbox after the process exits.
         let session = self.sessions.lock().unwrap().get(id).cloned();
@@ -735,6 +750,7 @@ impl SessionRegistry {
             });
         }
         for (id, session) in ids.iter().zip(&sessions) {
+            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
             if self.composer_outbox_for(id).has_pending_or_in_flight()
                 || session.as_ref().is_some_and(|session| session.run_state().is_running()) {
                 return Err(SessionWriterError::Busy("session is running or has pending messages"));
@@ -792,13 +808,9 @@ impl SessionRegistry {
         &self, id: &str, session_file: &Path, session_file_id: &str, cwd: &Path,
         plan: impl FnOnce() -> Result<SessionSpawnConfig, String>,
     ) -> Result<Arc<Session>, SessionHostError> {
-        if let Some(existing) = self.get(id) {
-            if !existing.is_idle_expired() {
-                return Ok(existing);
-            }
-        }
         let lock = self.start_lock_for(id);
         let _guard = lock.lock().unwrap();
+        (self.fence_checker)(id).map_err(SessionHostError::Spawn)?;
         // Won the lock: re-check (another caller may have finished spawning).
         if let Some(existing) = self.get(id) {
             if existing.is_idle_expired() {
@@ -833,6 +845,7 @@ impl SessionRegistry {
             &config,
             composer_outbox,
             Arc::clone(&self.running_signal),
+            Arc::clone(&self.fence_checker),
         )?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
         Ok(session)
@@ -940,6 +953,7 @@ fn spawn_session(
     config: &SessionSpawnConfig,
     composer_outbox: Arc<composer_outbox::ComposerOutbox>,
     running_signal: Arc<RunningSignal>,
+    fence_checker: SessionFenceChecker,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -1121,6 +1135,7 @@ fn spawn_session(
         composer_generation,
         composer_delivering: Mutex::new(false),
         activity_gate: std::sync::RwLock::new(()),
+        fence_checker,
         settle_cv: std::sync::Condvar::new(),
         running_signal,
     });
@@ -1840,6 +1855,26 @@ mod running_signal_tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    struct SessionRegistry;
+    impl SessionRegistry {
+        fn new() -> super::SessionRegistry {
+            super::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+        }
+    }
+
+    #[test]
+    fn session_fence_refuses_offline_writers_and_starts() {
+        let checker: SessionFenceChecker = Arc::new(|id| {
+            if id == "blocked" { Err("unknown writer outcome".into()) } else { Ok(()) }
+        });
+        let registry = super::SessionRegistry::with_fence_checker(checker);
+        let result = registry.with_offline_session_writer("blocked", Duration::from_millis(1), || Ok::<_, ()>(()));
+        assert!(matches!(result, Err(SessionWriterError::Busy(_))));
+        let result = registry.start_with_plan("blocked", Path::new("/missing"), "blocked", Path::new("/"), || unreachable!());
+        assert!(matches!(result, Err(SessionHostError::Spawn(message)) if message.contains("unknown writer outcome")));
+        assert!(registry.with_idle_session_writer("other", |_| Ok::<_, ()>(())).is_ok());
+    }
 
     #[test]
     fn idle_writer_rejects_unknown_queue_and_serializes_stale_start() {
