@@ -51,6 +51,8 @@ mod update_install;
 mod update_check;
 mod workspace_status;
 mod workspace_picker;
+#[cfg(test)]
+mod distro_tests;
 
 use logging::{desktop_log, install_panic_hook, mark_process_start, since_process_start_ms};
 use native_prefs::{

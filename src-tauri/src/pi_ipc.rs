@@ -2284,7 +2284,7 @@ pub(crate) fn management_call(
         .management
         .instance("global", &config)
         .map_err(|error| ("management_unavailable".to_string(), error))?;
-    if op == "modelsConfig.put" { return management_serial_call(state, op, args); }
+    if matches!(op, "modelsConfig.put" | "distro.configure" | "distro.seed") { return management_serial_call(state, op, args); }
     instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
 }
 
