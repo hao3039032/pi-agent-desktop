@@ -2053,7 +2053,20 @@ fn create_session(
     }
     let command_type = command_type(args);
     let agent_dir = state.agent_dir();
-    let requested_cwd = PathBuf::from(cwd_text);
+    // The cwd is folded BEFORE classification (normalizeCwd's path.resolve
+    // semantics): an absolute path carrying `..` that POINTS at a chat
+    // folder must classify as a chat (and the session header carry the
+    // folded identity), never smuggle the chat into a project spawn
+    // (Terra P1-4). Relative inputs keep the original behavior (the Next
+    // route used the raw string; the UI only ever sends absolute paths).
+    let requested_cwd = {
+        let raw = PathBuf::from(cwd_text);
+        if raw.is_absolute() {
+            PathBuf::from(lexical_fold(cwd_text, cfg!(windows)))
+        } else {
+            raw
+        }
+    };
 
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
@@ -2274,8 +2287,13 @@ fn user_home_dir() -> PathBuf {
 
 /// The HTTP route's `normalizeCwd` (app/api/cwd/validate/route.ts), ported
 /// so the static host answers `~`, `~/foo` and relative paths exactly like
-/// the server did: `~` → the user home, `~/foo` → joined onto it, anything
-/// else absolute as-is and relative resolved against the process cwd.
+/// the server did — with the ORIGINAL's `path.resolve` semantics: the
+/// joined path is LEXICALLY FOLDED (`.` dropped, `..` pops its parent)
+/// BEFORE classification, so a `~/.pi/agent/chats/../chats/<folder>` the
+/// user (or a crafted client) sends is classified against the FOLDED path
+/// and cannot slip a chat folder past `is_chat_workspace_path` as a
+/// project (Terra P1-4). Lexical only — never `canonicalize`: symlink
+/// targets keep their meaning.
 fn normalize_cwd(raw: &str) -> PathBuf {
     normalize_cwd_with_home(raw, user_home_dir())
 }
@@ -2284,17 +2302,101 @@ fn normalize_cwd(raw: &str) -> PathBuf {
 /// without the process-global env).
 fn normalize_cwd_with_home(raw: &str, home: PathBuf) -> PathBuf {
     if raw == "~" {
-        return home;
+        return PathBuf::from(lexical_fold(&home.to_string_lossy(), cfg!(windows)));
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        return home.join(rest);
+        let home_text = lexical_fold(&home.to_string_lossy(), cfg!(windows));
+        let joined = format!("{home_text}/{rest}");
+        return PathBuf::from(lexical_fold(&joined, cfg!(windows)));
     }
     let path = PathBuf::from(raw);
     if path.is_absolute() {
-        path
+        PathBuf::from(lexical_fold(raw, cfg!(windows)))
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let joined = format!("{}/{raw}", cwd.display());
+        PathBuf::from(lexical_fold(&joined, cfg!(windows)))
     }
+}
+
+/// Lexically fold `.` and `..` out of a path string — Node `path.resolve`'s
+/// component semantics, with no filesystem access and no symlink changes.
+/// `windows` selects the flavor (separator handling and the drive/UNC
+/// prefixes) so both platforms' rules are testable anywhere; a drive-only
+/// prefix (`C:` with no following separator — a drive-RELATIVE path whose
+/// anchor only the OS knows) is returned unfolded rather than guessed.
+fn lexical_fold(raw: &str, windows: bool) -> String {
+    let text = if windows { raw.replace('\\', "/") } else { raw.to_string() };
+    // The prefix (what carries the "absolute" meaning and survives `..`).
+    let (prefix, rest, anchored): (String, &str, bool) = if windows {
+        if let Some(tail) = text.strip_prefix("//?/UNC/") {
+            let mut parts = tail.splitn(2, '/');
+            let server = parts.next().unwrap_or("");
+            let after = parts.next().unwrap_or("");
+            let share = after.split('/').next().unwrap_or("");
+            let body = after.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+            (format!("\\\\?\\UNC\\{server}\\{share}\\"), body, true)
+        } else if let Some(tail) = text.strip_prefix("//?/") {
+            let mut parts = tail.splitn(2, '/');
+            let drive = parts.next().unwrap_or("");
+            let body = parts.next().unwrap_or("");
+            (format!("\\\\?\\{drive}\\"), body, true)
+        } else if text.starts_with("//") {
+            let tail = &text[2..];
+            let mut parts = tail.splitn(2, '/');
+            let server = parts.next().unwrap_or("");
+            let after = parts.next().unwrap_or("");
+            let share = after.split('/').next().unwrap_or("");
+            let body = after.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+            (format!("\\\\{server}\\{share}\\"), body, true)
+        } else if text.len() >= 2 && text.as_bytes()[1] == b':' && text[2..].starts_with('/') {
+            let drive = &text[..2];
+            (format!("{drive}\\"), &text[3..], true)
+        } else if text.len() >= 2
+            && text.as_bytes()[1] == b':'
+            && !text[2..].starts_with('/')
+            && text.len() > 2
+        {
+            // A drive-RELATIVE path (`C:foo`): its anchor is per-drive OS
+            // state the host cannot see — return it untouched rather than
+            // guess a parent.
+            return raw.to_string();
+        } else {
+            (String::new(), text.as_str(), false)
+        }
+    } else {
+        match text.strip_prefix('/') {
+            Some(tail) => ("/".to_string(), tail, true),
+            None => (String::new(), text.as_str(), false),
+        }
+    };
+    // Fold the components: `..` pops (never past the prefix), `.` and empty
+    // components drop, everything else pushes.
+    let mut components: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    let separator = if windows { '\\' } else { '/' };
+    let body = components.join(&separator.to_string());
+    if !anchored {
+        return body;
+    }
+    if body.is_empty() {
+        // The prefix alone (`/`, `\\\\srv\\share\\`, or a bare `C:`)
+        // — resolve's form for a root.
+        return prefix;
+    }
+    if !prefix.ends_with('/') && !prefix.ends_with('\\') {
+        // A `C:` drive anchor: re-attach the separator the prefix omitted.
+        return format!("{prefix}{separator}{body}");
+    }
+    format!("{prefix}{body}")
 }
 
 /// POST /api/cwd/validate (the `workspace.validateCwd` op): validate (and
@@ -2642,9 +2744,10 @@ mod tests {
     fn cwd_validation_normalizes_like_the_http_route() {
         // The HTTP route's normalizeCwd (app/api/cwd/validate/route.ts):
         // `~` and `~/foo` expand against the user home, relative paths
-        // resolve against the process cwd, absolute paths stay. The static
-        // host must answer the same directory the server did — a `~/project`
-        // the user types must not become a missing relative path.
+        // resolve against the process cwd, absolute paths stay — all with
+        // path.resolve's LEXICAL fold. The static host must answer the same
+        // directory the server did — a `~/project` the user types must not
+        // become a missing relative path.
         let home = PathBuf::from("/home/fixture-user");
         assert_eq!(normalize_cwd_with_home("~", home.clone()), home);
         assert_eq!(
@@ -2656,6 +2759,92 @@ mod tests {
         let cwd = std::env::current_dir().expect("the test process has a cwd");
         let relative = normalize_cwd_with_home("some/relative", home);
         assert_eq!(relative, cwd.join("some/relative"));
+    }
+
+    #[test]
+    fn lexical_fold_collapses_dots_like_path_resolve() {
+        // Unix flavor (the flavor this host runs under).
+        assert_eq!(lexical_fold("/a/b/../c", false), "/a/c");
+        assert_eq!(lexical_fold("/a/./b/", false), "/a/b", "trailing separators drop");
+        assert_eq!(lexical_fold("/../x", false), "/x", "`..` at the root stops at the root");
+        assert_eq!(lexical_fold("/a/b/../../..", false), "/");
+        assert_eq!(lexical_fold("a/b/../c", false), "a/c", "a relative input folds without inventing an anchor");
+        // Windows flavor: backslash separators, drive anchors, UNC and
+        // verbatim forms.
+        assert_eq!(lexical_fold(r"C:\a\b\..\c", true), r"C:\a\c");
+        assert_eq!(lexical_fold(r"C:\..\x", true), r"C:\x");
+        assert_eq!(lexical_fold(r"C:\", true), r"C:\");
+        assert_eq!(lexical_fold("C:/a/../b", true), r"C:\b", "a forward-slash drive path folds to backslashes");
+        assert_eq!(lexical_fold("\\\\server\\share\\a\\..\\b", true), "\\\\server\\share\\b");
+        assert_eq!(lexical_fold("//server/share/a/../b", true), "\\\\server\\share\\b", "forward slashes fold too");
+        assert_eq!(lexical_fold("\\\\?\\C:\\a\\..\\b", true), "\\\\?\\C:\\b");
+        assert_eq!(lexical_fold("\\\\?\\UNC\\srv\\share\\a\\..\\b", true), "\\\\?\\UNC\\srv\\share\\b");
+        // A drive-RELATIVE path (`C:` with no separator — its anchor is
+        // per-drive OS state) is returned untouched rather than guessed.
+        assert_eq!(lexical_fold("C:foo/../bar", true), "C:foo/../bar");
+        // Unix flavor keeps backslashes as ordinary name characters — they
+        // never split components, but `..` still folds lexically (Node's
+        // posix resolve does exactly this).
+        assert_eq!(lexical_fold("/a\\b/../c", false), "/c");
+    }
+
+    #[test]
+    fn chat_paths_with_dots_classify_as_chats_after_the_fold() {
+        // Terra P1-4: a cwd that lexically POINTS at the chat root or a
+        // chat folder must classify as one — the unfolded form kept `..`
+        // and slipped past the parent-path identity checks as a project.
+        let home = PathBuf::from("/home/fixture-user");
+        let agent = home.join(".pi").join("agent");
+        let folder = agent.join("chats").join("20260101-120000-abcd");
+
+        // The `~/` form the HTTP route folded via resolve().
+        let through_dots = normalize_cwd_with_home(
+            "~/.pi/agent/chats/../chats/20260101-120000-abcd",
+            home.clone(),
+        );
+        assert_eq!(through_dots, folder, "the folded path equals the plain folder path");
+        assert!(crate::session_view::is_chat_folder_path(&through_dots, &agent));
+
+        // A relative form folding onto the chat root.
+        let root_through_dots = normalize_cwd_with_home("~/.pi/agent/x/../chats", home.clone());
+        assert!(crate::session_view::is_chat_root_path(&root_through_dots, &agent));
+
+        // The legacy shared cwd through dots stays the legacy workspace.
+        let legacy = normalize_cwd_with_home("~/.pi/agent/chats/../chat-workspace", home.clone());
+        assert!(crate::session_view::is_legacy_chat_workspace_path(&legacy, &agent));
+
+        // An ordinary project through the SAME dots machinery is untouched
+        // in identity (still a project, still its own folder).
+        let project = normalize_cwd_with_home("~/work/../work/proj", home);
+        assert_eq!(project, PathBuf::from("/home/fixture-user/work/proj"));
+        assert!(!crate::session_view::is_chat_workspace_path(&project, &agent));
+    }
+
+    #[test]
+    fn validate_cwd_folds_an_absolute_chat_path_with_dots_into_the_chat_workspace() {
+        // The op path (validate_cwd shares normalize_cwd): a real chat
+        // folder addressed through `..` must answer workspaceKind "chat",
+        // not create a project identity for it.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let folder = crate::session_view::chat_workspace_dir(&agent_dir).join("20260101-120000-abcd");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::create_dir_all(dir.path().join("elsewhere")).expect("elsewhere");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+
+        let dotted = format!(
+            "{}/../chats/20260101-120000-abcd",
+            dir.path().join("agent").join("chats").display()
+        );
+        let answer = send(
+            &state,
+            json!({ "v": 1, "id": "cwd-fold", "op": "cwd.validate", "args": { "cwd": dotted } }),
+        );
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(answer["data"]["workspaceKind"], "chat", "{answer}");
+        assert_eq!(answer["data"]["cwd"], folder.display().to_string(), "the FOLDED path answers");
+        assert_eq!(answer["data"]["projectRoot"], Value::Null, "{answer}");
     }
 
     #[test]
