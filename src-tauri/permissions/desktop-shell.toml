@@ -97,3 +97,8 @@ commands.allow = ["pi_ipc_subscribe_running"]
 identifier = "allow-pi-ipc-subscribe-terminal"
 description = "Allows the app WebView to subscribe a terminal's output stream over a Tauri Channel (suffix reads with a cursor, reset+replay when the history window demands it)."
 commands.allow = ["pi_ipc_subscribe_terminal"]
+
+[[permission]]
+identifier = "allow-pi-ipc-subscribe-scheduled"
+description = "Allows the app WebView to subscribe scheduled-task change events over a Tauri Channel."
+commands.allow = ["pi_ipc_subscribe_scheduled"]
