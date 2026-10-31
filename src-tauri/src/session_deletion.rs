@@ -34,6 +34,79 @@ fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) { a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()) } else { a == b }
 }
 
+#[derive(Debug)]
+struct SessionReference {
+    id: String,
+    path: PathBuf,
+    parent: Option<PathBuf>,
+    subagent_parent: Option<String>,
+}
+
+/// Discover every session whose bytes the deletion would remove or rewrite.
+/// The caller repeats this after acquiring all returned writer gates.
+fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Vec<String>, (String, String)> {
+    use std::collections::{HashMap, HashSet};
+    let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
+    let mut files = Vec::new();
+    files_in(&root, &mut files)?;
+    let mut records = Vec::new();
+    let mut ids = HashSet::new();
+    for path in files {
+        let file = std::fs::File::open(&path).map_err(|e| error("io", e))?;
+        let before = file.metadata().map_err(|e| error("io", e))?;
+        let mut reader = std::io::BufReader::new(file);
+        let header = bounded_line(&mut reader, 64 * 1024)?.ok_or_else(|| error("not_supported", "Cannot verify an empty session file."))?;
+        if header.get("type").and_then(Value::as_str) != Some("session") { return Err(error("not_supported", "Cannot verify a session header.")); }
+        let id = header.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())
+            .ok_or_else(|| error("not_supported", "Cannot verify a session id."))?.to_string();
+        if !ids.insert(id.clone()) { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
+        let parent = match header.get("parentSession") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if Path::new(value).is_absolute() => Some(PathBuf::from(value)),
+            _ => return Err(error("not_supported", "Cannot verify a parent session path.")),
+        };
+        let mut subagent_parent = None;
+        while let Some(entry) = bounded_line(&mut reader, 16 * 1024 * 1024)? {
+            if entry.get("type").and_then(Value::as_str) == Some("custom")
+                && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent") {
+                let parent = entry.pointer("/data/parentSessionId").and_then(Value::as_str)
+                    .filter(|id| !id.is_empty()).ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))?;
+                if subagent_parent.replace(parent.to_string()).is_some() {
+                    return Err(error("not_supported", "Cannot verify duplicate subagent metadata."));
+                }
+            }
+        }
+        let after = reader.get_ref().metadata().map_err(|e| error("io", e))?;
+        if !same_file_version(&before, &after) { return Err(error("busy", "Session changed while checking references")); }
+        records.push(SessionReference { id, path, parent, subagent_parent });
+    }
+    let target = records.iter().find(|record| record.id == target_id).ok_or_else(|| error("not_found", "Session not found"))?;
+    let target_path = target.path.canonicalize().map_err(|e| error("io", e))?;
+    if !target_path.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
+    let mut by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for record in &records {
+        if let Some(parent) = record.subagent_parent.as_deref() {
+            by_parent.entry(parent).or_default().push(&record.id);
+        }
+    }
+    let mut affected: HashSet<String> = HashSet::from([target_id.to_string()]);
+    let mut pending = vec![target_id];
+    while let Some(parent) = pending.pop() {
+        for child in by_parent.get(parent).into_iter().flatten() {
+            if affected.insert((*child).to_string()) { pending.push(child); }
+        }
+    }
+    for record in &records {
+        if let Some(parent) = &record.parent {
+            let parent = parent.canonicalize().unwrap_or_else(|_| parent.clone());
+            if same_path(&parent, &target_path) { affected.insert(record.id.clone()); }
+        }
+    }
+    let mut result: Vec<_> = affected.into_iter().collect();
+    result.sort();
+    Ok(result)
+}
+
 /// Scheduler-owned data supplies this proof after a successful, non-corrupt load.
 pub(crate) trait ScheduledReferences {
     fn is_referenced(&self, session_id: &str) -> bool;
@@ -110,7 +183,14 @@ fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl Schedu
         return Err(error("invalid_args", "trashChatFolder must be a boolean"));
     }
     let trash_chat_folder = args.get("trashChatFolder").and_then(Value::as_bool) == Some(true);
-    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled, trash_chat_folder, preflight, proof))
+    let affected = affected_session_ids(state, id)?;
+    state.registry.with_idle_session_writers(&affected, |_| {
+        if affected_session_ids(state, id)? != affected { return Err(error("busy", "Session references changed during deletion preflight")); }
+        if affected.iter().any(|id| scheduled.is_referenced(id)) {
+            return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
+        }
+        delete_locked(state, id, scheduled, trash_chat_folder, preflight, proof)
+    })
         .map_err(|error| match error {
             session_host::SessionWriterError::Busy(message) => self::error("busy", message),
             session_host::SessionWriterError::Operation(error) => error,
@@ -312,6 +392,26 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(state.registry.get("target").is_none());
         assert!(!target.exists());
         drop(live);
+    }
+    #[test]
+    fn affected_set_includes_transitive_subagents_and_direct_forks() {
+        let (dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let fork = session(&root, "fork", Some(&target));
+        let sub1 = session(&root, "sub1", None);
+        let sub2 = session(&root, "sub2", None);
+        let unrelated = session(&root, "unrelated", None);
+        use std::io::Write;
+        for (path, parent) in [(&sub1, "target"), (&sub2, "sub1")] {
+            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"parentSessionId":parent}});
+            writeln!(std::fs::OpenOptions::new().append(true).open(path).unwrap(), "{marker}").unwrap();
+        }
+        assert_eq!(affected_session_ids(&state, "target").unwrap(), vec!["fork", "sub1", "sub2", "target"]);
+        let args = json!({"session":"target"});
+        assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["sub2".into()]), false, None).unwrap_err().0, "not_supported");
+        crate::session_writer_fence::begin(dir.path(), "fork", "op", "chat", &fork, None).unwrap();
+        assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
+        assert!(target.exists() && fork.exists() && sub1.exists() && sub2.exists() && unrelated.exists());
     }
     #[test]
     fn deletion_preflight_keeps_identity_across_replacement() {
