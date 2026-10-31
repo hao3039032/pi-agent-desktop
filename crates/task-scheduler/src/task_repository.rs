@@ -57,6 +57,19 @@ impl TaskRepository {
             .filter(|run| run.get("runId").is_some_and(Value::is_string) && run.get("taskId").and_then(Value::as_str) == Some(task_id)).collect())
     }
 
+    pub fn admit_manual(&self, task_id: &str, run: Value, now_ms: i64, pid: u32) -> Result<(), String> {
+        if !valid_id(task_id) { return Err("Invalid task id".into()); }
+        let _guard = TransactionLock::acquire(&self.agent_dir).map_err(|e| format!("scheduler transaction busy: {e}"))?;
+        let lease: Value = serde_json::from_str(&std::fs::read_to_string(self.agent_dir.join("scheduled-tasks/scheduler.lock")).map_err(|_| "Scheduler is not the owner")?).map_err(|_| "Scheduler is not the owner")?;
+        let heartbeat = lease["heartbeatAt"].as_str().and_then(crate::store::iso_to_ms).ok_or("Scheduler is not the owner")?;
+        if lease["pid"].as_u64() != Some(pid as u64) || now_ms.saturating_sub(heartbeat) >= crate::LEASE_STALE_MS as i64 { return Err("Scheduler is not the owner".into()); }
+        if !tasks_from(&self.read_file()?).iter().any(|task| task["id"] == task_id) { return Err("Task not found".into()); }
+        let mut runs = self.runs(task_id)?;
+        if runs.iter().any(|run| run["status"] == "running") { return Err("This task is already running".into()); }
+        runs.push(run);
+        self.write_runs_locked(task_id, &runs)
+    }
+
     /// Update one task's history while holding the same gate as task deletion.
     pub fn mutate_runs<T>(&self, task_id: &str, change: impl FnOnce(&mut Vec<Value>) -> Result<T, String>) -> Result<T, String> {
         if !valid_id(task_id) { return Err("Invalid task id".into()); }

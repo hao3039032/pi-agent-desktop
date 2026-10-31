@@ -36,23 +36,29 @@ fn failure(error: impl Into<String>) -> RunOutcome {
 /// Admit one manual run and return once its session is durably linked, or its
 /// early failure is recorded. Never retries a prompt whose outcome is unknown.
 pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
+    if !state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst) { return Err("Scheduler is not the owner".into()); }
     let agent = state.agent_dir();
     let repo = TaskRepository::new(&agent);
     let task = repo.list()?.into_iter().find(|task| task["id"] == task_id).ok_or("Task not found")?;
     let run_id = new_run_id()?;
     let record = json!({ "runId": run_id, "taskId": task_id, "trigger": "manual", "startedAt": now_iso(), "status": "running", "pid": std::process::id() });
-    repo.mutate_runs(task_id, |runs| {
-        if runs.iter().any(|run| run["status"] == "running") { return Err("This task is already running".into()); }
-        runs.push(record.clone());
-        Ok(())
-    })?;
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis() as i64;
+    state.scheduled_active.lock().unwrap().insert(run_id.clone());
+    if let Err(error) = repo.admit_manual(task_id, record.clone(), now_ms, std::process::id()) {
+        state.scheduled_active.lock().unwrap().remove(&run_id);
+        return Err(error);
+    }
     spawn_claimed(state, task, record)
 }
 
 pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) -> Result<Value, String> {
+    struct ActiveGuard { active: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>, run_id: String }
+    impl Drop for ActiveGuard { fn drop(&mut self) { self.active.lock().unwrap().remove(&self.run_id); } }
     let agent = state.agent_dir();
     let task_id = record["taskId"].as_str().ok_or("Run missing task id")?;
     let run_id = record["runId"].as_str().ok_or("Run missing id")?.to_string();
+    state.scheduled_active.lock().unwrap().insert(run_id.clone());
+    let guard = ActiveGuard { active: std::sync::Arc::clone(&state.scheduled_active), run_id: run_id.clone() };
     let trigger = record["trigger"].as_str().ok_or("Run missing trigger")?.to_string();
     let names = match task["toolPreset"].as_str().unwrap_or("read-only") {
         "none" => vec![],
@@ -86,6 +92,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let events = std::sync::Arc::clone(&state.scheduled_events);
     let task_name = task["name"].as_str().unwrap_or("").to_string();
     let spawned = std::thread::Builder::new().name(format!("scheduled-run-{run_id}")).spawn(move || {
+        let _guard = guard;
         let link_tx = ready_tx.clone();
         let attention_events = std::sync::Arc::clone(&events);
         let outcome = run_session(&session, marker, &prompt, Duration::from_secs(duration * 60), |session_id| {

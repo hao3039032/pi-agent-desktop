@@ -57,6 +57,9 @@ pub struct IpcHostState {
     /// The scheduled-task store root (the agent dir the host runs against).
     pub task_agent_dir: Mutex<Option<PathBuf>>,
     pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
+    pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
+    pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
+    pub(crate) scheduled_active: Arc<Mutex<BTreeSet<String>>>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
     /// The file access allow-list (the /api/files security boundary).
@@ -100,6 +103,9 @@ impl IpcHostState {
             management_config: Mutex::new(resolve_management_config()),
             task_agent_dir: Mutex::new(None),
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
+            scheduler_loop: Mutex::new(None),
+            scheduler_owner: std::sync::atomic::AtomicBool::new(false),
+            scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
             resources: ResourceRegistry::new(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
@@ -115,6 +121,20 @@ impl IpcHostState {
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
         }
+    }
+
+    pub fn start_scheduler(self: &Arc<Self>) -> Result<(), String> {
+        let mut current = self.scheduler_loop.lock().unwrap();
+        if current.is_none() {
+            *current = Some(crate::scheduler_tick::SchedulerLoop::start(Arc::clone(self), Duration::from_secs(30))?);
+        }
+        Ok(())
+    }
+
+    pub fn stop_scheduler(&self) {
+        let scheduler = self.scheduler_loop.lock().unwrap().take();
+        drop(scheduler);
+        self.scheduler_owner.store(false, Ordering::SeqCst);
     }
 
     /// Record a path the HOST derived (a session cwd or project root from
@@ -1475,7 +1495,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             if let Some(id) = args.get("subscriptionId").and_then(Value::as_str) { state.scheduled_events.unsubscribe(id); }
             protocol_ok(&id, json!({ "success": true }))
         }
-        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" | "tasks.run" => {
+        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" | "tasks.run" | "tasks.takeover" => {
             match crate::scheduler_host::dispatch(state, &op, &args) {
                 Ok(data) => {
                     if matches!(op, "tasks.create" | "tasks.update" | "tasks.delete" | "tasks.markSeen") {
@@ -4035,6 +4055,12 @@ mod tests {
         let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
         let task_id = "12345678-1234-1234-1234-123456789abc";
         repo.mutate(|tasks| { tasks.push(json!({ "id": task_id, "name": "run now fixture", "prompt": "second fixture prompt", "cwd": project, "enabled": true, "schedule": {"kind":"manual"}, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 })); Ok(()) }).unwrap();
+        let denied = send(&state, json!({ "v": 1, "id": "denied", "op": "tasks.run", "args": { "id": task_id } }));
+        assert_eq!(denied["error"]["code"], "busy");
+        assert!(repo.runs(task_id).unwrap().is_empty());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        assert!(task_scheduler::lease::acquire(&agent, std::process::id(), now, |_| true).unwrap());
+        state.scheduler_owner.store(true, Ordering::SeqCst);
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let channel = Channel::new(move |body| {
             if let tauri::ipc::InvokeResponseBody::Json(text) = body { let _ = event_tx.send(text); }
@@ -4062,6 +4088,8 @@ mod tests {
         assert!(types.iter().any(|kind| kind == "run_started"));
         assert!(types.iter().any(|kind| kind == "run_finished"));
         state.scheduled_events.unsubscribe(&subscription);
+        task_scheduler::lease::release(&agent, std::process::id()).unwrap();
+        state.scheduler_owner.store(false, Ordering::SeqCst);
         server.join().unwrap();
     }
 

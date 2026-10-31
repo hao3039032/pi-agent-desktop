@@ -293,12 +293,14 @@ fn content_type(path: &str) -> &'static str {
 
 fn main() {
     let mut static_dir: Option<PathBuf> = None;
+    let mut scheduler_agent_dir: Option<PathBuf> = None;
     let mut port: u16 = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--static-dir" => static_dir = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|value| value.parse().ok()).unwrap_or(0),
+            "--scheduler-agent-dir" => scheduler_agent_dir = args.next().map(PathBuf::from),
             other => {
                 eprintln!("[harness] unknown argument: {other}");
                 std::process::exit(2);
@@ -355,6 +357,17 @@ fn main() {
     // Envelope requests share the state Arc directly and dispatch through
     // the product's gated entry from their connection threads.
     let host_state = Arc::new(IpcHostState::new());
+    if let Some(agent) = scheduler_agent_dir {
+        let isolated = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).and_then(|path| path.canonicalize().ok());
+        let agent = agent.canonicalize().expect("scheduler fixture agent dir must exist");
+        let temp = std::env::temp_dir().canonicalize().expect("temporary directory resolves");
+        if isolated.as_ref() != Some(&agent) || !agent.starts_with(&temp) || agent == temp {
+            eprintln!("[harness] scheduler agent dir must be an explicit isolated temporary PI_CODING_AGENT_DIR");
+            std::process::exit(2);
+        }
+        *host_state.task_agent_dir.lock().unwrap() = Some(agent);
+        host_state.start_scheduler().expect("scheduler starts");
+    }
     let host_state_for_host = Arc::clone(&host_state);
     let host_state_for_http = Arc::clone(&host_state);
     let (host_tx, host_rx) = std::sync::mpsc::channel::<(HostCall, std::sync::mpsc::Sender<Value>)>();
@@ -383,6 +396,7 @@ fn main() {
                     // child (stdin EOF + grace kill of the child's process
                     // group), so no pi process is orphaned by this exit.
                     let state = app.state::<Arc<IpcHostState>>();
+                    state.stop_scheduler();
                     for id in state.registry.ids() {
                         let _ = state.registry.remove(&id, std::time::Duration::from_secs(5));
                     }

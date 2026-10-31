@@ -68,12 +68,13 @@ function setState(next: Partial<ScheduledTasksState>): void {
 export async function refreshScheduledTasks(): Promise<void> {
   const id = ++loadId;
   try {
-    const data = await clientForTasks().request<{ tasks: unknown[] }>("tasks.list");
+    const data = await clientForTasks().request<{ tasks: unknown[]; scheduler?: { owner: boolean | null; ownerInfo: SchedulerOwnerInfo | null } }>("tasks.list");
     if (id !== loadId) return;
     for (const task of data.tasks as ScheduledTaskView[]) {
       if (task.lastRun?.sessionId) scheduledSessionIds.add(task.lastRun.sessionId);
     }
-    setState({ tasks: data.tasks as ScheduledTaskView[], loaded: true, error: streamError });
+    setState({ tasks: data.tasks as ScheduledTaskView[], loaded: true, error: streamError,
+      schedulerOwner: data.scheduler?.owner ?? null, schedulerOwnerInfo: data.scheduler?.ownerInfo ?? null });
   } catch (error) {
     if (id !== loadId) return;
     setState({ loaded: true, error: error instanceof Error ? error.message : String(error) });

@@ -5,6 +5,19 @@ use crate::transaction_lock::TransactionLock;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Read the legacy-compatible lease without changing ownership.
+pub fn info<F: Fn(u32) -> bool>(agent_dir: &Path, now_ms: i64, alive: F) -> Result<Option<Value>, String> {
+    let path = agent_dir.join("scheduled-tasks/scheduler.lock");
+    let Some(mut lease) = read(&path)? else { return Ok(None) };
+    let Some(pid) = lease["pid"].as_u64().and_then(|value| u32::try_from(value).ok()) else { return Ok(None) };
+    let Some(heartbeat) = lease["heartbeatAt"].as_str().map(str::to_string) else { return Ok(None) };
+    let fresh = crate::store::iso_to_ms(&heartbeat).is_some_and(|time| now_ms.saturating_sub(time) < crate::LEASE_STALE_MS as i64);
+    if lease["startedAt"].as_str().is_none() { lease["startedAt"] = json!(heartbeat); }
+    lease["fresh"] = json!(fresh);
+    lease["alive"] = json!(alive(pid));
+    Ok(Some(lease))
+}
+
 pub fn acquire<F: Fn(u32) -> bool>(agent_dir: &Path, pid: u32, now_ms: i64, alive: F) -> Result<bool, String> {
     let _guard = TransactionLock::acquire(agent_dir).map_err(|e| e.to_string())?;
     let path = agent_dir.join("scheduled-tasks/scheduler.lock");

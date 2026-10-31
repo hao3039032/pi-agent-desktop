@@ -73,7 +73,11 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
                 let next = next_run(state, &task)?;
                 views.push(view(task, next, &runs));
             }
-            Ok(json!({ "tasks": views, "scheduler": { "owner": null, "ownerInfo": null } }))
+            let enabled = state.scheduler_loop.lock().unwrap().is_some();
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| err("io", e.to_string()))?.as_millis() as i64;
+            let owner_info = task_scheduler::lease::info(&state.agent_dir(), now, crate::scheduler_tick::pid_alive).map_err(|e| err("io", e))?;
+            let owner = if enabled { json!(state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst)) } else { Value::Null };
+            Ok(json!({ "tasks": views, "scheduler": { "owner": owner, "ownerInfo": owner_info } }))
         }
         "tasks.get" => {
             let task_id = id(args)?;
@@ -82,10 +86,19 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
             let next = next_run(state, &task)?;
             Ok(json!({ "task": view(task, next, &runs) }))
         }
+        "tasks.takeover" => {
+            if state.scheduler_loop.lock().unwrap().is_none() { return Err(err("not_supported", "Scheduler host is not started")); }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| err("io", e.to_string()))?.as_millis() as i64;
+            let owner = task_scheduler::lease::acquire(&state.agent_dir(), std::process::id(), now, crate::scheduler_tick::pid_alive).map_err(|e| err("io", e))?;
+            if !owner { return Err(err("busy", "Another live process owns the scheduler lease")); }
+            // The timer performs orphan recovery before publishing ownership;
+            // a takeover request must not admit runs ahead of that pass.
+            Ok(json!({ "owner": true }))
+        }
         "tasks.run" => {
             let result = crate::scheduled_runner::run_now(state, id(args)?).map_err(|e| {
                 if e == "Task not found" { err("not_found", e) }
-                else if e == "This task is already running" { err("busy", e) }
+                else if e == "This task is already running" || e == "Scheduler is not the owner" { err("busy", e) }
                 else { err("io", e) }
             })?;
             Ok(json!({ "run": result }))
