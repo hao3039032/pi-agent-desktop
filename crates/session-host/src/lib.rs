@@ -24,6 +24,7 @@
 //! tool events, fleet monitoring) layers on top in later M2 steps; this
 //! crate freezes the process-level backbone with real-pi tests.
 
+pub mod composer_outbox;
 pub mod history;
 pub mod machine;
 pub mod spawn_plan;
@@ -60,6 +61,11 @@ pub struct Session {
     epoch: AtomicU64,
     /// The message-level state machine (fed before fan-out).
     machine: Mutex<crate::machine::SessionMachine>,
+    /// The composer outbox (`lib/composer-queue.ts`'s host half): messages
+    /// queued while a run was active, delivered once the session is idle.
+    pub composer_outbox: composer_outbox::ComposerOutbox,
+    /// One drain at a time (the wrapper's `delivering` flag).
+    composer_delivering: Mutex<bool>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
 }
@@ -159,6 +165,15 @@ impl Session {
         self.state.lock().unwrap().started_at
     }
 
+    /// Emit a HOST-authored event to every subscriber (the composer
+    /// outbox's updates): the state machine never sees it (it models the
+    /// child's records only), subscribers receive it in arrival order.
+    pub(crate) fn emit_host_event(&self, event: Value) {
+        let mut state = self.state.lock().unwrap();
+        state.last_active = Instant::now();
+        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+    }
+
     fn fan_out(self: &Arc<Self>, record: Value) {
         // 1. The state machine eats first (it may request follow-ups).
         let follow_up = {
@@ -191,6 +206,9 @@ impl Session {
                         }
                         let _ =
                             client.command("get_session_stats", json!({}), Some(Duration::from_secs(30)));
+                        // A run settled: queued composer messages may deliver now
+                        // (the wrapper's agent_settled → wake).
+                        session.composer_wake();
                     })
                     .ok();
             }
@@ -663,6 +681,8 @@ fn spawn_session(
         }),
         epoch: AtomicU64::new(1),
         machine: Mutex::new(crate::machine::SessionMachine::new(session_file_id)),
+        composer_outbox: composer_outbox::ComposerOutbox::new(),
+        composer_delivering: Mutex::new(false),
         settle_cv: std::sync::Condvar::new(),
     });
     {
@@ -864,6 +884,35 @@ pub fn dispatch_session_op(
             let Some(command_type) = args.get("type").and_then(Value::as_str) else {
                 return Err(DispatchError::invalid("the command has no type"));
             };
+            // The composer outbox is HOST-owned (the wrapper's editable
+            // queue): these three never reach the child.
+            match command_type {
+                "queue_composer" | "take_composer_message" | "send_composer_message" => {
+                    let session = resolve_or_start(registry, session_id, "agent.command")?;
+                    return match command_type {
+                        "queue_composer" => {
+                            let message = args
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let images = args.get("images").filter(|images| !images.is_null()).cloned();
+                            session
+                                .composer_enqueue(message, images)
+                                .map_err(|message| DispatchError::invalid(&message))
+                        }
+                        "take_composer_message" => {
+                            let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+                            Ok(session.composer_take(id))
+                        }
+                        "send_composer_message" => {
+                            let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+                            session.composer_send_now(id).map_err(|message| DispatchError::invalid(&message))
+                        }
+                        _ => unreachable!(),
+                    };
+                }
+                _ => {}
+            }
             let payload = build_agent_command(command_type, args)?;
             let session = resolve_or_start(registry, session_id, "agent.command")?;
             session

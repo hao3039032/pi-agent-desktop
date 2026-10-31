@@ -1375,16 +1375,39 @@ fn session_view_dispatch(
                     .get_state()
                     .map_err(|error| ("agent_child_error".to_string(), error.to_string()))?;
                 let machine = session.run_state();
+                // The context meter's source: the child's own stats command
+                // (the wrapper cached it per run; the host asks now — the
+                // poll cadence is the wrapper's refresh cadence).
+                let stats = session
+                    .command("get_session_stats", json!({}), Some(Duration::from_secs(30)))
+                    .ok();
+                let context_usage = stats
+                    .as_ref()
+                    .and_then(|stats| stats.get("contextUsage"))
+                    .filter(|usage| !usage.is_null())
+                    .cloned()
+                    .map(|usage| json!({
+                        "percent": usage.get("percent").cloned().unwrap_or(Value::Null),
+                        "contextWindow": usage.get("contextWindow").cloned().unwrap_or(Value::Null),
+                        "tokens": usage.get("tokens").cloned().unwrap_or(Value::Null),
+                    }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
+                let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
                     "followUp": machine.follow_up_queue,
+                    "pending": pending,
+                    "pendingVersion": pending_version,
                 });
                 let state_json = json!({
                     "sessionId": raw.get("sessionId").cloned().unwrap_or(json!(session_id)),
                     "sessionFile": raw.get("sessionFile").cloned().unwrap_or(Value::Null),
                     "isStreaming": raw.get("isStreaming").and_then(Value::as_bool).unwrap_or(false),
                     "streamingMessage": session.streaming_message_value(),
+                    // A prompt is "running" while its admission is unresolved
+                    // (the wrapper's pendingPromptCount); the CLI child answers
+                    // admission synchronously, so a dispatch that returned had
+                    // already passed or failed it.
                     "isPromptRunning": false,
                     "isBashRunning": raw.get("isBashRunning").and_then(Value::as_bool),
                     "isCompacting": raw.get("isCompacting").and_then(Value::as_bool).unwrap_or(false),
@@ -1399,6 +1422,17 @@ fn session_view_dispatch(
                     "messageCount": raw.get("messageCount").and_then(Value::as_u64).unwrap_or(0),
                     "pendingMessageCount": raw.get("pendingMessageCount").and_then(Value::as_u64).unwrap_or(0),
                     "queuedMessages": queued_messages,
+                    // The context meter (null when the child cannot calculate
+                    // usage — unknown is not zero).
+                    "contextUsage": context_usage.unwrap_or(Value::Null),
+                    // The system panel's prompt: replaying the transcript's
+                    // system messages needs the SDK's own projection — served
+                    // with the readView family, not yet this poll (README's
+                    // unfixed list keeps it honest).
+                    "systemPrompt": "",
+                    "systemPromptStatus": "none",
+                    "extensionStatuses": [],
+                    "extensionWidgets": [],
                 });
                 return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
             }
@@ -3518,6 +3552,133 @@ mod tests {
         );
         assert_eq!(rejected["error"]["details"]["code"], "prompt_rejected", "{rejected}");
         assert_eq!(rejected["error"]["details"]["accepted"], false);
+    }
+
+    /// The composer outbox (queue_composer / take / send) and the state
+    /// poll's queued/context fields, against the REAL pi (PI_CLI_BIN,
+    /// sandboxed): an idle session with queued items delivers them as
+    /// follow-ups (the prompt command reaches the child), take removes, and
+    /// the state answer carries the queue snapshot.
+    #[test]
+    fn real_pi_composer_outbox_queues_and_delivers() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("cwd");
+        std::fs::create_dir_all(agent_dir.join("extensions")).expect("extensions");
+        // A local-only configured model (the recovery-smoke pattern: a dead
+        // endpoint with real limits — no model or network is ever called) so
+        // the child computes usage, and a discovered fixture command a queued
+        // message can address (project sessions discover agent extensions —
+        // the spawn shape the Next factory kept).
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{"providers":{"fixture":{"baseUrl":"http://127.0.0.1:1","apiKey":"fixture-not-a-credential","api":"openai-completions","models":[{"id":"local","name":"Local fixture","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}"#,
+        )
+        .expect("models");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProvider":"fixture","defaultModel":"local"}"#,
+        )
+        .expect("settings");
+        let marker = cwd.join("delivered-marker.txt");
+        let marker_text = marker.display().to_string().replace('\\', "\\\\");
+        std::fs::write(
+            agent_dir.join("extensions").join("fixture.js"),
+            format!(
+                "export default function(pi) {{ pi.registerCommand('fixture-mark', {{ handler: async () => {{ require('fs').appendFileSync({marker_text:?}, 'marked\\n'); }} }}); }}"
+            ),
+        )
+        .expect("fixture");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+
+        // A session to host the outbox.
+        let created = send(
+            &state,
+            json!({ "v": 1, "id": "cq0", "op": "sessions.create", "args": {
+                "cwd": cwd.display().to_string(), "type": "ensure_session",
+            }}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let sid = created["data"]["sessionId"].as_str().expect("id").to_string();
+
+        // 1. An empty message is refused (the wrapper's own validation).
+        let empty = send(
+            &state,
+            json!({ "v": 1, "id": "cq1", "op": "agent.command", "args": { "session": sid, "type": "queue_composer", "message": "   " } }),
+        );
+        assert_eq!(empty["error"]["code"], "invalid_args", "{empty}");
+
+        // 2. Queue one; the item answers and the state poll carries it.
+        let queued = send(
+            &state,
+            json!({ "v": 1, "id": "cq2", "op": "agent.command", "args": { "session": sid, "type": "queue_composer", "message": "queued hello" } }),
+        );
+        assert_eq!(queued["ok"], true, "{queued}");
+        let item_id = queued["data"]["id"].as_str().expect("the queued item id").to_string();
+        assert_eq!(queued["data"]["message"], "queued hello");
+
+        // 3. take_composer_message returns the item and the snapshot.
+        let taken = send(
+            &state,
+            json!({ "v": 1, "id": "cq3", "op": "agent.command", "args": { "session": sid, "type": "take_composer_message", "id": item_id } }),
+        );
+        assert_eq!(taken["ok"], true, "{taken}");
+        assert_eq!(taken["data"]["item"]["message"], "queued hello");
+        assert_eq!(taken["data"]["pending"].as_array().map(Vec::len), Some(0));
+
+        // 4. Queue a fixture command and let idle delivery send it to the
+        // child: the handled prompt runs the discovered fixture extension's
+        // command (proof the delivery rode the prompt command AND that
+        // project sessions discover agent-dir extensions — the factory's
+        // discovery-on shape).
+        let queued2 = send(
+            &state,
+            json!({ "v": 1, "id": "cq4", "op": "agent.command", "args": { "session": sid, "type": "queue_composer", "message": "/fixture-mark" } }),
+        );
+        assert_eq!(queued2["ok"], true, "{queued2}");
+        // The drain thread delivers; poll for the fixture's marker.
+        let mut delivered = false;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if std::fs::read_to_string(&marker).is_ok_and(|text| text.contains("marked")) {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "the queued message reached the child (the fixture command ran)");
+        // The queue emptied.
+        let poll = send(
+            &state,
+            json!({ "v": 1, "id": "cq5", "op": "sessions.state", "args": { "session": sid } }),
+        );
+        assert_eq!(poll["ok"], true, "{poll}");
+        assert_eq!(
+            poll["data"]["state"]["queuedMessages"]["pending"].as_array().map(Vec::len),
+            Some(0),
+            "the delivered item left the outbox: {}",
+            poll["data"]["state"]["queuedMessages"]
+        );
+        // The context meter answers the child's own usage (a configured
+        // local model → real limits; null stays null, never zero).
+        assert!(
+            poll["data"]["state"]["contextUsage"].is_null()
+                || poll["data"]["state"]["contextUsage"].is_object(),
+            "the context meter field: {}",
+            poll["data"]["state"]["contextUsage"]
+        );
+        assert!(poll["data"]["state"].get("systemPrompt").is_some(), "the system-prompt field exists");
+        state.registry.remove(&sid, std::time::Duration::from_secs(5));
     }
 
     #[test]
