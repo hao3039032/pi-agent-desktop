@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { IpcClient, MockTransport } from "../ipc/client.ts";
-import { bindSessionActionsService, deleteSession, renameSession } from "./session-actions-service.ts";
+import { autoNameSession, bindSessionActionsService, deleteSession, renameSession } from "./session-actions-service.ts";
 
 test("renameSession sends one explicit sessions.rename IPC request", async () => {
   const calls = [];
@@ -17,6 +17,14 @@ test("deleteSession preserves the chat-folder option in one IPC call", async () 
   bindSessionActionsService(new IpcClient(transport));
   await deleteSession("session-1", true);
   assert.deepEqual(calls, [{ session: "session-1", trashChatFolder: true }]);
+});
+
+test("autoNameSession surfaces the host refusal without a retry", async () => {
+  let calls = 0;
+  const transport = new MockTransport().on("sessions.autoName", () => { calls++; throw new Error("not supported"); });
+  bindSessionActionsService(new IpcClient(transport));
+  await assert.rejects(autoNameSession("session-1"));
+  assert.equal(calls, 1);
 });
 
 test("renameSession reports host errors without retrying", async () => {

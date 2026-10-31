@@ -31,7 +31,7 @@ import { SettingsPanel } from "./SettingsPanel";
 import { keepDocumentTitle } from "@/lib/document-title";
 import { fetchSessionView } from "@/lib/session-view-service";
 import { fetchSessionList } from "@/lib/session-list-service";
-import { viewSessionHistory } from "@/lib/session-actions-service";
+import { autoNameSession, viewSessionHistory } from "@/lib/session-actions-service";
 import { fetchChatWorkspaceRoot, validateWorkspaceCwd } from "@/lib/workspace-service";
 import { ProjectTrustDialog, type ProjectTrustFailure } from "./ProjectTrustDialog";
 import { BranchNavigator, hasSessionBranches } from "./BranchNavigator";
@@ -1517,16 +1517,8 @@ export function AppShell() {
     autoNameNoticeIdsRef.current.set(sessionId, noticeId);
 
     try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/auto-name`, {
-        method: "POST",
-        signal: AbortSignal.timeout(105_000),
-      });
-      const body = (await response.json().catch(() => ({}))) as { title?: string; error?: string };
-      if (!response.ok || !body.title) {
-        throw new Error(body.error || `HTTP ${response.status}`);
-      }
-
-      const title = body.title.trim();
+      const body = await autoNameSession(sessionId, AbortSignal.timeout(105_000));
+      const title = body.title?.trim() ?? "";
       if (!title) throw new Error(translate("title.emptyResponse"));
       const completed = { message: translate("title.updatedNotice", { title }), type: "success" as const, persistent: false };
       if (!updateAppNotice(noticeId, completed)) appNotify.success(completed);
