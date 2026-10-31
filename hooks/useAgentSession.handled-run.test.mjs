@@ -83,7 +83,9 @@ function harness({ sdkAgentActive = false, promptPending = true } = {}) {
     asConcreteThinkingLevel: (value) => value,
     PENDING_BASH_OUTPUT_CAP: 100,
     // agent_end refreshes the state once; the answer is irrelevant here.
-    fetch: () => Promise.resolve({ json: async () => ({ state: {} }) }),
+    // The state poll travels the session-view service seam (the harness
+    // stubs the seam function, exactly as it stubbed fetch before).
+    fetchAgentRunningState: () => Promise.resolve({ state: {} }),
     Date, console, window: undefined, document: undefined,
   });
   return { handler, refs, stage, calls };

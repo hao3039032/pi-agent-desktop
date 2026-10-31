@@ -714,7 +714,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
-        "sessions.get" | "sessions.context" | "sessions.state" => {
+        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err((code, message)) => protocol_error(&id, &code, &message),
@@ -1186,6 +1186,24 @@ fn session_view_dispatch(
     let agent_dir = state.agent_dir();
 
     match op {
+        // The lease renewal (POST /api/agent/[id]/lease): extend the idle
+        // lease and answer how many live event subscriptions hold it — the
+        // hook's self-heal (renewed 0 while it thinks it is attached)
+        // survives the transport swap.
+        "sessions.lease" => {
+            let Some(session) = state.registry.get(session_id) else {
+                return Ok(json!({ "renewed": 0 }));
+            };
+            session.lease();
+            let renewed = state
+                .event_relays
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|relay| relay.session_id == session_id)
+                .count() as u64;
+            Ok(json!({ "renewed": renewed }))
+        }
         // { running, state } — the /api/agent/[id] GET and
         // /api/sessions/[id]/state contract (both identical).
         "sessions.state" => {

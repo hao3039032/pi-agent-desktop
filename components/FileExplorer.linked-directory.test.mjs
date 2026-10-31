@@ -67,9 +67,18 @@ test("a folder that fails to load reports why instead of staying blank", () => {
   assert.match(source, /\{loadError && \(\s*<div role="alert"/);
 });
 
-test("allowing a link sends the target the operator was shown", () => {
-  assert.match(source, /\?type=allow-link`, \{\s*method: "POST",\s*headers: \{ "Content-Type": "application\/json" \},\s*body: JSON\.stringify\(\{ target \}\)/);
+test("allowing a link sends the target the operator was shown", async () => {
+  // The grant travels the file-tree service seam (lib/file-service.ts):
+  // the component must send the target it displayed to the seam, and the
+  // seam (the Next side) POSTs exactly that target — a link pointed
+  // elsewhere since the listing is refused, never granted blind.
   assert.match(source, /await allowOutsideLink\(node\.fullPath, pendingLinkTarget\);/);
+  const { readFile } = await import("node:fs/promises");
+  const seam = await readFile(new URL("../lib/file-service.ts", import.meta.url), "utf8");
+  assert.match(
+    seam,
+    /\?type=allow-link`, \{\s*method: "POST",\s*headers: \{ "Content-Type": "application\/json" \},\s*body: JSON\.stringify\(\{ target \}\)/,
+  );
   // A pending link is never listed: the server would only refuse it.
   assert.match(source, /if \(next && !loaded && !pendingLinkTarget\) loadChildren\(\);/);
 });

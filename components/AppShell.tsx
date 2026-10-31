@@ -29,6 +29,7 @@ const ScheduledView = dynamic(() => import("./scheduled/ScheduledView").then((m)
 import { openFileTab, saveFileViewerState } from "./file-tab-state";
 import { SettingsPanel } from "./SettingsPanel";
 import { keepDocumentTitle } from "@/lib/document-title";
+import { fetchSessionView } from "@/lib/session-view-service";
 import { ProjectTrustDialog, type ProjectTrustFailure } from "./ProjectTrustDialog";
 import { BranchNavigator, hasSessionBranches } from "./BranchNavigator";
 import { UpdateReminder } from "./UpdateReminder";
@@ -1380,9 +1381,9 @@ export function AppShell() {
       return;
     }
     try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { cache: "no-store" });
-      const data = await response.json() as { info?: SessionInfo; error?: string };
-      if (!response.ok || !data.info) throw new Error(data.error ?? `HTTP ${response.status}`);
+      const response = await fetchSessionView(sessionId, { deferThinking: true, deferMedia: true });
+      const data = response.data as { info?: SessionInfo; error?: string } | null;
+      if (!response.ok || !data?.info) throw new Error(data?.error ?? `HTTP ${response.status}`);
       handleSelectSession(data.info);
     } catch (error) {
       console.error("[pi-web] failed to open session:", error instanceof Error ? error.message : error);
@@ -1483,8 +1484,8 @@ export function AppShell() {
         const { sessionId } = notification;
         let targetSession: SessionInfo | null = sessionId ? sessionCatalog.find((s) => s.id === sessionId) ?? null : null;
         if (!targetSession && sessionId) {
-          const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { cache: "no-store" }).catch(() => null);
-          const data = response?.ok ? await response.json().catch(() => null) as { info?: SessionInfo } | null : null;
+          const response = await fetchSessionView(sessionId, { deferThinking: true, deferMedia: true });
+          const data = response.ok ? (response.data as { info?: SessionInfo } | null) : null;
           targetSession = data?.info ?? null;
         }
         deliverSessionNotification({ targetSession, title: notification.title, body: notification.body, tag: notification.tag });
@@ -3003,8 +3004,8 @@ export function AppShell() {
               // handleOpenSession only logs a failure; this page has to tell the user.
               const known = sessionCatalog.some((s) => s.id === sessionId && !s.transient);
               if (!known) {
-                const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { cache: "no-store" }).catch(() => null);
-                if (!response?.ok) return false;
+                const response = await fetchSessionView(sessionId, { deferThinking: true, deferMedia: true });
+                if (!response.ok) return false;
               }
               await handleOpenSession(sessionId);
               return true;

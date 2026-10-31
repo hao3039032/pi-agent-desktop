@@ -309,11 +309,14 @@ test('new runtime response cannot overwrite a switched session or clear a newer 
   Object.assign(h.env, {
     isNew: true, newSessionCwd: '/sandbox', ensuringNewSessionRef: ref(null), sessionIdRef: ref(null),
     newSessionModelOverrideRef: ref(null), thinkingLevelOverrideRef: ref(null), sessionToolsPinnedRef: ref(false),
-    toolPreset: 'configured', getToolNamesForPreset: () => undefined, fetch: () => response.promise,
+    toolPreset: 'configured', getToolNamesForPreset: () => undefined,
+    // The create call travels the session-view service seam (the env stubs
+    // the seam function, exactly as it stubbed fetch before).
+    createAgentSession: () => response.promise,
   });
   const pending = callback(hook, 'ensureNewSession', h.env)();
   switchTo(h.env, 'B'); const newer = Promise.resolve('B'); h.env.ensuringNewSessionRef.current = newer;
-  response.resolve({ ok:true, json:async () => ({sessionId:'late-A'}) });
+  response.resolve({ ok:true, status:200, data:{sessionId:'late-A'} });
   assert.equal(await pending, null); assert.equal(h.env.sessionIdRef.current, 'B');
   assert.equal(h.env.ensuringNewSessionRef.current, newer);
 });

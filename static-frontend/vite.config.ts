@@ -60,6 +60,14 @@ export default defineConfig({
         find: /^@\/lib\/file-service$/,
         replacement: resolve(import.meta.dirname, "src/data/file-service.ts"),
       },
+      {
+        // The session-view service (view read, context paging, state poll,
+        // session create, lease renewal) swaps the /api/sessions and
+        // /api/agent reads for sessions.get / sessions.context /
+        // sessions.state / sessions.create / sessions.lease over IPC.
+        find: /^@\/lib\/session-view-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/session-view-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

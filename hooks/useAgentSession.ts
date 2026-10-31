@@ -16,7 +16,13 @@ import { normalizeToolCalls } from "@/lib/normalize";
 import { attachmentAwareTitle } from "@/lib/chat-attachments";
 import { AgentCommandError, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { mergeComposerQueueSnapshot, type ComposerQueueActionResult, type PendingComposerMessage } from "@/lib/composer-queue-types";
-import { fetchWithRetry } from "@/lib/fetch-timeout";
+import {
+  createAgentSession,
+  fetchAgentRunningState,
+  fetchSessionContextPage,
+  fetchSessionView,
+  renewSessionLease,
+} from "@/lib/session-view-service";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
 import { rememberScrollPosition, sessionScrollTops } from "@/lib/scroll-memory";
 import {
@@ -790,15 +796,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     );
     try {
       if (showLoading) setLoading(true);
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", tree: "summary", wholeTurns: "1" });
-      if (options?.force) params.set("force", "1");
       // A hung first attempt must not leave "loading session" on screen
       // forever: abandon it, retry once with a longer deadline. The server
       // finishes its cold-start work regardless, so the retry usually lands
       // warm (see AGENTS.md — the session load must have a deadline).
-      const res = await fetchWithRetry(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
-        shouldRetry: isCurrent,
-      });
+      const res = await fetchSessionView(
+        sid,
+        {
+          force: options?.force,
+          wholeTurns: true,
+          summaryTree: true,
+          deferThinking: true,
+          deferMedia: true,
+        },
+        { shouldRetry: isCurrent },
+      );
       if (res.status === 404) {
         if (showLoading) {
           setData(null);
@@ -812,8 +824,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         deleteSessionViewSnapshot(sid);
         return null;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData;
+      if (!res.ok) throw new Error(res.error ?? `HTTP ${res.status}`);
+      const d = res.data as SessionData;
       if (!isCurrent()) return null;
       // Any history request (including an idle/background refresh) may have
       // captured the transcript before submission. Keep the optimistic message.
@@ -910,9 +922,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!includeState) return null;
 
       try {
-        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
-        if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
-        const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
+        const agentState = await fetchAgentRunningState(sid) as { running: boolean; state?: AgentStateResponse } | null;
+        if (agentState === null) throw new Error("the session state could not be read");
         if (!isCurrent() || promptRunIdRef.current !== requestPromptRunId) return null;
 
         const liveState = agentState.state;
@@ -957,16 +968,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       && !options?.signal?.aborted
     );
     try {
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", wholeTurns: "1" });
-      if (leafId) params.set("leafId", leafId);
       // Page upward: ask the server for the `tail` ancestors preceding `before`,
       // then prepend them. Omitting `before` fetches the most-recent `tail`.
-      if (before) params.set("before", before);
-      if (options?.tail) params.set("tail", String(options.tail));
-      const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
-      const res = await fetch(url, { signal: options?.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as { context: SessionData["context"] };
+      const res = await fetchSessionContextPage(
+        sid,
+        {
+          leafId,
+          before,
+          wholeTurns: true,
+          deferThinking: true,
+          deferMedia: true,
+          ...(options?.tail ? { tail: options.tail } : {}),
+        },
+        options?.signal,
+      );
+      const d = res as { context: SessionData["context"] };
       if (!sessionHookMountedRef.current) return false;
       if (!isCurrent()) return false;
       // A "before" request prepends history; it is not a new tail message.
@@ -1066,21 +1082,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // so pi resolves settings.json defaultTools instead of being pinned to ours (#700).
       const toolNames = chatWorkspace ? [] : getToolNamesForPreset(toolPreset);
       sessionToolsPinnedRef.current = chatWorkspace || toolNames !== undefined;
-      const res = await fetch("/api/agent/new", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cwd: newSessionCwd,
-          type: "ensure_session",
-          ...(toolNames !== undefined ? { toolNames } : {}),
-          ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
-          ...(selectedThinkingLevel
-            ? { thinkingLevel: selectedThinkingLevel }
-            : {}),
-        }),
+      const res = await createAgentSession({
+        cwd: newSessionCwd,
+        type: "ensure_session",
+        ...(toolNames !== undefined ? { toolNames } : {}),
+        ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
+        ...(selectedThinkingLevel
+          ? { thinkingLevel: selectedThinkingLevel }
+          : {}),
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const result = await res.json() as {
+      if (!res.ok) throw new Error(res.error ?? `HTTP ${res.status}`);
+      const result = res.data as {
         sessionId: string;
         model?: SelectedModel | null;
         thinkingLevel?: ThinkingLevelOption;
@@ -1243,12 +1255,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (disposed || renewing) return;
       renewing = true;
       try {
-        const response = await fetch(`/api/agent/${encodeURIComponent(sid)}/lease`, {
-          method: "POST",
-          cache: "no-store",
-        });
-        if (!response.ok || disposed) return;
-        const result = await response.json() as { renewed?: number };
+        const result = await renewSessionLease(sid);
+        if (result === null || disposed) return;
         if (
           !disposed
           && result.renewed === 0
@@ -1409,9 +1417,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       ) return;
 
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+        const data = await fetchAgentRunningState(sid) as { running?: boolean; state?: AgentStateResponse } | null;
+        if (data === null) throw new Error("the session state could not be read");
         if (
           generation !== eventStreamGraceGenerationRef.current
           || sessionIdRef.current !== sid
@@ -1485,9 +1492,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     while (agentRunningRef.current && Date.now() - startedAt < PROMPT_SETTLE_MAX_MS) {
       if (promptPreparingRef.current !== null || (runId !== undefined && promptRunIdRef.current !== runId)) return;
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
-        if (res.ok) {
-          const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+        const data = await fetchAgentRunningState(sid) as { running?: boolean; state?: AgentStateResponse } | null;
+        if (data !== null) {
           if (promptPreparingRef.current !== null || (runId !== undefined && promptRunIdRef.current !== runId) || sessionIdRef.current !== sid) return;
           const state = data.state;
           syncLiveModel(state);
@@ -1514,9 +1520,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     ) {
       await delay(BASH_STATE_RECONCILE_MS);
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
-        if (!res.ok) continue;
-        const data = await res.json() as { state?: AgentStateResponse };
+        const data = await fetchAgentRunningState(sid) as { state?: AgentStateResponse } | null;
+        if (data === null) continue;
         syncLiveModel(data.state);
         if (data.state?.isBashRunning) continue;
 
@@ -1542,9 +1547,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sessionGeneration = sessionGenerationRef.current;
     const runId = promptRunIdRef.current;
     try {
-      const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
-      if (!res.ok) return;
-      const data = await res.json() as { running?: boolean; state?: AgentStateResponse };
+      const data = await fetchAgentRunningState(sid) as { running?: boolean; state?: AgentStateResponse } | null;
+      if (data === null) return;
       // A slow response can straddle a run boundary (previous run finished
       // and the user already started the next one while this request was in
       // flight) — everything in it is stale, drop it.
@@ -1662,9 +1666,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           const runId = promptRunIdRef.current;
           if (!sid) break;
           loadSession(sid);
-          fetch(`/api/agent/${encodeURIComponent(sid)}`)
-            .then((r) => r.json())
-            .then((d: { state?: AgentStateResponse }) => {
+          fetchAgentRunningState(sid)
+            .then((d) => (d ?? { state: undefined }) as { state?: AgentStateResponse })
+            .then((d) => {
               if (
                 sessionIdRef.current !== sid
                 || sessionGenerationRef.current !== sessionGeneration

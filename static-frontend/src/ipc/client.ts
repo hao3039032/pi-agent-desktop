@@ -116,6 +116,15 @@ export class MockTransport implements IpcTransport {
     return this;
   }
 
+  /** Test seam: answer every request for an op with a protocol failure
+   *  envelope (the host's error codes, not a thrown exception). */
+  fail(op: string, error: { code: string; message: string }): this {
+    this.handlers.set(op, () => {
+      throw new MockFailure(error);
+    });
+    return this;
+  }
+
   send(request: IpcRequest, timeoutMs: number): Promise<unknown> {
     const handler = this.handlers.get(request.op);
     if (handler === undefined) {
@@ -125,6 +134,9 @@ export class MockTransport implements IpcTransport {
     try {
       result = handler(request.args);
     } catch (error) {
+      if (error instanceof MockFailure) {
+        return Promise.resolve(failure(request.id, error.error.code as IpcError["code"], error.error.message));
+      }
       return Promise.resolve(
         failure(request.id, "invalid_args", error instanceof Error ? error.message : String(error)),
       );
@@ -172,6 +184,15 @@ function failure(id: string, code: IpcError["code"], message: string): IpcRespon
 
 function isPromise(value: unknown): value is Promise<unknown> {
   return typeof value === "object" && value !== null && typeof (value as Promise<unknown>).then === "function";
+}
+
+/** A handler's explicit protocol failure (MockTransport.fail). */
+class MockFailure extends Error {
+  public readonly error: { code: string; message: string };
+  constructor(error: { code: string; message: string }) {
+    super(error.message);
+    this.error = error;
+  }
 }
 
 function withTimeout(

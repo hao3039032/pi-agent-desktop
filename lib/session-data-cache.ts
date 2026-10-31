@@ -1,4 +1,5 @@
 import type { AgentMessage, SessionTreeNode } from "@/lib/types";
+import { fetchSessionView } from "@/lib/session-view-service";
 
 export interface CachedSessionData {
   sessionId: string;
@@ -38,11 +39,10 @@ export function prefetchSessionData(sessionId: string): Promise<CachedSessionDat
   const pending = prefetches.get(sessionId);
   if (pending) return pending;
 
-  const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
-  const request = fetch(`/api/sessions/${encodeURIComponent(sessionId)}?${params}`)
-    .then(async (response) => {
+  const request = fetchSessionView(sessionId, { deferThinking: true, deferMedia: true })
+    .then((response) => {
       if (!response.ok) return null;
-      const data = await response.json() as CachedSessionData;
+      const data = response.data as CachedSessionData;
       cacheSessionData(sessionId, data);
       return data;
     })

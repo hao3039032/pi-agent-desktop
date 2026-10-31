@@ -42,7 +42,10 @@ test("keeps the session event stream open through the idle grace window", () => 
 
   assert.match(source, /const EVENT_STREAM_IDLE_GRACE_MS = 30_000/);
   assert.match(graceSource, /setTimeout\(\(\) => void checkServerIdle\(\), EVENT_STREAM_IDLE_GRACE_MS\)/);
-  assert.match(graceSource, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sid\)\}`\)/);
+  // The idle-grace poll travels the session-view service seam (HTTP in
+  // the Next app, sessions.state over IPC in the static build); the
+  // invariant under test is poll-until-idle-then-close, not the transport.
+  assert.match(graceSource, /await fetchAgentRunningState\(sid\)/);
   assert.match(graceSource, /closeEvents\(\)/);
   assert.match(finishSource, /scheduleEventStreamClose\(sid\)/);
   assert.doesNotMatch(finishSource, /closeEvents\(\)/);
@@ -185,7 +188,9 @@ test("only the session-mount load probes disk for external appends", () => {
     source.indexOf("sessionHookMountedRef.current = false"),
   );
   assert.match(loadSessionSource, /options\?: \{ force\?: boolean \}/);
-  assert.match(loadSessionSource, /if \(options\?\.force\) params\.set\("force", "1"\)/);
+  // force flows through the session-view service seam now; the invariant is
+  // that ONLY the mount load passes it (never a background refresh).
+  assert.match(loadSessionSource, /force: options\?\.force/);
   assert.match(loadSessionSource, /d\.wrapperRebuilt[\s\S]*?eventConnectionRef\.current\?\.close\(\)[\s\S]*?maintain\(sid\)/);
   assert.match(mountSource, /loadSession\(session\.id, !cached && !promoted, true, \{ force: true \}\)/);
   assert.match(source, /await loadSession\(sid\)/);
@@ -424,7 +429,10 @@ test("keeps the selected session warm while idle and renews its lease", () => {
   );
   assert.match(source, /sessionPropIdRef\.current === sid/);
   assert.match(source, /SESSION_LEASE_RENEW_INTERVAL_MS = 30_000/);
-  assert.match(source, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sid\)\}\/lease`/);
+  // The lease renewal travels the session-view service seam (HTTP in the
+  // Next app, sessions.lease over IPC in the static build); the invariant
+  // under test is the renewal + self-heal, not the transport spelling.
+  assert.match(source, /await renewSessionLease\(sid\)/);
   assert.match(source, /setInterval\(\(\) => void renewLease\(\), SESSION_LEASE_RENEW_INTERVAL_MS\)/);
   assert.match(source, /result\.renewed === 0[\s\S]*?closeEvents\(\)[\s\S]*?maintainEventsConnected\(sid\)/);
   assert.match(source, /if \(sessionPropIdRef\.current === sid\) \{[\s\S]*?cancelEventStreamGrace\(\);[\s\S]*?return;/);
