@@ -177,6 +177,10 @@ export function AppShell() {
     if (soundEnabledRef.current) playDoneSound();
   }, [playDoneSound, soundEnabledRef]);
   const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
+  const forkSourceIdentityRef = useRef<{ id: string | null; generation: number }>({ id: null, generation: 0 });
+  if (forkSourceIdentityRef.current.id !== (selectedSession?.id ?? null)) {
+    forkSourceIdentityRef.current = { id: selectedSession?.id ?? null, generation: forkSourceIdentityRef.current.generation + 1 };
+  }
   const [chatWorkspaceCwd, setChatWorkspaceCwd] = useState<string | null>(null);
   const [newSessionWorkspaceKind, setNewSessionWorkspaceKind] = useState<SessionWorkspaceKind>("project");
   // Resolve the hidden chat cwd independently of the sidebar's session poll so
@@ -1577,11 +1581,13 @@ export function AppShell() {
     sourceSessionId: string,
     sourceEntryId: string,
   ) => {
+    const identity = forkSourceIdentityRef.current;
     const result = await sendAgentCommand<{ newSessionId?: string }>(sourceSessionId, {
       type: "fork_branch",
       entryId: sourceEntryId,
     });
     if (!result?.newSessionId) throw new Error(translate("chat.quoteForkFailed"));
+    if (identity.id !== sourceSessionId || forkSourceIdentityRef.current !== identity) return;
     setPendingQuotePrompt({ sessionId: result.newSessionId, text: prompt });
     handleSessionForked(result.newSessionId);
   }, [handleSessionForked, translate]);

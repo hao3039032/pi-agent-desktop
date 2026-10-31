@@ -1189,6 +1189,17 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 protocol_error_value(&id, error)
             }
         },
+        "agent.command" if matches!(args.get("type").and_then(Value::as_str), Some("fork" | "fork_branch" | "clone" | "navigate_tree")) => {
+            match crate::session_actions::branch(state, &args) {
+                Ok(data) => {
+                    if data.get("newSessionId").and_then(Value::as_str).is_some() {
+                        bump_session_list_version(state);
+                    }
+                    protocol_ok(&id, data)
+                }
+                Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        }
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
         | "agent.eventsSnapshot" | "agent.command" | "agent.getTools" | "agent.setTools" => {
             // The resume path: an op on an on-disk session may cold-start its
@@ -3294,7 +3305,7 @@ pub(crate) fn key_of(path: &Path) -> String {
 }
 
 /// Dispatch a session op with the resume plan wired in.
-fn dispatch_with_resume(
+pub(crate) fn dispatch_with_resume(
     state: &IpcHostState,
     op: &str,
     args: &Value,
@@ -4440,6 +4451,8 @@ mod tests {
     #[test]
     fn agent_commands_refuse_unknown_types_and_bad_shapes() {
         let state = state();
+        let dir = tempfile::tempdir().expect("isolated agent dir");
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
         // Shape validation runs BEFORE the session lookup: a malformed
         // command never reaches a child (or spawns one).
         let ghost = send(
@@ -4457,13 +4470,17 @@ mod tests {
             json!({ "v": 1, "id": "c2b", "op": "agent.command", "args": { "session": "ghost", "type": "shell.exec" } }),
         );
         assert_eq!(unknown["error"]["code"], "invalid_args");
-        // Host-level commands refuse with not_supported (never a blind
-        // forward into a child).
+        // Branch actions validate before resolving or spawning a session.
         let host_level = send(
             &state,
             json!({ "v": 1, "id": "c2c", "op": "agent.command", "args": { "session": "ghost", "type": "fork" } }),
         );
-        assert_eq!(host_level["error"]["code"], "not_supported", "{host_level}");
+        assert_eq!(host_level["error"]["code"], "invalid_args", "{host_level}");
+        let summary = send(
+            &state,
+            json!({ "v": 1, "id": "c2d", "op": "agent.command", "args": { "session": "ghost", "type": "navigate_tree", "targetId": "entry", "summarize": true } }),
+        );
+        assert_eq!(summary["error"]["code"], "not_supported", "{summary}");
     }
 
     #[test]

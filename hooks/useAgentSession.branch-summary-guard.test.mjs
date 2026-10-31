@@ -27,8 +27,8 @@ assert.ok(leafChangeNode, "handleLeafChange not found");
 const helperJs = compile(helperNode.getText(branchSummarySource).replace(/^export /, ""));
 const branchSummaryHolds = new Script(`${helperJs}; branchSummaryHolds`).runInNewContext({});
 
-function leafChangeHarness({ pendingSummarySessionId, currentSessionId }) {
-  const calls = { activeLeaf: [], summarize: [], loadContext: [] };
+function leafChangeHarness({ pendingSummarySessionId, currentSessionId, commandResult }) {
+  const calls = { activeLeaf: [], summarize: [], loadContext: [], commands: [], loads: [], notices: [] };
   const context = {
     branchSummaryHolds,
     bashRunningRef: { current: false },
@@ -36,13 +36,16 @@ function leafChangeHarness({ pendingSummarySessionId, currentSessionId }) {
     isCompacting: false,
     branchSummarySessionIdRef: { current: pendingSummarySessionId },
     sessionIdRef: { current: currentSessionId },
+    sessionGenerationRef: { current: 1 },
+    branchNavigationRef: { current: null },
     sessionReadIdRef: { current: 0 },
     summarizeAndNavigate: async (leafId) => { calls.summarize.push(leafId); },
     setActiveLeafId: (leafId) => { calls.activeLeaf.push(leafId); },
     invalidateSessionData: () => {},
     loadContext: async (sid, leafId) => { calls.loadContext.push([sid, leafId]); return false; },
-    sendAgentCommand: async () => {},
-    addNotice: () => {},
+    sendAgentCommand: async (sid, command) => { calls.commands.push([sid, command]); if (commandResult instanceof Error) throw commandResult; return commandResult ?? { cancelled: false }; },
+    loadSession: async (sid) => { calls.loads.push(sid); },
+    addNotice: (notice) => { calls.notices.push(notice); },
     t: (key) => key,
   };
   const handlerJs = compile(leafChangeNode.initializer.arguments[0].getText(source));
@@ -61,8 +64,24 @@ test("a branch summary holds only the session it is summarizing", () => {
 test("a summary still running for the previous session does not lock branch switches in the next", async () => {
   const { handleLeafChange, calls } = leafChangeHarness({ pendingSummarySessionId: "a", currentSessionId: "b" });
   await handleLeafChange("leaf-1");
-  assert.deepEqual(calls.activeLeaf, ["leaf-1"]);
-  assert.deepEqual(calls.loadContext, [["b", "leaf-1"]]);
+  assert.deepEqual(calls.activeLeaf, []);
+  assert.equal(calls.commands.length, 1);
+  assert.equal(calls.commands[0][0], "b");
+  assert.equal(calls.commands[0][1].targetId, "leaf-1");
+  assert.deepEqual(calls.loads, ["b"]);
+});
+
+test("a cancelled or uncertain navigation never optimistically switches the view", async () => {
+  const cancelled = leafChangeHarness({ currentSessionId: "a", commandResult: { cancelled: true } });
+  await cancelled.handleLeafChange("leaf-1");
+  assert.deepEqual(cancelled.calls.activeLeaf, []);
+  assert.deepEqual(cancelled.calls.loads, []);
+  const failed = leafChangeHarness({ currentSessionId: "a", commandResult: new Error("outcome unknown") });
+  await failed.handleLeafChange("leaf-1");
+  assert.deepEqual(failed.calls.activeLeaf, []);
+  assert.deepEqual(failed.calls.loads, ["a"]);
+  assert.equal(failed.calls.notices.length, 1);
+  assert.equal(failed.calls.commands.length, 1, "unknown outcomes are not retried");
 });
 
 test("a summary running for the current session still locks its branch switches", async () => {

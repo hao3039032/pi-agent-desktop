@@ -29,6 +29,7 @@ mod native_prefs;
 pub mod pi_ipc;
 mod session_view;
 mod session_search;
+mod session_actions;
 mod shell;
 mod update_install;
 

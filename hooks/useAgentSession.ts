@@ -445,6 +445,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // straggler async refresh from the first A load cannot overwrite state
   // written after the second A load landed.
   const sessionGenerationRef = useRef(0);
+  const branchNavigationRef = useRef<{ sid: string; generation: number } | null>(null);
+  const historyLoadIdRef = useRef(0);
   const pendingInitialScrollTopRef = useRef<number | null>(null);
   const sessionPropIdRef = useRef<string | null>(session?.id ?? null);
   // False while the session carries no tool selection of its own, so its loadout
@@ -775,19 +777,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return true;
   }, []);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
+  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean; fresh?: boolean }) => {
     // Single-flight: concurrent reads for the same session (mount + SSE settle +
     // reconcile) share one request unless the caller forces a fresh read.
     const flightKey = `${options?.force ? "force:" : ""}${sid}:${sessionGenerationRef.current}:${promptRunIdRef.current}`;
-    const inflight = options?.force ? undefined : loadFlightsRef.current.get(flightKey);
+    const inflight = options?.force || options?.fresh ? undefined : loadFlightsRef.current.get(flightKey);
     if (inflight) return await inflight;
   const flight = (async (): Promise<unknown> => {
     let messagesLoaded = false;
     const sessionGeneration = sessionGenerationRef.current;
+    const historyLoadId = ++historyLoadIdRef.current;
     const requestPromptRunId = promptRunIdRef.current;
     const isCurrent = () => (
       sessionIdRef.current === sid
       && sessionGenerationRef.current === sessionGeneration
+      && historyLoadIdRef.current === historyLoadId
     );
     try {
       if (showLoading) setLoading(true);
@@ -806,6 +810,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         },
         { shouldRetry: isCurrent },
       );
+      if (!isCurrent()) return null;
       if (res.status === 404) {
         if (showLoading) {
           setData(null);
@@ -913,7 +918,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
 
       messagesLoaded = true;
-      if (showLoading) setLoading(false);
+      setLoading(false);
       if (!includeState) return null;
 
       try {
@@ -945,7 +950,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (isCurrent()) setError(String(e));
       return "error";
     } finally {
-      if (showLoading && !messagesLoaded && isCurrent()) setLoading(false);
+      if (!messagesLoaded && isCurrent()) setLoading(false);
     }
     })();
     if (!options?.force) loadFlightsRef.current.set(flightKey, flight);
@@ -2299,6 +2304,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (bashRunningRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) return;
+    const generation = sessionGenerationRef.current;
     setForkingEntryId(entryId);
     try {
       const result = await sendAgentCommand<{ cancelled?: boolean; newSessionId?: string }>(sid, {
@@ -2306,14 +2312,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         entryId,
       });
       const { cancelled, newSessionId } = result ?? {};
-      if (!cancelled && newSessionId) {
+      if (!cancelled && newSessionId && sessionIdRef.current === sid && sessionGenerationRef.current === generation) {
         onSessionForked?.(newSessionId);
       }
     } catch (e) {
       console.error("Fork failed:", e);
-      addNotice({ type: "error", message: t("chat.forkFailed", { error: e instanceof Error ? e.message : String(e) }) });
+      if (sessionIdRef.current === sid && sessionGenerationRef.current === generation) {
+        addNotice({ type: "error", message: t("chat.forkFailed", { error: e instanceof Error ? e.message : String(e) }) });
+      }
     } finally {
-      setForkingEntryId(null);
+      if (sessionIdRef.current === sid && sessionGenerationRef.current === generation) setForkingEntryId(null);
     }
   }, [addNotice, onSessionForked, t]);
 
@@ -2327,7 +2335,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         targetId: entryId,
       });
       if (result?.cancelled || sessionIdRef.current !== sid) return false;
-      await loadSession(sid);
+      await loadSession(sid, false, false, { fresh: true });
       return sessionIdRef.current === sid;
     } catch (e) {
       console.error("Failed to navigate:", e);
@@ -2346,19 +2354,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       await summarizeAndNavigate(leafId, options.customInstructions);
       return;
     }
-    setActiveLeafId(leafId);
     const sid = sessionIdRef.current;
-    if (!sid) return;
-    const loaded = await loadContext(sid, leafId);
-    if (loaded && leafId && sessionIdRef.current === sid) {
-      // The view already shows the chosen branch; if the agent's pointer cannot
-      // follow, the next prompt would continue the old one — say so.
-      sendAgentCommand(sid, { type: "navigate_tree", targetId: leafId }).catch((e) => {
-        if (sessionIdRef.current !== sid) return;
+    if (!sid || !leafId) return;
+    const generation = sessionGenerationRef.current;
+    if (branchNavigationRef.current?.sid === sid && branchNavigationRef.current.generation === generation) return;
+    const request = { sid, generation };
+    branchNavigationRef.current = request;
+    const current = () => sessionIdRef.current === sid && sessionGenerationRef.current === generation;
+    try {
+      const result = await sendAgentCommand<{ cancelled?: boolean }>(sid, { type: "navigate_tree", targetId: leafId });
+      if (current() && !result?.cancelled) await loadSession(sid, false, false, { fresh: true });
+    } catch (e) {
+      if (current()) {
         addNotice({ type: "error", message: t("chat.navigateFailed", { error: e instanceof Error ? e.message : String(e) }) });
-      });
+        // A lost acknowledgement may follow a successful move. Re-read the
+        // child rather than leaving a guessed branch on screen or retrying.
+        await loadSession(sid, false, false, { fresh: true });
+      }
+    } finally {
+      if (branchNavigationRef.current === request) branchNavigationRef.current = null;
     }
-  }, [addNotice, branchSummarySessionIdRef, isCompacting, loadContext, summarizeAndNavigate, t]);
+  }, [addNotice, branchSummarySessionIdRef, isCompacting, loadSession, summarizeAndNavigate, t]);
 
   const handleModelChange = useCallback(async (provider: string, modelId: string) => {
     if (isNew) {
