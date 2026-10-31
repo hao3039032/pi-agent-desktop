@@ -41,6 +41,7 @@ mod session_search;
 mod session_actions;
 mod trust_policy_fence;
 mod chat_sessions;
+mod session_writer_fence;
 mod session_deletion;
 mod terminal_host;
 mod scheduler_host;

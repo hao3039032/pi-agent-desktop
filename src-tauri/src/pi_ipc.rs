@@ -66,7 +66,7 @@ pub struct IpcHostState {
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     mcp_signin_tasks: Mutex<BTreeSet<String>>,
     /// The scheduled-task store root (the agent dir the host runs against).
-    pub task_agent_dir: Mutex<Option<PathBuf>>,
+    pub task_agent_dir: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
@@ -120,11 +120,36 @@ struct EventRelayHandle {
 }
 
 impl IpcHostState {
+    pub(crate) fn chat_unlock_permitted(&self) -> bool {
+        self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_chat_unlock_for_test(&mut self) {
+        self.chat_unlock_policy = ChatUnlockPolicy::StaticPackaged;
+    }
+
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
         let policy_gate = Arc::new(std::sync::RwLock::new(()));
+        let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
+        let fence_agent_dir = Arc::clone(&task_agent_dir);
+        let admitted_agent_dir = Mutex::new(None::<PathBuf>);
+        let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
+            let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
+                .clone().ok_or_else(|| "Agent directory unavailable".to_string())?;
+            let mut admitted = admitted_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?;
+            if admitted.as_ref().is_some_and(|previous| previous != &agent) {
+                return Err("Agent directory changed after session admission".into());
+            }
+            *admitted = Some(agent.clone());
+            if crate::trust_policy_fence::is_pending(&agent) {
+                return Err("Trust policy outcome is unresolved; session admission is blocked".into());
+            }
+            crate::session_writer_fence::assert_session_writable(&agent, id)
+        });
         Self {
-            registry: Arc::new(SessionRegistry::with_policy_gate(Arc::clone(&policy_gate))),
+            registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
@@ -139,7 +164,7 @@ impl IpcHostState {
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
-            task_agent_dir: Mutex::new(None),
+            task_agent_dir,
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),
@@ -1259,6 +1284,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         },
         "sessions.rename" => match crate::session_actions::rename(state, &args) {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.chatAccessGet" => match crate::chat_sessions::get_access(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
         "sessions.search" => match crate::session_search::search(state, &args) {
@@ -8368,6 +8397,32 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
 
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_persistent_fence_blocks_registry_writers_and_start_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = state();
+        *host.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        host.registry.with_idle_session_writer("existing", |_| Ok::<_, ()>(())).unwrap();
+        crate::trust_policy_fence::begin(dir.path(), "combined-operation", dir.path()).unwrap();
+        assert!(matches!(
+            host.registry.with_idle_session_writer("existing", |_| -> Result<(), ()> { panic!("pending trust must exclude writers") }),
+            Err(session_host::SessionWriterError::<()>::Busy(_))
+        ));
+        assert!(matches!(
+            host.registry.with_offline_session_writer("existing", Duration::ZERO, || -> Result<(), ()> { panic!("pending trust must exclude offline mutation") }),
+            Err(session_host::SessionWriterError::<()>::Busy(_))
+        ));
+        let file = dir.path().join("existing.jsonl");
+        std::fs::write(&file, "fixture").unwrap();
+        let rejected = host.registry.start_with_plan("existing", &file, "existing", dir.path(), || {
+            panic!("pending trust must prevent even spawn policy evaluation")
+        });
+        assert!(rejected.err().unwrap().to_string().contains("unresolved"));
+        crate::trust_policy_fence::complete(dir.path(), "combined-operation").unwrap();
+        host.registry.with_idle_session_writer("existing", |_| Ok::<_, ()>(())).unwrap();
     }
 
     #[cfg(unix)]

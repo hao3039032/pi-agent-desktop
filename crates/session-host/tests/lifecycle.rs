@@ -10,9 +10,17 @@ use std::time::Duration;
 use serde_json::json;
 
 use session_host::{
-    create_session_file, dispatch_session_op, SessionHostError, SessionRegistry,
+    create_session_file, dispatch_session_op, SessionHostError,
     SessionSpawnConfig, IDLE_TIMEOUT,
 };
+
+// Every lifecycle fixture opts into an isolated, unrestricted checker.
+struct SessionRegistry;
+impl SessionRegistry {
+    fn new() -> session_host::SessionRegistry {
+        session_host::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+    }
+}
 
 fn pi_bin() -> Option<String> {
     match std::env::var("PI_CLI_BIN") {
@@ -1238,6 +1246,38 @@ fn a_replaced_sessions_inflight_drain_only_parks_its_own_item() {
     assert_eq!(log_lines(&log_old), vec!["A".to_string()], "the old child saw A exactly once");
     assert_eq!(log_lines(&log_new), vec!["A".to_string()], "the new child saw A exactly once");
     registry.remove(&id, Duration::from_secs(5));
+}
+
+#[test]
+fn session_writer_fence_blocks_live_admissions_and_drain() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, _) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let id = "fenced-live";
+    let log = dir.path().join("prompts.log");
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&dir.path().join("agent"), &[
+        "--mock-session-id", id, "--mock-commands", &commands,
+        "--mock-prompt-log", log.to_str().unwrap(),
+    ]);
+    let fenced = Arc::new(AtomicBool::new(false));
+    let checker_flag = Arc::clone(&fenced);
+    let registry = session_host::SessionRegistry::with_fence_checker(Arc::new(move |_| {
+        if checker_flag.load(Ordering::SeqCst) { Err("unknown writer outcome".into()) } else { Ok(()) }
+    }));
+    let session = registry.start(id, &file, id, &cwd, &config).unwrap();
+    fenced.store(true, Ordering::SeqCst);
+    assert!(registry.start(id, &file, id, &cwd, &config).is_err());
+    assert!(session.command("prompt", json!({"message":"blocked"}), Some(Duration::from_secs(2))).is_err());
+    assert!(session.composer_enqueue("blocked", None).is_err());
+    session.composer_outbox.enqueue("queued", None).unwrap();
+    session.composer_wake();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(session.composer_outbox.has_items());
+    assert!(log_lines(&log).is_empty());
+    registry.remove(id, Duration::from_secs(5));
 }
 
 /// Terra round-4 (the reviewer's exact window): an old drain parked between
