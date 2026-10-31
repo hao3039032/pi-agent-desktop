@@ -325,6 +325,18 @@ mod linux {
             assert!(source.exists());
         }
         #[test]
+        fn search_recovers_before_taking_its_snapshot() {
+            let (dir, state, root, source) = fixture();
+            let metadata = std::fs::metadata(&source).unwrap();
+            assert!(remove_with_hook(&root, dir.path(), "a", &source, &metadata, |at| if at == "isolated" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            assert!(!source.exists());
+            // No management host is configured: the later IPC error is
+            // expected, but recovery must occur before that call.
+            let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"search","op":"sessions.search","args":{"query":"needle"}}));
+            assert_eq!(response["ok"], false, "{response}");
+            assert!(source.exists());
+        }
+        #[test]
         fn recovery_never_replaces_new_source() {
             let (dir, state, root, source) = fixture();
             let metadata = std::fs::metadata(&source).unwrap();
