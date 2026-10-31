@@ -109,6 +109,22 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Read only a session file's header id (the parent-session resolution:
+/// the parent's id is authoritative from ITS header, never from a filename
+/// suffix). None for a missing, empty or non-session file.
+pub fn read_header_id(file: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(file).ok()?;
+    let first_line = content.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    let header: Value = serde_json::from_str(first_line).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("id").and_then(Value::as_str).map(str::to_string)
+}
+
 /// Read one session file's header line into a summary.
 pub fn read_header_summary(file: &Path) -> Result<SessionSummary, String> {
     let content = std::fs::read_to_string(file).map_err(|error| format!("unreadable: {error}"))?;

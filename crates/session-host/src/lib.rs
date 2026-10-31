@@ -299,6 +299,26 @@ impl Session {
         self.run_state()
     }
 
+    /// The in-memory partial assistant message (the state responses'
+    /// `streamingMessage`): the machine's accumulated dense content blocks
+    /// projected onto the AgentMessage shape the UI seeds its snapshot with.
+    pub fn streaming_message_value(&self) -> Value {
+        let machine = self.machine.lock().unwrap();
+        match machine.streaming_message() {
+            Some(message) => {
+                let mut value = json!({
+                    "role": "assistant",
+                    "content": message.content,
+                });
+                if let Some(usage) = &message.usage {
+                    value["usage"] = usage.clone();
+                }
+                value
+            }
+            None => Value::Null,
+        }
+    }
+
     /// Orderly shutdown: stdin EOF then grace kill (pi-host close).
     pub fn shutdown(&self, grace: Duration) -> Option<i32> {
         self.client.close(grace)

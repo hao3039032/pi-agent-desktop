@@ -16,14 +16,13 @@
  */
 
 import assert from "node:assert/strict";
-import { cpSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
 import { resolvePiCliBin } from "../../lib/pi-rpc/test-utils.mjs";
-import { buildProjectionInto } from "./build-management-modules.mjs";
+import { stageManagedTree } from "./stage-managed-tree.mjs";
 
 const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 const { PiRpcClient } = await jiti.import("../../lib/pi-rpc/client.ts");
@@ -33,51 +32,11 @@ const HERE = import.meta.dirname;
 
 /**
  * Stage the vendored management tree (the desktop:prepare shape) into a temp
- * dir: croner + the pi SDK graph with its dependency closure, plus the
- * session-view projection bundle compiled from THIS repo's source.
+ * dir — scripts/migration/stage-managed-tree.mjs owns the staging rules.
  */
 async function stageVendoredTree(managed) {
   await mkdir(managed, { recursive: true });
-  const { readdirSync, existsSync, readFileSync } = await import("node:fs");
-  const vendorClosure = (entryPackage) => {
-    const seen = new Set();
-    const walk = (name) => {
-      if (seen.has(name)) return;
-      seen.add(name);
-      const dir = join(HERE, "../../node_modules", ...name.split("/"));
-      const manifest = join(dir, "package.json");
-      if (!existsSync(manifest)) return;
-      let deps = {};
-      try {
-        deps = JSON.parse(readFileSync(manifest, "utf8")).dependencies ?? {};
-      } catch {}
-      for (const dep of Object.keys(deps)) walk(dep);
-    };
-    walk(entryPackage);
-    return [...seen];
-  };
-  cpSync(join(HERE, "../../node_modules/croner"), join(managed, "croner"), { recursive: true });
-  for (const pkg of vendorClosure("@earendil-works/pi-ai")) {
-    const from = join(HERE, "../../node_modules", ...pkg.split("/"));
-    if (!existsSync(join(from, "package.json"))) continue;
-    cpSync(from, join(managed, ...pkg.split("/")), { recursive: true });
-  }
-  cpSync(
-    join(HERE, "../../node_modules/@earendil-works/pi-coding-agent"),
-    join(managed, "@earendil-works/pi-coding-agent"),
-    { recursive: true },
-  );
-  for (const pkg of vendorClosure("@earendil-works/pi-coding-agent")) {
-    const from = join(HERE, "../../node_modules", ...pkg.split("/"));
-    if (!existsSync(join(from, "package.json"))) continue;
-    const target = join(managed, ...pkg.split("/"));
-    if (!existsSync(join(target, "package.json"))) {
-      cpSync(from, target, { recursive: true });
-    }
-  }
-  // The projection bundle: compiled from this checkout's lib/ source, the
-  // same code the Next server runs (never a hand-maintained copy).
-  await buildProjectionInto(managed);
+  await stageManagedTree(managed);
 }
 
 test(

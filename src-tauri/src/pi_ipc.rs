@@ -56,6 +56,9 @@ pub struct IpcHostState {
     /// session index, artifact locations). resource grants only ever accept
     /// members of this set — the frontend cannot mint its own.
     proposed_paths: Mutex<BTreeSet<String>>,
+    /// Git project identity with the TS resolver's TTL cache
+    /// (lib/worktree.ts resolveProject).
+    pub projects: crate::session_view::ProjectResolver,
 }
 
 /// Handle that ends one event-stream relay thread on unsubscribe.
@@ -88,6 +91,7 @@ impl IpcHostState {
                 Mutex::new(roots)
             },
             proposed_paths: Mutex::new(BTreeSet::new()),
+            projects: crate::session_view::ProjectResolver::new(),
         }
     }
 
@@ -207,6 +211,44 @@ fn resolve_session_spawn_config() -> Option<SessionSpawnConfig> {
     })
 }
 
+/// The managed module tree (the vendored dependency tree the management
+/// extension loads by absolute path): an env override wins (tests, staged
+/// layouts), then the packaged `<resources>/managed` directory, then the
+/// dev checkout's `.managed-tree` (built by
+/// `node scripts/migration/stage-managed-tree.mjs`). Without a tree the
+/// config stays None and management ops answer management_unavailable —
+/// the host never pretends a projection it cannot run.
+fn resolve_managed_modules() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("PI_WEB_MANAGED_MODULES") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    if let Some(exe_dir) = exe_dir {
+        let candidates = [
+            exe_dir.join("../Resources/managed"),
+            exe_dir.join("../../resources/managed"),
+            exe_dir.join("managed"),
+        ];
+        for candidate in candidates {
+            if let Ok(resolved) = candidate.canonicalize() {
+                if resolved.is_dir() {
+                    return Some(resolved);
+                }
+            }
+        }
+    }
+    let dev = Path::new("../.managed-tree");
+    if let Ok(resolved) = dev.canonicalize() {
+        if resolved.is_dir() {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
 /// The management spawn config (the vendored management extension; its
 /// managed module tree is wired with the M3 packaging — until then the
 /// config stays None and models ops answer management_unavailable).
@@ -217,11 +259,15 @@ fn resolve_management_config() -> Option<ManagementSpawnConfig> {
         Ok(resolved) if resolved.is_file() => Some(resolved),
         _ => None,
     }?;
+    let managed = resolve_managed_modules()?;
     Some(ManagementSpawnConfig {
         executable: executable.to_string_lossy().into_owned(),
         agent_dir: None,
         extensions: vec![extension],
-        env: Vec::new(),
+        env: vec![(
+            "PI_WEB_MANAGED_MODULES".to_string(),
+            managed.to_string_lossy().into_owned(),
+        )],
     })
 }
 
@@ -663,6 +709,17 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
             protocol_ok(&id, json!({ "sessions": sessions }))
         }
+        // The session VIEW (GET /api/sessions/[id] and /context): the
+        // projection runs in the management instance over the repo's own
+        // lib/session-projection.ts bundle; this host owns resolution
+        // (live child first, disk scan second), the live one-shot snapshot,
+        // workspace classification and the git project identity.
+        "sessions.get" | "sessions.context" | "sessions.state" => {
+            match session_view_dispatch(state, op, &args) {
+                Ok(data) => protocol_ok(&id, data),
+                Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        }
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
         | "agent.eventsSnapshot" | "agent.command" | "agent.getTools" | "agent.setTools" => {
             // The resume path: an op on an on-disk session may cold-start its
@@ -1000,6 +1057,329 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
 #[tauri::command]
 pub fn pi_ipc(state: State<'_, IpcHostState>, request: Value) -> Value {
     dispatch_envelope(&state, request)
+}
+
+// --- the session view (sessions.get / sessions.context / sessions.state) ---
+
+/// One management-op call: the instance is per-scope on demand (60 s idle
+/// recycle), and every failure is (code, message) — never a fallback that
+/// would present a disk tail as a live view or an empty context as success.
+fn management_call(
+    state: &IpcHostState,
+    op: &str,
+    args: Value,
+) -> Result<Value, (String, String)> {
+    let config = state.management_config.lock().unwrap().clone();
+    let Some(config) = config else {
+        return Err((
+            "management_unavailable".to_string(),
+            "the management instance is not configured (the vendored module tree is missing)".to_string(),
+        ));
+    };
+    let instance = state
+        .management
+        .instance("global", &config)
+        .map_err(|error| ("management_unavailable".to_string(), error))?;
+    instance
+        .management_call_sync(op, args)
+        .map_err(|error| management_error_code(&error))
+}
+
+/// The extension reports failures as "[code] message"; recover the code for
+/// the protocol envelope (unknown codes stay io, never success).
+fn management_error_code(error: &str) -> (String, String) {
+    if let Some((code, rest)) = error.strip_prefix('[').and_then(|body| body.split_once(']')) {
+        let code = code.to_string();
+        let known = matches!(
+            code.as_str(),
+            "unknown_op" | "invalid_args" | "not_found" | "op_failed" | "invalid_cron"
+        );
+        (
+            if known { code } else { "io".to_string() },
+            rest.trim().to_string(),
+        )
+    } else {
+        ("io".to_string(), error.to_string())
+    }
+}
+
+/// Assemble the `info` object (the SessionInfo shape the sidebar and
+/// AppShell consume): the catalogue scan's per-file fields plus the host's
+/// workspace classification and git project identity — exactly what
+/// attachSessionProjectInfo layered on the Next server.
+#[allow(clippy::too_many_arguments)]
+fn session_info_json(
+    state: &IpcHostState,
+    agent_dir: &Path,
+    scan: &session_host::history::ScannedSession,
+    parent_session_id: Option<&str>,
+    relation: Option<Value>,
+    message_count: u64,
+    live: bool,
+) -> Value {
+    let cwd = PathBuf::from(&scan.cwd);
+    // The detail view's modified is the FILE mtime (the catalogue uses
+    // last-message activity instead — different fields, both correct).
+    let modified_ms = std::fs::metadata(&scan.path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(scan.modified_ms);
+    let mut info = json!({
+        "path": scan.path.display().to_string(),
+        "id": scan.id,
+        "cwd": scan.cwd,
+        "created": ms_to_iso(scan.created_ms),
+        "modified": ms_to_iso(modified_ms),
+        "messageCount": message_count,
+        "firstMessage": scan.first_message,
+        "transient": false,
+    });
+    if let Some(name) = &scan.name {
+        info["name"] = json!(name);
+    }
+    if scan.compaction_count > 0 {
+        info["compactionCount"] = json!(scan.compaction_count);
+    }
+    if let Some(parent) = parent_session_id {
+        info["parentSessionId"] = json!(parent);
+    }
+    if let Some(relation) = relation {
+        info["relation"] = relation;
+    }
+    // Workspace classification: chats stay out of projects, worktrees and
+    // project trust (the fork's chat policy boundary).
+    if crate::session_view::is_chat_workspace_path(&cwd, agent_dir) {
+        info["workspaceKind"] = json!("chat");
+        if crate::session_view::is_chat_folder_path(&cwd, agent_dir) {
+            info["chatFolder"] = json!(true);
+        }
+    } else {
+        info["workspaceKind"] = json!("project");
+        let project = state.projects.resolve(&cwd);
+        info["projectRoot"] = json!(project.project_root.display().to_string());
+        info["projectKey"] = json!(crate::session_view::project_identity_key(&project.project_root));
+        if let Some(branch) = project.branch {
+            info["branch"] = json!(branch);
+        }
+        if project.is_worktree {
+            info["isWorktree"] = json!(true);
+        }
+    }
+    let _ = live;
+    info
+}
+
+/// sessions.get / sessions.context / sessions.state (the GET /api/sessions/[id]
+/// family). Returns (code, message) failures; the caller maps them onto the
+/// protocol envelope.
+fn session_view_dispatch(
+    state: &IpcHostState,
+    op: &str,
+    args: &Value,
+) -> Result<Value, (String, String)> {
+    let session_id = args.get("session").and_then(Value::as_str).unwrap_or_default();
+    if session_id.is_empty() {
+        return Err(("invalid_args".to_string(), "session is required".to_string()));
+    }
+    let agent_dir = state.agent_dir();
+
+    match op {
+        // { running, state } — the /api/agent/[id] GET and
+        // /api/sessions/[id]/state contract (both identical).
+        "sessions.state" => {
+            if let Some(session) = state.registry.get(session_id) {
+                session.lease();
+                let raw = session
+                    .get_state()
+                    .map_err(|error| ("agent_child_error".to_string(), error.to_string()))?;
+                let machine = session.run_state();
+                let model = raw.get("model").cloned().unwrap_or(Value::Null);
+                let queued_messages = json!({
+                    "steering": machine.steering_queue,
+                    "followUp": machine.follow_up_queue,
+                });
+                let state_json = json!({
+                    "sessionId": raw.get("sessionId").cloned().unwrap_or(json!(session_id)),
+                    "sessionFile": raw.get("sessionFile").cloned().unwrap_or(Value::Null),
+                    "isStreaming": raw.get("isStreaming").and_then(Value::as_bool).unwrap_or(false),
+                    "streamingMessage": session.streaming_message_value(),
+                    "isPromptRunning": false,
+                    "isBashRunning": raw.get("isBashRunning").and_then(Value::as_bool),
+                    "isCompacting": raw.get("isCompacting").and_then(Value::as_bool).unwrap_or(false),
+                    "autoCompactionEnabled": raw.get("autoCompactionEnabled").cloned().unwrap_or(Value::Null),
+                    // Unknown until the child proves it (the repo's hard rule):
+                    // only set_auto_retry or an auto_retry_start event may set it.
+                    "autoRetryEnabled": machine.auto_retry_enabled,
+                    "steeringMode": raw.get("steeringMode").cloned().unwrap_or(Value::Null),
+                    "followUpMode": raw.get("followUpMode").cloned().unwrap_or(Value::Null),
+                    "model": model,
+                    "thinkingLevel": raw.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+                    "messageCount": raw.get("messageCount").and_then(Value::as_u64).unwrap_or(0),
+                    "pendingMessageCount": raw.get("pendingMessageCount").and_then(Value::as_u64).unwrap_or(0),
+                    "queuedMessages": queued_messages,
+                });
+                return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
+            }
+            // Not running: the on-disk existence check answers not_found
+            // exactly like the route (never an invented empty state).
+            if session_host::history::find_session_by_id(&agent_dir, session_id).is_none() {
+                return Err(("not_found".to_string(), format!("Session not found: {session_id}")));
+            }
+            Ok(json!({ "running": false }))
+        }
+
+        // The /api/sessions/[id]/context contract: branch paging over the
+        // append-only file (explicit leafId / before always address the disk
+        // view, exactly like the route).
+        "sessions.context" => {
+            let summary = session_host::history::find_session_by_id(&agent_dir, session_id)
+                .ok_or_else(|| ("not_found".to_string(), format!("Session not found: {session_id}")))?;
+            let mut call_args = json!({ "file": summary.file.display().to_string() });
+            for field in ["leafId", "before"] {
+                if let Some(value) = args.get(field).and_then(Value::as_str) {
+                    call_args[field] = json!(value);
+                }
+            }
+            if let Some(tail) = args.get("tail").and_then(Value::as_u64) {
+                call_args["tail"] = json!(tail);
+            }
+            copy_bool_arg(args, &mut call_args, "deferThinking");
+            copy_bool_arg(args, &mut call_args, "deferMedia");
+            copy_bool_arg(args, &mut call_args, "wholeTurns");
+            management_call(state, "session.readContext", call_args)
+        }
+
+        // GET /api/sessions/[id]: the live one-shot snapshot when a child
+        // owns the session (CLI-authoritative branch), else the disk view.
+        "sessions.get" => {
+            let summary = session_host::history::find_session_by_id(&agent_dir, session_id);
+            let live = state.registry.get(session_id);
+            let (file, source_id) = match (&live, &summary) {
+                (Some(session), _) => (session.session_file.clone(), format!("runtime:{session_id}")),
+                (None, Some(summary)) => (summary.file.clone(), "disk".to_string()),
+                (None, None) => {
+                    return Err(("not_found".to_string(), format!("Session not found: {session_id}")))
+                }
+            };
+            if let Some(session) = &live {
+                session.lease();
+            }
+
+            let defer_thinking = args.get("deferThinking").and_then(Value::as_bool).unwrap_or(false);
+            let defer_media = args.get("deferMedia").and_then(Value::as_bool).unwrap_or(false);
+            let summary_tree = args.get("summaryTree").and_then(Value::as_bool).unwrap_or(false);
+            let tail = args.get("tail").and_then(Value::as_u64).unwrap_or(50);
+            let whole_turns = args.get("wholeTurns").and_then(Value::as_bool).unwrap_or(false);
+
+            // 1. The projection (live snapshot handoff or the disk view).
+            let (projection, relation) = if let Some(session) = &live {
+                let (entries, leaf_id, tree) = crate::session_view::live_child_snapshot(session)
+                    .map_err(|message| ("agent_child_error".to_string(), message))?;
+                let handoff = crate::session_view::write_snapshot_handoff(
+                    &entries,
+                    leaf_id.as_deref(),
+                    &tree,
+                )
+                .map_err(|error| ("io".to_string(), error.to_string()))?;
+                let call_args = json!({
+                    "snapshotFile": handoff.display().to_string(),
+                    "sessionId": session_id,
+                    "sessionPath": file.display().to_string(),
+                    "summaryTree": summary_tree,
+                    "deferThinking": defer_thinking,
+                    "deferMedia": defer_media,
+                    "tail": tail,
+                    "wholeTurns": whole_turns,
+                });
+                let result = management_call(state, "session.projectSnapshot", call_args);
+                let _ = std::fs::remove_file(&handoff);
+                let result = result?;
+                let relation = result.get("relation").cloned();
+                (result, relation)
+            } else {
+                let call_args = json!({
+                    "file": file.display().to_string(),
+                    "summaryTree": summary_tree,
+                    "deferThinking": defer_thinking,
+                    "deferMedia": defer_media,
+                    "tail": tail,
+                    "wholeTurns": whole_turns,
+                });
+                let result = management_call(state, "session.readView", call_args)?;
+                let relation = result.get("relation").cloned();
+                (result, relation)
+            };
+
+            // 2. The info object needs the scan + the parent id.
+            let scan = session_host::history::scan_session_file_info(&file)
+                .ok_or_else(|| ("not_found".to_string(), format!("the session file is unreadable: {}", file.display())))?;
+            let parent_session_id = scan
+                .parent_session_path
+                .as_deref()
+                .and_then(|parent| session_host::history::read_header_id(Path::new(parent)));
+            let relation = relation.or_else(|| {
+                parent_session_id.as_deref().map(|parent| {
+                    json!({ "kind": "fork", "originSessionId": parent })
+                })
+            });
+            let message_count = projection
+                .get("stats")
+                .and_then(|stats| stats.get("totalMessages"))
+                .and_then(Value::as_u64)
+                .unwrap_or(scan.message_count);
+            let info = session_info_json(
+                state,
+                &agent_dir,
+                &scan,
+                parent_session_id.as_deref(),
+                relation,
+                message_count,
+                live.is_some(),
+            );
+
+            // 3. The snapshot revision (the host owns the fingerprint half).
+            let revision = crate::session_view::snapshot_revision(
+                &file,
+                &source_id,
+                projection
+                    .get("entryCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as usize,
+                projection
+                    .get("latestEntryId")
+                    .and_then(Value::as_str),
+                projection.get("leafId").and_then(Value::as_str),
+            );
+
+            let mut data = json!({
+                "sessionId": session_id,
+                "filePath": file.display().to_string(),
+                "info": info,
+                "leafId": projection.get("leafId").cloned().unwrap_or(Value::Null),
+                "tree": projection.get("tree").cloned().unwrap_or(json!([])),
+                "snapshotRevision": revision,
+                "context": projection.get("context").cloned().unwrap_or(json!({})),
+                "stats": projection.get("stats").cloned().unwrap_or(json!({})),
+                "totalActiveMs": projection.get("totalActiveMs").cloned().unwrap_or(json!(0)),
+            });
+            if summary_tree {
+                data["treeFormat"] = json!("summary");
+            }
+            if let Some(tool_names) = projection.get("toolNames") {
+                data["toolNames"] = tool_names.clone();
+            }
+            Ok(data)
+        }
+        other => Err(("unknown_op".to_string(), format!("unknown operation {other}"))),
+    }
+}
+
+fn copy_bool_arg(args: &Value, into: &mut Value, field: &str) {
+    if let Some(value) = args.get(field).and_then(Value::as_bool) {
+        into[field] = json!(value);
+    }
 }
 
 
@@ -2185,5 +2565,240 @@ mod tests {
             outside.canonicalize().unwrap().to_string_lossy(),
             "the explorer gets the target for its confirmation flow"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The session view over the REAL pi child (PI_CLI_BIN, sandboxed agent
+    // dir, staged vendored management tree): sessions.get / sessions.context
+    // / sessions.state — the M2 read loop.
+    // ---------------------------------------------------------------------
+
+    /// Write a fixture session file with a branch point, a model change, a
+    /// compaction divider and a tool pin (the same shape the differential
+    /// projection test pins field by field).
+    fn write_view_fixture(sessions_dir: &std::path::Path, cwd: &std::path::Path, id: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(sessions_dir).expect("sessions dir");
+        let file = sessions_dir.join(format!("20260201T100000_{id}.jsonl"));
+        let lines = vec![
+            json!({ "type": "session", "version": 3, "id": id, "timestamp": "2026-02-01T10:00:00.000Z", "cwd": cwd.display().to_string() }),
+            json!({ "type": "message", "id": "u1", "parentId": null, "timestamp": "2026-02-01T10:00:01.000Z", "message": { "role": "user", "content": "first question" } }),
+            json!({ "type": "message", "id": "a1", "parentId": "u1", "timestamp": "2026-02-01T10:00:02.000Z", "message": { "role": "assistant", "provider": "p", "model": "m1", "content": [{ "type": "text", "text": "answer one" }] } }),
+            json!({ "type": "message", "id": "u2", "parentId": "a1", "timestamp": "2026-02-01T10:00:03.000Z", "message": { "role": "user", "content": "the abandoned branch" } }),
+            json!({ "type": "message", "id": "u2b", "parentId": "a1", "timestamp": "2026-02-01T10:00:04.000Z", "message": { "role": "user", "content": "the kept branch" } }),
+            json!({ "type": "message", "id": "a2", "parentId": "u2b", "timestamp": "2026-02-01T10:00:05.000Z", "message": { "role": "assistant", "content": [{ "type": "text", "text": "answer two" }] } }),
+            json!({ "type": "model_change", "id": "mc1", "parentId": "a2", "timestamp": "2026-02-01T10:00:06.000Z", "provider": "prov", "modelId": "model-x" }),
+            json!({ "type": "thinking_level_change", "id": "tl1", "parentId": "mc1", "timestamp": "2026-02-01T10:00:07.000Z", "thinkingLevel": "high" }),
+            json!({ "type": "compaction", "id": "cp1", "parentId": "tl1", "timestamp": "2026-02-01T10:00:08.000Z", "summary": "earlier turns compacted", "firstKeptEntryId": "u2b", "tokensBefore": 4096 }),
+            json!({ "type": "message", "id": "u3", "parentId": "cp1", "timestamp": "2026-02-01T10:00:09.000Z", "message": { "role": "user", "content": "after compaction" } }),
+            json!({ "type": "custom", "id": "ts1", "parentId": "u3", "timestamp": "2026-02-01T10:00:10.000Z", "customType": "pi-web:tool-selection", "data": { "version": 1, "tools": ["read", "bash"] } }),
+            json!({ "type": "message", "id": "a3", "parentId": "ts1", "timestamp": "2026-02-01T10:00:11.000Z", "message": { "role": "assistant", "content": [{ "type": "text", "text": "final" }] } }),
+        ];
+        let body = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file, format!("{body}\n")).expect("fixture");
+        file
+    }
+
+    /// Stage the vendored management tree with the repo's node (the same
+    /// staging rules desktop:prepare uses — never a partial tree). The tree
+    /// root holds node_modules/ so the vendored packages resolve their
+    /// closure inside the tree (the desktop:prepare layout).
+    fn stage_managed_tree(dir: &std::path::Path) -> std::path::PathBuf {
+        let managed = dir.join("managed").join("node_modules");
+        let script = std::path::Path::new("../scripts/migration/stage-managed-tree.mjs")
+            .canonicalize()
+            .expect("the staging script resolves");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .arg("--out")
+            .arg(&managed)
+            .output()
+            .expect("node runs the staging script");
+        assert!(
+            output.status.success(),
+            "staging failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        managed
+    }
+
+    #[test]
+    fn real_pi_sessions_get_context_and_state_read_the_view() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let sessions = agent_dir.join("sessions").join("proj");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let file = write_view_fixture(&sessions, &cwd, "view-s1");
+        let managed = stage_managed_tree(dir.path());
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_config.lock().unwrap() = Some(session_host::SessionSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            session_dir: Some(sessions.clone()),
+            bridge_asset: std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+                .canonicalize()
+                .expect("bridge asset"),
+            extra_args: Vec::new(),
+        });
+        // The management instance runs SANDBOXED against the same temp agent
+        // dir with the staged vendored tree (never the real ~/.pi/agent).
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable,
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![(
+                "PI_WEB_MANAGED_MODULES".to_string(),
+                managed.display().to_string(),
+            )],
+        });
+
+        // 1. The disk view (no child): the full GET /api/sessions/[id] shape.
+        let view = send(
+            &state,
+            json!({ "v": 1, "id": "v1", "op": "sessions.get", "args": {
+                "session": "view-s1", "summaryTree": true, "deferThinking": true, "deferMedia": true, "wholeTurns": true,
+            } }),
+        );
+        assert_eq!(view["ok"], true, "the disk view answered: {view}");
+        let data = &view["data"];
+        assert_eq!(data["sessionId"], "view-s1");
+        assert_eq!(data["filePath"], file.display().to_string());
+        assert_eq!(data["treeFormat"], "summary");
+        assert_eq!(data["leafId"], "a3");
+        assert_eq!(data["info"]["id"], "view-s1");
+        assert_eq!(data["info"]["workspaceKind"], "project");
+        assert_eq!(data["info"]["firstMessage"], "first question");
+        assert_eq!(data["info"]["messageCount"], 7, "user+assistant messages over all branches");
+        assert_eq!(data["info"]["compactionCount"], 1);
+        assert_eq!(data["toolNames"].as_array().map(Vec::len), Some(2), "the tool pin survived");
+        let context = &data["context"];
+        assert_eq!(context["model"]["modelId"], "model-x");
+        assert_eq!(context["thinkingLevel"], "high");
+        let texts: Vec<&str> = context["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|message| {
+                message["content"]
+                    .as_str()
+                    .or_else(|| {
+                        message["content"].as_array().and_then(|blocks| {
+                            blocks
+                                .iter()
+                                .find(|block| block["type"] == "text")
+                                .and_then(|block| block["text"].as_str())
+                        })
+                    })
+                    .unwrap_or("")
+            })
+            .collect();
+        assert!(texts.contains(&"the kept branch"), "the active branch's texts: {texts:?}");
+        assert!(!texts.contains(&"the abandoned branch"), "the abandoned sibling stays out");
+        // The compaction divider renders as a custom message.
+        assert!(
+            context["messages"].as_array().unwrap().iter().any(|message| message["customType"] == "compaction"),
+            "the compaction divider renders"
+        );
+        assert!(data["snapshotRevision"].is_string(), "an opaque revision token");
+        assert_eq!(data["stats"]["totalMessages"], 7);
+
+        // 2. Branch paging: an explicit leaf addresses the abandoned branch.
+        let branch = send(
+            &state,
+            json!({ "v": 1, "id": "v2", "op": "sessions.context", "args": {
+                "session": "view-s1", "leafId": "u2", "deferThinking": true, "deferMedia": true,
+            } }),
+        );
+        assert_eq!(branch["ok"], true, "{branch}");
+        let branch_texts = branch["data"]["context"]["messages"].as_array().unwrap().len();
+        assert_eq!(branch_texts, 3, "u1, a1, u2 — the abandoned branch, not the tail");
+
+        // 3. `before` pagination excludes the cursor.
+        let page = send(
+            &state,
+            json!({ "v": 1, "id": "v3", "op": "sessions.context", "args": {
+                "session": "view-s1", "before": "cp1", "tail": 2, "deferThinking": true, "deferMedia": true,
+            } }),
+        );
+        assert_eq!(page["ok"], true, "{page}");
+        assert_eq!(page["data"]["before"], "cp1");
+        let page_ids = page["data"]["context"]["entryIds"].as_array().unwrap();
+        assert!(!page_ids.iter().any(|entry| entry == "cp1"), "the cursor is excluded");
+
+        // 4. State on a not-running session: running=false (and a ghost 404s).
+        let idle = send(
+            &state,
+            json!({ "v": 1, "id": "v4", "op": "sessions.state", "args": { "session": "view-s1" } }),
+        );
+        assert_eq!(idle["ok"], true, "{idle}");
+        assert_eq!(idle["data"]["running"], false);
+        let ghost = send(
+            &state,
+            json!({ "v": 1, "id": "v5", "op": "sessions.state", "args": { "session": "ghost" } }),
+        );
+        assert_eq!(ghost["error"]["code"], "not_found");
+
+        // 5. The LIVE view: cold-start the real child, then read the same
+        //    session through the one-shot snapshot handoff.
+        let started = send(
+            &state,
+            json!({ "v": 1, "id": "v6", "op": "agent.command", "args": { "session": "view-s1", "type": "get_state" } }),
+        );
+        assert_eq!(started["ok"], true, "the child cold-started: {started}");
+        let live = send(
+            &state,
+            json!({ "v": 1, "id": "v7", "op": "sessions.get", "args": {
+                "session": "view-s1", "summaryTree": true, "deferThinking": true, "deferMedia": true, "wholeTurns": true,
+            } }),
+        );
+        assert_eq!(live["ok"], true, "the live view answered: {live}");
+        assert_eq!(live["data"]["leafId"], "a3");
+        // The live snapshot's revision differs from the disk read's (the
+        // read source is part of the token).
+        assert_ne!(
+            live["data"]["snapshotRevision"], data["snapshotRevision"],
+            "runtime: vs disk — the token carries the source"
+        );
+        // The temp handoff file is gone.
+        let leftovers = std::fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("pi-web-snapshot-")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "the snapshot handoff files are cleaned up");
+
+        // 6. Live state: the child's get_state + the machine's projection.
+        let live_state = send(
+            &state,
+            json!({ "v": 1, "id": "v8", "op": "sessions.state", "args": { "session": "view-s1" } }),
+        );
+        assert_eq!(live_state["ok"], true, "{live_state}");
+        assert_eq!(live_state["data"]["running"], false, "idle after get_state");
+        assert_eq!(live_state["data"]["state"]["sessionId"], "view-s1");
+        assert_eq!(live_state["data"]["state"]["autoRetryEnabled"], serde_json::Value::Null, "unknown until the child proves it");
+
+        // Cleanup: the management child and the session child.
+        state.management.recycle_expired();
+        state.registry.remove("view-s1", std::time::Duration::from_secs(5));
     }
 }

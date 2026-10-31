@@ -21,6 +21,7 @@ mod file_access;
 mod logging;
 mod native_prefs;
 mod pi_ipc;
+mod session_view;
 mod shell;
 mod update_install;
 

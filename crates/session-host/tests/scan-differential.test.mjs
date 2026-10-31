@@ -15,7 +15,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -25,36 +25,59 @@ import { fileURLToPath } from "node:url";
 const jiti = createJiti(import.meta.url, { interopDefault: true });
 const { scanSessionFileInfo } = await jiti.import("../../../lib/session-list-scanner.ts");
 
-/** Run the Rust scan over a directory of session files, printing JSON. */
+/** The Rust fixture report is unavailable only when the toolchain itself is
+ *  missing — a present-but-failing cargo is a TEST FAILURE, never a skip
+ *  (a compile break inside history.rs must fail this differential, not
+ *  quietly stop checking the Rust scan). */
+class RustToolchainMissing extends Error {}
+
+/** Run the Rust scan over a directory of session files, printing JSON.
+ *  Returns { rows, dir }; the CALLER owns the temp dir's cleanup. */
 function rustScan(files) {
   const dir = mkdtempSync(join(tmpdir(), "rust-scan-"));
-  const sessions = join(dir, "sessions", "proj");
-  mkdirSync(sessions, { recursive: true });
-  const paths = [];
-  for (const [name, content] of Object.entries(files)) {
-    const file = join(sessions, name);
-    writeFileSync(file, content);
-    paths.push(file);
+  try {
+    const sessions = join(dir, "sessions", "proj");
+    mkdirSync(sessions, { recursive: true });
+    const paths = [];
+    for (const [name, content] of Object.entries(files)) {
+      const file = join(sessions, name);
+      writeFileSync(file, content);
+      paths.push(file);
+    }
+    const fixture = join(dir, "list.txt");
+    writeFileSync(fixture, paths.join("\n") + "\n");
+    // A missing cargo is the only skip-worthy condition: probe the tool
+    // FIRST so a broken build can never hide behind "unavailable".
+    const probe = spawnSync("cargo", ["--version"], { encoding: "utf8" });
+    if (probe.error || probe.status !== 0) {
+      throw new RustToolchainMissing("cargo is not installed or not runnable");
+    }
+    const run = spawnSync(
+      "cargo",
+      ["test", "--manifest-path", "crates/session-host/Cargo.toml", "--lib", "rust_scan_fixture_report", "--", "--nocapture", "--ignored"],
+      {
+        cwd: join(fileURLToPath(new URL(".", import.meta.url)), "../../.."),
+        encoding: "utf8",
+        env: { ...process.env, RUST_SCAN_FILES: fixture },
+      },
+    );
+    if (run.status !== 0 || !run.stdout.includes("RUST-SCAN ")) {
+      // The toolchain is present: any failure here is a real break — the
+      // compile error or the report's own panic surfaces verbatim.
+      throw new Error(
+        `the Rust fixture report failed (status ${run.status}): ` +
+          (run.stderr || run.stdout || "").slice(-1200),
+      );
+    }
+    const rows = run.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("RUST-SCAN "))
+      .map((line) => JSON.parse(line.slice("RUST-SCAN ".length)));
+    return { rows, dir };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
   }
-  const fixture = join(dir, "list.txt");
-  writeFileSync(fixture, paths.join("\n") + "\n");
-  const run = spawnSync(
-    "cargo",
-    ["test", "--manifest-path", "crates/session-host/Cargo.toml", "--lib", "rust_scan_fixture_report", "--", "--nocapture", "--ignored"],
-    {
-      cwd: join(fileURLToPath(new URL(".", import.meta.url)), "../../.."),
-      encoding: "utf8",
-      env: { ...process.env, RUST_SCAN_FILES: fixture },
-    },
-  );
-  if (run.status !== 0 || !run.stdout.includes("RUST-SCAN ")) {
-    return { error: run.stderr.slice(-400) || "the Rust fixture report did not run" };
-  }
-  const rows = run.stdout
-    .split("\n")
-    .filter((line) => line.startsWith("RUST-SCAN "))
-    .map((line) => JSON.parse(line.slice("RUST-SCAN ".length)));
-  return { rows };
 }
 
 const FIXTURES = {
@@ -109,42 +132,53 @@ const FIXTURES = {
 };
 
 test("the Rust scan matches the TS scanner field for field", async (t) => {
-  const rust = rustScan(FIXTURES);
-  if (rust.error) {
-    t.skip(`the Rust fixture report is unavailable here: ${rust.error}`);
-    return;
-  }
-  const byPath = new Map(
-    rust.rows.map((row) => [row.path, row.null === true ? null : row]),
-  );
-
-  for (const [name, content] of Object.entries(FIXTURES)) {
-    const dir = mkdtempSync(join(tmpdir(), "ts-scan-"));
-    const file = join(dir, name);
-    writeFileSync(file, content);
-    const ts = await scanSessionFileInfo(file);
-    const rs = byPath.get(name) ?? null; // the Rust report keys by file NAME
-
-    if (ts === null) {
-      assert.equal(rs, null, `${name}: TS hides the file, Rust must too`);
-      continue;
+  let rust;
+  try {
+    try {
+      rust = rustScan(FIXTURES);
+    } catch (error) {
+      if (error instanceof RustToolchainMissing) {
+        t.skip(`the Rust toolchain is unavailable here: ${error.message}`);
+        return;
+      }
+      throw error;
     }
-    assert.notEqual(rs, null, `${name}: TS lists the file, Rust hid it`);
-    assert.equal(rs.id, ts.id, `${name}: id`);
-    assert.equal(rs.cwd, ts.cwd, `${name}: cwd`);
-    assert.equal(rs.name ?? null, ts.name ?? null, `${name}: name (the session_info rename)`);
-    assert.equal(rs.parentSessionPath ?? null, ts.parentSessionPath ?? null, `${name}: parentSession`);
-    assert.equal(rs.messageCount, ts.messageCount, `${name}: messageCount`);
-    assert.equal(rs.compactionCount, ts.compactionCount ?? 0, `${name}: compactionCount`);
-    assert.equal(rs.firstMessage, ts.firstMessage, `${name}: firstMessage`);
-    // sizeBytes is a Rust-side extension (the TS shape has no size); the
-    // cheap header scan's sizeBytes covers it — not part of the differential.
-    // Times: the TS Date keeps milliseconds; compare to the ms.
-    const tsCreated = ts.created.getTime();
-    const tsModified = ts.modified.getTime();
-    if (rs.createdMs !== tsCreated) console.log("MISMATCH", name, "created", rs.createdMs, "vs", tsCreated);
-    if (rs.modifiedMs !== tsModified) console.log("MISMATCH", name, "modified", rs.modifiedMs, "vs", tsModified);
-    assert.equal(rs.createdMs, tsCreated, `${name}: created (ms + offset honored)`);
-    assert.equal(rs.modifiedMs, tsModified, `${name}: modified (activity > header > mtime)`);
+    const byPath = new Map(
+      rust.rows.map((row) => [row.path, row.null === true ? null : row]),
+    );
+
+    for (const [name, content] of Object.entries(FIXTURES)) {
+      const dir = mkdtempSync(join(tmpdir(), "ts-scan-"));
+      try {
+        const file = join(dir, name);
+        writeFileSync(file, content);
+        const ts = await scanSessionFileInfo(file);
+        const rs = byPath.get(name) ?? null; // the Rust report keys by file NAME
+
+        if (ts === null) {
+          assert.equal(rs, null, `${name}: TS hides the file, Rust must too`);
+          continue;
+        }
+        assert.notEqual(rs, null, `${name}: TS lists the file, Rust hid it`);
+        assert.equal(rs.id, ts.id, `${name}: id`);
+        assert.equal(rs.cwd, ts.cwd, `${name}: cwd`);
+        assert.equal(rs.name ?? null, ts.name ?? null, `${name}: name (the session_info rename)`);
+        assert.equal(rs.parentSessionPath ?? null, ts.parentSessionPath ?? null, `${name}: parentSession`);
+        assert.equal(rs.messageCount, ts.messageCount, `${name}: messageCount`);
+        assert.equal(rs.compactionCount, ts.compactionCount ?? 0, `${name}: compactionCount`);
+        assert.equal(rs.firstMessage, ts.firstMessage, `${name}: firstMessage`);
+        // sizeBytes is a Rust-side extension (the TS shape has no size); the
+        // cheap header scan's sizeBytes covers it — not part of the differential.
+        // Times: the TS Date keeps milliseconds; compare to the ms.
+        const tsCreated = ts.created.getTime();
+        const tsModified = ts.modified.getTime();
+        assert.equal(rs.createdMs, tsCreated, `${name}: created (ms + offset honored)`);
+        assert.equal(rs.modifiedMs, tsModified, `${name}: modified (activity > header > mtime)`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (rust) rmSync(rust.dir, { recursive: true, force: true });
   }
 });

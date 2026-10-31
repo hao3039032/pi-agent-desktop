@@ -42,6 +42,10 @@ export { projectTreeForResponse, toSummaryTree } from "${ROOT}/lib/project-tree.
 export { computeSessionStats } from "${ROOT}/lib/session-stats.ts";
 export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";
 export {
+  readSubagentRun,
+  SUBAGENT_META_TYPE,
+} from "${ROOT}/lib/subagents.ts";
+export {
   readSessionToolSelection,
   validateSessionToolSelection,
 } from "${ROOT}/lib/session-tool-selection.ts";
