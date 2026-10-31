@@ -132,6 +132,21 @@ impl Bridge {
         nonce: String,
         timeout: Duration,
     ) -> Arc<Self> {
+        Self::attach_inner(client, session_id, nonce, timeout, None)
+    }
+
+    /// Attach while forwarding ordinary notifies to the session's bounded ordered UI queue.
+    pub fn attach_with_ui_forward(
+        client: Arc<PiRpcClient>, session_id: String, nonce: String,
+        forward: std::sync::mpsc::SyncSender<crate::client::UiRequest>,
+    ) -> Arc<Self> {
+        Self::attach_inner(client, session_id, nonce, BRIDGE_TIMEOUT, Some(forward))
+    }
+
+    fn attach_inner(
+        client: Arc<PiRpcClient>, session_id: String, nonce: String, timeout: Duration,
+        forward: Option<std::sync::mpsc::SyncSender<crate::client::UiRequest>>,
+    ) -> Arc<Self> {
         let state = Arc::new(Mutex::new(BridgeState { pending: HashMap::new(), transport_fatal: None }));
         let (notify_tx, notify_rx) = std::sync::mpsc::channel::<crate::client::UiRequest>();
         // Bridge envelopes bypass the startup window's queue: they are
@@ -144,7 +159,10 @@ impl Bridge {
                 .and_then(Value::as_str)
                 .is_some_and(|message| message.starts_with(BRIDGE_RESULT_PREFIX))
         });
-        let notify_subscription = client.on_ui("notify", notify_tx, Some(bypass));
+        let notify_subscription = match forward {
+            Some(forward) => client.on_ui_with_plain_forward("notify", notify_tx, bypass, forward),
+            None => client.on_ui("notify", notify_tx, Some(bypass)),
+        };
         // Held for the Bridge's lifetime; Drop detaches it (the handler's
         // sender dies, the router thread's recv fails, the thread exits).
 

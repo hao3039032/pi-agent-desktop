@@ -527,7 +527,7 @@ pub fn pi_ipc_subscribe_events(
     );
     let subscription_id_for_relay = subscription_id.clone();
     let epoch = session_handle.epoch();
-    let (subscriber_id, events) = session_handle.subscribe();
+    let (subscriber_id, events, pending_ui) = session_handle.subscribe_with_ui();
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -561,12 +561,19 @@ pub fn pi_ipc_subscribe_events(
                 "state": session_run_state_json(&session_handle),
                 // The SSE `connected` contract: the client reconciles its
                 // dialog queue against what the session still holds.
-                "pendingExtensionUiIds": session_handle.run_state().pending_ui_request_ids,
+                "pendingExtensionUiIds": pending_ui.iter().filter_map(|record| record.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
             });
             seq += 1;
             if on_event.send(stream_frame(&subscription_id, epoch, seq, "snapshot", snapshot)).is_err() {
                 detach(subscriber_id);
                 return;
+            }
+            for record in pending_ui {
+                seq += 1;
+                if on_event.send(stream_frame(&subscription_id, epoch, seq, "event", record)).is_err() {
+                    detach(subscriber_id);
+                    return;
+                }
             }
             loop {
                 if stop_for_relay.load(Ordering::SeqCst) {
@@ -1305,6 +1312,17 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     protocol_ok(&id, data)
                 }
                 Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        }
+        "agent.respondUi" => {
+            let session_id = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let request_id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            match state.registry.get(session_id) {
+                Some(session) => match session.respond_ui(request_id, &args) {
+                    Ok(()) => protocol_ok(&id, json!({ "ok": true })),
+                    Err(message) => protocol_error(&id, "invalid_params", message),
+                },
+                None => protocol_error(&id, "not_found", "session is not running"),
             }
         }
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
@@ -3956,6 +3974,53 @@ mod tests {
 
     fn send(state: &IpcHostState, request: Value) -> Value {
         dispatch_envelope(state, request)
+    }
+
+    #[test]
+    fn real_pi_extension_ui_response_ipc_is_session_bound() {
+        let Ok(executable) = std::env::var("PI_CLI_BIN") else { eprintln!("skipping: PI_CLI_BIN not set"); return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ext = dir.path().join("confirm.mjs");
+        let output = dir.path().join("answer");
+        std::fs::write(&ext, format!(r#"import {{ writeFileSync }} from 'node:fs';
+export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_, ctx) => {{
+  const answer = await ctx.ui.confirm('Allow?', 'fixture');
+  writeFileSync({:?}, JSON.stringify(answer));
+}} }});"#, output.to_string_lossy())).unwrap();
+        let (file, id) = session_host::create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+        let bridge = Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        let config = session_host::SessionSpawnConfig {
+            executable, agent_dir: Some(agent), session_dir: None, bridge_asset: bridge,
+            artifacts_asset: None, chat_asset: None, chat_asset_sha256: None,
+            shape: session_host::SessionSpawnShape::Project { tool_args: None },
+            initial_model: None, thinking_level: None,
+            extra_args: vec!["--extension".into(), ext.to_string_lossy().into_owned()],
+        };
+        let state = state();
+        let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
+        let (_sub, events, _) = session.subscribe_with_ui();
+        let prompt = Arc::clone(&session);
+        let handle = std::thread::spawn(move || prompt.command("prompt", json!({"message":"/fixture-confirm"}), Some(Duration::from_secs(10))));
+        let event = loop {
+            let event = events.recv_timeout(Duration::from_secs(10)).unwrap();
+            if event["method"] == "confirm" { break event }
+        };
+        let request_id = event["id"].as_str().unwrap();
+        let reply = send(&state, json!({"v":1,"id":"reply","op":"agent.respondUi","args":{
+            "session":id,"type":"extension_ui_response","id":request_id,"confirmed":false
+        }}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        let replay = send(&state, json!({"v":1,"id":"replay","op":"agent.respondUi","args":{
+            "session":id,"type":"extension_ui_response","id":request_id,"confirmed":true
+        }}));
+        assert_eq!(replay["ok"], false, "{replay}");
+        handle.join().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "false");
+        state.registry.remove(&id, Duration::from_secs(5));
     }
 
     #[test]
