@@ -8,6 +8,9 @@
       /* Inline theme bootstrap (src/theme-init.ts twin): first paint is
          themed offline, no network. */
       (function(){var t="auto";try{var s=localStorage.getItem("pi-theme");if(["auto","light","dark"].includes(s))t=s}catch(e){}if(t==="auto")t=window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";var r=document.documentElement;r.dataset.theme=t;r.classList.toggle("dark",t==="dark")})();
+      /* Inline font bootstrap (lib/font-preferences.ts twin): first paint restores
+         font preferences offline without font flash, no network. */
+      (function(){try{var f=JSON.parse(localStorage.getItem("pi-fonts")||"null");var valid=function(v){return typeof v==="string"&&v.length<=120&&v===v.trim()&&!/[\u0000-\u001f\u007f-\u009f"'\\,;:{}()<>\[\]\/]/.test(v)};if(f&&valid(f.ui)&&valid(f.mono)){var s=document.documentElement.style;for(var p of[["ui",f.ui],["display",f.ui],["mono",f.mono]]){if(p[1])s.setProperty("--font-"+p[0],JSON.stringify(p[1])+", var(--font-"+p[0]+"-default)");else s.removeProperty("--font-"+p[0])}}}catch(e){}})();
     </script>
   </head>
   <body>

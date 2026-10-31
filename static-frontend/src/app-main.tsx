@@ -20,6 +20,7 @@ import { bindAgentClient } from "./data/agent-client.ts";
 import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindEnabledModelsService } from "./data/enabled-models-service.ts";
 import { bindFileService } from "./data/file-service.ts";
+import { bindFontService } from "./data/font-service.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
@@ -41,6 +42,7 @@ async function boot(): Promise<void> {
   bindModelsService(client);
   bindEnabledModelsService(client);
   bindModelsConfigService(client);
+  bindFontService(client);
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);

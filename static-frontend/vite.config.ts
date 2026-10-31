@@ -131,6 +131,12 @@ export default defineConfig({
         find: /^@\/lib\/models-config-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-config-service.ts"),
       },
+      {
+        // The font service swaps /api/appearance/fonts and /api/desktop/fonts
+        // for appearance.fontsGet / appearance.fontsSet / desktop.fonts over IPC.
+        find: /^@\/lib\/font-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/font-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

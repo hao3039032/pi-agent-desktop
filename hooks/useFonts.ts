@@ -3,6 +3,7 @@
 import { useSyncExternalStore } from "react";
 import { APP_PREF_KEYS, getPrefJson, setPrefJson } from "@/lib/app-prefs";
 import { applyFontPreferences, DEFAULT_FONTS, FONT_CHANGE_EVENT, isFontPreferences, type FontPreferences } from "@/lib/font-preferences";
+import { fetchFontPreferences, saveFontPreferences } from "@/lib/font-service";
 
 type State = { fonts: FontPreferences; saving: boolean; error: "load" | "save" | null };
 const SERVER_STATE: State = { fonts: DEFAULT_FONTS, saving: false, error: null };
@@ -34,14 +35,10 @@ function restore() {
   if (loadingStarted) return;
   loadingStarted = true;
   const startedAt = revision;
-  void fetch("/api/appearance/fonts", { cache: "no-store", signal: AbortSignal.timeout(10_000) })
-    .then(async (response) => {
-      if (!response.ok) throw new Error("Could not read fonts");
-      return response.json() as Promise<{ fonts?: unknown }>;
-    })
-    .then(({ fonts }) => {
+  void fetchFontPreferences()
+    .then((fonts) => {
       if (startedAt !== revision) return;
-      publish({ fonts: isFontPreferences(fonts) ? fonts : snapshot().fonts, saving: false, error: null });
+      publish({ fonts: fonts ? fonts : snapshot().fonts, saving: false, error: null });
     })
     .catch(() => { if (startedAt === revision) publish({ ...snapshot(), error: "load" }); });
 }
@@ -59,11 +56,7 @@ function setFonts(fonts: FontPreferences) {
   publish({ fonts, saving: true, error: null });
   writeQueue = writeQueue.catch(() => {}).then(async () => {
     try {
-      const response = await fetch("/api/appearance/fonts", {
-        method: "PUT", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fonts }), signal: AbortSignal.timeout(10_000),
-      });
-      if (!response.ok) throw new Error("Could not save fonts");
+      await saveFontPreferences(fonts);
       if (selectedAt === revision) publish({ fonts, saving: false, error: null });
     } catch {
       if (selectedAt === revision) publish({ fonts, saving: false, error: "save" });

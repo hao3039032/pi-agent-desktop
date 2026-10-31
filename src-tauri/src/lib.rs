@@ -18,6 +18,7 @@ use std::os::windows::process::CommandExt as _;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Url};
 
 mod file_access;
+pub mod fonts;
 mod logging;
 mod native_prefs;
 // `pi_ipc` is pub for the static-UI acceptance harness bin (same crate,
