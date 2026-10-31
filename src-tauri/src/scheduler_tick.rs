@@ -130,13 +130,11 @@ impl SchedulerLoop {
             let mut owner = false;
             loop {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-                let had_lease = task_scheduler::lease::info(&state.agent_dir(), now, pid_alive).ok().flatten()
-                    .is_some_and(|info| info["pid"].as_u64() == Some(std::process::id() as u64) && info["fresh"] == true);
                 let next = match tick(&state, now) {
                     Ok(owner) => owner,
                     Err(error) => { eprintln!("scheduled tick failed: {error}"); false }
                 };
-                let owns_lease = if next { true } else if had_lease {
+                let owns_lease = if next { true } else if owner {
                     task_scheduler::lease::info(&state.agent_dir(), now, pid_alive).ok().flatten()
                         .is_some_and(|info| info["pid"].as_u64() == Some(std::process::id() as u64) && info["fresh"] == true)
                 } else { false };
@@ -187,6 +185,18 @@ mod tests {
         }
         state.shutdown_scheduler().unwrap();
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn failed_recovery_never_publishes_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("scheduled-tasks.json"), "{broken").unwrap();
+        let state = Arc::new(IpcHostState::new());
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let mut scheduler = SchedulerLoop::start(Arc::clone(&state), std::time::Duration::from_millis(20)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst));
+        scheduler.stop();
     }
 
     #[test]
