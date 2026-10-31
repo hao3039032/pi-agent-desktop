@@ -81,6 +81,12 @@ export {
   logoutProvider,
   ProviderAuthRefusalError,
 } from "${ROOT}/lib/provider-auth-service.server.ts";
+export {
+  startLoginFlow,
+  pollLoginFlow,
+  submitLoginCode,
+  cancelLoginFlow,
+} from "${ROOT}/lib/provider-auth-login.server.ts";
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
 export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";

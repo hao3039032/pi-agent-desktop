@@ -40,6 +40,10 @@ pub struct IpcHostState {
     subscription_counter: AtomicU64,
     /// Live event-stream relays by subscription id (unsubscribe detaches).
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
+    /// The provider-auth domain's login-stream relays (the same release
+    /// contract: unsubscribe cancels the flow host-side). Kept in the
+    /// domain's own map so the shared one stays untouched.
+    pub(crate) login_relays: Arc<crate::provider_auth::LoginRelays>,
     /// Running-set relay THREADS alive right now (the thread-lifetime
     /// truth, distinct from `event_relays`, which the unsubscribe handler
     /// clears itself): a relay that ignores its stop flag would hold this
@@ -105,6 +109,7 @@ impl IpcHostState {
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
+            login_relays: Arc::new(Default::default()),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
             terminal_management_lock: Mutex::new(()),
@@ -427,7 +432,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// One stream frame (docs/migration/ipc-protocol.md §3).
-fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &str, payload: Value) -> Value {
+pub(crate) fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &str, payload: Value) -> Value {
     json!({
         "subscriptionId": subscription_id,
         "epoch": epoch,
@@ -1246,26 +1251,33 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // fresh snapshot.
         "agent.unsubscribeEvents" => {
             let subscription_id = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
-            let handle = state.event_relays.lock().unwrap().remove(subscription_id);
-            match handle {
-                Some(handle) => {
-                    handle.stop.store(true, Ordering::SeqCst);
-                    if let Some(session) = state.registry.get(&handle.session_id) {
-                        session.unsubscribe(handle.subscriber_id);
+            // The provider-auth login streams unsubscribe through the same
+            // op (their relays live in the domain's own map): stop the relay
+            // and cancel the flow host-side.
+            if crate::provider_auth::unsubscribe_login_stream(state, subscription_id) {
+                protocol_ok(&id, json!({ "unsubscribed": subscription_id }))
+            } else {
+                let handle = state.event_relays.lock().unwrap().remove(subscription_id);
+                match handle {
+                    Some(handle) => {
+                        handle.stop.store(true, Ordering::SeqCst);
+                        if let Some(session) = state.registry.get(&handle.session_id) {
+                            session.unsubscribe(handle.subscriber_id);
+                        }
+                        // WAKE the running-set relay's waiter (Terra P2-2): it
+                        // sleeps on the registry's running signal with a 30 s
+                        // probe — without this bump a quiet unsubscribe leaves
+                        // the relay thread (and its liveness count) alive until
+                        // the probe. The bump is wake-only: no transition is
+                        // recorded, nothing replays; the relay re-checks its
+                        // stop flag and detaches at once. The session-events
+                        // relay is unaffected (its recv_timeout is already
+                        // bounded at 500 ms).
+                        state.registry.running_signal().notify();
+                        protocol_ok(&id, json!({ "unsubscribed": subscription_id }))
                     }
-                    // WAKE the running-set relay's waiter (Terra P2-2): it
-                    // sleeps on the registry's running signal with a 30 s
-                    // probe — without this bump a quiet unsubscribe leaves
-                    // the relay thread (and its liveness count) alive until
-                    // the probe. The bump is wake-only: no transition is
-                    // recorded, nothing replays; the relay re-checks its
-                    // stop flag and detaches at once. The session-events
-                    // relay is unaffected (its recv_timeout is already
-                    // bounded at 500 ms).
-                    state.registry.running_signal().notify();
-                    protocol_ok(&id, json!({ "unsubscribed": subscription_id }))
+                    None => protocol_error(&id, "not_found", &format!("no subscription {subscription_id}")),
                 }
-                None => protocol_error(&id, "not_found", &format!("no subscription {subscription_id}")),
             }
         }
         // Terminals (crates/pty-host): idempotent create, serialized input,
@@ -1764,7 +1776,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // live in the domain module; the compositions themselves run in the
         // management instance (the same lib/provider-auth-service.server.ts
         // the Next /api/auth/* routes serve).
-        "auth.providers" | "auth.apiKeyStore" | "auth.apiKeyDelete" | "auth.logout" => {
+        "auth.providers" | "auth.apiKeyStore" | "auth.apiKeyDelete" | "auth.logout"
+        | "auth.loginManualCode" | "auth.loginSubmit" | "auth.loginCancel" => {
             match crate::provider_auth::dispatch(state, op, &id, &args) {
                 Some(answer) => answer,
                 None => protocol_error(&id, "unknown_op", &format!("unknown operation: {op}")),

@@ -192,6 +192,13 @@ export default defineConfig({
         find: /^@\/lib\/provider-auth-service$/,
         replacement: resolve(import.meta.dirname, "src/data/provider-auth-service.ts"),
       },
+      {
+        // The provider-auth login service swaps the /api/auth/login/[provider]
+        // route for auth.loginStream (over Tauri Channel) and auth.loginManualCode
+        // over IPC.
+        find: /^@\/lib\/provider-auth-login$/,
+        replacement: resolve(import.meta.dirname, "src/data/provider-auth-login.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

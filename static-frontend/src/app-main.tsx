@@ -30,6 +30,7 @@ import { bindModelsExtrasService } from "./data/models-extras-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindSkillsClient } from "./data/skills-client.ts";
 import { bindPluginsClient } from "./data/plugins-client.ts";
+import { bindProviderAuthLogin } from "./data/provider-auth-login.ts";
 import { bindProviderAuthService } from "./data/provider-auth-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
@@ -65,6 +66,7 @@ async function boot(): Promise<void> {
   bindCustomCssService(client);
   bindModelsExtrasService(client);
   bindProviderAuthService(client);
+  bindProviderAuthLogin(client);
   bindSessionViewService(client);
   bindSessionListService(client);
   bindSessionActionsService(client);

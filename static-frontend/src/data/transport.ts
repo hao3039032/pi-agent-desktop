@@ -166,7 +166,9 @@ class HostBridgeTransport implements IpcTransport {
               ? "pi_ipc_subscribe_running"
               : op === "terminal.subscribeOutput"
                 ? "pi_ipc_subscribe_terminal"
-                : null;
+                : op === "auth.loginStream"
+                  ? "pi_ipc_login_stream"
+                  : null;
         if (command === null) {
           handle.stopLocalDelivery();
           onError({ code: "unknown_op", message: `no stream handler for '${op}'`, retryable: false });
@@ -177,7 +179,9 @@ class HostBridgeTransport implements IpcTransport {
             ? { session: args?.session, onEvent: handle.channel }
             : command === "pi_ipc_subscribe_running"
               ? { onFrame: handle.channel }
-              : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
+              : command === "pi_ipc_login_stream"
+                ? { provider: args?.provider, onEvent: handle.channel }
+                : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
         const ack = await invoke(command, payload);
         const parsed = parseSubscribeAck(ack);
         if ("error" in parsed) {

@@ -16,6 +16,12 @@
 //! renders the message, never a status code.
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tauri::ipc::Channel;
+use tauri::State;
 
 use crate::pi_ipc::IpcHostState;
 
@@ -23,6 +29,67 @@ use crate::pi_ipc::IpcHostState;
 /// `apiKey.login()` (offline prompt shim) plus the credential write. The
 /// default management minute would cut a slow provider validation in half.
 const API_KEY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+// --- the OAuth login stream -------------------------------------------------
+//
+// The old GET /api/auth/login/[provider] SSE stream, over a Tauri Channel:
+// the login runs detached INSIDE the management instance (its prompts and
+// notifications buffer as the SSE event shapes — see
+// lib/provider-auth-login.server.ts), and this relay polls them out by
+// sequence and forwards every frame. Events and the stream contract are the
+// plan's §四 stream rules: monotonic seq per subscription, an atomic first
+// frame, and release on unsubscribe/page reload.
+
+/// The login relay's cadence. Each poll is a full management call whose
+/// end-of-call touch keeps the instance lease fresh for the flow's whole
+/// lifetime — that IS the login's activity lease (no shared-crates change).
+const LOGIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// One poll's bound. A poll is an idempotent READ, so a stolen result
+/// envelope (the known on_ui single-slot race between concurrent management
+/// calls — see the notify-router work) costs one 5s gap and a retry, never a
+/// false failure and never a resent mutation. Raise once the router lands.
+const LOGIN_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Consecutive failed polls before the stream reports "Connection lost"
+/// (the old SSE stream's error semantics when the server dropped).
+const LOGIN_POLL_MAX_FAILURES: u32 = 3;
+
+/// The whole flow's backstop deadline (the old SSE stream lived as long as
+/// the login did; a stuck provider flow still ends).
+const LOGIN_FLOW_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Host-side login-flow + subscription ids (correlation keys, not security
+/// tokens — the handshake tokens are crypto-random inside the extension).
+static LOGIN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Handle that ends one login-stream relay on unsubscribe.
+pub(crate) struct LoginRelayHandle {
+    pub stop: Arc<AtomicBool>,
+    /// The flow this relay drives (unsubscribe cancels it host-side too).
+    pub flow_id: String,
+}
+
+/// The login-stream relays by subscription id (pi_ipc's event_relays
+/// pattern, this domain's own map so the shared one stays untouched).
+#[derive(Default)]
+pub(crate) struct LoginRelays {
+    relays: Mutex<BTreeMap<String, LoginRelayHandle>>,
+}
+
+impl LoginRelays {
+    pub fn cancel(&self, subscription_id: &str) -> Option<LoginRelayHandle> {
+        self.relays.lock().unwrap().remove(subscription_id)
+    }
+
+    fn insert(&self, subscription_id: &str, handle: LoginRelayHandle) {
+        self.relays.lock().unwrap().insert(subscription_id.to_string(), handle);
+    }
+
+    fn remove(&self, subscription_id: &str) {
+        self.relays.lock().unwrap().remove(subscription_id);
+    }
+}
 
 /// The closed envelope of every `auth.*` op's provider argument: a non-empty
 /// string, bounded so a hostile caller cannot smuggle an oversized id into a
@@ -44,6 +111,17 @@ fn validated_api_key_arg(args: &Value) -> Result<String, String> {
         return Err("apiKey is required".to_string());
     }
     Ok(api_key.to_string())
+}
+
+/// One non-empty, bounded string field (tokens, codes, flow ids — all
+/// host-generated or crypto-random strings with no business meaning to
+/// validate beyond their shape).
+fn string_arg(args: &Value, key: &str) -> Result<String, String> {
+    let value = args.get(key).and_then(Value::as_str).unwrap_or("");
+    if value.is_empty() || value.len() > 512 {
+        return Err(format!("{key} is required"));
+    }
+    Ok(value.to_string())
 }
 
 /// One global-scope management call with the caller's bound.
@@ -146,8 +224,266 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
                 },
             )
         }
+        // POST /api/auth/login/[provider]'s body: answer a pending login
+        // prompt through its token (the old 404/400 messages ride the
+        // statuses). A one-shot mutation — never auto-resent.
+        "auth.loginManualCode" | "auth.loginSubmit" => {
+            let (provider, token, code) =
+                match (validated_provider_arg(args), string_arg(args, "token"), string_arg(args, "code")) {
+                    (Ok(provider), Ok(token), Ok(code)) => (provider, token, code),
+                    _ => {
+                        return Some(crate::pi_ipc::protocol_error(
+                            id,
+                            "invalid_args",
+                            "provider, token and code are required",
+                        ));
+                    }
+                };
+            Some(
+                match management_call_bounded(
+                    state,
+                    "auth.loginSubmit",
+                    json!({ "provider": provider, "token": token, "code": code }),
+                    std::time::Duration::from_secs(60),
+                ) {
+                    Ok(result) => {
+                        if let Some(status) = result.get("status").and_then(Value::as_str) {
+                            if status != "accepted" {
+                                let message = result
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Failed to submit code");
+                                let code = if status == "no_pending" { "not_found" } else { "invalid_args" };
+                                return Some(crate::pi_ipc::protocol_error(id, code, message));
+                            }
+                        }
+                        crate::pi_ipc::protocol_ok(id, result)
+                    }
+                    Err((code, message)) => crate::pi_ipc::protocol_error(id, &code, &message),
+                },
+            )
+        }
+        // Cancel a login flow (the user closed the panel / the stream
+        // unsubscribed): a cooperative, extension-side abort — the shared
+        // instance is never killed, and a request is not a confirmation.
+        "auth.loginCancel" => {
+            if let Some(subscription_id) = args.get("subscriptionId").and_then(Value::as_str) {
+                if !subscription_id.is_empty() {
+                    let cancelled = unsubscribe_login_stream(state, subscription_id);
+                    return Some(crate::pi_ipc::protocol_ok(id, json!({ "cancelled": cancelled })));
+                }
+            }
+            let flow_id = match string_arg(args, "flowId") {
+                Ok(flow_id) => flow_id,
+                Err(message) => {
+                    return Some(crate::pi_ipc::protocol_error(id, "invalid_args", &message));
+                }
+            };
+            Some(
+                match management_call_bounded(
+                    state,
+                    "auth.loginCancel",
+                    json!({ "flowId": flow_id }),
+                    std::time::Duration::from_secs(60),
+                ) {
+                    Ok(result) => crate::pi_ipc::protocol_ok(id, result),
+                    Err((code, message)) => crate::pi_ipc::protocol_error(id, &code, &message),
+                },
+            )
+        }
         _ => None,
     }
+}
+
+// --- the OAuth login stream (the pi_ipc_login_stream command) -------------
+
+/// The login-stream relay: polls the flow's buffered events out of the
+/// management instance and forwards each as a Channel frame. Every exit
+/// path cancels the flow (extension-side abort) unless it already ended —
+/// the unsubscribe/page-reload release the plan's stream contract requires.
+fn login_relay(
+    state: &Arc<IpcHostState>,
+    subscription_id: String,
+    flow_id: String,
+    instance: Arc<management_host::ManagementInstance>,
+    on_event: Channel<Value>,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    state.login_relays.insert(
+        &subscription_id,
+        LoginRelayHandle { stop: Arc::clone(&stop), flow_id: flow_id.clone() },
+    );
+    let relays = Arc::clone(&state.login_relays);
+    let started = Instant::now();
+    std::thread::Builder::new()
+        .name(format!("ipc-login-{subscription_id}"))
+        .spawn(move || {
+            let mut frame_seq: u64 = 0;
+            let mut since: u64 = 0;
+            let mut failures: u32 = 0;
+            let send = |frame_seq: &mut u64, kind: &str, payload: Value| -> bool {
+                *frame_seq += 1;
+                on_event
+                    .send(crate::pi_ipc::stream_frame(
+                        &subscription_id,
+                        1,
+                        *frame_seq,
+                        kind,
+                        payload,
+                    ))
+                    .is_ok()
+            };
+            loop {
+                if stop.load(Ordering::SeqCst) || started.elapsed() >= LOGIN_FLOW_DEADLINE {
+                    break;
+                }
+                std::thread::sleep(LOGIN_POLL_INTERVAL);
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let poll = instance.management_call(
+                    "auth.loginPoll",
+                    json!({ "flowId": flow_id, "since": since }),
+                    LOGIN_POLL_TIMEOUT,
+                );
+                match poll {
+                    Ok(snapshot) => {
+                        failures = 0;
+                        let done = snapshot.get("done").and_then(Value::as_bool).unwrap_or(true);
+                        if let Some(events) = snapshot.get("events").and_then(Value::as_array) {
+                            for queued in events {
+                                let Some(event) = queued.get("event") else { continue };
+                                if !send(&mut frame_seq, "event", event.clone()) {
+                                    // The WebView is gone: cancel and detach.
+                                    stop.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(last) = snapshot.get("lastSeq").and_then(Value::as_u64) {
+                            since = last;
+                        }
+                        if stop.load(Ordering::SeqCst) || done {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        failures += 1;
+                        // A stolen result envelope (the known concurrent-call
+                        // notify race) or a busy child costs one bounded gap;
+                        // only a persistent failure is a lost connection —
+                        // the old SSE stream's error when the server dropped.
+                        if failures >= LOGIN_POLL_MAX_FAILURES || instance.client_has_exited() {
+                            let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": "Connection lost" }));
+                            break;
+                        }
+                    }
+                }
+            }
+            // Every exit path cancels the flow (idempotent: an ended flow
+            // answers cancelled:false and the child state is already gone).
+            let _ = instance.management_call(
+                "auth.loginCancel",
+                json!({ "flowId": flow_id }),
+                Duration::from_secs(5),
+            );
+            relays.remove(&subscription_id);
+        })
+        .expect("the login relay thread spawns");
+}
+
+/// Open the OAuth login stream (the static transport's auth.loginStream):
+/// starts the flow in the management instance and streams its events over a
+/// Tauri Channel — the old GET /api/auth/login/[provider] SSE stream. The
+/// ack always carries a subscriptionId (the stream opened); a refused start
+/// (unknown provider) arrives as the stream's FIRST error event, exactly
+/// like the old stream's `{type:"error"}` before close.
+#[tauri::command]
+pub fn pi_ipc_login_stream(
+    state: State<'_, Arc<IpcHostState>>,
+    provider: String,
+    on_event: Channel<Value>,
+) -> Value {
+    if provider.is_empty() || provider.len() > 200 {
+        return crate::pi_ipc::protocol_error("?", "invalid_args", "provider is required");
+    }
+    let config = state.management_config.lock().unwrap().clone();
+    let Some(config) = config else {
+        return crate::pi_ipc::protocol_error(
+            "?",
+            "management_unavailable",
+            "the management instance is not configured (the vendored module tree is missing)",
+        );
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => {
+            return crate::pi_ipc::protocol_error("?", "management_unavailable", &error);
+        }
+    };
+    let number = LOGIN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let subscription_id = format!("login-{number}");
+    let flow_id = format!("loginflow-{number}");
+    // Start the flow BEFORE the relay exists is impossible to miss events:
+    // events buffer in the child from the login's first moment, and the
+    // relay's first poll reads from since=0.
+    let start = instance.management_call(
+        "auth.loginStart",
+        json!({ "flowId": flow_id, "provider": provider }),
+        Duration::from_secs(60),
+    );
+    match start {
+        Ok(answer) if answer.get("started").and_then(Value::as_bool) == Some(true) => {
+            login_relay(&state, subscription_id.clone(), flow_id.clone(), instance, on_event);
+            json!({ "subscriptionId": subscription_id, "flowId": flow_id })
+        }
+        Ok(answer) => {
+            // The stream opened; the refusal is its first (and last) event —
+            // the old SSE stream's exact shape for an unknown provider.
+            let message = answer
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown provider")
+                .to_string();
+            let subscription_id = format!("login-refused-{number}");
+            let mut frame_seq: u64 = 0;
+            frame_seq += 1;
+            let _ = on_event.send(crate::pi_ipc::stream_frame(
+                &subscription_id,
+                1,
+                frame_seq,
+                "event",
+                json!({ "type": "error", "message": message }),
+            ));
+            json!({ "subscriptionId": subscription_id })
+        }
+        Err(error) => {
+            let (code, message) = crate::pi_ipc::management_error_code(&error);
+            crate::pi_ipc::protocol_error("?", &code, &message)
+        }
+    }
+}
+
+/// The unsubscribe half for login streams (pi_ipc's agent.unsubscribeEvents
+/// arm delegates here): stop the relay and cancel the flow host-side. The
+/// relay also cancels as its last act — this is the prompt path so an
+/// unsubscribe is not stuck behind a slow poll.
+pub(crate) fn unsubscribe_login_stream(state: &IpcHostState, subscription_id: &str) -> bool {
+    let Some(handle) = state.login_relays.cancel(subscription_id) else {
+        return false;
+    };
+    handle.stop.store(true, Ordering::SeqCst);
+    // Best-effort prompt cancel; the relay's own cancel is the backstop.
+    if let Some(config) = state.management_config.lock().unwrap().clone() {
+        if let Ok(instance) = state.management.instance("global", &config) {
+            let _ = instance.management_call(
+                "auth.loginCancel",
+                json!({ "flowId": handle.flow_id }),
+                Duration::from_secs(5),
+            );
+        }
+    }
+    true
 }
 
 
@@ -203,6 +539,14 @@ mod tests {
         assert_eq!(answer["error"]["message"], "apiKey is required", "{answer}");
 
         let answer = dispatch(&state, "auth.logout", "k2", &json!({ "provider": "" }))
+            .expect("the op is owned");
+        assert_eq!(answer["error"]["code"], "invalid_args", "{answer}");
+
+        let answer = dispatch(&state, "auth.loginManualCode", "k3", &json!({ "provider": "openai", "token": "" }))
+            .expect("the op is owned");
+        assert_eq!(answer["error"]["code"], "invalid_args", "{answer}");
+
+        let answer = dispatch(&state, "auth.loginCancel", "k4", &json!({}))
             .expect("the op is owned");
         assert_eq!(answer["error"]["code"], "invalid_args", "{answer}");
     }
@@ -371,6 +715,16 @@ mod tests {
             .expect("openai entry")
             .clone();
         assert_eq!(openai_relisted["configured"], false, "{openai_relisted}");
+
+        // 7. auth.loginManualCode with unknown token surfaces not_found.
+        let code_refused = send("auth.loginManualCode", json!({ "provider": "openai", "token": "openai-bad", "code": "123" }));
+        assert_eq!(code_refused["ok"], false, "{code_refused}");
+        assert_eq!(code_refused["error"]["code"], "not_found", "{code_refused}");
+
+        // 8. auth.loginCancel for unknown flow answers cancelled: false.
+        let cancel_res = send("auth.loginCancel", json!({ "flowId": "nonexistent-flow" }));
+        assert_eq!(cancel_res["ok"], true, "{cancel_res}");
+        assert_eq!(cancel_res["data"]["cancelled"], false, "{cancel_res}");
     }
 
     /// A custom models.json provider stays out of the API-key list even with

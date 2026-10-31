@@ -69,6 +69,7 @@ test("every stream op maps onto its host subscribe command", async () => {
     ["agent.subscribeEvents", "pi_ipc_subscribe_events"],
     ["agent.subscribeRunning", "pi_ipc_subscribe_running"],
     ["terminal.subscribeOutput", "pi_ipc_subscribe_terminal"],
+    ["auth.loginStream", "pi_ipc_login_stream"],
   ];
   for (const [op, command] of mappings) {
     assert.ok(source.includes(`"${op}"`), `${op} wired in the transport`);
