@@ -35,6 +35,7 @@ mod session_view;
 pub mod settings_extras;
 mod session_search;
 mod session_actions;
+mod session_deletion;
 mod shell;
 mod update_install;
 

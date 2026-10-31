@@ -1176,6 +1176,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
+        "sessions.delete" => match crate::session_deletion::delete(state, &args) {
+            Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "sessions.export" => match crate::session_actions::export(state, &args) {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),

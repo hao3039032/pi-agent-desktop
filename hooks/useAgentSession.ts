@@ -2329,17 +2329,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (bashRunningRef.current) return false;
     const sid = sessionIdRef.current;
     if (!sid) return false;
+    const generation = sessionGenerationRef.current;
+    const current = () => sessionIdRef.current === sid && sessionGenerationRef.current === generation;
     try {
       const result = await sendAgentCommand<{ cancelled?: boolean }>(sid, {
         type: "navigate_tree",
         targetId: entryId,
       });
-      if (result?.cancelled || sessionIdRef.current !== sid) return false;
+      if (result?.cancelled || !current()) return false;
       await loadSession(sid, false, false, { fresh: true });
-      return sessionIdRef.current === sid;
+      return current();
     } catch (e) {
       console.error("Failed to navigate:", e);
-      addNotice({ type: "error", message: t("chat.navigateFailed", { error: e instanceof Error ? e.message : String(e) }) });
+      if (current()) {
+        addNotice({ type: "error", message: t("chat.navigateFailed", { error: e instanceof Error ? e.message : String(e) }) });
+        await loadSession(sid, false, false, { fresh: true });
+      }
       return false;
     }
   }, [addNotice, loadSession, t]);

@@ -254,7 +254,7 @@ impl OutboxState {
 impl Session {
     /// `queue_composer` (a host-level command): enqueue, notify, wake.
     pub fn composer_enqueue(self: &Arc<Self>, message: &str, images: Option<Value>) -> Result<Value, String> {
-        let _admission = self.activity_gate.try_lock().map_err(|_| "session branch operation is in progress".to_string())?;
+        let _admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
         let item = self.composer_outbox.enqueue(message, images)?;
         self.emit_composer_update();
         self.composer_wake();
@@ -282,7 +282,7 @@ impl Session {
     /// may already be running) is parked with the unknown marker — never
     /// silently re-delivered.
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
-        let admission = self.activity_gate.try_lock().map_err(|_| "session branch operation is in progress".to_string())?;
+        let admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
         let Some(item) = self.composer_outbox.take(id) else {
             // Missing is a normal no-op (another window won the claim).
             return Ok(self.composer_answer(None));
@@ -331,7 +331,7 @@ impl Session {
         &self,
         item: &PendingComposerMessage,
         behavior: &str,
-        admission: std::sync::MutexGuard<'_, ()>,
+        admission: std::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<(), pi_host::PiRpcError> {
         let mut payload = json!({ "message": item.message, "streamingBehavior": behavior });
         if let Some(images) = item.images.as_ref().and_then(Value::as_array).filter(|items| !items.is_empty()) {
@@ -437,7 +437,7 @@ impl Session {
                 // same call fences this drain once its session was replaced:
                 // a drain parked between its alive-check and its claim must
                 // not take the replacement's queue (Terra round-4).
-                let admission = self.activity_gate.lock().unwrap();
+                let admission = self.activity_gate.read().unwrap();
                 let Some(item) = self
                     .composer_outbox
                     .claim_front_for_delivery(self.composer_generation)
