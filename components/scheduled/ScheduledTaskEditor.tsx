@@ -6,6 +6,8 @@ import { AppCombobox } from "../AppCombobox";
 import { useEffect, useId, useMemo, useState, type FormEvent } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { apiErrorText, scheduledApi, type CronPreview, type TaskInput } from "@/lib/scheduled-tasks/client";
+import { fetchModelsData } from "@/lib/models-service";
+import { fetchProjectTrustStatus } from "@/lib/project-trust-client";
 import {
   DEFAULT_PRESET,
   cronFromPreset,
@@ -170,9 +172,8 @@ function useModelOptions(cwd: string): ModelOption[] {
     if (!cwd.trim()) return;
     let cancelled = false;
     const timer = setTimeout(() => {
-      fetch(`/api/models?cwd=${encodeURIComponent(cwd.trim())}`, { cache: "no-store" })
-        .then((response) => (response.ok ? response.json() : null))
-        .then((data: { modelList?: ModelOption[] } | null) => {
+      fetchModelsData(cwd.trim())
+        .then((data) => {
           if (!cancelled && data?.modelList) setModels(data.modelList);
         })
         .catch(() => undefined);
@@ -192,10 +193,9 @@ function useUntrustedProject(cwd: string): boolean {
     if (!cwd.trim()) return;
     let cancelled = false;
     const timer = setTimeout(() => {
-      fetch(`/api/project-trust?cwd=${encodeURIComponent(cwd.trim())}`, { cache: "no-store" })
-        .then((response) => (response.ok ? response.json() : null))
-        .then((status: { requiresTrust?: boolean; trusted?: boolean } | null) => {
-          if (!cancelled) setUntrusted(Boolean(status?.requiresTrust && !status.trusted));
+      fetchProjectTrustStatus(cwd.trim())
+        .then((status) => {
+          if (!cancelled) setUntrusted(Boolean(status.ok && status.requiresTrust && !status.trusted));
         })
         .catch(() => { if (!cancelled) setUntrusted(false); });
     }, 400);

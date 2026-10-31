@@ -107,6 +107,9 @@ export { searchSkills } from "${ROOT}/lib/skills-search.server.ts";
 export { checkManagedPluginUpdates, checkManagedSkillUpdates } from "${ROOT}/lib/updates-management.server.ts";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 registerBunOAuthFlows();
+export { validateCron, nextCronRuns, nextCronRun, systemTimezone } from "${ROOT}/lib/scheduled-tasks/cron.ts";
+export { buildTask, applyTaskPatch } from "${ROOT}/lib/scheduled-tasks/task-input.ts";
+export { decideSlot } from "${ROOT}/lib/scheduled-tasks/catch-up.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";

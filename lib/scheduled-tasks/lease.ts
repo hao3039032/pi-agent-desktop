@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, rmSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { writePrivateFileAtomicSync } from "../atomic-file";
+import { withScheduledTasksTransaction } from "./transaction-lock";
 
 /**
  * Only one process may fire scheduled tasks. A dev server and the desktop app
@@ -37,13 +38,19 @@ export function isPidAlive(pid: number): boolean {
 }
 
 function readLease(path: string): Lease | null {
+  let content: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Lease>;
-    if (typeof parsed.pid !== "number" || typeof parsed.heartbeatAt !== "string") return null;
-    return { pid: parsed.pid, startedAt: String(parsed.startedAt ?? parsed.heartbeatAt), heartbeatAt: parsed.heartbeatAt };
-  } catch {
-    return null;
+    content = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
+  const parsed = JSON.parse(content) as Partial<Lease>;
+  if (!Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0 || (parsed.pid ?? 0) > 0xffff_ffff || typeof parsed.heartbeatAt !== "string"
+    || Number.isNaN(new Date(parsed.heartbeatAt).getTime())) {
+    throw new Error("Invalid scheduler lease");
+  }
+  return { pid: parsed.pid!, startedAt: String(parsed.startedAt ?? parsed.heartbeatAt), heartbeatAt: parsed.heartbeatAt };
 }
 
 /** Read the current owner without trying to acquire its lease. */
@@ -71,25 +78,26 @@ export function acquireLease(
   const now = options.now ?? new Date();
   const alive = options.alive ?? isPidAlive;
   const path = leasePath(dir);
-  const current = readLease(path);
-
-  if (current && current.pid !== pid) {
-    const fresh = now.getTime() - new Date(current.heartbeatAt).getTime() < LEASE_STALE_MS;
-    if (fresh && alive(current.pid)) return false;
-  }
-  mkdirSync(dir, { recursive: true });
-  const lease: Lease = {
-    pid,
-    startedAt: current && current.pid === pid ? current.startedAt : now.toISOString(),
-    heartbeatAt: now.toISOString(),
-  };
-  writePrivateFileAtomicSync(path, `${JSON.stringify(lease)}\n`);
-  // Two processes can take over a dead owner's lease in the same instant;
-  // the one whose write landed last keeps it, and the other sees that here.
-  return readLease(path)?.pid === pid;
+  return withScheduledTasksTransaction(dirname(dir), () => {
+    const current = readLease(path);
+    if (current && current.pid !== pid) {
+      const fresh = now.getTime() - new Date(current.heartbeatAt).getTime() < LEASE_STALE_MS;
+      if (fresh && alive(current.pid)) return false;
+    }
+    mkdirSync(dir, { recursive: true });
+    const lease: Lease = {
+      pid,
+      startedAt: current && current.pid === pid ? current.startedAt : now.toISOString(),
+      heartbeatAt: now.toISOString(),
+    };
+    writePrivateFileAtomicSync(path, `${JSON.stringify(lease)}\n`);
+    return true;
+  });
 }
 
 export function releaseLease(dir: string, pid = process.pid): void {
   const path = leasePath(dir);
-  if (readLease(path)?.pid === pid) rmSync(path, { force: true });
+  withScheduledTasksTransaction(dirname(dir), () => {
+    if (readLease(path)?.pid === pid) rmSync(path, { force: true });
+  });
 }

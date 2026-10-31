@@ -168,6 +168,8 @@ class HostBridgeTransport implements IpcTransport {
                 ? "pi_ipc_subscribe_terminal"
                 : op === "auth.loginStream"
                   ? "pi_ipc_login_stream"
+                : op === "tasks.subscribeEvents"
+                  ? "pi_ipc_subscribe_scheduled"
                   : null;
         if (command === null) {
           handle.stopLocalDelivery();
@@ -181,8 +183,20 @@ class HostBridgeTransport implements IpcTransport {
               ? { onFrame: handle.channel }
               : command === "pi_ipc_login_stream"
                 ? { provider: args?.provider, onEvent: handle.channel }
+              : command === "pi_ipc_subscribe_scheduled"
+                ? { onEvent: handle.channel }
                 : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
         const ack = await invoke(command, payload);
+        if (closed) {
+          handle.stopLocalDelivery();
+          const parsed = parseSubscribeAck(ack);
+          if ("subscriptionId" in parsed && parsed.subscriptionId !== null) {
+            try {
+              await invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `unsubscribe-${parsed.subscriptionId}`, op: command === "pi_ipc_subscribe_terminal" ? "terminal.unsubscribe" : command === "pi_ipc_subscribe_scheduled" ? "tasks.unsubscribe" : "agent.unsubscribeEvents", args: { subscriptionId: parsed.subscriptionId } } });
+            } catch { /* the host may already be gone */ }
+          }
+          return;
+        }
         const parsed = parseSubscribeAck(ack);
         if ("error" in parsed) {
           handle.stopLocalDelivery();
@@ -203,7 +217,7 @@ class HostBridgeTransport implements IpcTransport {
               const request: IpcRequest = {
                 v: IPC_PROTOCOL_VERSION,
                 id: `unsubscribe-${subscriptionId}`,
-                op: command === "pi_ipc_subscribe_terminal" ? "terminal.unsubscribe" : "agent.unsubscribeEvents",
+                op: command === "pi_ipc_subscribe_terminal" ? "terminal.unsubscribe" : command === "pi_ipc_subscribe_scheduled" ? "tasks.unsubscribe" : "agent.unsubscribeEvents",
                 args: { subscriptionId },
               };
               try {

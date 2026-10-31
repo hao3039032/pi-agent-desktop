@@ -144,8 +144,30 @@ impl TaskStore {
             }
             list.push(raw.clone());
         }
-        let serialized = serde_json::to_string_pretty(&json!({ "tasks": list })).map_err(|error| error.to_string())?;
         let file = self.tasks_file();
+        // Keep root-level extensions and entries this engine cannot interpret.
+        // Never replace an unreadable or malformed existing file with a new one.
+        let mut root = match std::fs::read_to_string(&file) {
+            Ok(content) => {
+                let value: Value = serde_json::from_str(&content)
+                    .map_err(|error| format!("corrupt tasks file: {error}"))?;
+                value.as_object().cloned().ok_or("corrupt tasks file: expected object")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Map::new(),
+            Err(error) => return Err(format!("unreadable: {error}")),
+        };
+        if let Some(existing) = root.get("tasks") {
+            let entries = existing.as_array().ok_or("corrupt tasks file: no tasks array")?;
+            let mut foreign: Vec<Value> = entries.iter().filter(|entry| {
+                entry.get("id").and_then(Value::as_str).is_none()
+                    || !matches!(entry.pointer("/schedule/kind").and_then(Value::as_str), Some("manual" | "once" | "cron"))
+            }).cloned().collect();
+            foreign.extend(list);
+            list = foreign;
+        }
+        root.insert("version".into(), json!(1));
+        root.insert("tasks".into(), Value::Array(list));
+        let serialized = serde_json::to_string_pretty(&Value::Object(root)).map_err(|error| error.to_string())?;
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("mkdir failed: {error}"))?;
         }
@@ -293,22 +315,44 @@ fn iso_to_ms_impl(value: &str) -> Option<i64> {
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;
     }
+    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') { return None; }
     let year: i64 = value.get(0..4)?.parse().ok()?;
     let month: i64 = value.get(5..7)?.parse().ok()?;
     let day: i64 = value.get(8..10)?.parse().ok()?;
     let hour: i64 = value.get(11..13)?.parse().ok()?;
     let minute: i64 = value.get(14..16)?.parse().ok()?;
     let second: i64 = value.get(17..19)?.parse().ok()?;
-    let millis: i64 = value
-        .get(20..23)
-        .and_then(|fraction| fraction.parse().ok())
-        .unwrap_or(0);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, 2 if leap => 29, 2 => 28, _ => return None };
+    if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 { return None; }
+    let mut pos = 19;
+    let mut millis = 0;
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        let start = pos;
+        while bytes.get(pos).is_some_and(u8::is_ascii_digit) { pos += 1; }
+        if pos == start { return None; }
+        let fraction = value.get(start..pos)?;
+        let mut first_three = fraction.bytes().take(3).map(|byte| (byte - b'0') as i64);
+        millis = first_three.next().unwrap_or(0) * 100 + first_three.next().unwrap_or(0) * 10 + first_three.next().unwrap_or(0);
+    }
+    let offset = match bytes.get(pos)? {
+        b'Z' if pos + 1 == bytes.len() => 0,
+        sign @ (b'+' | b'-') if pos + 6 == bytes.len() && bytes.get(pos + 3) == Some(&b':') => {
+            let hours: i64 = value.get(pos + 1..pos + 3)?.parse().ok()?;
+            let minutes: i64 = value.get(pos + 4..pos + 6)?.parse().ok()?;
+            if hours > 23 || minutes > 59 { return None; }
+            let seconds = hours * 3600 + minutes * 60;
+            if *sign == b'+' { seconds } else { -seconds }
+        }
+        _ => return None,
+    };
     let days = days_from_civil(year, month, day);
-    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000 + millis)
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second - offset) * 1000 + millis)
 }
 
 /// epoch ms → ISO-8601 (Zulu, millisecond precision).
-pub(crate) fn ms_to_iso(ms: i64) -> String {
+pub fn ms_to_iso(ms: i64) -> String {
     let seconds = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     let days = seconds.div_euclid(86_400);
@@ -382,6 +426,35 @@ mod tests {
     }
 
     #[test]
+    fn task_write_preserves_root_and_unrecognized_entries_and_rejects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scheduled-tasks.json");
+        let original = json!({
+            "version": 1,
+            "futureRoot": { "keep": true },
+            "tasks": [
+                { "id": "foreign", "schedule": { "kind": "future" }, "data": 42 },
+                "unrecognized",
+                { "id": "t1", "enabled": true, "schedule": { "kind": "manual" } }
+            ]
+        });
+        std::fs::write(&path, original.to_string()).unwrap();
+        let store = TaskStore::new(dir.path());
+        let tasks: Vec<_> = store.read_tasks().unwrap().into_values().collect();
+        store.write_tasks(&tasks).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["futureRoot"], original["futureRoot"]);
+        assert_eq!(saved["version"], 1);
+        assert_eq!(saved["tasks"][0], original["tasks"][0]);
+        assert_eq!(saved["tasks"][1], original["tasks"][1]);
+        assert_eq!(saved["tasks"][2]["id"], "t1");
+
+        std::fs::write(&path, "{ broken").unwrap();
+        assert!(store.write_tasks(&tasks).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ broken");
+    }
+
+    #[test]
     fn runs_append_and_read_with_truncated_tail() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = TaskStore::new(dir.path());
@@ -430,5 +503,11 @@ mod tests {
         assert_eq!(iso_to_ms(&ms_to_iso(1_772_342_220_123)), Some(1_772_342_220_123));
         assert_eq!(iso_to_ms("2026-03-01T05:17:00.000Z"), Some(1_772_342_220_000));
         assert_eq!(iso_to_ms("not a date"), None);
+        assert_eq!(iso_to_ms("2026-03-01T13:17:00.000+08:00"), Some(1_772_342_220_000));
+        assert_eq!(iso_to_ms("2026-03-01T00:17:00-05:00"), Some(1_772_342_220_000));
+        assert_eq!(iso_to_ms("2026-03-01T05:17:00.1Z"), Some(1_772_342_220_100));
+        assert_eq!(iso_to_ms("2026-13-01T05:17:00Z"), None);
+        assert_eq!(iso_to_ms("2026-02-30T05:17:00Z"), None);
+        assert_eq!(iso_to_ms("2026-03-01T05:17:00garbage"), None);
     }
 }

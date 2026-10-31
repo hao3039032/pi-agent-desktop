@@ -34,6 +34,7 @@ import { bindProviderAuthLogin } from "./data/provider-auth-login.ts";
 import { bindProviderAuthService } from "./data/provider-auth-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
+import { bindScheduledTasksClient } from "./data/scheduled-tasks-client.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
 import { bindSessionActionsService } from "./data/session-actions-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
@@ -74,6 +75,7 @@ async function boot(): Promise<void> {
   bindWorktreeService(client);
   bindDesktopConnection(client);
   bindScheduledTasksStore(client);
+  bindScheduledTasksClient(client);
   bindProjectTrustClient(client);
   bindStateMirrorClient(client);
   void applyCustomCssToDocument();

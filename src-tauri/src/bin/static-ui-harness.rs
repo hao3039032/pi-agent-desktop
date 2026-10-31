@@ -49,7 +49,7 @@ use tauri::App;
 use tauri::Manager;
 
 use pi_agent_desktop_lib::pi_ipc::{
-    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, pi_ipc_subscribe_terminal, IpcHostState,
+    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, pi_ipc_subscribe_terminal, pi_ipc_subscribe_scheduled, IpcHostState,
 };
 
 /// One call the host thread (which owns the `App` and therefore the
@@ -64,6 +64,7 @@ enum HostCall {
     SubscribeEvents { session: String, cb: u32 },
     SubscribeRunning { cb: u32 },
     SubscribeTerminal { id: String, cursor: u64, cb: u32 },
+    SubscribeScheduled { cb: u32 },
     /// Orderly teardown of everything the host owns children-wise (sessions,
     /// management instances, PTYs). The connection thread exits the process
     /// once the reply is flushed.
@@ -288,12 +289,14 @@ fn content_type(path: &str) -> &'static str {
 
 fn main() {
     let mut static_dir: Option<PathBuf> = None;
+    let mut scheduler_agent_dir: Option<PathBuf> = None;
     let mut port: u16 = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--static-dir" => static_dir = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|value| value.parse().ok()).unwrap_or(0),
+            "--scheduler-agent-dir" => scheduler_agent_dir = args.next().map(PathBuf::from),
             other => {
                 eprintln!("[harness] unknown argument: {other}");
                 std::process::exit(2);
@@ -350,6 +353,17 @@ fn main() {
     // Envelope requests share the state Arc directly and dispatch through
     // the product's gated entry from their connection threads.
     let host_state = Arc::new(IpcHostState::new());
+    if let Some(agent) = scheduler_agent_dir {
+        let isolated = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).and_then(|path| path.canonicalize().ok());
+        let agent = agent.canonicalize().expect("scheduler fixture agent dir must exist");
+        let temp = std::env::temp_dir().canonicalize().expect("temporary directory resolves");
+        if isolated.as_ref() != Some(&agent) || !agent.starts_with(&temp) || agent == temp {
+            eprintln!("[harness] scheduler agent dir must be an explicit isolated temporary PI_CODING_AGENT_DIR");
+            std::process::exit(2);
+        }
+        *host_state.task_agent_dir.lock().unwrap() = Some(agent);
+        host_state.start_scheduler().expect("scheduler starts");
+    }
     let host_state_for_host = Arc::clone(&host_state);
     let host_state_for_http = Arc::clone(&host_state);
     let (host_tx, host_rx) = std::sync::mpsc::channel::<(HostCall, std::sync::mpsc::Sender<Value>)>();
@@ -373,11 +387,15 @@ fn main() {
                 HostCall::SubscribeTerminal { id, cursor, cb } => {
                     pi_ipc_subscribe_terminal(app.state::<Arc<IpcHostState>>(), id, cursor, bridge_for_host.channel(cb))
                 }
+                HostCall::SubscribeScheduled { cb } => {
+                    pi_ipc_subscribe_scheduled(app.state::<Arc<IpcHostState>>(), bridge_for_host.channel(cb))
+                }
                 HostCall::Shutdown => {
                     // Orderly teardown, the same paths the product uses per
                     // child (stdin EOF + grace kill of the child's process
                     // group), so no pi process is orphaned by this exit.
                     let state = app.state::<Arc<IpcHostState>>();
+                    if let Err(error) = state.shutdown_scheduler() { eprintln!("[harness] scheduler shutdown: {error}"); }
                     for id in state.registry.ids() {
                         let _ = state.registry.remove(&id, std::time::Duration::from_secs(5));
                     }
@@ -654,6 +672,12 @@ fn handle_invoke(
                 return json!({ "harnessError": "pi_ipc_subscribe_running needs an onFrame channel" });
             };
             HostCall::SubscribeRunning { cb }
+        }
+        "pi_ipc_subscribe_scheduled" => {
+            let Some(cb) = args.get("onEvent").and_then(channel_ref) else {
+                return json!({ "harnessError": "pi_ipc_subscribe_scheduled needs an onEvent channel" });
+            };
+            HostCall::SubscribeScheduled { cb }
         }
         other => return json!({ "harnessError": format!("the harness host does not implement '{other}'") }),
     };

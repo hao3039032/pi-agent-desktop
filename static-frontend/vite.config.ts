@@ -95,6 +95,10 @@ export default defineConfig({
         replacement: resolve(import.meta.dirname, "src/data/desktop-connection.ts"),
       },
       {
+        find: /^@\/lib\/scheduled-tasks\/client$/,
+        replacement: resolve(import.meta.dirname, "src/data/scheduled-tasks-client.ts"),
+      },
+      {
         // The scheduled-tasks store swaps the /api/scheduled-tasks list and
         // its EventSource for the host's tasks.list (real data) with no
         // event stream yet — the scheduler's host wiring (M4) will add one.

@@ -8,7 +8,6 @@
 
 use base64::Engine;
 use resource_protocol::{ResourceRegistry, ResourceResponse};
-use task_scheduler::TaskStore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -65,6 +64,11 @@ pub struct IpcHostState {
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     /// The scheduled-task store root (the agent dir the host runs against).
     pub task_agent_dir: Mutex<Option<PathBuf>>,
+    pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
+    pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
+    pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
+    pub(crate) scheduled_active: Arc<Mutex<BTreeSet<String>>>,
+    pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
     /// The file access allow-list (the /api/files security boundary).
@@ -119,6 +123,11 @@ impl IpcHostState {
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             task_agent_dir: Mutex::new(None),
+            scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
+            scheduler_loop: Mutex::new(None),
+            scheduler_owner: std::sync::atomic::AtomicBool::new(false),
+            scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
+            scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
@@ -164,6 +173,53 @@ impl IpcHostState {
         let now = std::time::Instant::now();
         map.retain(|_, expires_at| *expires_at > now);
         map.remove(&normalized).is_some()
+    }
+
+    pub fn start_scheduler(self: &Arc<Self>) -> Result<(), String> {
+        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        let mut current = self.scheduler_loop.lock().unwrap();
+        if current.is_none() {
+            *current = Some(crate::scheduler_tick::SchedulerLoop::start(Arc::clone(self), Duration::from_secs(30))?);
+        }
+        Ok(())
+    }
+
+    pub fn stop_scheduler(&self) {
+        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        self.stop_scheduler_locked();
+    }
+
+    fn stop_scheduler_locked(&self) {
+        let mut current = self.scheduler_loop.lock().unwrap();
+        self.scheduler_owner.store(false, Ordering::SeqCst);
+        let scheduler = current.take();
+        drop(scheduler);
+        self.scheduler_owner.store(false, Ordering::SeqCst);
+    }
+
+    /// Host shutdown: stop new claims, reap linked child sessions, then let
+    /// their workers persist outcomes before management instances are closed.
+    pub fn shutdown_scheduler(&self) -> Result<(), String> {
+        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        self.stop_scheduler_locked();
+        let repo = task_scheduler::task_repository::TaskRepository::new(self.agent_dir());
+        let deadline = std::time::Instant::now() + Duration::from_secs(35);
+        loop {
+            let active = self.scheduled_active.lock().unwrap().clone();
+            if active.is_empty() { return Ok(()); }
+            for task in repo.list()? {
+                let Some(task_id) = task["id"].as_str() else { continue };
+                for run in repo.runs(task_id)? {
+                    if run["runId"].as_str().is_some_and(|id| active.contains(id)) {
+                        if let Some(session_id) = run["sessionId"].as_str() {
+                            self.registry.remove(session_id, Duration::from_secs(5));
+                        }
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline { return Err("Scheduled runs did not stop during host shutdown".into()); }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Record a path the HOST derived (a session cwd or project root from
@@ -440,6 +496,14 @@ pub(crate) fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &s
         "kind": kind,
         "payload": payload,
     })
+}
+
+#[tauri::command]
+pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event: Channel<Value>) -> Value {
+    match state.scheduled_events.subscribe(on_event) {
+        Ok(subscription_id) => json!({ "subscriptionId": subscription_id, "epoch": 1 }),
+        Err(error) => protocol_error("?", "io", &error),
+    }
 }
 
 /// Subscribe to a session's event stream on a Tauri Channel. The first
@@ -1091,6 +1155,16 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 // no first message = not listed).
                 if let Some(info) = live_session_info(state, &agent_dir, &session, &id) {
                     sessions.push(info);
+                }
+            }
+            let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
+                Ok(index) => index,
+                Err(error) => return protocol_error(&id, "io", &error.0),
+            };
+            for session in &mut sessions {
+                let relation = session.get("id").and_then(Value::as_str).and_then(|id| scheduled.relation(id));
+                if let Some((task_id, run_id)) = relation {
+                    session["relation"] = json!({ "kind": "scheduled", "taskId": task_id, "runId": run_id });
                 }
             }
             sessions.sort_by(|a, b| {
@@ -1786,20 +1860,31 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
-        "tasks.list" => {
-            let agent_dir = state
-                .task_agent_dir
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(default_agent_dir);
-            let store = TaskStore::new(agent_dir);
-            match store.read_tasks() {
-                Ok(tasks) => protocol_ok(
-                    &id,
-                    json!({ "tasks": tasks.values().map(|(_, raw)| raw).collect::<Vec<_>>() }),
-                ),
-                Err(error) => protocol_error(&id, "io", &error),
+        "tasks.unsubscribe" => {
+            if let Some(id) = args.get("subscriptionId").and_then(Value::as_str) { state.scheduled_events.unsubscribe(id); }
+            protocol_ok(&id, json!({ "success": true }))
+        }
+        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" | "tasks.run" | "tasks.takeover" => {
+            match crate::scheduler_host::dispatch(state, &op, &args) {
+                Ok(data) => {
+                    if matches!(op, "tasks.create" | "tasks.update" | "tasks.delete" | "tasks.markSeen") {
+                        let task_id = args.get("id").and_then(Value::as_str).or_else(|| data["task"]["id"].as_str());
+                        if let Some(task_id) = task_id { state.scheduled_events.emit(json!({ "type": "task_changed", "taskId": task_id })); }
+                    }
+                    protocol_ok(&id, data)
+                },
+                Err(error) => {
+                    let mut body = json!({ "code": error.code, "message": error.message, "retryable": false });
+                    if let Some(key) = error.key { body["reason"] = json!(key); }
+                    if let Some(params) = error.params { body["details"] = json!({ "params": params }); }
+                    protocol_error_value(&id, body)
+                }
+            }
+        }
+        "tasks.previewCron" => {
+            match management_call(state, "tasks.previewCron", args.clone()) {
+                Ok(preview) => protocol_ok(&id, preview),
+                Err(error) => protocol_error(&id, &error.0, &error.1),
             }
         }
         // Preview resources (crates/resource-protocol): grants are HOST-side
@@ -3036,7 +3121,7 @@ fn chat_only_prompt(state: &IpcHostState, cwd: &Path) -> Result<String, String> 
 /// never reached the child answers `prompt_rejected` with `accepted:false`
 /// (details on the protocol error object) — the composer's no-blind-retry
 /// admission signal.
-fn create_session(
+pub(crate) fn create_session(
     state: &IpcHostState,
     args: &Value,
 ) -> Result<Value, (String, String, Option<Value>)> {
@@ -4417,20 +4502,295 @@ mod tests {
         std::fs::write(
             dir.path().join("scheduled-tasks.json"),
             serde_json::json!({ "tasks": [{
-                "id": "t1", "name": "T", "prompt": "go", "cwd": "/w",
-                "schedule": { "kind": "cron", "expr": "*/10 * * * *", "timezone": "UTC" },
+                "id": "12345678-1234-1234-1234-123456789abc", "name": "T", "prompt": "go", "cwd": "/w",
+                "schedule": { "kind": "manual" },
                 "enabled": true,
             }]})
             .to_string(),
         )
         .expect("write");
         let response = send(&state, json!({ "v": 1, "id": "k2", "op": "tasks.list" }));
-        assert_eq!(response["data"]["tasks"][0]["id"], "t1");
+        assert_eq!(response["data"]["tasks"][0]["id"], "12345678-1234-1234-1234-123456789abc");
+        assert_eq!(response["data"]["tasks"][0]["unreadRuns"], 0);
 
         // A corrupt store is an io error, never an empty success.
         std::fs::write(dir.path().join("scheduled-tasks.json"), "{ broken").expect("write");
         let response = send(&state, json!({ "v": 1, "id": "k3", "op": "tasks.list" }));
         assert_eq!(response["error"]["code"], "io");
+    }
+
+    #[test]
+    fn real_pi_scheduled_marker_requires_durable_link_before_prompt() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set"); return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap(); std::fs::create_dir_all(&project).unwrap();
+        let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_endpoint = stalled.local_addr().unwrap();
+        stalled.set_nonblocking(true).unwrap();
+        let stall_server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match stalled.accept() {
+                    Ok((stream, _)) => { std::thread::sleep(Duration::from_secs(2)); drop(stream); return; }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => return,
+                }
+            }
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            let until = std::time::Instant::now() + Duration::from_secs(20);
+            let mut answered = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let handled = (|| -> bool {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 { return false; }
+                            let line = line.trim_end();
+                            if line.is_empty() { break; }
+                            if let Some((key, value)) = line.split_once(':') {
+                                if key.eq_ignore_ascii_case("content-length") { length = value.trim().parse().unwrap_or(0); }
+                            }
+                        }
+                        let mut body = vec![0; length];
+                        if reader.read_exact(&mut body).is_err() { return false; }
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"fixture answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+                        true
+                        })();
+                        if handled { answered += 1; }
+                        if answered == 2 { return; }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => return,
+                }
+            }
+        });
+        std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{"baseUrl":format!("http://{endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Test","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]},"stall":{"baseUrl":format!("http://{stalled_endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Stall","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}).to_string()).unwrap();
+        std::fs::write(agent.join("settings.json"), r#"{"defaultProvider":"fixture","defaultModel":"test"}"#).unwrap();
+        let state = Arc::new(state());
+        struct Shutdown<'a>(&'a IpcHostState);
+        impl Drop for Shutdown<'_> {
+            fn drop(&mut self) { for id in self.0.registry.ids() { self.0.registry.remove(&id, Duration::from_secs(5)); } }
+        }
+        let _shutdown = Shutdown(&state);
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        let bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        let created = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"] })).expect("start session");
+        let id = created["sessionId"].as_str().unwrap();
+        let session = state.registry.get(id).unwrap();
+        let linked = std::cell::Cell::new(false);
+        let refused = crate::scheduled_runner::run_session(&session,
+            json!({ "version": 1, "taskId": "not-a-uuid", "runId": "r1", "taskName": "fixture", "trigger": "manual" }),
+            "must never be sent", Duration::from_secs(1), |_| { linked.set(true); Ok(()) }, || {});
+        assert_eq!(refused.status, "failed");
+        assert!(!linked.get(), "the refused marker must not link or prompt");
+        let result = crate::scheduled_runner::run_session(&session,
+            json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "r1", "taskName": "fixture", "trigger": "manual" }),
+            "must never be sent", Duration::from_secs(1), |_| Err("fixture ledger failure".into()), || {});
+        assert_eq!(result.status, "failed");
+        assert!(result.error.as_deref().unwrap().contains("ledger failure"));
+        let content = std::fs::read_to_string(&session.session_file).unwrap();
+        assert!(content.contains("pi-web:scheduled-run"), "marker must be written by the child");
+        assert!(!content.contains("must never be sent"), "unlinked session must not receive the prompt");
+        let linked = std::cell::Cell::new(false);
+        let finished = crate::scheduled_runner::run_session(&session,
+            json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "r2", "taskName": "fixture", "trigger": "manual" }),
+            "fixture prompt", Duration::from_secs(10), |_| { linked.set(true); Ok(()) }, || {});
+        assert!(linked.get());
+        assert_eq!(finished.status, "succeeded", "{finished:?}");
+        assert!(!finished.counts_as_failure);
+        assert!(finished.error_code.is_none());
+        let stalled_session = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"], "provider": "stall", "modelId": "test" })).unwrap();
+        let stalled_session = state.registry.get(stalled_session["sessionId"].as_str().unwrap()).unwrap();
+        let timed_out = crate::scheduled_runner::run_session(&stalled_session,
+            json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "timeout", "taskName": "fixture", "trigger": "manual" }),
+            "stalled fixture", Duration::from_millis(250), |_| Ok(()), || {});
+        assert_eq!(timed_out.status, "aborted", "{timed_out:?}");
+        assert_eq!(timed_out.error_code, Some("time-limit"));
+        stall_server.join().unwrap();
+        let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
+        let task_id = "12345678-1234-1234-1234-123456789abc";
+        repo.mutate(|tasks| { tasks.push(json!({ "id": task_id, "name": "run now fixture", "prompt": "second fixture prompt", "cwd": project, "enabled": true, "schedule": {"kind":"manual"}, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 })); Ok(()) }).unwrap();
+        let denied = send(&state, json!({ "v": 1, "id": "denied", "op": "tasks.run", "args": { "id": task_id } }));
+        assert_eq!(denied["error"]["code"], "busy");
+        assert!(repo.runs(task_id).unwrap().is_empty());
+        state.start_scheduler().unwrap();
+        state.start_scheduler().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !state.scheduler_owner.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "scheduler did not become owner");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body { let _ = event_tx.send(text); }
+            Ok(())
+        });
+        let subscription = state.scheduled_events.subscribe(channel).unwrap();
+        let started = send(&state, json!({ "v": 1, "id": "run", "op": "tasks.run", "args": { "id": task_id } }));
+        assert_eq!(started["ok"], true, "{started}");
+        let run = &started["data"]["run"];
+        let linked_session = run["sessionId"].as_str().expect("the session is linked before the run is returned");
+        let index = crate::scheduled_session_index::ScheduledSessionIndex::load(&agent).unwrap();
+        assert!(index.is_referenced(linked_session));
+        let until = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let runs = repo.runs(task_id).unwrap();
+            if runs[0]["status"] != "running" { assert_eq!(runs[0]["status"], "succeeded", "{:?}", runs); break; }
+            assert!(std::time::Instant::now() < until, "run did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut types = Vec::new();
+        while types.len() < 4 {
+            let frame: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+            if let Some(kind) = frame["payload"]["type"].as_str() { types.push(kind.to_string()); }
+        }
+        assert!(types.iter().any(|kind| kind == "run_started"));
+        assert!(types.iter().any(|kind| kind == "run_finished"));
+        state.scheduled_events.unsubscribe(&subscription);
+        state.shutdown_scheduler().unwrap();
+        assert!(!agent.join("scheduled-tasks/scheduler.lock").exists());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn real_pi_scheduler_tick_claims_one_due_slot_with_controlled_clock() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { eprintln!("skipping: PI_CLI_BIN not set"); return; };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent"); let project = dir.path().join("project"); let managed = dir.path().join("managed");
+        std::fs::create_dir_all(&agent).unwrap(); std::fs::create_dir_all(&project).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        assert!(std::process::Command::new("node").current_dir(&root).arg(root.join("scripts/migration/build-management-modules.mjs")).arg("--out").arg(&managed).status().unwrap().success());
+        let state = Arc::new(state());
+        struct Shutdown<'a>(&'a IpcHostState);
+        impl Drop for Shutdown<'_> { fn drop(&mut self) { self.0.management.shutdown_all(Duration::from_secs(5)); } }
+        let _shutdown = Shutdown(&state);
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.spawn_base.lock().unwrap() = None;
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent.clone()), extensions: vec![root.join("lib/pi-rpc/assets/pi-web-management.mjs")],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string())],
+        });
+        let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
+        let task_id = "12345678-1234-1234-1234-123456789abc";
+        let now = 1_772_342_220_000_i64;
+        let before = task_scheduler::store::ms_to_iso(now - 120_000);
+        let at = task_scheduler::store::ms_to_iso(now - 30_000);
+        let catchup_id = "22222222-2222-2222-2222-222222222222";
+        let dropped_id = "33333333-3333-3333-3333-333333333333";
+        let invalid_id = "00000000-0000-0000-0000-000000000000";
+        repo.mutate(|tasks| {
+            tasks.push(json!({ "id": invalid_id, "name": "invalid legacy cron", "prompt": "never", "cwd": project, "enabled": true,
+                "schedule": { "kind": "cron", "expr": "bad cron", "timezone": "UTC" }, "createdAt": before, "lastScheduledFor": before }));
+            for (id, due, since) in [
+                (task_id, at.clone(), before.clone()),
+                (catchup_id, task_scheduler::store::ms_to_iso(now - 3 * 86_400_000), task_scheduler::store::ms_to_iso(now - 4 * 86_400_000)),
+                (dropped_id, task_scheduler::store::ms_to_iso(now - 8 * 86_400_000), task_scheduler::store::ms_to_iso(now - 9 * 86_400_000)),
+            ] {
+                tasks.push(json!({ "id": id, "name": id, "prompt": "must not execute", "cwd": project, "enabled": true,
+                    "schedule": {"kind":"once", "at": due}, "createdAt": since, "lastScheduledFor": since, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 }));
+            }
+            Ok(())
+        }).unwrap();
+        crate::scheduler_tick::tick(&state, now).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = repo.runs(task_id).unwrap();
+            if runs.first().is_some_and(|run| run["status"] == "failed") { assert_eq!(runs[0]["trigger"], "schedule"); break; }
+            assert!(std::time::Instant::now() < deadline, "run did not finish after spawn refusal");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let runs = repo.runs(catchup_id).unwrap();
+            if runs.first().is_some_and(|run| run["status"] == "failed") { assert_eq!(runs[0]["trigger"], "catch-up"); break; }
+            assert!(std::time::Instant::now() < deadline, "catch-up did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let dropped = repo.runs(dropped_id).unwrap();
+        assert_eq!(dropped[0]["status"], "skipped");
+        assert_eq!(dropped[0]["skipReason"], "app-asleep");
+        assert!(repo.list().unwrap().iter().filter(|task| task["id"] != invalid_id).all(|task| task["enabled"] == false));
+        assert!(repo.runs(invalid_id).unwrap().is_empty());
+        crate::scheduler_tick::tick(&state, now + 30_000).unwrap();
+        assert_eq!(repo.runs(task_id).unwrap().len(), 1);
+        task_scheduler::lease::release(&agent, std::process::id()).unwrap();
+    }
+
+    #[test]
+    fn real_pi_scheduled_task_editing_roundtrip() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let managed = dir.path().join("managed");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        let status = std::process::Command::new("node").current_dir(&root)
+            .arg(root.join("scripts/migration/build-management-modules.mjs"))
+            .arg("--out").arg(&managed).status().unwrap();
+        assert!(status.success());
+        let state = state();
+        struct Shutdown<'a>(&'a IpcHostState);
+        impl Drop for Shutdown<'_> { fn drop(&mut self) { self.0.management.shutdown_all(Duration::from_secs(5)); } }
+        let _shutdown = Shutdown(&state);
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent),
+            extensions: vec![root.join("lib/pi-rpc/assets/pi-web-management.mjs")],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string())],
+        });
+        let call = |op: &str, args: Value| send(&state, json!({"v": 1, "id": op, "op": op, "args": args}));
+        let input = json!({ "name": "fixture", "prompt": "hello", "cwd": project,
+            "schedule": { "kind": "manual" } });
+        let created = call("tasks.create", json!({ "input": input }));
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(created["data"]["task"]["toolPreset"], "read-only");
+        let id = created["data"]["task"]["id"].as_str().unwrap();
+        let listed = call("tasks.list", json!({}));
+        assert_eq!(listed["data"]["tasks"].as_array().unwrap().len(), 1);
+        let duplicate = call("tasks.create", json!({ "input": input }));
+        assert_eq!(duplicate["ok"], false, "duplicate names refuse");
+        assert_eq!(duplicate["error"]["reason"], "scheduled.error.nameTaken");
+        let refused = call("tasks.update", json!({ "id": id, "patch": { "toolPreset": "full" } }));
+        assert_eq!(refused["ok"], false, "write access requires acknowledgement");
+        assert_eq!(refused["error"]["reason"], "scheduled.error.writeAck");
+        let updated = call("tasks.update", json!({ "id": id, "patch": { "name": "edited" } }));
+        assert_eq!(updated["data"]["task"]["name"], "edited", "{updated}");
+        let fetched = call("tasks.get", json!({ "id": id }));
+        assert_eq!(fetched["data"]["task"]["name"], "edited", "{fetched}");
+        let run_dir = dir.path().join("agent/scheduled-tasks/runs");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join(format!("{id}.jsonl")), format!("{}\n", json!({ "runId": "r1", "taskId": id, "sessionId": "s1", "status": "succeeded" }))).unwrap();
+        std::fs::write(run_dir.join(format!("{id}.archive.jsonl")), "{}\n").unwrap();
+        let history = call("tasks.runs", json!({ "id": id }));
+        assert_eq!(history["data"]["runs"][0]["runId"], "r1", "{history}");
+        assert_eq!(call("tasks.list", json!({}))["data"]["tasks"][0]["unreadRuns"], 1);
+        let seen = call("tasks.markSeen", json!({ "id": id, "runId": "r1" }));
+        assert!(seen["data"]["run"]["seenAt"].is_string(), "{seen}");
+        assert_eq!(call("tasks.list", json!({}))["data"]["tasks"][0]["unreadRuns"], 0);
+        let removed = call("tasks.delete", json!({ "id": id }));
+        assert_eq!(removed["data"]["success"], true, "{removed}");
+        assert!(!run_dir.join(format!("{id}.jsonl")).exists());
+        assert!(!run_dir.join(format!("{id}.archive.jsonl")).exists());
+        assert_eq!(call("tasks.list", json!({}))["data"]["tasks"].as_array().unwrap().len(), 0);
     }
 
     #[test]

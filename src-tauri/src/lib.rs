@@ -41,6 +41,11 @@ mod session_search;
 mod session_actions;
 mod session_deletion;
 mod terminal_host;
+mod scheduler_host;
+mod scheduler_tick;
+mod scheduled_runner;
+mod scheduled_events;
+pub mod scheduled_session_index;
 mod shell;
 mod update_install;
 
@@ -1407,6 +1412,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pi_ipc::pi_ipc,
             pi_ipc::pi_ipc_subscribe_events,
+            pi_ipc::pi_ipc_subscribe_scheduled,
             pi_ipc::pi_ipc_subscribe_running,
             pi_ipc::pi_ipc_subscribe_terminal,
             provider_auth::pi_ipc_login_stream,

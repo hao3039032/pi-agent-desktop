@@ -195,15 +195,20 @@ export class Scheduler {
    * first. Returns the task as stored, or undefined when another process won.
    */
   private claimSlot(task: ScheduledTask, since: Date, slot: Date): ScheduledTask | undefined {
-    const current = getTask(task.id, this.agentDir);
-    if (!current || !current.enabled) return undefined;
-    if (new Date(current.lastScheduledFor ?? current.createdAt).getTime() !== since.getTime()) return undefined;
-    return updateTask(task.id, (stored) => ({
-      ...stored,
-      lastScheduledFor: slot.toISOString(),
-      // A one-time task is finished the moment its slot is claimed.
-      ...(stored.schedule.kind === "once" ? { enabled: false } : {}),
-    }), this.agentDir);
+    let claimed = false;
+    const updated = updateTask(task.id, (stored) => {
+      const owner = this.ownerInfo();
+      if (!owner || owner.pid !== this.pid || !owner.fresh
+        || !stored.enabled || new Date(stored.lastScheduledFor ?? stored.createdAt).getTime() !== since.getTime()) return stored;
+      claimed = true;
+      return {
+        ...stored,
+        lastScheduledFor: slot.toISOString(),
+        // A one-time task is finished the moment its slot is claimed.
+        ...(stored.schedule.kind === "once" ? { enabled: false } : {}),
+      };
+    }, this.agentDir);
+    return claimed ? updated : undefined;
   }
 
   private recordSkipped(task: ScheduledTask, slot: Date, reason: "app-asleep" | "overlap", skippedSlots: number): void {

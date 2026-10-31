@@ -17,7 +17,10 @@
 //!   croner (plan §三): this crate consumes a [`CronOracle`].
 
 pub mod engine;
+pub mod lease;
 pub mod store;
+pub mod task_repository;
+pub mod transaction_lock;
 pub use engine::{Engine, RunSpawner, TickReport};
 pub use store::{RunRecord, TaskStore};
 
