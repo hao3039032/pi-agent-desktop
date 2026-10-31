@@ -51,8 +51,7 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     }
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
-    let root = agent.join("sessions").canonicalize().map_err(|e| error("io", e))?;
-    crate::session_deletion_journal::recover(state, &root)?;
+    crate::session_deletion_journal::recover_pending(state, &agent)?;
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
     delete_with_index(state, args, &index)

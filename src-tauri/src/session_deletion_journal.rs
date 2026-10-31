@@ -1,5 +1,36 @@
 //! Recoverable isolation of one session file. Caller holds the scheduler gate
 //! and the session writer gate; paths come only from the host session scan.
+
+pub(crate) fn has_pending(agent: &std::path::Path) -> Result<bool, (String, String)> {
+    let path = agent.join("session-deletion-journal");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(("io".into(), error.to_string())),
+        Ok(metadata) if !metadata.file_type().is_dir() => Err(("io".into(), "Unsafe session deletion journal directory".into())),
+        Ok(_) => {
+            #[cfg(target_os = "linux")]
+            let mut entries = {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::OpenOptionsExt;
+                let directory = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path).map_err(|error| ("io".into(), error.to_string()))?;
+                std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd())).map_err(|error| ("io".into(), error.to_string()))?
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mut entries = std::fs::read_dir(path).map_err(|error| ("io".into(), error.to_string()))?;
+            match entries.next() { None => Ok(false), Some(Ok(_)) => Ok(true), Some(Err(error)) => Err(("io".into(), error.to_string())) }
+        }
+    }
+}
+pub(crate) fn recover_pending(state: &crate::pi_ipc::IpcHostState, agent: &std::path::Path) -> Result<(), (String, String)> {
+    if !has_pending(agent)? { return Ok(()); }
+    if !state.deletion_recovery_permitted() {
+        return Err(("busy".into(), "Session deletion recovery is pending exclusive maintenance".into()));
+    }
+    let root = agent.join("sessions").canonicalize().map_err(|error| ("io".into(), error.to_string()))?;
+    recover(state, &root)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::CString;
@@ -338,6 +369,21 @@ mod linux {
                 assert_eq!(source.exists(), phase != "committed", "{phase}");
                 recover(&state, &root).unwrap();
             }
+        }
+        #[test]
+        fn empty_journal_without_sessions_is_not_pending() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("session-deletion-journal")).unwrap();
+            let state = crate::pi_ipc::IpcHostState::new();
+            *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+            for op in ["sessions.index", "sessions.list", "sessions.search"] {
+                let args = if op == "sessions.search" { json!({"query":""}) } else { json!({}) };
+                let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"test","op":op,"args":args}));
+                assert_eq!(response["ok"], true, "{op}: {response}");
+            }
+            std::fs::create_dir(dir.path().join("session-deletion-journal/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")).unwrap();
+            let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"test","op":"sessions.list","args":{}}));
+            assert_eq!(response["error"]["code"], "busy", "{response}");
         }
         #[test]
         fn pending_journal_requires_explicit_isolated_maintenance() {

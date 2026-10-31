@@ -1166,18 +1166,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Ok(lock) => lock,
                 Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
             };
-            match std::fs::symlink_metadata(agent_dir.join("session-deletion-journal")) {
-                Ok(_) => {
-                    let root = match agent_dir.join("sessions").canonicalize() {
-                        Ok(root) => root,
-                        Err(error) => return protocol_error(&id, "io", &error.to_string()),
-                    };
-                    if let Err((code, message)) = crate::session_deletion_journal::recover(state, &root) {
-                        return protocol_error(&id, &code, &message);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => return protocol_error(&id, "io", &error.to_string()),
+            if let Err((code, message)) = crate::session_deletion_journal::recover_pending(state, &agent_dir) {
+                return protocol_error(&id, &code, &message);
             }
             let initial = session_host::scan_sessions(&agent_dir);
             let mut identities: Vec<_> = initial.projects.values().flatten().map(|session| (session.file.clone(), session.id.clone())).collect();
@@ -1228,18 +1218,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Ok(lock) => lock,
                 Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
             };
-            match std::fs::symlink_metadata(agent_dir.join("session-deletion-journal")) {
-                Ok(_) => {
-                    let root = match agent_dir.join("sessions").canonicalize() {
-                        Ok(root) => root,
-                        Err(error) => return protocol_error(&id, "io", &error.to_string()),
-                    };
-                    if let Err((code, message)) = crate::session_deletion_journal::recover(state, &root) {
-                        return protocol_error(&id, &code, &message);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => return protocol_error(&id, "io", &error.to_string()),
+            if let Err((code, message)) = crate::session_deletion_journal::recover_pending(state, &agent_dir) {
+                return protocol_error(&id, &code, &message);
             }
             let files = session_host::list_session_files(&agent_dir);
             // Discover ids first, then fence them in stable order and re-read

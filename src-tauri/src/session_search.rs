@@ -19,14 +19,7 @@ fn check_empty_query(state: &IpcHostState) -> Result<(), Failure> {
     if crate::trust_policy_fence::is_pending(&agent) { return Err(("busy".into(), "Trust policy outcome is unresolved".into())); }
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
-    match std::fs::symlink_metadata(agent.join("session-deletion-journal")) {
-        Ok(_) => {
-            let root = agent.join("sessions").canonicalize().map_err(io)?;
-            crate::session_deletion_journal::recover(state, &root)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io(error)),
-    }
+    crate::session_deletion_journal::recover_pending(state, &agent)
 }
 
 #[cfg(target_os = "linux")]
@@ -104,15 +97,14 @@ fn snapshot(state: &IpcHostState) -> Result<SearchSnapshot, Failure> {
     let directory = tempfile::Builder::new().prefix("pi-session-search-").tempdir().map_err(io)?;
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
+    crate::session_deletion_journal::recover_pending(state, &agent)?;
     let root = match agent.join("sessions").canonicalize() {
         Ok(root) => root,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-            && matches!(std::fs::symlink_metadata(agent.join("session-deletion-journal")), Err(ref missing) if missing.kind() == std::io::ErrorKind::NotFound) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(SearchSnapshot { _directory: directory, candidates: Vec::new(), by_snapshot: HashMap::new(), truncated: false });
         }
         Err(e) => return Err(io(e)),
     };
-    crate::session_deletion_journal::recover(state, &root)?;
     let files = collect_search_files(&root, start)?;
     let mut scans = Vec::new();
     let mut scanned_bytes = 0u64;
@@ -209,13 +201,12 @@ pub(crate) fn search(state: &IpcHostState, args: &Value) -> Result<Value, Failur
     if crate::trust_policy_fence::is_pending(&agent) { return Err(("busy".into(), "Trust policy outcome is unresolved".into())); }
     let transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
+    crate::session_deletion_journal::recover_pending(state, &agent)?;
     let root = match agent.join("sessions").canonicalize() {
         Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            && matches!(std::fs::symlink_metadata(agent.join("session-deletion-journal")), Err(ref missing) if missing.kind() == std::io::ErrorKind::NotFound) => return Ok(json!({"results": [], "truncated": false})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({"results": [], "truncated": false})),
         Err(error) => return Err(io(error)),
     };
-    crate::session_deletion_journal::recover(state, &root)?;
     drop(transaction);
     drop(_policy);
     let mut scans: Vec<_> = session_host::list_session_files(&agent).iter()
