@@ -1,6 +1,4 @@
-import { createModelRuntimeWithExtensions } from "@/lib/model-runtime";
-import { readCodemodePreference } from "@/lib/codemode-settings";
-import { listNonChatModels, type NonChatModelRuntime } from "@/lib/nonchat-models";
+import { loadNonChatModels } from "@/lib/models-extras-service.server";
 
 export const runtime = "nodejs";
 
@@ -11,12 +9,8 @@ export const runtime = "nodejs";
  */
 export async function GET() {
   try {
-    const modelRuntime = await createModelRuntimeWithExtensions();
-    const [models, codemode] = await Promise.all([
-      listNonChatModels(modelRuntime as unknown as NonChatModelRuntime),
-      readCodemodePreference(),
-    ]);
-    return Response.json({ ...models, codemode });
+    const result = await loadNonChatModels();
+    return Response.json(result);
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
   }

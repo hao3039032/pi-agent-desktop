@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
-import type { CodemodePreference } from "@/lib/codemode-settings";
-import type { NonChatModelInfo, NonChatModels, NonChatModelType } from "@/lib/nonchat-models";
+import { fetchNonChatModels, type NonChatModelsResponse } from "@/lib/models-extras-service";
+import type { NonChatModelInfo, NonChatModelType } from "@/lib/nonchat-models";
 import {
   ConfigButton,
   ConfigDetailHeader,
@@ -14,8 +14,6 @@ import {
   ConfigNotice,
   ConfigSectionTitle,
 } from "./SettingsUi";
-
-type NonChatModelsResponse = NonChatModels & { codemode: CodemodePreference };
 
 const SECTION_KEYS: Record<NonChatModelType, { title: string; how: string }> = {
   classifier: { title: "models.nonChatClassifiers", how: "models.nonChatClassifiersHow" },
@@ -48,13 +46,8 @@ export function NonChatModelsDetail({ onOpenMcp }: { onOpenMcp?: () => void }) {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/models/nonchat")
-      .then(async (res) => {
-        const body = await res.json() as NonChatModelsResponse & { error?: string };
-        if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
-        return body;
-      })
-      .then((body) => { if (!cancelled) setData(body); })
+    fetchNonChatModels()
+      .then((body) => { if (!cancelled) setData(body as NonChatModelsResponse); })
       .catch((e: unknown) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); });
     return () => { cancelled = true; };
   }, []);

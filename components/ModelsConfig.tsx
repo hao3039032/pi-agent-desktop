@@ -5,6 +5,11 @@ import { AppSelect } from "./AppSelect";
 import { useState, useEffect, useCallback, useId, useRef } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { fetchModelsConfig, saveModelsConfig } from "@/lib/models-config-service";
+import {
+  discoverProviderModels,
+  fetchModelCatalogPresets,
+  testModelConfiguration,
+} from "@/lib/models-extras-service";
 import type { ModelCatalogPreset, ModelCatalogRecommendation } from "@/lib/model-catalog";
 import type { DiscoveredModel } from "@/lib/model-discovery";
 import {
@@ -351,17 +356,11 @@ function ProviderDetail({ name, editingName, provider, onChange, onEditingNameCh
     setDiscoveryState({ phase: "loading" });
     setSelectedModelIds([]);
     try {
-      const res = await fetch("/api/models-config/discover", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerName: name, provider: { ...provider, models: undefined } }),
+      const data = await discoverProviderModels({
+        providerName: name,
+        provider: { ...provider, models: undefined },
       });
-      const data = await res.json() as { models?: DiscoveredModel[]; endpoint?: string; error?: string };
       if (requestId !== discoveryRequestIdRef.current) return;
-      if (!res.ok || data.error || !data.models) {
-        setDiscoveryState({ phase: "error", message: data.error ?? `HTTP ${res.status}` });
-        return;
-      }
       setDiscoveryState({ phase: "success", models: data.models, endpoint: data.endpoint ?? provider.baseUrl ?? "" });
     } catch (error) {
       if (requestId !== discoveryRequestIdRef.current) return;
@@ -973,22 +972,11 @@ function ModelDetail({
     if (!model.id.trim() || testState.phase === "testing") return;
     setTestState({ phase: "testing" });
     try {
-      const res = await fetch("/api/models-config/test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerName, provider, model }),
-      });
-      const d = await res.json() as {
-        ok?: boolean;
-        error?: string;
-        latencyMs?: number;
-        status?: number;
-        responseText?: string;
-      };
-      if (!res.ok || !d.ok) {
+      const d = await testModelConfiguration({ providerName, provider, model });
+      if (!d.ok) {
         setTestState({
           phase: "error",
-          message: d.error ?? `HTTP ${res.status}`,
+          message: d.error ?? "Model returned an error",
           latencyMs: d.latencyMs,
           status: d.status,
         });
@@ -1011,13 +999,15 @@ function ModelDetail({
     const requestId = ++catalogRequestIdRef.current;
     setCatalogState({ phase: "loading" });
     try {
-      const params = new URLSearchParams({ q: query, provider: providerName, limit: "50" });
-      if (provider.baseUrl?.trim()) params.set("baseUrl", provider.baseUrl.trim());
-      const res = await fetch(`/api/models-config/catalog?${params}`);
-      const data = await res.json() as { recommendation?: ModelCatalogRecommendation; error?: string };
+      const data = await fetchModelCatalogPresets({
+        q: query,
+        provider: providerName,
+        limit: 50,
+        baseUrl: provider.baseUrl?.trim() || undefined,
+      });
       if (requestId !== catalogRequestIdRef.current) return;
-      if (!res.ok || data.error || !data.recommendation) {
-        setCatalogState({ phase: "error", message: data.error ?? `HTTP ${res.status}` });
+      if (!data.recommendation) {
+        setCatalogState({ phase: "error", message: "No recommendation returned" });
         return;
       }
       const filled = fillEmptyModelFields(model, data.recommendation.preset);

@@ -9,6 +9,7 @@ import {
   type EnabledModelsMutation,
 } from "@/lib/enabled-models-service";
 import type { EnabledModelsView } from "@/lib/enabled-models";
+import { refreshModelCatalog } from "@/lib/models-extras-service";
 import {
   enabledModelsBulkActions,
   enabledModelsProviderToggle,
@@ -29,14 +30,6 @@ import { ConfigButton, ConfigSwitch } from "./SettingsUi";
  * serialized: each one is a read-modify-write of one settings key, so
  * overlapping edits from the same panel could otherwise lose one of them.
  */
-
-/** Shape of `POST /api/models/refresh`, mirroring `CatalogRefreshResult`. */
-interface CatalogRefreshResponse {
-  completed?: boolean;
-  changed?: boolean;
-  reason?: "offline" | "runtime";
-  error?: string;
-}
 
 interface Failure {
   /** Translation key for a known refusal. */
@@ -323,13 +316,7 @@ function useCatalogRefresh(providerId: string, onChanged: () => void) {
     setNote(null);
     void (async () => {
       try {
-        const res = await fetch("/api/models/refresh", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: providerId }),
-        });
-        const data = await res.json() as CatalogRefreshResponse;
-        if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+        const data = await refreshModelCatalog(providerId);
         if (data.reason === "offline") setNote("models.catalogOffline");
         else if (!data.completed) setNote("models.catalogUnreachable");
         else setNote(data.changed ? "models.catalogUpdated" : "models.catalogUnchanged");

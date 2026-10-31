@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { formatUpdatedTime } from "@/lib/i18n/format";
 import { isProviderUsageId } from "@/lib/provider-usage-ids";
+import { fetchProviderUsage } from "@/lib/models-extras-service";
 
 type UsageBucket = {
   id: string;
@@ -63,13 +64,7 @@ function ProviderUsageContent({ providerId, enabled }: { providerId: string; ena
     setQuerying(true);
     setError(null);
     try {
-      const response = await fetch("/api/provider-usage/query", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerId }),
-      });
-      const result = await response.json() as UsageResponse & { error?: string };
-      if (!response.ok) throw new Error(result.error ?? `HTTP ${response.status}`);
+      const result = (await fetchProviderUsage(providerId)) as UsageResponse;
       if (result.status === "ready") {
         setSnapshot(result);
         try { localStorage.setItem(`${STORAGE_PREFIX}${providerId}`, JSON.stringify(result)); } catch {}

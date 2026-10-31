@@ -1528,6 +1528,75 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(e) => e.to_protocol_value(&id),
             }
         }
+        "modelsConfig.catalog" => {
+            let mut payload = json!({});
+            if let Some(q) = args.get("q").and_then(Value::as_str) {
+                payload["q"] = Value::String(q.to_string());
+            }
+            if let Some(provider) = args.get("provider").and_then(Value::as_str) {
+                payload["provider"] = Value::String(provider.to_string());
+            }
+            if let Some(base_url) = args.get("baseUrl").and_then(Value::as_str) {
+                payload["baseUrl"] = Value::String(base_url.to_string());
+            }
+            if let Some(limit) = args.get("limit").and_then(Value::as_i64) {
+                payload["limit"] = json!(limit);
+            }
+            match management_call(state, "modelsConfig.catalog", payload) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "modelsConfig.discover" => {
+            let (provider_name, provider) = match validated_models_discover_payload(&args) {
+                Ok(tuple) => tuple,
+                Err(message) => return protocol_error(&id, "invalid_args", &message),
+            };
+            match management_call(state, "modelsConfig.discover", json!({
+                "providerName": provider_name,
+                "provider": provider,
+            })) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "modelsConfig.test" => {
+            let (provider_name, provider, model) = match validated_models_test_payload(&args) {
+                Ok(tuple) => tuple,
+                Err(message) => return protocol_error(&id, "invalid_args", &message),
+            };
+            match management_call(state, "modelsConfig.test", json!({
+                "providerName": provider_name,
+                "provider": provider,
+                "model": model,
+            })) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "models.nonchat" => match management_call(state, "models.nonchat", json!({})) {
+            Ok(result) => protocol_ok(&id, result),
+            Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+        },
+        "models.refreshCatalog" => {
+            let mut payload = json!({});
+            if let Some(provider) = args.get("provider").and_then(Value::as_str) {
+                payload["provider"] = Value::String(provider.to_string());
+            }
+            match management_call(state, "models.refreshCatalog", payload) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "models.providerUsage" => {
+            let Some(provider_id) = args.get("providerId").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
+                return protocol_error(&id, "invalid_args", "providerId is required");
+            };
+            match management_call(state, "models.providerUsage", json!({ "providerId": provider_id })) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
@@ -2062,6 +2131,45 @@ fn validated_models_config_payload(args: &Value) -> Result<Value, String> {
         }
     }
     Ok(config.clone())
+}
+
+fn validated_models_discover_payload(args: &Value) -> Result<(String, Value), String> {
+    let provider_name = args
+        .get("providerName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "providerName is required".to_string())?;
+    let provider = args
+        .get("provider")
+        .filter(|p| p.is_object())
+        .ok_or_else(|| "provider must be a JSON object".to_string())?;
+    Ok((provider_name.to_string(), provider.clone()))
+}
+
+fn validated_models_test_payload(args: &Value) -> Result<(String, Value, Value), String> {
+    let provider_name = args
+        .get("providerName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "providerName is required".to_string())?;
+    let provider = args
+        .get("provider")
+        .filter(|p| p.is_object())
+        .ok_or_else(|| "provider must be a JSON object".to_string())?;
+    let model = args
+        .get("model")
+        .filter(|m| m.is_object())
+        .ok_or_else(|| "model must be a JSON object".to_string())?;
+    let model_id = model
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Model ID is required".to_string())?;
+    let _ = model_id;
+    Ok((provider_name.to_string(), provider.clone(), model.clone()))
 }
 
 /// Assemble the `info` object (the SessionInfo shape the sidebar and
@@ -4997,6 +5105,67 @@ mod tests {
         );
         assert_eq!(unconfigured["ok"], false, "{unconfigured}");
         assert_eq!(unconfigured["error"]["code"], "management_unavailable");
+    }
+
+    #[test]
+    fn models_extras_gates_envelopes_before_any_instance() {
+        let state = state();
+        *state.management_config.lock().unwrap() = None;
+
+        // modelsConfig.discover validations
+        for (label, args, message) in [
+            ("discover missing providerName", json!({}), "providerName is required"),
+            ("discover empty providerName", json!({ "providerName": "  " }), "providerName is required"),
+            ("discover missing provider", json!({ "providerName": "p" }), "provider must be a JSON object"),
+            ("discover non-object provider", json!({ "providerName": "p", "provider": "x" }), "provider must be a JSON object"),
+        ] {
+            let response = send(
+                &state,
+                json!({ "v": 1, "id": "mdisc", "op": "modelsConfig.discover", "args": args }),
+            );
+            assert_eq!(response["ok"], false, "{label}: {response}");
+            assert_eq!(response["error"]["code"], "invalid_args", "{label}: {response}");
+            assert_eq!(response["error"]["message"], message, "{label}: {response}");
+        }
+
+        // modelsConfig.test validations
+        for (label, args, message) in [
+            ("test missing providerName", json!({}), "providerName is required"),
+            ("test missing provider", json!({ "providerName": "p" }), "provider must be a JSON object"),
+            ("test missing model", json!({ "providerName": "p", "provider": {} }), "model must be a JSON object"),
+            ("test missing model.id", json!({ "providerName": "p", "provider": {}, "model": {} }), "Model ID is required"),
+        ] {
+            let response = send(
+                &state,
+                json!({ "v": 1, "id": "mtest", "op": "modelsConfig.test", "args": args }),
+            );
+            assert_eq!(response["ok"], false, "{label}: {response}");
+            assert_eq!(response["error"]["code"], "invalid_args", "{label}: {response}");
+            assert_eq!(response["error"]["message"], message, "{label}: {response}");
+        }
+
+        // models.providerUsage validations
+        let no_provider_id = send(
+            &state,
+            json!({ "v": 1, "id": "musage", "op": "models.providerUsage", "args": {} }),
+        );
+        assert_eq!(no_provider_id["ok"], false, "{no_provider_id}");
+        assert_eq!(no_provider_id["error"]["code"], "invalid_args", "{no_provider_id}");
+        assert_eq!(no_provider_id["error"]["message"], "providerId is required", "{no_provider_id}");
+
+        // Valid requests reach the unconfigured management instance:
+        for (op, args) in [
+            ("modelsConfig.catalog", json!({})),
+            ("modelsConfig.discover", json!({ "providerName": "p", "provider": {} })),
+            ("modelsConfig.test", json!({ "providerName": "p", "provider": {}, "model": { "id": "m" } })),
+            ("models.nonchat", json!({})),
+            ("models.refreshCatalog", json!({})),
+            ("models.providerUsage", json!({ "providerId": "deepseek" })),
+        ] {
+            let res = send(&state, json!({ "v": 1, "id": "mext", "op": op, "args": args }));
+            assert_eq!(res["ok"], false, "{op}: {res}");
+            assert_eq!(res["error"]["code"], "management_unavailable", "{op}: {res}");
+        }
     }
 
     /// The models.json save over the REAL pi management instance

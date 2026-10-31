@@ -26,6 +26,7 @@ import { bindFileService } from "./data/file-service.ts";
 import { bindFontService } from "./data/font-service.ts";
 import { bindGitStatusService } from "./data/git-status-service.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
+import { bindModelsExtrasService } from "./data/models-extras-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
@@ -54,6 +55,7 @@ async function boot(): Promise<void> {
   bindArtifactsSettingsService(client);
   bindChatSettingsService(client);
   bindCustomCssService(client);
+  bindModelsExtrasService(client);
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);
