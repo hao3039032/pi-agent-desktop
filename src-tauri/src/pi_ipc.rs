@@ -1691,6 +1691,21 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // (readRedactedModelsConfig), so a stored literal apiKey can never
         // reach the frontend. No cwd scope — models.json is a global file
         // read, like the route's bare GET.
+        "distro.status" => match management_call(state, "distro.status", json!({})) {
+            Ok(status) => protocol_ok(&id, status),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "distro.configure" => {
+            if !args["baseUrl"].is_string() || !args["apiKey"].is_string() || !args["useNpmMirror"].is_boolean() {
+                return protocol_error(&id, "invalid_args", "Invalid distro configuration");
+            }
+            match management_call(state, "distro.configure", json!({
+                "baseUrl": args["baseUrl"], "apiKey": args["apiKey"], "useNpmMirror": args["useNpmMirror"]
+            })) {
+                Ok(status) => protocol_ok(&id, status),
+                Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        },
         "modelsConfig.get" => match management_call(state, "modelsConfig.get", json!({})) {
             Ok(config) => protocol_ok(&id, config),
             Err(error) => protocol_error(&id, error.0.as_str(), &error.1),

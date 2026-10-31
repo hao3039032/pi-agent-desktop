@@ -145,6 +145,7 @@ export default defineConfig({
         find: /^@\/lib\/font-service$/,
         replacement: resolve(import.meta.dirname, "src/data/font-service.ts"),
       },
+      { find: /^@\/lib\/distro-service$/, replacement: resolve(import.meta.dirname, "src/data/distro-service.ts") },
       { find: /^@\/lib\/git-status-service$/, replacement: resolve(import.meta.dirname, "src/data/git-status-service.ts") },
       { find: /^@\/lib\/worktree-service$/, replacement: resolve(import.meta.dirname, "src/data/worktree-service.ts") },
       {
