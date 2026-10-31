@@ -1,5 +1,7 @@
 import { grantFilePreview, grantFileResource, revokeFileResource } from "./file-service";
 
+export function initialFileResourceUrl(_path: string, _sessionId?: string | null, _revision?: number, _preview = false): undefined { return undefined; }
+
 /** The handle names one host-authorized file, not an arbitrary filesystem path. */
 export async function openFileResourceUrl(path: string, sessionId?: string | null, _revision?: number): Promise<{ url: string; release: () => void }> {
   const handle = await grantFileResource(path, sessionId);

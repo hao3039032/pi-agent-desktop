@@ -137,8 +137,10 @@ export async function revealDirectory(cwd: string): Promise<void> {
   if (!response.ok) throw await responseError(response, `HTTP ${response.status}`);
 }
 
-export async function fileExists(filePath: string): Promise<boolean> {
-  try { return (await fetch(`/api/files/${encodeFilePathForApi(filePath)}?type=meta`)).ok; }
+export async function fileExists(filePath: string, sessionId?: string | null): Promise<boolean> {
+  const params = new URLSearchParams({ type: "meta" });
+  if (sessionId) params.set("sessionId", sessionId);
+  try { return (await fetch(`/api/files/${encodeFilePathForApi(filePath)}?${params}`)).ok; }
   catch { return false; }
 }
 

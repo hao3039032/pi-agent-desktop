@@ -9,7 +9,7 @@ import { useFileResourceUrl } from "@/hooks/useFileResourceUrl";
 import { useI18n } from "@/hooks/useI18n";
 import { fenceFilePaths, inlineCodeFilePath } from "@/lib/file-context-menu";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
-import { fileExists } from "@/lib/file-service";
+import { fileExists, usesStaticFileHost } from "@/lib/file-service";
 import { markdownRehypePlugins, markdownRemarkPlugins, markdownUrlTransform, markdownUserRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
 import { ImagePreview } from "./ImagePreview";
 import { MermaidBlock, CodeBlock } from "./MermaidBlock";
@@ -30,6 +30,7 @@ interface MarkdownBodyProps {
   className?: string;
   isStreaming?: boolean;
   cwd?: string;
+  sessionId?: string;
   onOpenFile?: (filePath: string, page?: number) => void;
   /** Render every line ending as a line break, for text the user typed. */
   keepLineBreaks?: boolean;
@@ -41,13 +42,14 @@ function MarkdownImage({
   src,
   alt,
   cwd,
+  sessionId,
   ...props
-}: ComponentProps<"img"> & ExtraProps & { cwd?: string }) {
+}: ComponentProps<"img"> & ExtraProps & { cwd?: string; sessionId?: string }) {
   const insideLink = useContext(MarkdownLinkContext);
   delete props.node;
   const href = typeof src === "string" ? src : undefined;
   const filePath = href ? resolveLocalFileHref(href, cwd) : null;
-  const localSrc = useFileResourceUrl(filePath);
+  const localSrc = useFileResourceUrl(filePath, sessionId);
   const imageSrc = filePath ? localSrc : href;
   // Dynamic local paths are served directly by the file API.
   // eslint-disable-next-line @next/next/no-img-element
@@ -63,11 +65,13 @@ function MarkdownImage({
 /** Inline code that may name a file: right-click offers the file menu once the server confirms it exists. */
 function MarkdownInlineCode({
   cwd,
+  sessionId,
   onOpenFile,
   children,
   ...props
 }: ComponentProps<"code"> & ExtraProps & {
   cwd: string | undefined;
+  sessionId?: string;
   onOpenFile: ((filePath: string, page?: number) => void) | undefined;
 }) {
   delete props.node;
@@ -78,7 +82,7 @@ function MarkdownInlineCode({
       {...props}
       onContextMenu={onOpenFile ? (event) => {
         const filePath = inlineCodeFilePath(String(children), cwd);
-        if (filePath) showFileMenu(event, { filePath, verify: true });
+        if (filePath) showFileMenu(event, { filePath, sessionId, verify: true });
       } : undefined}
     >
       {children}
@@ -87,17 +91,17 @@ function MarkdownInlineCode({
 }
 
 /** "Open" beside Copy on a code block the prose above attributes to a saved file; shown once the server confirms the file exists. */
-function CodeBlockOpenFile({ filePath, onOpenFile }: { filePath: string; onOpenFile: (filePath: string) => void }) {
+function CodeBlockOpenFile({ filePath, sessionId, onOpenFile }: { filePath: string; sessionId?: string; onOpenFile: (filePath: string) => void }) {
   const { t } = useI18n();
   const [exists, setExists] = useState(false);
   useEffect(() => {
     let cancelled = false;
     setExists(false);
-    fileExists(filePath)
+    fileExists(filePath, sessionId)
       .then((exists) => { if (!cancelled) setExists(exists); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [filePath]);
+  }, [filePath, sessionId]);
   if (!exists) return null;
   const name = filePath.split(/[\\/]/).pop() ?? filePath;
   return (
@@ -128,15 +132,18 @@ function CodeBlockOpenFile({ filePath, onOpenFile }: { filePath: string; onOpenF
 function MarkdownLocalFileLink({
   filePath,
   page,
+  sessionId,
   onOpenFile,
   children,
   ...props
 }: ComponentProps<"a"> & ExtraProps & {
   filePath: string;
   page: number | undefined;
+  sessionId?: string;
   onOpenFile: (filePath: string, page?: number) => void;
 }) {
   delete props.node;
+  const resourceUrl = useFileResourceUrl(filePath, sessionId);
   const showFileMenu = useFileContextMenu(onOpenFile);
   const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
     if (!shouldOpenLocalFileInApp(event)) return;
@@ -149,8 +156,9 @@ function MarkdownLocalFileLink({
     <MarkdownLinkContext.Provider value={true}>
       <a
         {...props}
+        href={usesStaticFileHost() ? (resourceUrl ? `${resourceUrl}${page ? `#page=${page}` : ""}` : undefined) : props.href}
         onClick={handleClick}
-        onContextMenu={(event) => showFileMenu(event, { filePath, page })}
+        onContextMenu={(event) => showFileMenu(event, { filePath, page, sessionId })}
       >
         {children}
       </a>
@@ -163,6 +171,7 @@ function buildComponents(
   cwd: string | undefined,
   onOpenFile: ((filePath: string, page?: number) => void) | undefined,
   fenceFiles: Map<number, string>,
+  sessionId: string | undefined,
 ): Components {
   return {
     code({ className, children, node, ...props }) {
@@ -201,12 +210,12 @@ function buildComponents(
             code={raw.replace(/\n$/, "")}
             lang={lang}
             isStreaming={isStreaming}
-            headerAction={savedPath && onOpenFile ? <CodeBlockOpenFile filePath={savedPath} onOpenFile={onOpenFile} /> : undefined}
+            headerAction={savedPath && onOpenFile ? <CodeBlockOpenFile filePath={savedPath} sessionId={sessionId} onOpenFile={onOpenFile} /> : undefined}
           />
         );
       }
       return (
-        <MarkdownInlineCode cwd={cwd} onOpenFile={onOpenFile} {...props}>
+        <MarkdownInlineCode cwd={cwd} sessionId={sessionId} onOpenFile={onOpenFile} {...props}>
           {children}
         </MarkdownInlineCode>
       );
@@ -241,6 +250,7 @@ function buildComponents(
           {...props}
           filePath={filePath}
           page={parsePdfPageFragment(href) ?? undefined}
+          sessionId={sessionId}
           onOpenFile={openFile}
         >
           {children}
@@ -248,7 +258,7 @@ function buildComponents(
       );
     },
     img(props) {
-      return <MarkdownImage cwd={cwd} {...props} />;
+      return <MarkdownImage cwd={cwd} sessionId={sessionId} {...props} />;
     },
     table({ children }) {
       return (
@@ -262,7 +272,7 @@ function buildComponents(
 
 // Memoized: markdown parsing + highlighting is the most expensive render work
 // in the app, so parent re-renders with identical props must be free.
-export const MarkdownBody = memo(function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile, keepLineBreaks, artifacts }: MarkdownBodyProps) {
+export const MarkdownBody = memo(function MarkdownBody({ children, className, isStreaming, cwd, sessionId, onOpenFile, keepLineBreaks, artifacts }: MarkdownBodyProps) {
   const markdown = useStreamingMarkdownText(children, Boolean(isStreaming));
   const normalizedMarkdown = useMemo(
     () => normalizeDisplayMath(artifacts && markdown.includes(":::artifact") ? encodeArtifactsForMarkdown(markdown) : markdown),
@@ -274,8 +284,8 @@ export const MarkdownBody = memo(function MarkdownBody({ children, className, is
     [normalizedMarkdown, cwd, trackFences],
   );
   const components = useMemo(
-    () => buildComponents(isStreaming, cwd, onOpenFile, fenceFiles),
-    [isStreaming, cwd, onOpenFile, fenceFiles],
+    () => buildComponents(isStreaming, cwd, onOpenFile, fenceFiles, sessionId),
+    [isStreaming, cwd, onOpenFile, fenceFiles, sessionId],
   );
   // Reuse the element when a new network delta has not published a snapshot.
   const body = useMemo(() => (

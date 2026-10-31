@@ -57,6 +57,10 @@ try {
   await page.addInitScript(`window.__STATIC_UI_HARNESS_TOKEN__ = ${JSON.stringify(token)}; ${polyfill}`);
   await page.goto(`${url}${html.slice(dist.length)}?cwd=${encodeURIComponent(project)}`);
   await page.waitForFunction(() => { const img = document.querySelector(".markdown-image img"); return img instanceof HTMLImageElement && img.complete && img.naturalWidth === 1; }, null, { timeout: 20_000 });
+  const localLink = page.getByRole("link", { name: "local" });
+  await page.waitForFunction(() => document.querySelector('.markdown-body a')?.getAttribute('href')?.startsWith('/__harness__/resource/'));
+  await localLink.click();
+  assert.equal(await page.locator('body').getAttribute('data-opened-file'), join(project, 'style.css'));
   const frame = page.frameLocator('.file-viewer-content iframe').first();
   await frame.locator("#fixture").waitFor({ timeout: 20_000 });
   await page.waitForFunction(() => { const f = document.querySelector('.file-viewer-content iframe'); return f?.contentDocument?.querySelector('#fixture') && getComputedStyle(f.contentDocument.querySelector('#fixture')).color === 'rgb(12, 34, 56)'; });

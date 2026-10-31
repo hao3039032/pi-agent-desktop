@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { openFilePreviewUrl, openFileResourceUrl } from "@/lib/file-resource-url";
+import { initialFileResourceUrl, openFilePreviewUrl, openFileResourceUrl } from "@/lib/file-resource-url";
 
 /** Acquire and revoke a resource even when acquisition finishes after unmount. */
 export function useFileResourceUrl(path?: string | null, sessionId?: string | null, revision?: number, preview = false): string | undefined {
@@ -18,5 +18,7 @@ export function useFileResourceUrl(path?: string | null, sessionId?: string | nu
     }).catch(() => { if (!cancelled) setResource(undefined); });
     return () => { cancelled = true; release?.(); };
   }, [path, sessionId, revision, preview]);
-  return resource && resource.path === path && resource.sessionId === sessionId && resource.revision === revision && resource.preview === preview ? resource.url : undefined;
+  return resource && resource.path === path && resource.sessionId === sessionId && resource.revision === revision && resource.preview === preview
+    ? resource.url
+    : path ? initialFileResourceUrl(path, sessionId, revision, preview) : undefined;
 }

@@ -156,9 +156,9 @@ export async function revealDirectory(cwd: string): Promise<void> {
   await ensureClient().request("files.reveal", { cwd }, { timeoutMs: 15_000 });
 }
 
-export async function fileExists(filePath: string): Promise<boolean> {
+export async function fileExists(filePath: string, sessionId?: string | null): Promise<boolean> {
   try {
-    const handle = await grantFileResource(filePath);
+    const handle = await grantFileResource(filePath, sessionId);
     await revokeFileResource(handle);
     return true;
   } catch { return false; }
