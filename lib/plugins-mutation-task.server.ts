@@ -1,3 +1,5 @@
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getProjectTrustStatus } from "@/lib/project-trust";
 import { managePlugins } from "@/lib/plugins-service.server";
 import type { PluginScope } from "@/lib/api-types";
 
@@ -7,6 +9,7 @@ export async function runPluginMutationTask(
   context: { signal: AbortSignal; progress: (value: { phase: string }) => void },
 ) {
   if (context.signal.aborted) throw new Error("Plugin operation cancelled before it started");
+  if (input.scope === "project" && !getProjectTrustStatus(input.cwd, getAgentDir()).trusted) throw new Error("Project resources must be trusted");
   context.progress({ phase: "running" });
   // The SDK does not accept a signal. The host must stop the exclusive process
   // tree on cancellation and retain an unknown outcome, not reuse this worker.
