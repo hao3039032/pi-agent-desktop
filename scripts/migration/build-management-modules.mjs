@@ -49,6 +49,11 @@ export {
   readSessionToolSelection,
   validateSessionToolSelection,
 } from "${ROOT}/lib/session-tool-selection.ts";
+export { chatWorkspacePrompt } from "${ROOT}/lib/chat-workspace-prompt.ts";
+export {
+  contextFilesSystemPrompt,
+  CHAT_ONLY_RESOURCE_LOADER_OPTIONS,
+} from "${ROOT}/lib/chat-only.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";

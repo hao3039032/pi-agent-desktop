@@ -77,6 +77,118 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// A chat's own folder (`createChatFolder`): `<root>/YYYYMMDD-HHMMSS-hex`
+/// with LOCAL time (the stamp is a name the user reads) and private perms;
+/// a same-second collision retries with new randomness.
+pub fn create_chat_folder(agent_dir: &Path) -> std::io::Result<PathBuf> {
+    let root = ensure_chat_workspace(agent_dir)?;
+    let (year, month, day, hour, minute, second) = local_now_parts();
+    for _ in 0..5 {
+        let mut random = [0u8; 4];
+        getrandom::fill(&mut random)?;
+        let hex: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let dir = root.join(format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}-{hex}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            match std::fs::DirBuilder::new().recursive(false).mode(0o700).create(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        #[cfg(not(unix))]
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other("Could not create a folder for the chat"))
+}
+
+/// Local-time calendar parts (the chat folder stamp is a LOCAL name).
+#[cfg(unix)]
+fn local_now_parts() -> (i64, u32, u32, u32, u32, u32) {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return utc_now_parts_local_fallback();
+        }
+        (
+            (tm.tm_year as i64) + 1900,
+            (tm.tm_mon as u32) + 1,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+            tm.tm_sec as u32,
+        )
+    }
+}
+
+#[cfg(not(unix))]
+fn local_now_parts() -> (i64, u32, u32, u32, u32, u32) {
+    utc_now_parts_local_fallback()
+}
+
+fn utc_now_parts_local_fallback() -> (i64, u32, u32, u32, u32, u32) {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since_epoch.as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    (year, month, day, rest / 3600, (rest % 3600) / 60, rest % 60)
+}
+
+/// The local calendar date (the scratch-cwd stamp `localDateStamp`: a
+/// user-facing LOCAL name).
+pub fn local_now_parts_pub() -> (i64, u32, u32, u32, u32, u32) {
+    local_now_parts()
+}
+
+/// Howard Hinnant's civil_from_days (the same algorithm session-host uses).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// Make sure a chat's cwd exists (`ensureChatCwd`: a folder pruned while
+/// empty, or the legacy shared cwd, comes back — private perms).
+pub fn ensure_chat_cwd(cwd: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(cwd)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(cwd)?;
+    Ok(())
+}
+
+/// The session-storage dir a cwd's sessions live in
+/// (`getDefaultSessionDirPath`): `<agentDir>/sessions/--<cwd / \ : → - >--`.
+pub fn default_session_dir(agent_dir: &Path, cwd: &Path) -> PathBuf {
+    let text = cwd.to_string_lossy();
+    let stripped = text.trim_start_matches(['/', '\\']);
+    let safe: String = stripped
+        .chars()
+        .map(|c| matches!(c, '/' | '\\' | ':').then_some('-').unwrap_or(c))
+        .collect();
+    agent_dir.join("sessions").join(format!("--{safe}--"))
+}
+
 /// The root a new chat is requested with.
 pub fn is_chat_root_path(cwd: &Path, agent_dir: &Path) -> bool {
     same_path(cwd, &chat_workspace_dir(agent_dir))
@@ -216,6 +328,84 @@ pub fn project_identity_key(project_root: &Path) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// The trust-requiring entries under a cwd's `.pi` (`trust-manager.js`
+/// TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES; `lib/project-trust.ts` pins
+/// this list against the SDK's own).
+const TRUST_REQUIRING_PROJECT_ENTRIES: [&str; 8] = [
+    "settings.json",
+    "mcp.json",
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+];
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether a cwd carries project-local resources gated by trust
+/// (`hasTrustRequiringProjectResources`): the `.pi` entries, or an
+/// `.agents/skills` in it or an ancestor — the user's own `~/.agents/skills`
+/// never counts.
+pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
+    let config_dir = cwd.join(".pi");
+    if TRUST_REQUIRING_PROJECT_ENTRIES
+        .iter()
+        .any(|entry| config_dir.join(entry).exists())
+    {
+        return true;
+    }
+    let user_skills = std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".agents").join("skills"));
+    let mut current = canonical(cwd);
+    loop {
+        let skills = current.join(".agents").join("skills");
+        if user_skills.as_deref() != Some(skills.as_path()) && skills.exists() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = canonical(parent),
+            _ => return false,
+        }
+    }
+}
+
+/// The trust store's nearest decision for a cwd (`ProjectTrustStore.getEntry`
+/// → `findNearestTrustEntry` over `<agentDir>/trust.json`).
+fn nearest_trust_entry(agent_dir: &Path, cwd: &Path) -> Option<bool> {
+    let path = agent_dir.join("trust.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim_start_matches('\u{feff}');
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let store = parsed.as_object()?;
+    let mut current = canonical(cwd);
+    loop {
+        if let Some(value) = store.get(current.to_string_lossy().as_ref()) {
+            match value {
+                serde_json::Value::Bool(decision) => return Some(*decision),
+                _ => return None,
+            }
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = canonical(parent),
+            _ => return None,
+        }
+    }
+}
+
+/// The effective project trust for a cwd (`getProjectTrustStatus`): a cwd
+/// with nothing trust-requiring is trusted; otherwise the store decides.
+pub fn project_trusted(agent_dir: &Path, cwd: &Path) -> bool {
+    if !has_trust_requiring_project_resources(cwd) {
+        return true;
+    }
+    nearest_trust_entry(agent_dir, cwd) == Some(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +637,65 @@ mod tests {
         std::fs::write(&file, "{}\n{}\n").expect("grow");
         let grown = snapshot_revision(&file, "disk", 10, Some("e10"), Some("e10"));
         assert_ne!(first, grown, "the disk fingerprint changed with the file");
+    }
+
+    #[test]
+    fn chat_folders_are_local_time_named_private_and_unique() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("agent");
+        let first = create_chat_folder(&agent).expect("first");
+        let second = create_chat_folder(&agent).expect("second");
+        assert_ne!(first, second, "same-second creates get distinct folders");
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        // YYYYMMDD-HHMMSS-hex(8): 24 characters, both dashes in place.
+        assert_eq!(name.len(), 24, "the stamp shape: {name}");
+        assert_eq!(&name[8..9], "-", "the stamp's first dash: {name}");
+        assert_eq!(&name[15..16], "-", "the stamp's second dash: {name}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&first).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "a chat folder is private");
+        }
+        assert!(is_chat_folder_path(&first, &agent));
+    }
+
+    #[test]
+    fn session_dirs_encode_the_cwd_like_the_sdk() {
+        let agent = Path::new("/agent");
+        let encoded = default_session_dir(agent, Path::new("/home/hao/work"));
+        assert_eq!(encoded, Path::new("/agent/sessions/--home-hao-work--"));
+        // Every separator AND a colon become dashes (the JS char class
+        // `[/\\:]`), so a Windows drive letter doubles up.
+        let windows = default_session_dir(agent, Path::new(r"C:\Users\hao"));
+        assert_eq!(windows, Path::new("/agent/sessions/--C--Users-hao--"));
+    }
+
+    #[test]
+    fn trust_follows_the_sdk_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("work");
+        std::fs::create_dir_all(&project).expect("project");
+        // Nothing trust-requiring: trusted without any store entry.
+        assert!(project_trusted(&agent, &project));
+        // A .pi/settings.json makes trust required; no store → untrusted.
+        std::fs::create_dir_all(project.join(".pi")).expect("pi");
+        std::fs::write(project.join(".pi").join("settings.json"), "{}").expect("settings");
+        assert!(!project_trusted(&agent, &project));
+        // A trust.json decision for the exact cwd flips it.
+        std::fs::create_dir_all(&agent).expect("agent dir");
+        let real_project = project.canonicalize().expect("real");
+        std::fs::write(
+            agent.join("trust.json"),
+            format!("{{\n  {}: true\n}}\n", serde_json::json!(real_project.display().to_string())),
+        )
+        .expect("trust");
+        assert!(project_trusted(&agent, &project));
+        // An ancestor decision applies to a subdirectory.
+        let sub = project.join("packages");
+        std::fs::create_dir_all(&sub).expect("sub");
+        assert!(has_trust_requiring_project_resources(&sub) || project_trusted(&agent, &sub));
     }
 
     #[test]

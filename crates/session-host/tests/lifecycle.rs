@@ -38,6 +38,11 @@ fn config(executable: &str, agent_dir: &std::path::Path) -> SessionSpawnConfig {
         agent_dir: Some(agent_dir.to_path_buf()),
         session_dir: None,
         bridge_asset: bridge_asset(),
+        artifacts_asset: None,
+        chat_asset: None,
+        shape: session_host::SessionSpawnShape::Project { tool_args: None },
+        initial_model: None,
+        thinking_level: None,
         extra_args: Vec::new(),
     }
 }

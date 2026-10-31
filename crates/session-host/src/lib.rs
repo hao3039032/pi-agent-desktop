@@ -26,6 +26,7 @@
 
 pub mod history;
 pub mod machine;
+pub mod spawn_plan;
 pub use history::{list_session_files, scan_session_file_info, scan_sessions, SessionIndex, SessionSummary};
 pub use machine::{FollowUp, SessionMachine, SessionRunState, StreamingMessage};
 
@@ -337,7 +338,27 @@ impl Session {
 
 static SUBSCRIBER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// How to spawn session children.
+/// How to spawn session children: the KIND drives everything the Next
+/// factory (`lib/pi-rpc/factory.ts` startCliRpcSessionFromManager) decided
+/// per session — discovery flags, tools, exact prompts and the chat policy.
+#[derive(Clone)]
+pub enum SessionSpawnShape {
+    /// A project session (the factory's normal path): discovery stays ON —
+    /// the child loads user extensions, skills, prompt templates, themes and
+    /// context files on its own, exactly like the Next server's children. An
+    /// optional pinned selection applies via `--tools` (already entry-
+    /// mapped with the shell switch applied by [`spawn_plan::build_tool_entries`]).
+    Project { tool_args: Option<Vec<String>> },
+    /// The chat-only pin (an empty pinned selection in a project): no tools,
+    /// no discovery, and the exact prompt built from the session cwd's
+    /// context files replaces pi's own (`--no-*` + `--system-prompt`).
+    ChatOnly { prompt_file: PathBuf },
+    /// A chat workspace session: the chat policy extension, the exact chat
+    /// prompt, and — while locked — the chat tool loadout replacing the
+    /// coding domain plus the delegation tools excluded.
+    Chat { prompt_file: PathBuf, folder: bool, unlocked: bool, files_enabled: bool },
+}
+
 #[derive(Clone)]
 pub struct SessionSpawnConfig {
     /// Absolute pi executable.
@@ -348,7 +369,20 @@ pub struct SessionSpawnConfig {
     pub session_dir: Option<PathBuf>,
     /// Absolute path of the shipped bridge extension.
     pub bridge_asset: PathBuf,
-    /// Extra args after the standard set.
+    /// The artifacts guide asset (loaded wherever the bridge loads).
+    pub artifacts_asset: Option<PathBuf>,
+    /// The chat policy asset (`pi-web-chat.mjs`) a chat session loads.
+    pub chat_asset: Option<PathBuf>,
+    /// What kind of session to spawn (args, discovery, prompt, tools).
+    pub shape: SessionSpawnShape,
+    /// The model the child must run: the file's saved model, else the
+    /// request's initial pick — applied via `set_model` after the handshake
+    /// exactly like the factory's restore step (a failure leaves the child
+    /// on its default; it never fails the session).
+    pub initial_model: Option<(String, String)>,
+    /// A requested thinking level (`--thinking`).
+    pub thinking_level: Option<String>,
+    /// Extra args after the standard set (tests).
     pub extra_args: Vec<String>,
 }
 
@@ -506,22 +540,96 @@ fn spawn_session(
         .session_dir
         .clone()
         .unwrap_or_else(|| session_file.parent().map(Path::to_path_buf).unwrap_or_default());
+    // The spawn shape mirrors the Next factory exactly (which flags a KIND
+    // gets, which assets load, which env the child sees):
+    //
+    // - project: discovery ON (skills/context files/user extensions load);
+    // - chat-only pin: everything off + the exact context-files prompt;
+    // - chat: context files off (the chat preamble replaces pi's prompt),
+    //   the chat policy asset, and — locked — the chat tool loadout plus
+    //   the delegation tools excluded.
     let mut args: Vec<String> = vec![
         "--session".into(),
         session_file.to_string_lossy().into_owned(),
         "--session-dir".into(),
         session_dir.to_string_lossy().into_owned(),
-        // Discovery stays off: only the explicit bridge asset loads.
-        "--no-extensions".into(),
-        "--no-skills".into(),
-        "--no-prompt-templates".into(),
-        "--no-themes".into(),
-        "--no-context-files".into(),
-        "--extension".into(),
-        config.bridge_asset.to_string_lossy().into_owned(),
     ];
-    args.extend(config.extra_args.iter().cloned());
     let mut env = EnvPolicy::inherit().set("PI_WEB_BRIDGE_NONCE", nonce.clone());
+    match &config.shape {
+        SessionSpawnShape::Project { tool_args } => {
+            if let Some(entries) = tool_args {
+                args.push("--tools".into());
+                args.push(entries.join(","));
+            }
+        }
+        SessionSpawnShape::ChatOnly { prompt_file } => {
+            args.extend([
+                "--no-tools".into(),
+                "--no-extensions".into(),
+                "--no-skills".into(),
+                "--no-prompt-templates".into(),
+                "--no-themes".into(),
+                "--no-context-files".into(),
+                "--system-prompt".into(),
+                prompt_file.to_string_lossy().into_owned(),
+            ]);
+        }
+        SessionSpawnShape::Chat { prompt_file, folder, unlocked, files_enabled } => {
+            args.push("--no-context-files".into());
+            args.push("--system-prompt".into());
+            args.push(prompt_file.to_string_lossy().into_owned());
+            if let Some(chat_asset) = &config.chat_asset {
+                args.push("--extension".into());
+                args.push(chat_asset.to_string_lossy().into_owned());
+            }
+            if !unlocked {
+                // Delegation tools hand work to agents that carry their own
+                // tools — a chat's limits would not reach them.
+                args.push("--exclude-tools".into());
+                args.push("Agent,get_subagent_result,steer_subagent".into());
+                // The chat loadout replaces the coding domain (folder chats
+                // get the file tools, a legacy chat `read` alone).
+                let loadout: &[&str] = if *folder {
+                    &["read", "write", "edit", "grep", "find", "ls"]
+                } else {
+                    &["read"]
+                };
+                let default_tools = config
+                    .agent_dir
+                    .as_deref()
+                    .and_then(|agent_dir| spawn_plan::resolved_default_tools(agent_dir, cwd, true));
+                let selection: Vec<String> = loadout.iter().map(|name| name.to_string()).collect();
+                let entries = spawn_plan::build_tool_entries(&selection, default_tools.as_ref());
+                args.push("--tools".into());
+                args.push(entries.join(","));
+            }
+            env = env.set(
+                "PI_WEB_CHAT_MODE",
+                if *unlocked {
+                    "unlocked"
+                } else if *folder {
+                    "folder"
+                } else {
+                    "legacy"
+                },
+            );
+            if *files_enabled {
+                env = env.set("PI_WEB_CHAT_FILES", "1");
+            }
+        }
+    }
+    args.push("--extension".into());
+    args.push(config.bridge_asset.to_string_lossy().into_owned());
+    if let Some(artifacts) = &config.artifacts_asset {
+        // The artifacts guide loads wherever the bridge loads (every kind).
+        args.push("--extension".into());
+        args.push(artifacts.to_string_lossy().into_owned());
+    }
+    if let Some(thinking) = &config.thinking_level {
+        args.push("--thinking".into());
+        args.push(thinking.clone());
+    }
+    args.extend(config.extra_args.iter().cloned());
     if let Some(agent_dir) = &config.agent_dir {
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
     }
@@ -604,7 +712,47 @@ fn spawn_session(
         state.shutdown(Duration::from_secs(5));
         return Err(error);
     }
+
+    // The factory's restore step: run the model the session was left on (the
+    // file's saved model, else the request's initial pick) unless the child
+    // already does. A set_model failure leaves the child on its default —
+    // it never fails the session (applyModel's contract).
+    if let Some((provider, model_id)) = &config.initial_model {
+        let current = state.get_state().ok().and_then(|child| {
+            let model = child.get("model")?;
+            Some((
+                model.get("provider").and_then(Value::as_str).unwrap_or_default().to_string(),
+                model.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+            ))
+        });
+        if !state_matches(&current, provider, model_id) {
+            let _ = state.command(
+                "set_model",
+                json!({ "provider": provider, "modelId": model_id }),
+                Some(Duration::from_secs(60)),
+            );
+        }
+    }
+
+    // pi reads --system-prompt once at startup; the handshake's answer means
+    // the child consumed its arguments, so the private prompt file can go.
+    match &config.shape {
+        SessionSpawnShape::ChatOnly { prompt_file } | SessionSpawnShape::Chat { prompt_file, .. } => {
+            spawn_plan::remove_prompt_file(prompt_file);
+        }
+        SessionSpawnShape::Project { .. } => {}
+    }
     Ok(state)
+}
+
+/// Does the child already run the wanted model? (provider AND id.)
+fn state_matches(current: &Option<(String, String)>, provider: &str, model_id: &str) -> bool {
+    match current {
+        Some((child_provider, child_model)) => {
+            child_provider == provider && child_model == model_id
+        }
+        None => false,
+    }
 }
 
 // --- Tauri IPC dispatch (the closed operation table) ------------------------
@@ -616,11 +764,23 @@ fn spawn_session(
 /// session that is not running starts it from its on-disk file — the
 /// `POST /api/agent/[id]` contract (startRpcSession on demand). Without a
 /// config the answer is `not_found` (the host has no pi to spawn).
+/// The RESUME contract: a session op on an on-disk session the host is not
+/// running cold-starts its child (the `POST /api/agent/[id]` contract —
+/// `startRpcSession` on demand). The plan callback owns everything the Next
+/// factory computed per session kind (classification, persisted tool pin,
+/// chat unlock marker, exact prompts, saved model, thinking level): the
+/// crate cannot build those itself (prompts come from the management
+/// instance), so the host passes the builder in.
+pub struct ResumeContext<'a> {
+    pub agent_dir: &'a Path,
+    pub plan: &'a dyn Fn(&SessionSummary) -> Result<SessionSpawnConfig, String>,
+}
+
 pub fn dispatch_session_op(
     registry: &SessionRegistry,
     op: &str,
     args: &Value,
-    resume: Option<(&SessionSpawnConfig, &Path)>,
+    resume: Option<&ResumeContext<'_>>,
 ) -> Result<Value, DispatchError> {
     let session_id = args.get("session").and_then(Value::as_str).unwrap_or_default();
     // The resume path: every session op may cold-start an on-disk session.
@@ -631,19 +791,21 @@ pub fn dispatch_session_op(
         if let Some(session) = registry.get(session_id) {
             return Ok(session);
         }
-        let Some((config, agent_dir)) = resume else {
+        let Some(resume) = resume else {
             return Err(DispatchError::not_found(session_id));
         };
-        let Some(summary) = crate::history::find_session_by_id(agent_dir, session_id) else {
+        let Some(summary) = crate::history::find_session_by_id(resume.agent_dir, session_id) else {
             return Err(DispatchError::not_found(session_id));
         };
+        let config = (resume.plan)(&summary)
+            .map_err(|message| DispatchError::Spawn(SessionHostError::Spawn(message), registry_op.to_string()))?;
         registry
             .start(
                 session_id,
                 &summary.file,
                 &summary.id,
                 Path::new(&summary.cwd),
-                config,
+                &config,
             )
             .map_err(|error| DispatchError::Spawn(error, registry_op.to_string()))
     };
@@ -1034,7 +1196,7 @@ fn iso_now_compact() -> String {
 }
 
 /// ISO-8601 UTC with milliseconds for the header.
-fn iso_now_iso() -> String {
+pub(crate) fn iso_now_iso() -> String {
     let (year, month, day, hour, minute, second) = utc_now_parts();
     let millis = sub_second_millis();
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")

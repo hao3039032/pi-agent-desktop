@@ -125,6 +125,109 @@ pub fn read_header_id(file: &Path) -> Option<String> {
     header.get("id").and_then(Value::as_str).map(str::to_string)
 }
 
+/// The subagent relation of a session file (`readSessionRelationEntries` +
+/// `readSubagentRun`, bounded the same way): the meta entry must sit in the
+/// file's SECOND line (a subagent session opens with its marker), and the
+/// lifecycle entry is searched in the last 256 KiB. None = not a subagent
+/// session — the caller falls back to the fork relation.
+const SUBAGENT_META_TYPE: &str = "pi-web:subagent";
+const SUBAGENT_RESULT_TYPE: &str = "pi-web:subagent-result";
+const SUBAGENT_STATUS_TYPE: &str = "pi-web:subagent-status";
+const RELATION_TAIL_MAX_BYTES: u64 = 256 * 1024;
+
+pub fn read_subagent_relation(file: &Path) -> Option<Value> {
+    // The bounded prefix: the header plus (at most) the first entry line.
+    // The 256 KiB bound matches the TS reader's; an over-long line fails to
+    // parse there and does here too (the truncation marker breaks the JSON).
+    let mut handle = std::fs::File::open(file).ok()?;
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(&mut handle);
+    let mut header = String::new();
+    let mut second = String::new();
+    let _ = reader.read_line(&mut header);
+    let _ = reader.read_line(&mut second);
+    if second.len() > RELATION_TAIL_MAX_BYTES as usize {
+        second.truncate(RELATION_TAIL_MAX_BYTES as usize);
+    }
+    let meta: Value = serde_json::from_str(second.trim()).ok()?;
+    if meta.get("type").and_then(Value::as_str) != Some("custom")
+        || meta.get("customType").and_then(Value::as_str) != Some(SUBAGENT_META_TYPE)
+    {
+        return None;
+    }
+    let data = meta.get("data")?;
+    if data.get("version").and_then(Value::as_i64) != Some(1) {
+        return None;
+    }
+    let parent_session_id = data.get("parentSessionId").and_then(Value::as_str)?.to_string();
+    if parent_session_id.is_empty() {
+        return None;
+    }
+    let profile = data
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("general-purpose")
+        .to_string();
+    let description = data
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("Subagent")
+        .to_string();
+
+    // The lifecycle entry (result or status), searched newest-first in the
+    // bounded tail; a torn last line is skipped like every parse miss.
+    let meta = std::fs::metadata(file).ok()?;
+    let size = meta.len();
+    let start = size.saturating_sub(RELATION_TAIL_MAX_BYTES);
+    use std::io::{Read, Seek, SeekFrom};
+    let mut handle = std::fs::File::open(file).ok()?;
+    handle.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = String::new();
+    handle.take(RELATION_TAIL_MAX_BYTES).read_to_string(&mut tail).ok()?;
+    let lines: Vec<&str> = if start > 0 {
+        tail.split('\n').skip(1).collect() // A partial first line is dropped.
+    } else {
+        tail.split('\n').collect()
+    };
+    let mut status = "interrupted".to_string();
+    for line in lines.iter().rev() {
+        let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if entry.get("type").and_then(Value::as_str) != Some("custom") {
+            continue;
+        }
+        let custom_type = entry.get("customType").and_then(Value::as_str).unwrap_or_default();
+        if custom_type == SUBAGENT_RESULT_TYPE {
+            if let Some(result_status) = entry
+                .get("data")
+                .and_then(|data| data.get("status"))
+                .and_then(Value::as_str)
+            {
+                if matches!(result_status, "completed" | "failed" | "aborted") {
+                    status = result_status.to_string();
+                }
+            }
+            break;
+        }
+        if custom_type == SUBAGENT_STATUS_TYPE {
+            let data = entry.get("data");
+            let version_ok = data.and_then(|data| data.get("version")).and_then(Value::as_i64) == Some(1);
+            if let Some(status_value) = data.and_then(|data| data.get("status")).and_then(Value::as_str) {
+                if version_ok && matches!(status_value, "queued" | "running") {
+                    status = status_value.to_string();
+                    break;
+                }
+            }
+        }
+    }
+    Some(json!({
+        "kind": "subagent",
+        "parentSessionId": parent_session_id,
+        "profile": profile,
+        "description": description,
+        "status": status,
+    }))
+}
+
 /// Read one session file's header line into a summary.
 pub fn read_header_summary(file: &Path) -> Result<SessionSummary, String> {
     let content = std::fs::read_to_string(file).map_err(|error| format!("unreadable: {error}"))?;

@@ -222,6 +222,107 @@ test(
 );
 
 /**
+ * M2: the spawn prompts (chat.systemPrompt / session.chatOnlyPrompt) — the
+ * ops the Rust host's sessions.create calls while building a child's spawn
+ * plan. Differentiially pinned against the repo source: chat.systemPrompt
+ * must answer EXACTLY lib/chat-workspace-prompt.ts's output, and
+ * session.chatOnlyPrompt must join the cwd's context files in pi's own
+ * discovery order (the vendored SDK's resource loader).
+ */
+test(
+  "the spawn-prompt ops answer the repo implementation exactly",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-prompt-"));
+    let client = null;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(agentDir, { recursive: true });
+      // A context file the chat-only prompt joins (pi's discovery order).
+      await writeFile(join(cwd, "AGENTS.md"), "context-file body", "utf8");
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      const nonce = "mgmt-nonce-prompt";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+        },
+        onLog: () => {},
+      });
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `mgmt-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 60_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+
+      // The repo implementation (the ONE source the bundle compiles from).
+      const { chatWorkspacePrompt } = await jiti.import("../../lib/chat-workspace-prompt.ts");
+      try {
+        for (const scope of [
+          { filesEnabled: true, folder: false, unlocked: false },
+          { filesEnabled: true, folder: true, unlocked: false },
+          { filesEnabled: true, folder: true, unlocked: true },
+          { filesEnabled: false, folder: false, unlocked: false },
+        ]) {
+          const answered = await call("chat.systemPrompt", scope);
+          assert.equal(answered.ok, true, JSON.stringify(answered));
+          assert.equal(
+            answered.result.prompt,
+            chatWorkspacePrompt(scope.filesEnabled, {
+              ...(scope.folder ? { folder: true } : {}),
+              ...(scope.unlocked ? { unlocked: true } : {}),
+            }),
+            `the exact prompt for ${JSON.stringify(scope)}`,
+          );
+        }
+
+        // The chat-only pin: the cwd's context files joined in order.
+        const chatOnly = await call("session.chatOnlyPrompt", { cwd });
+        assert.equal(chatOnly.ok, true, JSON.stringify(chatOnly));
+        assert.equal(chatOnly.result.prompt, "context-file body", "the AGENTS.md body joined");
+      } finally {
+        await client.close(5_000);
+        client = null;
+      }
+    } finally {
+      if (client) await client.close(5_000).catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+/**
  * M2: the session-view projection ops (session.readView / readContext /
  * projectSnapshot) — the mgmt-extension half of GET /api/sessions/[id] and
  * /api/sessions/[id]/context.

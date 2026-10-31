@@ -10,7 +10,7 @@ use base64::Engine;
 use resource_protocol::{ResourceRegistry, ResourceResponse};
 use task_scheduler::TaskStore;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use management_host::{ManagementHost, ManagementSpawnConfig};
-use session_host::{SessionRegistry, SessionSpawnConfig};
+use session_host::SessionRegistry;
 
 // Terminal output frames carry base64 inside JSON Channels today; the
 // raw-bytes upgrade (protocol doc §4) lands with the M4 binary channel.
@@ -31,10 +31,10 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// The managed host state (one registry per app process).
 pub struct IpcHostState {
     pub registry: SessionRegistry,
-    /// The spawn config is resolved at host startup (the packaged pi
+    /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
-    pub spawn_config: Mutex<Option<SessionSpawnConfig>>,
+    pub spawn_base: Mutex<Option<SpawnBase>>,
     subscription_counter: AtomicU64,
     /// Live event-stream relays by subscription id (unsubscribe detaches).
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
@@ -59,6 +59,11 @@ pub struct IpcHostState {
     /// Git project identity with the TS resolver's TTL cache
     /// (lib/worktree.ts resolveProject).
     pub projects: crate::session_view::ProjectResolver,
+    /// The catalogue's version counter (`invalidateSessionListCache` +
+    /// `getSessionListVersion`): bumped by every host-visible mutation that
+    /// changes the list a client holds (a create, a rename). Clients compare
+    /// and refetch — the cross-window staleness contract.
+    session_list_version: AtomicU64,
 }
 
 /// Handle that ends one event-stream relay thread on unsubscribe.
@@ -73,7 +78,7 @@ impl IpcHostState {
     pub fn new() -> Self {
         Self {
             registry: SessionRegistry::new(),
-            spawn_config: Mutex::new(resolve_session_spawn_config()),
+            spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             terminals: pty_host::PtyHost::new(),
@@ -92,6 +97,7 @@ impl IpcHostState {
             },
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
+            session_list_version: AtomicU64::new(1),
         }
     }
 
@@ -120,6 +126,16 @@ impl IpcHostState {
             .clone()
             .unwrap_or_else(default_agent_dir)
     }
+
+    /// The current catalogue version (the client's staleness check).
+    pub fn session_list_version(&self) -> u64 {
+        self.session_list_version.load(Ordering::SeqCst)
+    }
+}
+
+/// Bump the catalogue version (a list-changing mutation happened).
+fn bump_session_list_version(state: &IpcHostState) -> u64 {
+    state.session_list_version.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// The pi executable the host spawns (lib/pi-rpc/factory.ts's resolution,
@@ -167,7 +183,24 @@ fn resolve_pi_executable() -> Option<PathBuf> {
 /// packaged server tree first, the dev checkout second, an env override
 /// always wins.
 fn resolve_bridge_asset() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("PI_WEB_BRIDGE_EXTENSION") {
+    resolve_asset("pi-web-bridge.mjs", "PI_WEB_BRIDGE_EXTENSION")
+}
+
+/// The artifacts guide asset (`resolveArtifactsExtensionPath`, same rules).
+fn resolve_artifacts_asset() -> Option<PathBuf> {
+    resolve_asset("pi-web-artifacts.mjs", "PI_WEB_ARTIFACTS_EXTENSION")
+}
+
+/// The chat policy asset (`resolveAssetPath("pi-web-chat.mjs")`).
+fn resolve_chat_asset() -> Option<PathBuf> {
+    resolve_asset("pi-web-chat.mjs", "PI_WEB_CHAT_EXTENSION")
+}
+
+/// A shipped extension asset next to the server code (bridge, artifacts,
+/// chat policy): env override, the packaged resources tree, the dev
+/// checkout.
+fn resolve_asset(file: &str, env_override: &str) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(env_override) {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
@@ -176,8 +209,8 @@ fn resolve_bridge_asset() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
     if let Some(exe_dir) = exe_dir {
         let candidates = [
-            exe_dir.join("../Resources/server/lib/pi-rpc/assets/pi-web-bridge.mjs"),
-            exe_dir.join("../../resources/server/lib/pi-rpc/assets/pi-web-bridge.mjs"),
+            exe_dir.join(format!("../Resources/server/lib/pi-rpc/assets/{file}")),
+            exe_dir.join(format!("../../resources/server/lib/pi-rpc/assets/{file}")),
         ];
         for candidate in candidates {
             if let Ok(resolved) = candidate.canonicalize() {
@@ -187,7 +220,7 @@ fn resolve_bridge_asset() -> Option<PathBuf> {
             }
         }
     }
-    let dev = Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs");
+    let dev = Path::new("../lib/pi-rpc/assets").join(file);
     if let Ok(resolved) = dev.canonicalize() {
         if resolved.is_file() {
             return Some(resolved);
@@ -196,18 +229,28 @@ fn resolve_bridge_asset() -> Option<PathBuf> {
     None
 }
 
-/// The session spawn config, when a pi executable AND the bridge asset
-/// resolve. Without either, session ops answer not_found (never a fake
-/// child) — the same honesty rule the models ops apply to management.
-fn resolve_session_spawn_config() -> Option<SessionSpawnConfig> {
+/// The session spawn base, when a pi executable AND the bridge asset
+/// resolve: the executable plus the shipped assets every session loads.
+/// Without either, session ops answer not_found (never a fake child) — the
+/// same honesty rule the models ops apply to management. The per-session
+/// plan (kind, tools, prompts, model) is computed at spawn time by
+/// [`build_spawn_plan`].
+#[derive(Clone)]
+pub struct SpawnBase {
+    pub executable: String,
+    pub bridge_asset: PathBuf,
+    pub artifacts_asset: Option<PathBuf>,
+    pub chat_asset: Option<PathBuf>,
+}
+
+fn resolve_session_spawn_base() -> Option<SpawnBase> {
     let executable = resolve_pi_executable()?;
     let bridge_asset = resolve_bridge_asset()?;
-    Some(SessionSpawnConfig {
+    Some(SpawnBase {
         executable: executable.to_string_lossy().into_owned(),
-        agent_dir: None,
-        session_dir: None,
         bridge_asset,
-        extra_args: Vec::new(),
+        artifacts_asset: resolve_artifacts_asset(),
+        chat_asset: resolve_chat_asset(),
     })
 }
 
@@ -527,11 +570,20 @@ impl Default for IpcHostState {
 
 /// The response envelope for a protocol-level rejection.
 fn protocol_error(id: &str, code: &str, message: &str) -> Value {
+    protocol_error_value(
+        id,
+        json!({ "code": code, "message": message, "retryable": false }),
+    )
+}
+
+/// The response envelope for a failure with a custom error object (extra
+/// fields ride along — e.g. a create failure's prompt_rejected details).
+fn protocol_error_value(id: &str, error: Value) -> Value {
     json!({
         "v": IPC_PROTOCOL_VERSION,
         "id": id,
         "ok": false,
-        "error": { "code": code, "message": message, "retryable": false },
+        "error": error,
     })
 }
 
@@ -664,42 +716,79 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
             protocol_ok(&id, data)
         }
-        // The catalogue (GET /api/sessions' projection): a flat session
-        // array, newest first. The Rust scan provides id/cwd/name/created/
-        // modified/parentSession/firstMessage/sizeBytes; the Next route's
-        // messageCount/workspaceKind/relation/running fields are NOT
-        // derivable from headers and stay pending (README's unfixed list) —
-        // the static UI must not pretend they exist.
-        // The catalogue: the FULL per-file scan (the TS scanSessionFileInfo
-        // semantics, differential-tested) — the session_info rename, message
-        // and compaction counts, the attachment-aware first-user title, and
-        // the activity-based modified time. Field-for-field the GET
-        // /api/sessions projection except workspaceKind/relation/running
-        // (runtime state the disk cannot know — README's unfixed list).
+        // The catalogue (GET /api/sessions): the full per-file scan (the TS
+        // scanSessionFileInfo semantics, differential-tested) projected onto
+        // the SessionInfo shape the sidebar consumes — workspace
+        // classification, git project identity, the fork/subagent relation —
+        // merged with the live registry's not-yet-flushed rows, plus the
+        // payload's envelope fields (runningSessionIds,
+        // completionNotificationSuppressedSessionIds, chatWorkspaceCwd,
+        // sessionListVersion).
         "sessions.catalogue" => {
             let agent_dir = state.agent_dir();
             let files = session_host::list_session_files(&agent_dir);
-            let mut sessions: Vec<Value> = files
-                .iter()
-                .filter_map(|file| session_host::scan_session_file_info(file))
-                .map(|scan| {
-                    json!({
-                        "id": scan.id,
-                        "path": scan.path.display().to_string(),
-                        "cwd": scan.cwd,
-                        "name": scan.name,
-                        "created": ms_to_iso(scan.created_ms),
-                        "modified": ms_to_iso(scan.modified_ms),
-                        "messageCount": scan.message_count,
-                        "compactionCount": if scan.compaction_count > 0 { json!(scan.compaction_count) } else { Value::Null },
-                        "parentSessionId": scan.parent_session_path,
-                        "firstMessage": scan.first_message,
-                        "sizeBytes": scan.size_bytes,
+            // The parent-id map first (a fork's originSessionId resolves
+            // from ITS header, never a filename suffix).
+            let mut id_by_file: HashMap<String, String> = HashMap::new();
+            let mut scans: Vec<session_host::history::ScannedSession> = Vec::new();
+            for file in &files {
+                if let Some(scan) = session_host::scan_session_file_info(file) {
+                    if let Some(id) = session_host::history::read_header_id(file) {
+                        id_by_file.insert(key_of(file), id);
+                    }
+                    scans.push(scan);
+                }
+            }
+            let mut sessions: Vec<Value> = Vec::new();
+            for scan in &scans {
+                let parent_id = scan
+                    .parent_session_path
+                    .as_deref()
+                    .map(Path::new)
+                    .and_then(|parent| id_by_file.get(&key_of(parent)).cloned());
+                // The subagent relation reads the file's bounded prefix/tail;
+                // a fork falls back to the parent link alone (the origin id
+                // present only when the parent file itself still resolves).
+                let relation = session_host::history::read_subagent_relation(&scan.path).or_else(|| {
+                    scan.parent_session_path.as_deref().map(|_| {
+                        json!({
+                            "kind": "fork",
+                            "originSessionId": parent_id.clone().map(Value::String).unwrap_or(Value::Null),
+                        })
                     })
-                })
+                });
+                let relation = match relation {
+                    Some(value) if value.is_object() => Some(value),
+                    _ => None,
+                };
+                sessions.push(catalogue_info(state, &agent_dir, scan, parent_id, relation));
+            }
+            // The running set the payload carries (the SSE stream's source).
+            let running: Vec<String> = state
+                .registry
+                .ids()
+                .into_iter()
+                .filter(|id| state.registry.get(id).is_some_and(|session| session.run_state().is_running()))
                 .collect();
+            // Not-yet-flushed live sessions supplement the disk rows (the
+            // disk scan is authoritative once the file exists — mergeSessionLists).
+            let on_disk: std::collections::HashSet<String> =
+                sessions.iter().filter_map(|info| info.get("id").and_then(Value::as_str).map(str::to_string)).collect();
+            for id in state.registry.ids() {
+                if on_disk.contains(&id) {
+                    continue;
+                }
+                let Some(session) = state.registry.get(&id) else { continue };
+                // An ensure_session-created runtime with nothing sent yet
+                // stays hidden (getRpcSessionInfos' own rule: not running and
+                // no first message = not listed).
+                if let Some(info) = live_session_info(state, &agent_dir, &session, &id) {
+                    sessions.push(info);
+                }
+            }
             sessions.sort_by(|a, b| {
-                b.get("modified").and_then(Value::as_str).cmp(&a.get("modified").and_then(Value::as_str))
+                let modified = |info: &Value| info.get("modified").and_then(Value::as_str).unwrap_or("").to_string();
+                modified(b).cmp(&modified(a))
             });
             // Host-derived roots stay in step with the catalogue's cwds.
             for value in sessions.iter() {
@@ -707,7 +796,24 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     state.propose_path(Path::new(cwd));
                 }
             }
-            protocol_ok(&id, json!({ "sessions": sessions }))
+            // The hidden chat root (ensureChatWorkspace; the sidebar's new-chat
+            // target) and the catalogue's version counter.
+            let chat_root = crate::session_view::ensure_chat_workspace(&agent_dir)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| {
+                    crate::session_view::chat_workspace_dir(&agent_dir).display().to_string()
+                });
+            state.propose_path(Path::new(&chat_root));
+            protocol_ok(
+                &id,
+                json!({
+                    "sessions": sessions,
+                    "sessionListVersion": state.session_list_version(),
+                    "runningSessionIds": running,
+                    "completionNotificationSuppressedSessionIds": [],
+                    "chatWorkspaceCwd": chat_root,
+                }),
+            )
         }
         // The session VIEW (GET /api/sessions/[id] and /context): the
         // projection runs in the management instance over the repo's own
@@ -720,17 +826,73 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        // The workspace ops (GET /api/home, GET /api/chat-workspace,
+        // POST /api/default-cwd, POST /api/cwd/validate): path selection and
+        // validation the shell and project picker need before any session
+        // exists. All host-side (the home dir, the hidden chat root, the
+        // scratch cwd, project validation) — the frontend never chooses what
+        // gets proposed for browsing.
+        "desktop.home" => {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            protocol_ok(&id, json!({ "home": home }))
+        }
+        "workspace.chatRoot" => {
+            let agent_dir = state.agent_dir();
+            match crate::session_view::ensure_chat_workspace(&agent_dir) {
+                Ok(cwd) => {
+                    state.propose_path(&cwd);
+                    protocol_ok(&id, json!({ "cwd": cwd.display().to_string() }))
+                }
+                Err(error) => protocol_error(&id, "io", &error.to_string()),
+            }
+        }
+        "workspace.defaultCwd" => {
+            // ~/pi-cwd/<local YYYYMMDD>, created on demand (defaultCwdPath).
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            let (year, month, day, _, _, _) = crate::session_view::local_now_parts_pub();
+            let dir = PathBuf::from(&home)
+                .join("pi-cwd")
+                .join(format!("{year:04}{month:02}{day:02}"));
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    state.propose_path(&dir);
+                    protocol_ok(&id, json!({ "cwd": dir.display().to_string() }))
+                }
+                Err(error) => protocol_error(&id, "io", &error.to_string()),
+            }
+        }
+        "workspace.validateCwd" => match validate_cwd(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        // POST /api/agent/new: a brand-new session (the factory + the
+        // route's contract — cwd validation, the chat folder factory, the
+        // spawn plan, ensure_session vs the first command, and the honest
+        // prompt_rejected error shape when a prompt-type create fails).
+        "sessions.create" => match create_session(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message, details)) => {
+                let mut error = json!({ "code": code, "message": message, "retryable": false });
+                if let Some(details) = details {
+                    error["details"] = details;
+                }
+                protocol_error_value(&id, error)
+            }
+        },
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
         | "agent.eventsSnapshot" | "agent.command" | "agent.getTools" | "agent.setTools" => {
             // The resume path: an op on an on-disk session may cold-start its
-            // child (the POST /api/agent/[id] contract) — only when the host
-            // resolved a spawn config; otherwise not_found stays honest.
-            let config = state.spawn_config.lock().unwrap().clone();
-            let agent_dir = state.agent_dir();
-            let resume = config.as_ref().map(|config| (config, agent_dir.as_path()));
-            match session_host::dispatch_session_op(&state.registry, op, &args, resume) {
+            // child (the POST /api/agent/[id] contract) — the plan builder
+            // recomputes the session's spawn shape from its file and cwd
+            // (kind, persisted pin, chat unlock, saved model), exactly what
+            // startRpcSession re-derived per start on the Next server.
+            match dispatch_with_resume(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
-                Err(error) => protocol_error(&id, error.code(), &error.to_string()),
+                Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
         // End one event-stream subscription (page hide, session switch):
@@ -1400,6 +1562,692 @@ fn copy_bool_arg(args: &Value, into: &mut Value, field: &str) {
     }
 }
 
+// --- the spawn plan (sessions.create + the resume path) ---------------------
+//
+// What `startRpcSessionLocked` + `startCliRpcSessionFromManager` computed
+// per session on the Next server, computed here from the same inputs: the
+// cwd's workspace classification, the session file's persisted state (tool
+// pin, chat unlock marker, saved model) and the request's explicit picks.
+
+/// Pi Web's own settings block for chats (`lib/chat-settings.ts`: the model
+/// and reasoning level a NEW chat starts on when the request picks none).
+fn read_chat_settings(agent_dir: &Path) -> (Option<(String, String)>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(agent_dir.join("pi-web").join("settings.json")) else {
+        return (None, None);
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&text) else {
+        return (None, None);
+    };
+    let chats = parsed.get("chats").cloned().unwrap_or(Value::Null);
+    let model = chats
+        .get("model")
+        .and_then(|model| {
+            let provider = model.get("provider").and_then(Value::as_str)?;
+            let model_id = model.get("modelId").and_then(Value::as_str)?;
+            (!provider.is_empty() && !model_id.is_empty()).then(|| (provider.to_string(), model_id.to_string()))
+        });
+    let thinking = chats
+        .get("thinkingLevel")
+        .and_then(Value::as_str)
+        .filter(|level| {
+            matches!(*level, "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+        })
+        .map(str::to_string);
+    (model, thinking)
+}
+
+/// Whether a session file's branch already carries a real message (a chat
+/// starts applying Settings › Chats only while it is still empty).
+fn file_has_messages(file: &Path) -> bool {
+    let Ok(handle) = std::fs::File::open(file) else { return false };
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(handle).lines().map_while(Result::ok) {
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let role = entry
+            .get("message")
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str);
+        if role != Some("system") {
+            return true;
+        }
+    }
+    false
+}
+
+/// One request's explicit picks (POST /api/agent/new's provider/modelId/
+/// toolNames/thinkingLevel).
+#[derive(Default)]
+struct SpawnRequest {
+    tool_names: Option<Vec<String>>,
+    initial_model: Option<(String, String)>,
+    thinking_level: Option<String>,
+}
+
+/// Build the spawn plan for one session (create or resume). `session_file`
+/// exists in both cases (create made the header first); `persist_new_pin`
+/// writes a requested pin into a session that has none yet — the create
+/// path only (resume never rewrites the file).
+#[allow(clippy::too_many_arguments)]
+fn build_spawn_plan(
+    state: &IpcHostState,
+    base: &SpawnBase,
+    cwd: &Path,
+    session_file: &Path,
+    request: &SpawnRequest,
+    persist_new_pin: bool,
+) -> Result<session_host::SessionSpawnConfig, String> {
+    let agent_dir = state.agent_dir();
+
+    // 1. The kind (chat root never reaches here — create turns it into a
+    // folder first; a resumed chat file carries its folder/legacy cwd).
+    let chat_workspace = crate::session_view::is_chat_workspace_path(cwd, &agent_dir);
+    let chat_folder = crate::session_view::is_chat_folder_path(cwd, &agent_dir);
+
+    // 2. The saved model (the file's own model wins; the request's initial
+    // pick only fills a session that never chose one).
+    let saved_model = session_host::spawn_plan::read_saved_model(session_file).or(request.initial_model.clone());
+
+    let config = if chat_workspace {
+        // A chat: the unlock marker decides the loadout; a chat has no tool
+        // preset of its own (the request's toolNames is ignored — the
+        // workspace policy decides, server-side).
+        let unlocked = session_host::spawn_plan::read_chat_unlocked(session_file);
+        // Chats read Settings › Chats while they are still empty.
+        let (chat_model, chat_thinking) = if file_has_messages(session_file) {
+            (None, None)
+        } else {
+            read_chat_settings(&agent_dir)
+        };
+        let model = saved_model.or(chat_model);
+        let thinking = request.thinking_level.clone().or(chat_thinking);
+        let prompt = chat_prompt(state, true, chat_folder, unlocked)?;
+        let prompt_file = session_host::spawn_plan::write_prompt_file(&prompt)
+            .map_err(|error| format!("the chat prompt file could not be written: {error}"))?;
+        let shape = session_host::SessionSpawnShape::Chat {
+            prompt_file,
+            folder: chat_folder,
+            unlocked,
+            // A chat's file tools are a local-only capability; the desktop
+            // host is never network-exposed.
+            files_enabled: true,
+        };
+        session_host::SessionSpawnConfig {
+            executable: base.executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            session_dir: Some(crate::session_view::default_session_dir(&agent_dir, cwd)),
+            bridge_asset: base.bridge_asset.clone(),
+            artifacts_asset: base.artifacts_asset.clone(),
+            chat_asset: base.chat_asset.clone(),
+            shape,
+            initial_model: model,
+            thinking_level: thinking,
+            extra_args: Vec::new(),
+        }
+    } else {
+        // A project session: the persisted pin wins over the request's; a
+        // new pin is persisted before the child opens the file (exactly the
+        // Next factory's order).
+        let persisted = session_host::spawn_plan::read_session_tool_selection(session_file);
+        let requested = request.tool_names.clone();
+        if persist_new_pin && persisted.is_none() {
+            if let Some(names) = &requested {
+                session_host::spawn_plan::append_custom_entry(
+                    session_file,
+                    session_host::spawn_plan::TOOL_SELECTION_TYPE,
+                    json!({ "version": 1, "tools": names }),
+                )
+                .map_err(|error| format!("the tool pin could not be persisted: {error}"))?;
+            }
+        }
+        let selection = persisted.or(requested);
+        let (shape, model, thinking) = match selection {
+            Some(names) if names.is_empty() => {
+                // The chat-only pin: the exact prompt built from the cwd's
+                // context files replaces pi's own.
+                let prompt = chat_only_prompt(state, cwd)?;
+                let prompt_file = session_host::spawn_plan::write_prompt_file(&prompt)
+                    .map_err(|error| format!("the chat-only prompt file could not be written: {error}"))?;
+                (
+                    session_host::SessionSpawnShape::ChatOnly { prompt_file },
+                    saved_model,
+                    request.thinking_level.clone(),
+                )
+            }
+            Some(names) => {
+                let default_tools = session_host::spawn_plan::resolved_default_tools(
+                    &agent_dir,
+                    cwd,
+                    crate::session_view::project_trusted(&agent_dir, cwd),
+                );
+                let entries = session_host::spawn_plan::build_tool_entries(&names, default_tools.as_ref());
+                (
+                    session_host::SessionSpawnShape::Project { tool_args: Some(entries) },
+                    saved_model,
+                    request.thinking_level.clone(),
+                )
+            }
+            None => (
+                session_host::SessionSpawnShape::Project { tool_args: None },
+                saved_model,
+                request.thinking_level.clone(),
+            ),
+        };
+        session_host::SessionSpawnConfig {
+            executable: base.executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            session_dir: Some(crate::session_view::default_session_dir(&agent_dir, cwd)),
+            bridge_asset: base.bridge_asset.clone(),
+            artifacts_asset: base.artifacts_asset.clone(),
+            chat_asset: base.chat_asset.clone(),
+            shape,
+            initial_model: model,
+            thinking_level: thinking,
+            extra_args: Vec::new(),
+        }
+    };
+    Ok(config)
+}
+
+/// The chat preamble (ONE implementation: `chatWorkspacePrompt` in
+/// lib/chat-workspace-policy.ts, served by the management instance from the
+/// vendored bundle — never a Rust copy of the prompt text).
+fn chat_prompt(state: &IpcHostState, files_enabled: bool, folder: bool, unlocked: bool) -> Result<String, String> {
+    let result = management_call(
+        state,
+        "chat.systemPrompt",
+        json!({ "filesEnabled": files_enabled, "folder": folder, "unlocked": unlocked }),
+    )
+    .map_err(|(code, message)| format!("the chat prompt could not be built ({code}): {message}"))?;
+    result
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "the chat prompt op answered no prompt".to_string())
+}
+
+/// The chat-only pin's exact prompt: the session cwd's context files joined
+/// in pi's discovery order (contextFilesSystemPrompt over the resource
+/// loader — same op shape the Next server ran offline).
+fn chat_only_prompt(state: &IpcHostState, cwd: &Path) -> Result<String, String> {
+    let result = management_call(
+        state,
+        "session.chatOnlyPrompt",
+        json!({ "cwd": cwd.display().to_string() }),
+    )
+    .map_err(|(code, message)| format!("the chat-only prompt could not be built ({code}): {message}"))?;
+    result
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "the chat-only prompt op answered no prompt".to_string())
+}
+
+/// POST /api/agent/new (the `sessions.create` op): a brand-new session.
+/// Most calls immediately send the first command; `type:"ensure_session"`
+/// only creates the runtime so clients can query commands. Answers pi's
+/// real session id plus the model/thinking state selected at startup.
+///
+/// The failure shape keeps the route's contract: a prompt-type create that
+/// never reached the child answers `prompt_rejected` with `accepted:false`
+/// (details on the protocol error object) — the composer's no-blind-retry
+/// admission signal.
+fn create_session(
+    state: &IpcHostState,
+    args: &Value,
+) -> Result<Value, (String, String, Option<Value>)> {
+    let invalid = |message: &str, command_type: Option<&str>| -> (String, String, Option<Value>) {
+        let rejected = command_type == Some("prompt");
+        (
+            "invalid_args".to_string(),
+            message.to_string(),
+            rejected.then(|| json!({ "code": "prompt_rejected", "accepted": false })),
+        )
+    };
+
+    // 1. The cwd (the body's `cwd`; everything else is the first command).
+    let Some(cwd_text) = args.get("cwd").and_then(Value::as_str) else {
+        return Err(invalid("cwd is required", command_type(args).as_deref()));
+    };
+    if cwd_text.is_empty() {
+        return Err(invalid("cwd is required", command_type(args).as_deref()));
+    }
+    let command_type = command_type(args);
+    let agent_dir = state.agent_dir();
+    let requested_cwd = PathBuf::from(cwd_text);
+
+    let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
+    let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
+    if chat_workspace {
+        // ensureChatWorkspace runs before the folder factory (both private).
+        crate::session_view::ensure_chat_workspace(&agent_dir)
+            .map_err(|error| ("io".to_string(), error.to_string(), None))?;
+    }
+    if !requested_cwd.is_dir() {
+        return Err(invalid(
+            &format!("Directory does not exist: {cwd_text}"),
+            command_type.as_deref(),
+        ));
+    }
+
+    // 2. The request's explicit picks (provider/modelId pair, toolNames,
+    // thinkingLevel — the fields the route extracts from the command).
+    let provider = args.get("provider").and_then(Value::as_str).map(str::to_string);
+    let model_id = args.get("modelId").and_then(Value::as_str).map(str::to_string);
+    if provider.is_some() != model_id.is_some() {
+        return Err((
+            "invalid_args".to_string(),
+            "provider and modelId must be provided together".to_string(),
+            None,
+        ));
+    }
+    let initial_model = provider.zip(model_id);
+    let thinking_level = args
+        .get("thinkingLevel")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|level| {
+            matches!(level.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+        });
+    if args.get("thinkingLevel").is_some() && thinking_level.is_none() {
+        return Err(invalid(
+            &format!("Invalid thinking level: {}", args.get("thinkingLevel").unwrap()),
+            command_type.as_deref(),
+        ));
+    }
+    // A chat has no tool preset: a stale or hand-crafted client selection is
+    // ignored — the workspace policy decides, server-side.
+    let tool_names = if chat_workspace {
+        None
+    } else {
+        match args.get("toolNames").and_then(Value::as_array) {
+            Some(tools) => Some(
+                session_host::spawn_plan::validate_tool_selection(tools).ok_or_else(|| {
+                    invalid("toolNames must contain only built-in tool names", command_type.as_deref())
+                })?,
+            ),
+            None => None,
+        }
+    };
+
+    // 3. The session file: a chat requested with the ROOT gets a folder of
+    // its own; every session's header is the host's (create_session_file).
+    let session_cwd = if chat_root {
+        crate::session_view::create_chat_folder(&agent_dir)
+            .map_err(|error| ("io".to_string(), error.to_string(), None))?
+    } else if chat_workspace {
+        crate::session_view::ensure_chat_cwd(&requested_cwd)
+            .map_err(|error| ("io".to_string(), error.to_string(), None))?;
+        requested_cwd.clone()
+    } else {
+        requested_cwd.clone()
+    };
+    let session_dir = crate::session_view::default_session_dir(&agent_dir, &session_cwd);
+    let (session_file, session_id) = session_host::create_session_file(&session_dir, &session_cwd)
+        .map_err(|error| ("io".to_string(), error.to_string(), None))?;
+    // A brand-new cwd is immediately browsable (allowFileRoot's contract).
+    state.propose_path(&session_cwd);
+
+    // 4. Spawn through the shared plan (kind, pin, prompts, model).
+    let base = state
+        .spawn_base
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| ("not_found".to_string(), "no pi executable resolved".to_string(), None))?;
+    let request = SpawnRequest { tool_names, initial_model, thinking_level };
+    let config = build_spawn_plan(state, &base, &session_cwd, &session_file, &request, true)
+        .map_err(|message| ("op_failed".to_string(), message, None))?;
+    let session = state
+        .registry
+        .start(&session_id, &session_file, &session_id, &session_cwd, &config)
+        .map_err(|error| {
+            let rejected = command_type.as_deref() == Some("prompt");
+            (
+                "agent_spawn_failed".to_string(),
+                error.to_string(),
+                rejected.then(|| json!({ "code": "prompt_rejected", "accepted": false })),
+            )
+        })?;
+    // A new session in the list invalidates the client's catalogue cache.
+    bump_session_list_version(state);
+
+    // 5. The startup state the route answered (pi's real session id plus the
+    // model/thinking state selected at startup).
+    let child_state = session
+        .get_state()
+        .map_err(|error| ("agent_child_error".to_string(), error.to_string(), None))?;
+    let model = child_state.get("model").and_then(|model| {
+        let provider = model.get("provider").and_then(Value::as_str)?;
+        let id = model.get("id").and_then(Value::as_str)?;
+        Some(json!({ "provider": provider, "modelId": id }))
+    });
+    let thinking_level = child_state.get("thinkingLevel").cloned().unwrap_or(Value::Null);
+
+    if command_type.as_deref() == Some("ensure_session") {
+        return Ok(json!({
+            "success": true,
+            "sessionId": session_id,
+            "data": null,
+            "model": model.unwrap_or(Value::Null),
+            "thinkingLevel": thinking_level,
+        }));
+    }
+
+    // 6. The first command rides the same closed surface the composer uses
+    // (the payload is rebuilt from the validated fields only).
+    let command_type = command_type.ok_or_else(|| {
+        invalid("the first command has no type", None)
+    })?;
+    let payload = session_host::build_agent_command(&command_type, args)
+        .map_err(|error| ("invalid_args".to_string(), error.to_string(), None))?;
+    let data = session
+        .command(&command_type, payload, Some(std::time::Duration::from_secs(120)))
+        .map_err(|error| {
+            let rejected = command_type == "prompt";
+            (
+                "op_failed".to_string(),
+                error.to_string(),
+                rejected.then(|| json!({ "code": "prompt_rejected", "accepted": false })),
+            )
+        })?;
+    Ok(json!({
+        "success": true,
+        "sessionId": session_id,
+        "data": data,
+        "model": model.unwrap_or(Value::Null),
+        "thinkingLevel": thinking_level,
+    }))
+}
+
+/// The command type the create body carries (the route's `command.type`).
+fn command_type(args: &Value) -> Option<String> {
+    args.get("type")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// POST /api/cwd/validate (the `workspace.validateCwd` op): validate (and
+/// select) a cwd. A chat root maps onto the hidden chat cwd; a real
+/// directory is probed for readability (a permission-denied folder is
+/// rejected at selection time, not later) and answers its project identity.
+fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let agent_dir = state.agent_dir();
+    let Some(raw) = args.get("cwd").and_then(Value::as_str) else {
+        return Err(("invalid_args".to_string(), "Path is required".to_string()));
+    };
+    let cwd_text = raw.trim();
+    if cwd_text.is_empty() {
+        return Err(("invalid_args".to_string(), "Path is required".to_string()));
+    }
+    let cwd = PathBuf::from(cwd_text);
+
+    if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
+        // A chat's own folder (or the legacy shared cwd) stays what it is;
+        // only the root maps onto the hidden chat cwd.
+        let chat_cwd = if crate::session_view::is_chat_root_path(&cwd, &agent_dir) {
+            crate::session_view::ensure_chat_workspace(&agent_dir)
+                .map_err(|error| ("io".to_string(), error.to_string()))?
+        } else {
+            crate::session_view::ensure_chat_cwd(&cwd)
+                .map_err(|error| ("io".to_string(), error.to_string()))?;
+            cwd.clone()
+        };
+        state.propose_path(&chat_cwd);
+        return Ok(json!({
+            "success": true,
+            "cwd": chat_cwd.display().to_string(),
+            "projectRoot": Value::Null,
+            "projectKey": Value::Null,
+            "workspaceKind": "chat",
+        }));
+    }
+
+    // A real directory (stat first: missing and not-a-directory answer
+    // differently; a permission error at selection time, not later).
+    let meta = std::fs::metadata(&cwd).map_err(|error| {
+        (
+            "invalid_args".to_string(),
+            format!("Directory does not exist: {cwd_text}")
+                .replace("does not exist", if error.kind() == std::io::ErrorKind::PermissionDenied { "is not readable" } else { "does not exist" }),
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(("invalid_args".to_string(), format!("Path is not a directory: {cwd_text}")));
+    }
+    // The read probe (the route's readdirSync: mode bits are not enough).
+    if std::fs::read_dir(&cwd).is_err() {
+        return Err((
+            "invalid_args".to_string(),
+            format!("Directory cannot be read: {cwd_text}"),
+        ));
+    }
+    state.propose_path(&cwd);
+    let project = state.projects.resolve(&cwd);
+    Ok(json!({
+        "success": true,
+        "cwd": cwd.display().to_string(),
+        "projectRoot": project.project_root.display().to_string(),
+        "projectKey": crate::session_view::project_identity_key(&project.project_root),
+    }))
+}
+
+/// The catalogue's SessionInfo (`mapScannedSession` +
+/// `attachSessionProjectInfo`): the scan fields with the activity-based
+/// modified time, the resolved parent id, the relation and the workspace
+/// classification. `session_info_json` (the detail view) differs only in
+/// its modified source (the file mtime there).
+fn catalogue_info(
+    state: &IpcHostState,
+    agent_dir: &Path,
+    scan: &session_host::history::ScannedSession,
+    parent_session_id: Option<String>,
+    relation: Option<Value>,
+) -> Value {
+    let cwd = PathBuf::from(&scan.cwd);
+    let mut info = json!({
+        "path": scan.path.display().to_string(),
+        "id": scan.id,
+        "cwd": scan.cwd,
+        "created": ms_to_iso(scan.created_ms),
+        "modified": ms_to_iso(scan.modified_ms),
+        "messageCount": scan.message_count,
+        "firstMessage": scan.first_message,
+        "transient": false,
+    });
+    if let Some(name) = &scan.name {
+        info["name"] = json!(name);
+    }
+    if scan.compaction_count > 0 {
+        info["compactionCount"] = json!(scan.compaction_count);
+    }
+    if let Some(parent) = parent_session_id {
+        info["parentSessionId"] = json!(parent);
+    }
+    if let Some(relation) = relation {
+        // The fork relation's originSessionId rides only when it resolved.
+        if relation.get("kind").and_then(Value::as_str) == Some("fork")
+            && relation.get("originSessionId") == Some(&Value::Null)
+        {
+            let mut trimmed = relation;
+            trimmed.as_object_mut().expect("relation object").remove("originSessionId");
+            info["relation"] = trimmed;
+        } else {
+            info["relation"] = relation;
+        }
+    }
+    attach_workspace_identity(state, agent_dir, &mut info, &cwd);
+    info
+}
+
+/// The workspace half of the SessionInfo (`attachSessionProjectInfo`):
+/// chats stay out of projects; a project row carries its git identity.
+fn attach_workspace_identity(state: &IpcHostState, agent_dir: &Path, info: &mut Value, cwd: &Path) {
+    if crate::session_view::is_chat_workspace_path(cwd, agent_dir) {
+        info["workspaceKind"] = json!("chat");
+        if crate::session_view::is_chat_folder_path(cwd, agent_dir) {
+            info["chatFolder"] = json!(true);
+        }
+        return;
+    }
+    info["workspaceKind"] = json!("project");
+    let project = state.projects.resolve(cwd);
+    info["projectRoot"] = json!(project.project_root.display().to_string());
+    info["projectKey"] = json!(crate::session_view::project_identity_key(&project.project_root));
+    if let Some(branch) = project.branch {
+        info["branch"] = json!(branch);
+    }
+    if project.is_worktree {
+        info["isWorktree"] = json!(true);
+    }
+}
+
+/// A live registry session not yet on disk (`getRpcSessionInfos` + the
+/// merge rule): a transient row shown while the child has not flushed its
+/// file. Hidden when it neither runs nor has a first message.
+fn live_session_info(
+    state: &IpcHostState,
+    agent_dir: &Path,
+    session: &std::sync::Arc<session_host::Session>,
+    id: &str,
+) -> Option<Value> {
+    let snapshot = session
+        .command("get_entries", json!({}), Some(std::time::Duration::from_secs(30)))
+        .ok()?;
+    let entries = snapshot.get("entries").and_then(Value::as_array)?;
+    let mut message_count = 0u64;
+    let mut first_message: Option<String> = None;
+    let mut last_activity_ms: i64 = 0;
+    for entry in entries {
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(message) = entry.get("message") else { continue };
+        message_count += 1;
+        if message.get("role").and_then(Value::as_str) == Some("user") && first_message.is_none() {
+            first_message = message
+                .get("content")
+                .and_then(|content| content.as_str().map(str::to_string).or_else(|| {
+                    content.as_array().and_then(|blocks| {
+                        blocks
+                            .iter()
+                            .find_map(|block| block.get("text").and_then(Value::as_str))
+                            .map(str::to_string)
+                    })
+                }));
+        }
+        if let Some(timestamp) = entry.get("timestamp").and_then(Value::as_str) {
+            if let Some(parsed) = chrono_parse_iso(timestamp) {
+                last_activity_ms = last_activity_ms.max(parsed);
+            }
+        }
+    }
+    let running = session.run_state().is_running();
+    if !running && first_message.is_none() {
+        return None;
+    }
+    let created = entries
+        .first()
+        .and_then(|entry| entry.get("timestamp"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let created_ms = chrono_parse_iso(&created).unwrap_or(0);
+    let modified_ms = if last_activity_ms > 0 { last_activity_ms } else { created_ms };
+    let mut info = json!({
+        "path": session.session_file.display().to_string(),
+        "id": id,
+        "cwd": session.cwd.display().to_string(),
+        "created": ms_to_iso(created_ms),
+        "modified": ms_to_iso(modified_ms),
+        "messageCount": message_count,
+        "firstMessage": first_message.unwrap_or_else(|| "(no messages)".to_string()),
+        "transient": true,
+    });
+    attach_workspace_identity(state, agent_dir, &mut info, &session.cwd);
+    Some(info)
+}
+
+/// Parse an ISO-8601 timestamp to epoch ms (Date.parse's happy path).
+fn chrono_parse_iso(timestamp: &str) -> Option<i64> {
+    // The entries pi writes are `YYYY-MM-DDTHH:MM:SS.sssZ`; accept an offset too.
+    let bytes = timestamp.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    let year: i64 = timestamp.get(0..4)?.parse().ok()?;
+    let month: i64 = timestamp.get(5..7)?.parse().ok()?;
+    let day: i64 = timestamp.get(8..10)?.parse().ok()?;
+    let hour: i64 = timestamp.get(11..13)?.parse().ok()?;
+    let minute: i64 = timestamp.get(14..16)?.parse().ok()?;
+    let second: i64 = timestamp.get(17..19)?.parse().ok()?;
+    let millis: i64 = if timestamp.len() > 20 && &timestamp[19..20] == "." {
+        let fraction: String = timestamp[20..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let padded = format!("{fraction:0<3}");
+        padded.get(0..3)?.parse().unwrap_or(0)
+    } else {
+        0
+    };
+    // Days from civil (Howard Hinnant) then straight to epoch ms.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let mut epoch_ms = ((days * 86_400) + hour * 3_600 + minute * 60 + second) * 1000 + millis;
+    // An explicit UTC offset shifts the epoch the other way.
+    if let Some(offset) = timestamp.rfind(['+', '-']) {
+        if offset > 19 {
+            let sign: i64 = if &timestamp[offset..offset + 1] == "+" { 1 } else { -1 };
+            let oh: i64 = timestamp.get(offset + 1..offset + 3).and_then(|v| v.parse().ok()).unwrap_or(0);
+            let om: i64 = timestamp.get(offset + 4..offset + 6).and_then(|v| v.parse().ok()).unwrap_or(0);
+            epoch_ms -= sign * (oh * 3_600 + om * 60) * 1000;
+        }
+    }
+    Some(epoch_ms)
+}
+
+/// The map key for parent-id resolution (the file's absolute path).
+fn key_of(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Dispatch a session op with the resume plan wired in.
+fn dispatch_with_resume(
+    state: &IpcHostState,
+    op: &str,
+    args: &Value,
+) -> Result<Value, (String, String)> {
+    let base = state.spawn_base.lock().unwrap().clone();
+    let agent_dir = state.agent_dir();
+    let Some(base) = base else {
+        // No pi executable: not_found stays honest (never a fake child).
+        let error = session_host::dispatch_session_op(&state.registry, op, args, None)
+            .map_err(|error| (error.code().to_string(), error.to_string()))?;
+        return Ok(error);
+    };
+    let plan = |summary: &session_host::SessionSummary| {
+        build_spawn_plan(
+            state,
+            &base,
+            Path::new(&summary.cwd),
+            &summary.file,
+            &SpawnRequest::default(),
+            false,
+        )
+    };
+    let resume = session_host::ResumeContext { agent_dir: agent_dir.as_path(), plan: &plan };
+    session_host::dispatch_session_op(&state.registry, op, args, Some(&resume))
+        .map_err(|error| (error.code().to_string(), error.to_string()))
+}
+
 
 /// Epoch ms → ISO-8601 Zulu (the catalogue's created/modified strings).
 fn ms_to_iso(ms: i64) -> String {
@@ -1434,6 +2282,21 @@ mod tests {
 
     fn state() -> IpcHostState {
         IpcHostState::new()
+    }
+
+    /// A spawn base for tests: the real executable the caller resolved plus
+    /// the checkout's assets (artifacts + chat alongside the bridge).
+    fn spawn_base(executable: &str, bridge: std::path::PathBuf) -> SpawnBase {
+        SpawnBase {
+            executable: executable.to_string(),
+            bridge_asset: bridge,
+            artifacts_asset: std::path::Path::new("../lib/pi-rpc/assets/pi-web-artifacts.mjs")
+                .canonicalize()
+                .ok(),
+            chat_asset: std::path::Path::new("../lib/pi-rpc/assets/pi-web-chat.mjs")
+                .canonicalize()
+                .ok(),
+        }
     }
 
     fn send(state: &IpcHostState, request: Value) -> Value {
@@ -1540,6 +2403,121 @@ mod tests {
         assert!(sessions[0]["path"].as_str().unwrap_or_default().ends_with("newer.jsonl"));
         // The scan-derived roots still get proposed (browsability in step).
         assert!(state.is_proposed("/proj"));
+    }
+
+    #[test]
+    fn sessions_catalogue_serves_the_sidebar_payload() {
+        // The FULL GET /api/sessions contract: SessionInfo rows (workspace
+        // classification, fork relation with the parent's real id, the
+        // transient: false disk rows) plus the envelope fields the sidebar's
+        // running/unread/chat-root wiring consumes.
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let sessions = agent_dir.join("sessions").join("--home-hao-work--");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+
+        // A parent and its fork (the fork records the parent's PATH; the
+        // catalogue resolves the parent's ID from ITS header).
+        let parent = sessions.join("parent.jsonl");
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"type":"session","version":3,"id":"p1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/home/hao/work"}"#,
+                "\n",
+                r#"{"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"parent question"}}"#,
+                "\n",
+            ),
+        )
+        .expect("parent");
+        let fork = sessions.join("fork.jsonl");
+        std::fs::write(
+            &fork,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"f1\",\"timestamp\":\"2026-02-01T00:00:00.000Z\",\"cwd\":\"/home/hao/work\",\"parentSession\":\"{}\"}}\n",
+                parent.display().to_string().replace('\\', "\\\\"),
+            ),
+        )
+        .expect("fork");
+
+        let catalogue = send(&state, json!({ "v": 1, "id": "cat2", "op": "sessions.catalogue" }));
+        assert_eq!(catalogue["ok"], true, "{catalogue}");
+        let payload = &catalogue["data"];
+        // The envelope fields (the sidebar's whole payload contract).
+        assert!(payload["sessionListVersion"].is_u64(), "the version counter: {}", payload["sessionListVersion"]);
+        assert_eq!(payload["runningSessionIds"], json!([]));
+        assert_eq!(payload["completionNotificationSuppressedSessionIds"], json!([]));
+        let chat_root = payload["chatWorkspaceCwd"].as_str().expect("chat root");
+        assert!(chat_root.ends_with("/chats"), "the hidden chat root: {chat_root}");
+        assert!(state.is_proposed(chat_root));
+
+        let rows = payload["sessions"].as_array().expect("rows");
+        let fork_row = rows.iter().find(|row| row["id"] == "f1").expect("the fork row");
+        // The fork relation resolves the parent's REAL id from its header.
+        assert_eq!(fork_row["parentSessionId"], "p1");
+        assert_eq!(fork_row["relation"]["kind"], "fork");
+        assert_eq!(fork_row["relation"]["originSessionId"], "p1");
+        assert_eq!(fork_row["transient"], false);
+        // The project identity (non-git cwd: the cwd itself).
+        assert_eq!(fork_row["workspaceKind"], "project");
+        assert!(fork_row["projectKey"].is_string(), "the grouping key");
+
+        // A chat session classifies as the chat workspace (no project row).
+        let chat_sessions = agent_dir.join("sessions").join("--agent-chats-20260201-100000-abcd--");
+        std::fs::create_dir_all(&chat_sessions).expect("chat sessions");
+        let chat_dir = agent_dir.join("chats").join("20260201-100000-abcd");
+        std::fs::create_dir_all(&chat_dir).expect("chat folder");
+        std::fs::write(
+            chat_sessions.join("chat.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"c1\",\"timestamp\":\"2026-03-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
+                chat_dir.display().to_string().replace('\\', "\\\\"),
+            ),
+        )
+        .expect("chat");
+        let catalogue = send(&state, json!({ "v": 1, "id": "cat3", "op": "sessions.catalogue" }));
+        let rows = catalogue["data"]["sessions"].as_array().expect("rows");
+        let chat_row = rows.iter().find(|row| row["id"] == "c1").expect("the chat row");
+        assert_eq!(chat_row["workspaceKind"], "chat");
+        assert_eq!(chat_row["chatFolder"], true);
+        assert!(chat_row.get("projectKey").is_none(), "a chat carries no project identity");
+    }
+
+    #[test]
+    fn sessions_catalogue_lists_a_subagent_relation_from_the_bounded_reads() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let sessions = dir.path().join("sessions").join("--home-hao-work--");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        let subagent = sessions.join("sub.jsonl");
+        std::fs::write(
+            &subagent,
+            concat!(
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/home/hao/work","parentSession":"/gone.jsonl"}"#,
+                "\n",
+                r#"{"type":"custom","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"p1","parentSessionPath":"/gone.jsonl","profile":"researcher","description":"Digging"}}"#,
+                "\n",
+                r#"{"type":"custom","id":"m2","parentId":"m1","timestamp":"2026-01-01T00:00:02.000Z","customType":"pi-web:subagent-result","data":{"version":1,"status":"completed","result":"done"}}"#,
+                "\n",
+            ),
+        )
+        .expect("subagent");
+
+        let catalogue = send(&state, json!({ "v": 1, "id": "cat4", "op": "sessions.catalogue" }));
+        let rows = catalogue["data"]["sessions"].as_array().expect("rows");
+        let row = rows.iter().find(|row| row["id"] == "s1").expect("the subagent row");
+        // The subagent relation (the parent id from the marker, not the
+        // missing parent file; the completed status from the tail entry).
+        assert_eq!(row["relation"]["kind"], "subagent");
+        assert_eq!(row["relation"]["parentSessionId"], "p1");
+        assert_eq!(row["relation"]["profile"], "researcher");
+        assert_eq!(row["relation"]["description"], "Digging");
+        assert_eq!(row["relation"]["status"], "completed");
+        // A subagent whose parent file is gone still carries the parent link
+        // from the marker (never a fork relation).
+        assert!(row.get("parentSessionId").is_none());
     }
 
     #[test]
@@ -2195,7 +3173,7 @@ mod tests {
     fn session_ops_on_missing_sessions_are_not_found() {
         let state = state();
         // Deterministic without a staged pi: no spawn config, no children.
-        *state.spawn_config.lock().unwrap() = None;
+        *state.spawn_base.lock().unwrap() = None;
         let response = send(
             &state,
             json!({ "v": 1, "id": "r6", "op": "agent.interrupt", "args": { "session": "ghost" } }),
@@ -2293,17 +3271,11 @@ mod tests {
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&sessions).expect("sessions");
         std::fs::create_dir_all(&cwd).expect("cwd");
-        let (file, file_id) = session_host::create_session_file(&sessions, &cwd).expect("create");
+        let (_file, file_id) = session_host::create_session_file(&sessions, &cwd).expect("create");
 
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
-        *state.spawn_config.lock().unwrap() = Some(session_host::SessionSpawnConfig {
-            executable,
-            agent_dir: Some(agent_dir),
-            session_dir: Some(sessions),
-            bridge_asset: bridge,
-            extra_args: Vec::new(),
-        });
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
 
         let tools = send(
             &state,
@@ -2367,13 +3339,7 @@ mod tests {
 
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
-        *state.spawn_config.lock().unwrap() = Some(session_host::SessionSpawnConfig {
-            executable,
-            agent_dir: Some(agent_dir),
-            session_dir: Some(sessions),
-            bridge_asset: bridge,
-            extra_args: Vec::new(),
-        });
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
 
         // A command on the not-yet-running session RESUMES it: the child
         // spawns, handshakes and answers get_state.
@@ -2393,6 +3359,165 @@ mod tests {
         assert_eq!(again["ok"], true, "{again}");
         // Cleanup: shut the child down.
         state.registry.remove(&file_id, std::time::Duration::from_secs(5));
+    }
+
+    /// The vertical create loop against the REAL pi (PI_CLI_BIN, sandboxed
+    /// agent dir + a staged managed tree): POST /api/agent/new's contract —
+    /// the ensure_session create for a project (with a persisted tool pin)
+    /// and for a chat (the ROOT request becomes a folder of its own), the
+    /// startup state answer, and the honest invalid-args rejection.
+    #[test]
+    fn real_pi_sessions_create_runs_the_factory_contract() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let managed = stage_managed_tree(dir.path());
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![(
+                "PI_WEB_MANAGED_MODULES".to_string(),
+                managed.display().to_string(),
+            )],
+        });
+
+        // 1. ensure_session for a PROJECT with a pinned tool selection.
+        let created = send(
+            &state,
+            json!({ "v": 1, "id": "new1", "op": "sessions.create", "args": {
+                "cwd": cwd.display().to_string(),
+                "type": "ensure_session",
+                "toolNames": ["read", "bash"],
+            }}),
+        );
+        assert_eq!(created["ok"], true, "the project session created: {created}");
+        assert_eq!(created["data"]["success"], true);
+        assert_eq!(created["data"]["data"], Value::Null, "ensure_session answers data: null");
+        let project_id = created["data"]["sessionId"].as_str().expect("the session id").to_string();
+        assert!(!project_id.is_empty());
+        // The session file landed in the SDK's encoded dir with the header id.
+        let encoded = crate::session_view::default_session_dir(&agent_dir, &cwd);
+        let mut file = None;
+        for entry in std::fs::read_dir(&encoded).expect("the encoded session dir exists").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(&format!("_{project_id}.jsonl")) {
+                file = Some(entry.path());
+            }
+        }
+        let file = file.expect("the session file carries the header id");
+        // The pin persisted BEFORE the child opened the file (the factory's order).
+        let pinned = session_host::spawn_plan::read_session_tool_selection(&file);
+        assert_eq!(pinned, Some(vec!["read".to_string(), "bash".to_string()]));
+        // The child answers get_state (the handshake passed; the model state
+        // the route answered came from the child).
+        let state_answer = send(
+            &state,
+            json!({ "v": 1, "id": "new1s", "op": "agent.command", "args": { "session": project_id, "type": "get_state" } }),
+        );
+        assert_eq!(state_answer["ok"], true, "{state_answer}");
+        // The pinned tools applied to the child: read+bash active, the rest
+        // of the coding domain not.
+        let tools = send(
+            &state,
+            json!({ "v": 1, "id": "new1t", "op": "agent.getTools", "args": { "session": project_id } }),
+        );
+        assert_eq!(tools["ok"], true, "{tools}");
+        let active: Vec<&str> = tools["data"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter(|tool| tool["active"] == true)
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(active.contains(&"read"), "the pinned read is active: {active:?}");
+        assert!(active.contains(&"bash"), "the pinned bash is active: {active:?}");
+        assert!(!active.contains(&"edit"), "an unpinned coding tool is off: {active:?}");
+        state.registry.remove(&project_id, std::time::Duration::from_secs(5));
+
+        // 2. ensure_session for a CHAT: the ROOT request becomes a folder of
+        // its own under the hidden chat root, and the spawn plan loads the
+        // chat prompt through the management instance.
+        let chat_root = crate::session_view::chat_workspace_dir(&agent_dir);
+        let chat_created = send(
+            &state,
+            json!({ "v": 1, "id": "new2", "op": "sessions.create", "args": {
+                "cwd": chat_root.display().to_string(),
+                "type": "ensure_session",
+                // A chat ignores a stale client tool selection (the policy decides).
+                "toolNames": ["bash"],
+            }}),
+        );
+        assert_eq!(chat_created["ok"], true, "the chat session created: {chat_created}");
+        let chat_id = chat_created["data"]["sessionId"].as_str().expect("the chat id").to_string();
+        // The chat's cwd is a FOLDER under the root (never the root itself).
+        let chat_summary = session_host::history::find_session_by_id(&agent_dir, &chat_id).expect("the chat session file");
+        let chat_cwd = std::path::PathBuf::from(&chat_summary.cwd);
+        assert!(crate::session_view::is_chat_folder_path(&chat_cwd, &agent_dir), "a folder chat: {}", chat_cwd.display());
+        // No tool pin persisted for a chat (the request's selection ignored).
+        assert_eq!(session_host::spawn_plan::read_session_tool_selection(&chat_summary.file), None);
+        // The chat child answers and its loadout is the chat's own: read
+        // active, the shell tools withheld.
+        let chat_tools = send(
+            &state,
+            json!({ "v": 1, "id": "new2t", "op": "agent.getTools", "args": { "session": chat_id } }),
+        );
+        assert_eq!(chat_tools["ok"], true, "{chat_tools}");
+        let chat_active: Vec<&str> = chat_tools["data"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter(|tool| tool["active"] == true)
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(chat_active.contains(&"read"), "a folder chat keeps read: {chat_active:?}");
+        assert!(chat_active.contains(&"write"), "a folder chat keeps write: {chat_active:?}");
+        assert!(!chat_active.contains(&"bash"), "a locked chat has no shell: {chat_active:?}");
+        state.registry.remove(&chat_id, std::time::Duration::from_secs(5));
+
+        // 3. The honest rejection: a cwd that does not exist.
+        let missing = send(
+            &state,
+            json!({ "v": 1, "id": "new3", "op": "sessions.create", "args": {
+                "cwd": dir.path().join("nope").display().to_string(),
+                "type": "ensure_session",
+            }}),
+        );
+        assert_eq!(missing["ok"], false, "{missing}");
+        assert_eq!(missing["error"]["code"], "invalid_args");
+        assert!(
+            missing["error"]["message"].as_str().unwrap_or("").contains("does not exist"),
+            "the route's message: {}",
+            missing["error"]["message"]
+        );
+        // A prompt-type create that never reached the child carries the
+        // rejection contract (no blind retry).
+        let rejected = send(
+            &state,
+            json!({ "v": 1, "id": "new4", "op": "sessions.create", "args": {
+                "cwd": dir.path().join("nope").display().to_string(),
+                "type": "prompt",
+                "message": "hello",
+            }}),
+        );
+        assert_eq!(rejected["error"]["details"]["code"], "prompt_rejected", "{rejected}");
+        assert_eq!(rejected["error"]["details"]["accepted"], false);
     }
 
     #[test]
@@ -2660,15 +3785,12 @@ mod tests {
 
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
-        *state.spawn_config.lock().unwrap() = Some(session_host::SessionSpawnConfig {
-            executable: executable.clone(),
-            agent_dir: Some(agent_dir.clone()),
-            session_dir: Some(sessions.clone()),
-            bridge_asset: std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(
+            &executable,
+            std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
                 .canonicalize()
                 .expect("bridge asset"),
-            extra_args: Vec::new(),
-        });
+        ));
         // The management instance runs SANDBOXED against the same temp agent
         // dir with the staged vendored tree (never the real ~/.pi/agent).
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
