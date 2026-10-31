@@ -1,0 +1,339 @@
+import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
+import { randomUUID } from "node:crypto";
+import { invalidateModelsCache } from "./models-cache";
+import { createModelRuntimeWithExtensions } from "./model-runtime";
+import { oauthLoginOptions } from "./oauth-login-options";
+
+/**
+ * The OAuth/device-code login flows for the management instance's
+ * auth.login* ops (migration M3): the stateful half of the old
+ * GET/POST /api/auth/login/[provider] pair, restructured for the
+ * management protocol.
+ *
+ * The old SSE route ran ModelRuntime.login() with a prompt/notify shim and
+ * streamed every prompt/notification to the WebView; the answers came back
+ * through the POST route keyed by a random token. Over IPC the SAME
+ * interaction runs inside the management child: the flow buffers its events
+ * (auth.loginPoll drains them by sequence) and auth.loginSubmit answers a
+ * pending prompt through the same token discipline (crypto.randomUUID,
+ * "<provider>-<uuid>", one pending manual request reused until it
+ * resolves — the GET route's exact semantics, select/text prompts each
+ * minting their own).
+ *
+ * Everything user-visible is the old route's wire shape: the event objects
+ * below are the SSE `data:` payloads verbatim, and the refusal messages are
+ * the POST route's 404/400 bodies. The device-code and loopback-callback
+ * flows themselves run inside the SDK (pi-ai's own callback server), inside
+ * this child — no app HTTP server exists on any path.
+ *
+ * The host (src-tauri/src/provider_auth.rs) owns the flow id, drives the
+ * polling and cancels on unsubscribe; this module never invents ids, and a
+ * flow nobody polls for FLOW_IDLE_TIMEOUT is cancelled (the poll IS the
+ * lease — the same backstop the SSE client disconnect was).
+ */
+
+/** The SSE `data:` payloads of the old login stream, verbatim. */
+export type OAuthLoginEvent =
+  | { type: "auth"; url: string; instructions: string | null; token: string }
+  | {
+      type: "device_code";
+      userCode: string;
+      verificationUri: string;
+      intervalSeconds: number | null;
+      expiresInSeconds: number | null;
+    }
+  | { type: "prompt_request"; message: string; placeholder: string | null; token: string }
+  | { type: "select_request"; message: string; options: { id: string; label: string }[]; token: string }
+  | { type: "progress"; message: string }
+  | { type: "success" }
+  | { type: "error"; message: string }
+  | { type: "cancelled" };
+
+/** The old POST route's shaped answers for a submitted code. */
+export type OAuthLoginSubmitResult =
+  | { status: "accepted" }
+  | { status: "no_pending"; message: string }
+  | { status: "provider_mismatch"; message: string };
+
+export interface QueuedLoginEvent {
+  seq: number;
+  event: OAuthLoginEvent;
+}
+
+/** At most this many concurrent flows; the oldest is cancelled on overflow. */
+const MAX_FLOWS = 8;
+/** A flow nobody polls for this long is cancelled (the poll IS the lease). */
+const FLOW_IDLE_TIMEOUT_MS = 120_000;
+/** A bounded buffer: a real login is a few dozen events at most. */
+const MAX_EVENTS = 512;
+/** Finished flows kept for late polls (bounded; the terminal event survives). */
+const MAX_FINISHED = 16;
+
+/** One minted handshake token and the prompt awaiting its answer. */
+interface PendingPrompt {
+  token: string;
+  provider: string;
+  resolve: (value: string) => void;
+  reject: (error: Error) => void;
+  settled: boolean;
+}
+
+interface LoginFlow {
+  provider: string;
+  /** Monotonic per-flow sequence; the host resumes polls with the last it saw. */
+  seq: number;
+  events: QueuedLoginEvent[];
+  done: boolean;
+  /** One manual-code handshake at a time, reused across auth_url events. */
+  pendingManual: { pending: PendingPrompt; answer: Promise<string> } | undefined;
+  /** Every token this flow minted (finish rejects what the flow still owes). */
+  liveTokens: Set<PendingPrompt>;
+  abort: AbortController;
+  lastPolled: number;
+}
+
+const flows = new Map<string, LoginFlow>();
+const finishedFlows = new Map<string, LoginFlow>();
+/** Every live token across flows: the old route's global registry. */
+const tokens = new Map<string, PendingPrompt>();
+
+const flowSweeper = setInterval(() => {
+  const now = Date.now();
+  for (const [flowId, flow] of flows) {
+    if (flow.done) continue;
+    // A poller refreshes lastPolled; an abandoned flow (relay gone, host
+    // died without the unsubscribe) cancels like the old client disconnect.
+    if (now - flow.lastPolled > FLOW_IDLE_TIMEOUT_MS) {
+      cancelLoginFlow(flowId);
+    }
+  }
+}, 30_000);
+// Never hold the child open for the sweeper alone.
+flowSweeper.unref?.();
+
+function enqueue(flow: LoginFlow, event: OAuthLoginEvent): void {
+  if (flow.done) return;
+  flow.seq += 1;
+  flow.events.push({ seq: flow.seq, event });
+  if (flow.events.length > MAX_EVENTS) {
+    // Overflow ends the flow with the old stream's error shape; the buffer
+    // keeps the newest MAX_EVENTS entries for the poller's post-mortem.
+    flow.events.splice(0, flow.events.length - MAX_EVENTS);
+    finishFlow(flow, { type: "error", message: "Login event buffer overflow" });
+  }
+}
+
+/** Record the terminal event, abort the login, reject every token still owed. */
+function finishFlow(flow: LoginFlow, terminal: OAuthLoginEvent): void {
+  if (flow.done) return;
+  flow.done = true;
+  flow.seq += 1;
+  flow.events.push({ seq: flow.seq, event: terminal });
+  flow.abort.abort();
+  for (const pending of flow.liveTokens) {
+    if (!pending.settled) {
+      pending.settled = true;
+      tokens.delete(pending.token);
+      pending.reject(new Error("Login cancelled"));
+    }
+  }
+  flow.liveTokens.clear();
+}
+
+/** The old route's createClientInputRequest: mint a token + its promise. */
+function mintPrompt(flow: LoginFlow): { pending: PendingPrompt; answer: Promise<string> } {
+  // Manual-code handshake token; crypto randomness so a pending OAuth
+  // manual flow cannot be hijacked by predicting Math.random().
+  const token = `${flow.provider}-${randomUUID()}`;
+  let settle: (value: string | PromiseLike<string>) => void = () => {};
+  let fail: (error: Error) => void = () => {};
+  const answer = new Promise<string>((resolve, reject) => {
+    settle = resolve;
+    fail = reject;
+  });
+  const pending: PendingPrompt = {
+    token,
+    provider: flow.provider,
+    resolve: (value) => {
+      if (pending.settled) return;
+      pending.settled = true;
+      tokens.delete(token);
+      settle(value);
+    },
+    reject: (error) => {
+      if (pending.settled) return;
+      pending.settled = true;
+      tokens.delete(token);
+      fail(error);
+    },
+    settled: false,
+  };
+  tokens.set(token, pending);
+  flow.liveTokens.add(pending);
+  return { pending, answer };
+}
+
+/** Retire a finished flow, keeping its terminal events for late polls. */
+function retireFlow(flowId: string, flow: LoginFlow): void {
+  flows.delete(flowId);
+  finishedFlows.set(flowId, flow);
+  while (finishedFlows.size > MAX_FINISHED) {
+    const oldest = finishedFlows.keys().next().value;
+    if (typeof oldest !== "string") break;
+    finishedFlows.delete(oldest);
+  }
+}
+
+/**
+ * auth.loginStart: validate the provider and begin the flow. The flowId is
+ * the HOST's (never accepted from the WebView); a duplicate id refuses.
+ * The login itself runs detached — the op answers immediately and the flow's
+ * events buffer until a terminal outcome (the SSE stream's whole lifetime).
+ */
+export async function startLoginFlow(
+  flowId: string,
+  provider: string,
+): Promise<{ started: true } | { started: false; message: string }> {
+  if (flows.has(flowId)) return { started: false, message: "A login flow is already running" };
+  const modelRuntime = await createModelRuntimeWithExtensions();
+  if (!modelRuntime.getProvider(provider)?.auth.oauth) {
+    return { started: false, message: `Unknown provider: ${provider}` };
+  }
+  if (flows.size >= MAX_FLOWS) {
+    // Evict the oldest flow when the table is full (cancelLoginFlow also
+    // retires it, keeping its terminal events for a late poll).
+    const oldest = flows.keys().next().value;
+    if (typeof oldest === "string") cancelLoginFlow(oldest);
+  }
+  const flow: LoginFlow = {
+    provider,
+    seq: 0,
+    events: [],
+    done: false,
+    pendingManual: undefined,
+    liveTokens: new Set(),
+    abort: new AbortController(),
+    lastPolled: Date.now(),
+  };
+  flows.set(flowId, flow);
+
+  const getManualInputRequest = (): { pending: PendingPrompt; answer: Promise<string> } => {
+    // One manual-code handshake reused across auth_url + manual_code (the
+    // GET route's dedup: the paste panel's token answers the SDK prompt).
+    if (!flow.pendingManual || flow.pendingManual.pending.settled) {
+      const minted = mintPrompt(flow);
+      flow.pendingManual = minted;
+      minted.answer
+        .finally(() => {
+          if (flow.pendingManual === minted) flow.pendingManual = undefined;
+        })
+        .catch(() => {});
+    }
+    return flow.pendingManual;
+  };
+
+  void (async () => {
+    try {
+      await modelRuntime.login(provider, "oauth", {
+        signal: flow.abort.signal,
+        prompt: async (prompt: AuthPrompt) => {
+          const manual = prompt.type === "manual_code";
+          const minted = manual ? getManualInputRequest() : mintPrompt(flow);
+          if (prompt.type === "select") {
+            enqueue(flow, {
+              type: "select_request",
+              message: prompt.message,
+              options: prompt.options.map((option) => ({ id: option.id, label: option.label })),
+              token: minted.pending.token,
+            });
+          } else {
+            enqueue(flow, {
+              type: "prompt_request",
+              message: prompt.message,
+              placeholder: prompt.placeholder ?? null,
+              token: minted.pending.token,
+            });
+          }
+          flow.lastPolled = Date.now();
+          return minted.answer;
+        },
+        notify: (event: AuthEvent) => {
+          if (event.type === "auth_url") {
+            enqueue(flow, {
+              type: "auth",
+              url: event.url,
+              instructions: event.instructions ?? null,
+              token: getManualInputRequest().pending.token,
+            });
+          } else if (event.type === "device_code") {
+            enqueue(flow, {
+              type: "device_code",
+              userCode: event.userCode,
+              verificationUri: event.verificationUri,
+              intervalSeconds: event.intervalSeconds ?? null,
+              expiresInSeconds: event.expiresInSeconds ?? null,
+            });
+          } else {
+            enqueue(flow, { type: "progress", message: event.message });
+          }
+          flow.lastPolled = Date.now();
+        },
+      }, oauthLoginOptions());
+      invalidateModelsCache();
+      finishFlow(flow, { type: "success" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      finishFlow(flow, message === "Login cancelled"
+        ? { type: "cancelled" }
+        : { type: "error", message });
+    } finally {
+      retireFlow(flowId, flow);
+    }
+  })();
+
+  return { started: true };
+}
+
+/**
+ * auth.loginPoll: the events with seq > since, plus whether the flow has
+ * ended. An unknown id answers done (the child recycled mid-flow; the host
+ * turns that into the stream's "Connection lost").
+ */
+export function pollLoginFlow(
+  flowId: string,
+  since: number,
+): { events: QueuedLoginEvent[]; lastSeq: number; done: boolean } {
+  const flow = flows.get(flowId) ?? finishedFlows.get(flowId);
+  if (!flow) return { events: [], lastSeq: since, done: true };
+  flow.lastPolled = Date.now();
+  const events = flow.events.filter((queued) => queued.seq > since);
+  return { events, lastSeq: flow.seq, done: flow.done };
+}
+
+/**
+ * auth.loginSubmit: the old POST route's body — answer a pending token.
+ * Tokens are provider-prefixed; a token from another provider's flow
+ * refuses (the route's 400), an unknown token its 404.
+ */
+export function submitLoginCode(
+  provider: string,
+  token: string,
+  code: string,
+): OAuthLoginSubmitResult {
+  const pending = tokens.get(token);
+  if (!pending) return { status: "no_pending", message: "No pending login for token" };
+  if (!token.startsWith(`${provider}-`)) {
+    return { status: "provider_mismatch", message: "Token does not match provider" };
+  }
+  pending.resolve(code);
+  return { status: "accepted" };
+}
+
+/** auth.loginCancel: abort the flow (the user closed the panel). */
+export function cancelLoginFlow(flowId: string): boolean {
+  const flow = flows.get(flowId);
+  if (!flow) return false;
+  finishFlow(flow, { type: "cancelled" });
+  retireFlow(flowId, flow);
+  return true;
+}

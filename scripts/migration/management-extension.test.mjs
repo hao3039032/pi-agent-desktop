@@ -1208,7 +1208,16 @@ test(
         // 1. The capability table carries the auth ops.
         const capabilities = await call("sys.capabilities", {});
         assert.equal(capabilities.ok, true, JSON.stringify(capabilities));
-        for (const op of ["auth.providers", "auth.apiKeyStore", "auth.apiKeyDelete", "auth.logout"]) {
+        for (const op of [
+          "auth.providers",
+          "auth.apiKeyStore",
+          "auth.apiKeyDelete",
+          "auth.logout",
+          "auth.loginStart",
+          "auth.loginPoll",
+          "auth.loginSubmit",
+          "auth.loginCancel",
+        ]) {
           assert.ok(capabilities.result.ops.includes(op), `${op} in the capability table`);
         }
 
@@ -1292,6 +1301,26 @@ test(
         const noProvider = await call("auth.apiKeyDelete", {});
         assert.equal(noProvider.ok, false, JSON.stringify(noProvider));
         assert.equal(noProvider.code, "invalid_args");
+
+        // 9. auth.login* ops via management instance
+        const loginRefused = await call("auth.loginStart", { flowId: "flow-unknown", provider: "not-a-real-provider" });
+        assert.equal(loginRefused.ok, true, JSON.stringify(loginRefused));
+        assert.equal(loginRefused.result.started, false);
+        assert.match(loginRefused.result.message, /Unknown provider/);
+
+        const pollEmpty = await call("auth.loginPoll", { flowId: "nonexistent-flow", since: 0 });
+        assert.equal(pollEmpty.ok, true, JSON.stringify(pollEmpty));
+        assert.deepEqual(pollEmpty.result.events, []);
+        assert.equal(pollEmpty.result.done, true);
+
+        const submitBad = await call("auth.loginSubmit", { provider: "openai", token: "openai-bad-token", code: "123" });
+        assert.equal(submitBad.ok, true, JSON.stringify(submitBad));
+        assert.equal(submitBad.result.status, "no_pending");
+
+        const cancelNone = await call("auth.loginCancel", { flowId: "nonexistent-flow" });
+        assert.equal(cancelNone.ok, true, JSON.stringify(cancelNone));
+        assert.equal(cancelNone.result.cancelled, false);
+
         const stillUsable = await call("auth.providers", {});
         assert.equal(stillUsable.ok, true, "usable after refused ops");
       } finally {

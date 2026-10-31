@@ -13,6 +13,11 @@ import {
   type ApiKeyProvider,
   type OAuthProvider,
 } from "@/lib/provider-auth-service";
+import {
+  subscribeOAuthLogin,
+  submitOAuthLoginCode,
+  type OAuthLoginEvent,
+} from "@/lib/provider-auth-login";
 import type { ModelCatalogPreset, ModelCatalogRecommendation } from "@/lib/model-catalog";
 import type { DiscoveredModel } from "@/lib/model-discovery";
 import {
@@ -1381,7 +1386,8 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
   const [loginState, setLoginState] = useState<OAuthLoginState>({ phase: "idle" });
   const { t } = useI18n();
   const [inputValue, setInputValue] = useState("");
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const unsubscribeRef = useRef<(() => void) | null>(null);
+  const submittedTokensRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -1394,63 +1400,68 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
   useEffect(() => {
     setLoginState({ phase: "idle" });
     setInputValue("");
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
+    submittedTokensRef.current.clear();
+    unsubscribeRef.current?.();
+    unsubscribeRef.current = null;
   }, [provider.id]);
 
   useEffect(() => {
-    return () => { eventSourceRef.current?.close(); };
+    return () => {
+      unsubscribeRef.current?.();
+      unsubscribeRef.current = null;
+    };
   }, []);
 
   const handleLogin = useCallback(() => {
-    eventSourceRef.current?.close();
+    unsubscribeRef.current?.();
+    unsubscribeRef.current = null;
+    submittedTokensRef.current.clear();
     setLoginState({ phase: "connecting" });
     setInputValue("");
 
-    const es = new EventSource(`/api/auth/login/${encodeURIComponent(provider.id)}`);
-    eventSourceRef.current = es;
-
-    es.onmessage = (e) => {
-      const data = JSON.parse(e.data) as {
-        type: string; url?: string; instructions?: string | null;
-        token?: string; message?: string; placeholder?: string | null;
-        userCode?: string; verificationUri?: string; intervalSeconds?: number | null; expiresInSeconds?: number | null;
-        options?: { id: string; label: string }[];
-      };
-      if (data.type === "auth") {
-        setLoginState({ phase: "auth", url: data.url!, instructions: data.instructions ?? null, token: data.token! });
-        window.open(data.url!, "_blank", "noopener,noreferrer");
-      } else if (data.type === "device_code") {
-        setLoginState({
-          phase: "device_code",
-          userCode: data.userCode!,
-          verificationUri: data.verificationUri!,
-          intervalSeconds: data.intervalSeconds ?? null,
-          expiresInSeconds: data.expiresInSeconds ?? null,
-        });
-        window.open(data.verificationUri!, "_blank", "noopener,noreferrer");
-      } else if (data.type === "prompt_request") {
-        setLoginState({ phase: "prompt", message: data.message!, placeholder: data.placeholder ?? null, token: data.token! });
-      } else if (data.type === "select_request") {
-        setLoginState({ phase: "select", message: data.message!, options: data.options ?? [], token: data.token! });
-      } else if (data.type === "progress") {
-        setLoginState({ phase: "progress", message: data.message! });
-      } else if (data.type === "success") {
-        es.close();
-        setLoginState({ phase: "success" });
-        onRefresh();
-      } else if (data.type === "error") {
-        es.close();
-        setLoginState({ phase: "error", message: data.message! });
-      } else if (data.type === "cancelled") {
-        es.close();
-        setLoginState({ phase: "idle" });
-      }
-    };
-    es.onerror = () => {
-      es.close();
-      setLoginState((prev) => prev.phase === "success" ? prev : { phase: "error", message: "Connection lost" });
-    };
+    const unsubscribe = subscribeOAuthLogin(
+      provider.id,
+      (data: OAuthLoginEvent) => {
+        if (data.type === "auth") {
+          setLoginState({ phase: "auth", url: data.url, instructions: data.instructions ?? null, token: data.token });
+          window.open(data.url, "_blank", "noopener,noreferrer");
+        } else if (data.type === "device_code") {
+          setLoginState({
+            phase: "device_code",
+            userCode: data.userCode,
+            verificationUri: data.verificationUri,
+            intervalSeconds: data.intervalSeconds ?? null,
+            expiresInSeconds: data.expiresInSeconds ?? null,
+          });
+          window.open(data.verificationUri, "_blank", "noopener,noreferrer");
+        } else if (data.type === "prompt_request") {
+          setLoginState({ phase: "prompt", message: data.message, placeholder: data.placeholder ?? null, token: data.token });
+        } else if (data.type === "select_request") {
+          setLoginState({ phase: "select", message: data.message, options: data.options ?? [], token: data.token });
+        } else if (data.type === "progress") {
+          setLoginState({ phase: "progress", message: data.message });
+        } else if (data.type === "success") {
+          unsubscribeRef.current?.();
+          unsubscribeRef.current = null;
+          setLoginState({ phase: "success" });
+          onRefresh();
+        } else if (data.type === "error") {
+          unsubscribeRef.current?.();
+          unsubscribeRef.current = null;
+          setLoginState({ phase: "error", message: data.message });
+        } else if (data.type === "cancelled") {
+          unsubscribeRef.current?.();
+          unsubscribeRef.current = null;
+          setLoginState({ phase: "idle" });
+        }
+      },
+      (err: Error) => {
+        unsubscribeRef.current?.();
+        unsubscribeRef.current = null;
+        setLoginState((prev) => prev.phase === "success" ? prev : { phase: "error", message: err.message || "Connection lost" });
+      },
+    );
+    unsubscribeRef.current = unsubscribe;
   }, [provider.id, onRefresh]);
 
   const handleLogout = useCallback(async () => {
@@ -1468,39 +1479,29 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
   }, [provider.id, onRefresh]);
 
   const submitCode = useCallback(async (token: string, code: string) => {
-    if (!code.trim()) return;
+    const trimmed = code.trim();
+    if (!trimmed) return;
+    if (submittedTokensRef.current.has(token)) return;
+    submittedTokensRef.current.add(token);
     setLoginState({ phase: "progress", message: "Verifying…" });
     try {
-      const res = await fetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, code: code.trim() }),
-      });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({})) as { error?: string };
-        setLoginState({ phase: "error", message: d.error ?? `Server error ${res.status}` });
-        return;
-      }
+      await submitOAuthLoginCode(provider.id, token, trimmed);
       setInputValue("");
-      // Success path: SSE stream will emit "success" and update state
+      // Success path: stream will emit "success" and update state
     } catch (e) {
+      submittedTokensRef.current.delete(token);
       setLoginState({ phase: "error", message: e instanceof Error ? e.message : "Network error" });
     }
   }, [provider.id]);
 
   const submitSelection = useCallback(async (token: string, value: string) => {
+    if (submittedTokensRef.current.has(token)) return;
+    submittedTokensRef.current.add(token);
     setLoginState({ phase: "progress", message: "Continuing…" });
     try {
-      const res = await fetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, code: value }),
-      });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({})) as { error?: string };
-        setLoginState({ phase: "error", message: d.error ?? `Server error ${res.status}` });
-      }
+      await submitOAuthLoginCode(provider.id, token, value);
     } catch (e) {
+      submittedTokensRef.current.delete(token);
       setLoginState({ phase: "error", message: e instanceof Error ? e.message : "Network error" });
     }
   }, [provider.id]);
@@ -1525,7 +1526,11 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
           {isWorking ? (
             <ConfigButton
               size="small"
-              onClick={() => { eventSourceRef.current?.close(); setLoginState({ phase: "idle" }); }}
+              onClick={() => {
+                unsubscribeRef.current?.();
+                unsubscribeRef.current = null;
+                setLoginState({ phase: "idle" });
+              }}
             >
               {t("i18n.cancel")}
             </ConfigButton>

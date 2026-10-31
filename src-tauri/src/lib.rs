@@ -1400,6 +1400,7 @@ pub fn run() {
             pi_ipc::pi_ipc_subscribe_events,
             pi_ipc::pi_ipc_subscribe_running,
             pi_ipc::pi_ipc_subscribe_terminal,
+            provider_auth::pi_ipc_login_stream,
             get_desktop_api_token,
             open_external_url,
             open_path,
