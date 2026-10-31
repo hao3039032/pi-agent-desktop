@@ -144,6 +144,7 @@ pub struct UiRequest {
 struct UiHandlerEntry {
     tx: std::sync::mpsc::Sender<UiRequest>,
     bypass: Option<BypassFn>,
+    notify_inline: Option<Arc<dyn Fn(&Value) + Send + Sync>>,
 }
 
 struct PendingEntry {
@@ -368,10 +369,20 @@ impl PiRpcClient {
     ) -> UiSubscription {
         {
             let mut inner = self.shared.inner.lock().unwrap();
-            inner.ui_handlers.insert(method.to_string(), UiHandlerEntry { tx, bypass });
+            inner.ui_handlers.insert(method.to_string(), UiHandlerEntry { tx, bypass, notify_inline: None });
             flush_buffered_ui(&self.shared, &mut inner);
         }
         UiSubscription { shared: Arc::clone(&self.shared), method: method.to_string() }
+    }
+
+    /// Consume fire-and-forget notifications inline without an unbounded queue.
+    /// The callback must be fast and must not call back into this client.
+    pub fn on_notify_inline(&self, callback: Arc<dyn Fn(&Value) + Send + Sync>) -> UiSubscription {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut inner = self.shared.inner.lock().unwrap();
+        inner.ui_handlers.insert("notify".to_string(), UiHandlerEntry { tx, bypass: None, notify_inline: Some(callback) });
+        flush_buffered_ui(&self.shared, &mut inner);
+        UiSubscription { shared: Arc::clone(&self.shared), method: "notify".to_string() }
     }
 
     /// How many child-UI requests are waiting for a handler (diagnostics and
@@ -859,6 +870,10 @@ fn deliver_ui_request(
     method: &str,
     registration: &UiHandlerEntry,
 ) {
+    if let Some(callback) = &registration.notify_inline {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(record)));
+        return;
+    }
     let request =
         UiRequest { id: id.to_string(), method: method.to_string(), record: record.clone() };
     if registration.tx.send(request).is_err() {

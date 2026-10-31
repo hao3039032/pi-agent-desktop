@@ -48,17 +48,46 @@ pub struct ManagementSpawnConfig {
 }
 
 /// One running management child.
+#[derive(Clone)]
 pub struct ManagementInstance {
     pub scope: String,
     client: Arc<PiRpcClient>,
-    state: Mutex<InstanceState>,
+    state: Arc<Mutex<InstanceState>>,
     /// The management protocol nonce this child was spawned with. The HOST
     /// generates it at spawn (never accepted from the caller): a caller-
     /// supplied nonce — or worse, an empty one — would let a forged envelope
     /// from anywhere in the child bind to the management protocol.
     nonce: String,
-    pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>>,
-    _notify_subscription: pi_host::client::UiSubscription,
+    pending: Arc<Mutex<HashMap<String, PendingTask>>>,
+    _notify_subscription: Arc<pi_host::client::UiSubscription>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskKind { ReadOnly, Mutation }
+
+/// Host-internal snapshot. Operations must return frontend-safe results and
+/// progress: this generic transport cannot infer which arbitrary values are secrets.
+#[derive(Clone, Debug)]
+pub struct TaskSnapshot {
+    pub status: TaskStatus,
+    pub progress: Option<Value>,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub cancel_requested: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskStatus { Running, Unknown, Succeeded, Failed, Cancelled }
+
+struct TaskRecord {
+    snapshot: TaskSnapshot,
+    finished_at: Option<Instant>,
+}
+
+struct PendingTask {
+    tx: std::sync::mpsc::Sender<Value>,
+    task: Arc<Mutex<TaskRecord>>,
+    nonce: String,
 }
 
 struct InstanceState {
@@ -66,13 +95,14 @@ struct InstanceState {
     last_used: Instant,
     active: usize,
     closing: bool,
+    tasks: HashMap<String, Arc<Mutex<TaskRecord>>>,
 }
 
-struct Activity<'a>(&'a ManagementInstance);
+struct Activity(Arc<Mutex<InstanceState>>);
 
-impl Drop for Activity<'_> {
+impl Drop for Activity {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.0.lock().unwrap();
         state.active -= 1;
         state.last_used = Instant::now();
         state.lease_until = state.last_used + IDLE_RECYCLE;
@@ -90,57 +120,189 @@ impl ManagementInstance {
     /// The general form: send `/pi-web:mgmt <rid> <b64url>` and await the
     /// PI_WEB_MGMT_V1 envelope with matching rid and the spawning nonce.
     pub fn management_call(&self, op: &str, args: Value, timeout: Duration) -> Result<Value, String> {
+        let handle = self.start_task(op, args, Duration::from_secs(600), TaskKind::Mutation)?;
+        let until = Instant::now() + timeout;
+        loop {
+            let snapshot = self.task_snapshot(&handle)?;
+            match snapshot.status {
+                TaskStatus::Succeeded => return Ok(snapshot.result.unwrap_or(Value::Null)),
+                TaskStatus::Failed | TaskStatus::Cancelled => return Err(snapshot.error.unwrap_or_else(|| "management operation failed".into())),
+                TaskStatus::Unknown => return Err(snapshot.error.unwrap_or_else(|| "management op outcome unknown".into())),
+                TaskStatus::Running => {}
+            }
+            if Instant::now() >= until {
+                if let Some(task) = self.state.lock().unwrap().tasks.get(&handle) {
+                    let mut task = task.lock().unwrap();
+                    if task.snapshot.status == TaskStatus::Running { task.snapshot.status = TaskStatus::Unknown; }
+                }
+                return Err(format!("management op timed out; outcome unknown (task {handle})"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn management_call_wait(&self, op: &str, args: Value, request_id: &str, task: Arc<Mutex<TaskRecord>>) -> Result<Value, String> {
         use std::sync::mpsc;
-        let _activity = self.admit()?;
         let nonce = self.nonce.clone();
-        let request_id = format!("call-{}", uuid::Uuid::new_v4());
         let payload = json!({ "op": op, "args": args, "nonce": nonce });
         let token = base64_url_no_pad(&payload.to_string());
 
         let (envelope_tx, envelope_rx) = mpsc::channel::<Value>();
-        self.pending.lock().unwrap().insert(request_id.clone(), envelope_tx);
+        self.pending.lock().unwrap().insert(request_id.to_string(), PendingTask { tx: envelope_tx, task: Arc::clone(&task), nonce: nonce.clone() });
 
         let result = (|| -> Result<Value, String> {
             let ack = self
                 .client
-                .command("prompt", json!({ "message": format!("/pi-web:mgmt {request_id} {token}") }), Some(timeout + Duration::from_secs(10)))
+                .command("prompt", json!({ "message": format!("/pi-web:mgmt {request_id} {token}") }), None)
                 .map_err(|error| format!("management prompt failed: {error}"))?;
             if ack.get("disposition").and_then(Value::as_str) != Some("handled") {
                 return Err("the management command was not handled (extension missing?)".to_string());
             }
-            match envelope_rx.recv_timeout(timeout) {
+            if task.lock().unwrap().snapshot.cancel_requested { let _ = self.send_cancel(request_id); }
+            loop {
+              match envelope_rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(envelope) => {
                     if envelope.get("nonce").and_then(Value::as_str) != Some(nonce.as_str()) {
                         return Err("the management envelope carried the wrong nonce".to_string());
                     }
                     if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
-                        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+                        return Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
                     } else {
                         let code = envelope.get("code").and_then(Value::as_str).unwrap_or("op_failed");
                         let error = envelope.get("error").and_then(Value::as_str).unwrap_or("unknown error");
-                        Err(format!("[{code}] {error}"))
+                        return Err(format!("[{code}] {error}"))
                     }
                 }
-                Err(_) => Err(format!("management op {op} timed out")),
+                Err(mpsc::RecvTimeoutError::Timeout) if !self.client.has_exited() => continue,
+                Err(_) => return Err(format!("management op {op} outcome unknown: child exited")),
+              }
             }
         })();
-        self.pending.lock().unwrap().remove(&request_id);
+        self.pending.lock().unwrap().remove(request_id);
         self.touch();
         result
     }
 
-    fn admit(&self) -> Result<Activity<'_>, String> {
+    /// Start a task. `kind` and `deadline` are trusted host policy, never frontend input.
+    /// Operations must redact secrets before reporting a result or progress.
+    pub fn start_task(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind) -> Result<String, String> {
+        if deadline.is_zero() || deadline > Duration::from_secs(600) { return Err("invalid management task deadline".into()); }
+        if kind == TaskKind::ReadOnly && !matches!(op,
+            "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
+            "session.readHeader" | "session.readEntries" | "session.readContext" | "session.readView" |
+            "session.projectSnapshot" | "chat.systemPrompt" | "session.chatOnlyPrompt" |
+            "models.list" | "models.enabledGet" | "modelsConfig.get") {
+            return Err("operation is not approved as read-only".into());
+        }
+        let handle = format!("task-{}", uuid::Uuid::new_v4());
+        let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
+            status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
+        }, finished_at: None }));
+        let activity = {
+            let mut state = self.state.lock().unwrap();
+            state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
+            if state.closing || self.client.has_exited() { return Err("management instance is closing".into()); }
+            if state.tasks.len() >= 128 { return Err("management task capacity reached".into()); }
+            if kind == TaskKind::Mutation && state.tasks.values().any(|task| task.lock().unwrap().snapshot.status == TaskStatus::Unknown) {
+                return Err("management scope has an unknown outcome".into());
+            }
+            state.active += 1;
+            state.tasks.insert(handle.clone(), Arc::clone(&task));
+            Activity(Arc::clone(&self.state))
+        };
+        let instance = self.clone();
+        let id = handle.clone();
+        let operation = op.to_string();
+        let worker_task = Arc::clone(&task);
+        if let Err(error) = std::thread::Builder::new().name("mgmt-task".into()).spawn(move || {
+            let result = instance.management_call_wait(&operation, args, &id, Arc::clone(&worker_task));
+            let mut record = worker_task.lock().unwrap();
+            match result {
+                Ok(value) => { record.snapshot.status = TaskStatus::Succeeded; record.snapshot.result = Some(value); record.finished_at = Some(Instant::now()); }
+                Err(error) if error.starts_with('[') => {
+                    record.snapshot.status = if error.starts_with("[cancelled]") { TaskStatus::Cancelled } else { TaskStatus::Failed };
+                    record.snapshot.error = Some(error); record.finished_at = Some(Instant::now());
+                }
+                Err(error) => { record.snapshot.status = TaskStatus::Unknown; record.snapshot.error = Some(error); }
+            }
+            drop(record);
+            drop(activity);
+        }) {
+            self.state.lock().unwrap().tasks.remove(&handle);
+            return Err(format!("management task failed to start: {error}"));
+        }
+        let instance = self.clone();
+        let id = handle.clone();
+        let deadline_task = Arc::clone(&task);
+        if std::thread::Builder::new().name("mgmt-deadline".into()).spawn(move || {
+            let task = deadline_task;
+            let until = Instant::now() + deadline;
+            loop {
+                if task.lock().unwrap().finished_at.is_some() { return; }
+                let Some(left) = until.checked_duration_since(Instant::now()) else { break };
+                std::thread::sleep(left.min(Duration::from_millis(100)));
+            }
+            let should_cancel = {
+                let mut record = task.lock().unwrap();
+                if record.finished_at.is_some() { false } else { record.snapshot.status = TaskStatus::Unknown; true }
+            };
+            if should_cancel { let _ = instance.cancel_task(&id); }
+        }).is_err() {
+            let mut record = task.lock().unwrap();
+            if record.finished_at.is_none() {
+                record.snapshot.status = TaskStatus::Unknown;
+                record.snapshot.error = Some("management deadline monitor failed".into());
+            }
+            drop(record);
+            let _ = self.cancel_task(&handle);
+        }
+        Ok(handle)
+    }
+
+    pub fn task_snapshot(&self, handle: &str) -> Result<TaskSnapshot, String> {
+        let state = self.state.lock().unwrap();
+        let task = state.tasks.get(handle).ok_or("management task not found")?;
+        let snapshot = task.lock().unwrap().snapshot.clone();
+        Ok(snapshot)
+    }
+
+    pub fn cancel_task(&self, handle: &str) -> Result<(), String> {
+        {
+            let state = self.state.lock().unwrap();
+            let task = state.tasks.get(handle).ok_or("management task not found")?;
+            let mut task = task.lock().unwrap();
+            if task.finished_at.is_some() { return Err("management task is terminal".into()); }
+            if task.snapshot.cancel_requested { return Ok(()); }
+            task.snapshot.cancel_requested = true;
+        }
+        self.send_cancel(handle)
+    }
+
+    fn send_cancel(&self, handle: &str) -> Result<(), String> {
+        let client = Arc::clone(&self.client);
+        let token = base64_url_no_pad(&json!({"op": "__cancel", "args": {"rid": handle}, "nonce": self.nonce}).to_string());
+        let request_id = format!("cancel-{}", uuid::Uuid::new_v4());
+        std::thread::Builder::new().name("mgmt-cancel".into()).spawn(move || {
+            let _ = client.command("prompt", json!({"message": format!("/pi-web:mgmt {request_id} {token}")}), Some(Duration::from_secs(10)));
+        }).map(|_| ()).map_err(|error| format!("management cancel request could not start: {error}"))
+    }
+
+    fn admit(&self) -> Result<Activity, String> {
         let mut state = self.state.lock().unwrap();
         if state.closing || self.client.has_exited() {
             return Err("management instance is closing".into());
         }
+        if state.active >= 128 {
+            return Err("management instance has too many active operations".into());
+        }
         state.active += 1;
-        Ok(Activity(self))
+        Ok(Activity(Arc::clone(&self.state)))
     }
 
     fn retire_if_expired(&self) -> bool {
         let mut state = self.state.lock().unwrap();
-        if self.client.has_exited() || (!state.closing && state.active == 0 && state.lease_until <= Instant::now()) {
+        state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
+        if state.tasks.is_empty() && (self.client.has_exited() || (!state.closing && state.active == 0 && state.lease_until <= Instant::now())) {
             state.closing = true;
             true
         } else {
@@ -157,7 +319,7 @@ impl ManagementInstance {
     /// Whether this instance should be recycled now.
     pub fn is_expired(&self) -> bool {
         let state = self.state.lock().unwrap();
-        self.client.has_exited() || state.closing || (state.active == 0 && state.lease_until <= Instant::now())
+        state.tasks.is_empty() && (self.client.has_exited() || state.closing || (state.active == 0 && state.lease_until <= Instant::now()))
     }
 
     /// Provider/model enumeration: the child's own registry, which includes
@@ -165,6 +327,7 @@ impl ManagementInstance {
     pub fn available_models(
         &self,
     ) -> Result<Value, pi_host::PiRpcError> {
+        let _activity = self.admit().map_err(|error| pi_host::PiRpcError::new(pi_host::ErrorKind::Closing, error))?;
         let result = self.client.command(
             "get_available_models",
             json!({}),
@@ -181,6 +344,7 @@ impl ManagementInstance {
         message: &str,
         timeout: Duration,
     ) -> Result<Value, pi_host::PiRpcError> {
+        let _activity = self.admit().map_err(|error| pi_host::PiRpcError::new(pi_host::ErrorKind::Closing, error))?;
         let result = self.client.command("prompt", json!({ "message": message }), Some(timeout))?;
         self.touch();
         Ok(result)
@@ -188,7 +352,14 @@ impl ManagementInstance {
 
     /// Orderly shutdown.
     pub fn shutdown(&self, grace: Duration) -> Option<i32> {
-        self.state.lock().unwrap().closing = true;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.closing = true;
+            for task in state.tasks.values() {
+                let mut task = task.lock().unwrap();
+                if task.finished_at.is_none() { task.snapshot.status = TaskStatus::Unknown; }
+            }
+        }
         self.client.close(grace)
     }
 
@@ -316,7 +487,14 @@ impl ManagementHost {
         let instances: Vec<Arc<ManagementInstance>> = {
             let mut instances = self.instances.lock().unwrap();
             self.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
-            for instance in instances.values() { instance.state.lock().unwrap().closing = true; }
+            for instance in instances.values() {
+                let mut state = instance.state.lock().unwrap();
+                state.closing = true;
+                for task in state.tasks.values() {
+                    let mut task = task.lock().unwrap();
+                    if task.finished_at.is_none() { task.snapshot.status = TaskStatus::Unknown; }
+                }
+            }
             instances.drain().map(|(_, value)| value).collect()
         };
         for instance in instances {
@@ -326,15 +504,27 @@ impl ManagementHost {
 }
 
 fn route_envelope(
-    pending: &Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
+    pending: &Mutex<HashMap<String, PendingTask>>,
     record: &Value,
 ) {
-    let Some(body) = record.get("message").and_then(Value::as_str)
-        .and_then(|message| message.strip_prefix("PI_WEB_MGMT_V1 ")) else { return };
+    let Some(message) = record.get("message").and_then(Value::as_str) else { return };
+    let (progress, body) = if let Some(body) = message.strip_prefix("PI_WEB_MGMT_PROGRESS_V1 ") {
+        (true, body)
+    } else if let Some(body) = message.strip_prefix("PI_WEB_MGMT_V1 ") {
+        (false, body)
+    } else { return };
+    if progress && body.len() > 4096 { return; }
     let Ok(envelope) = serde_json::from_str::<Value>(body) else { return };
     let Some(rid) = envelope.get("rid").and_then(Value::as_str) else { return };
-    if let Some(sender) = pending.lock().unwrap().get(rid) {
-        let _ = sender.send(envelope.clone());
+    let mut pending = pending.lock().unwrap();
+    if progress {
+        if let Some(entry) = pending.get(rid) {
+            if envelope.get("nonce").and_then(Value::as_str) == Some(entry.nonce.as_str()) {
+                entry.task.lock().unwrap().snapshot.progress = envelope.get("progress").cloned();
+            }
+        }
+    } else if let Some(entry) = pending.remove(rid) {
+        let _ = entry.tx.send(envelope.clone());
     }
 }
 
@@ -407,29 +597,21 @@ fn spawn_management(
     )
     .map_err(|error| format!("management instance failed to start: {error}"))?;
     let pending = Arc::new(Mutex::new(HashMap::new()));
-    let (notify_tx, notify_rx) = std::sync::mpsc::channel::<pi_host::client::UiRequest>();
-    let notify_subscription = client.on_ui("notify", notify_tx, None);
     let router_pending = Arc::clone(&pending);
-    std::thread::Builder::new()
-        .name("mgmt-notify-router".into())
-        .spawn(move || {
-            while let Ok(request) = notify_rx.recv() {
-                route_envelope(&router_pending, &request.record);
-            }
-        })
-        .map_err(|error| format!("envelope router failed: {error}"))?;
+    let notify_subscription = client.on_notify_inline(Arc::new(move |record| route_envelope(&router_pending, record)));
     Ok(Arc::new(ManagementInstance {
         scope: scope.to_string(),
         nonce,
         client,
         pending,
-        _notify_subscription: notify_subscription,
-        state: Mutex::new(InstanceState {
+        _notify_subscription: Arc::new(notify_subscription),
+        state: Arc::new(Mutex::new(InstanceState {
             lease_until: Instant::now() + IDLE_RECYCLE,
             last_used: Instant::now(),
             active: 0,
             closing: false,
-        }),
+            tasks: HashMap::new(),
+        })),
     }))
 }
 
@@ -569,8 +751,15 @@ mod tests {
         let pending = Mutex::new(HashMap::new());
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        pending.lock().unwrap().insert("a".to_string(), a_tx);
-        pending.lock().unwrap().insert("b".to_string(), b_tx);
+        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None }));
+        let task_a = task();
+        pending.lock().unwrap().insert("a".to_string(), PendingTask { tx: a_tx, task: Arc::clone(&task_a), nonce: "good".into() });
+        pending.lock().unwrap().insert("b".to_string(), PendingTask { tx: b_tx, task: task(), nonce: "good".into() });
+        for i in 0..1000 {
+            route_envelope(&pending, &json!({"message": format!("PI_WEB_MGMT_PROGRESS_V1 {{\"rid\":\"a\",\"nonce\":\"good\",\"progress\":{i}}}")}));
+        }
+        route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_PROGRESS_V1 {\"rid\":\"a\",\"nonce\":\"bad\",\"progress\":0}"}));
+        assert_eq!(task_a.lock().unwrap().snapshot.progress, Some(json!(999)));
         route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"b\",\"nonce\":\"bad\"}"}));
         route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"a\",\"nonce\":\"good\"}"}));
         assert_eq!(a_rx.try_recv().unwrap()["nonce"], "good");
@@ -754,6 +943,150 @@ export default function managementFixture(pi) {
         assert!(error.contains("invalid_cron"), "{error}");
 
         host.recycle_expired_all_for_tests();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_process_routes_reversed_replies_and_wrong_nonce() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-pi");
+        std::fs::write(&executable, r##"#!/usr/bin/env node
+const readline = require('node:readline');
+const pending = [];
+const emit = value => process.stdout.write(JSON.stringify(value) + '\n');
+readline.createInterface({input: process.stdin}).on('line', line => {
+  const command = JSON.parse(line);
+  if (command.type !== 'prompt') return;
+  const [, rid, token] = command.message.split(' ');
+  const payload = JSON.parse(Buffer.from(token, 'base64url'));
+  emit({type:'response', id:command.id, command:'prompt', success:true, data:{disposition:'handled'}});
+  pending.push([rid, payload.op]);
+  if (pending.length === 2) {
+    for (const [id, op] of pending.reverse()) {
+      const body = {rid:id, nonce:op === 'bad' ? 'wrong' : process.env.PI_WEB_MGMT_NONCE, ok:true, result:op};
+      emit({type:'extension_ui_request', id, method:'notify', message:'PI_WEB_MGMT_V1 ' + JSON.stringify(body)});
+    }
+    pending.length = 0;
+  }
+});
+"##).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = ManagementSpawnConfig { executable: executable.to_string_lossy().into_owned(), agent_dir: Some(dir.path().join("agent")), extensions: vec![], env: vec![] };
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).unwrap();
+        let a = instance.start_task("good", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let b = instance.start_task("bad", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while (instance.task_snapshot(&a).unwrap().status == TaskStatus::Running || instance.task_snapshot(&b).unwrap().status == TaskStatus::Running) && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(instance.task_snapshot(&a).unwrap().result, Some(json!("good")));
+        let bad = instance.task_snapshot(&b).unwrap();
+        assert_eq!(bad.status, TaskStatus::Unknown);
+        assert!(bad.error.unwrap().contains("wrong nonce"));
+        host.shutdown_all(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn real_pi_tasks_progress_cancel_and_unknown_are_isolated() {
+        let Some(executable) = pi_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let fixture = dir.path().join("fixture.mjs");
+        std::fs::write(&fixture, r#"
+export default function(pi) {
+ const tasks = new Map();
+ pi.registerCommand('pi-web:mgmt', { handler: async (args, ctx) => {
+   const [rid, token] = args.split(' ');
+   const payload = JSON.parse(Buffer.from(token, 'base64url').toString());
+   const nonce = process.env.PI_WEB_MGMT_NONCE;
+   if (payload.op === '__cancel') { tasks.get(payload.args.rid)?.abort(); return; }
+   const controller = new AbortController(); tasks.set(rid, controller);
+   void (async () => {
+     for (let i=0; i<1000 && payload.op === 'slow'; i++) ctx.ui.notify('PI_WEB_MGMT_PROGRESS_V1 ' + JSON.stringify({rid, nonce, progress: {i}}), 'info');
+     if (payload.op !== 'sys.capabilities') await new Promise(resolve => setTimeout(resolve, 500));
+     const cancelled = controller.signal.aborted && payload.op !== 'ignore';
+     ctx.ui.notify('PI_WEB_MGMT_V1 ' + JSON.stringify({rid, nonce, ok: !cancelled, ...(cancelled ? {code:'cancelled', error:'cancelled'} : {result: payload.op})}), 'info');
+     tasks.delete(rid);
+   })();
+ }});
+}
+"#).unwrap();
+        let config = ManagementSpawnConfig { executable, agent_dir: Some(agent_dir), extensions: vec![fixture], env: vec![] };
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).unwrap();
+        let a = instance.start_task("slow", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let b = instance.start_task("slow", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let read = instance.start_task("sys.capabilities", json!({}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while instance.task_snapshot(&a).unwrap().progress.is_none() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert!(instance.task_snapshot(&a).unwrap().progress.is_some());
+        instance.cancel_task(&a).unwrap();
+        while [ &a, &b, &read ].iter().any(|id| instance.task_snapshot(id).unwrap().status == TaskStatus::Running) && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(instance.task_snapshot(&a).unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(instance.task_snapshot(&b).unwrap().status, TaskStatus::Succeeded);
+        assert_eq!(instance.task_snapshot(&read).unwrap().status, TaskStatus::Succeeded);
+        let unknown = instance.start_task("ignore", json!({}), Duration::from_millis(30), TaskKind::Mutation).unwrap();
+        while instance.task_snapshot(&unknown).unwrap().status == TaskStatus::Running && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(instance.task_snapshot(&unknown).unwrap().status, TaskStatus::Unknown);
+        while !instance.task_snapshot(&unknown).unwrap().cancel_requested && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert!(instance.task_snapshot(&unknown).unwrap().cancel_requested);
+        assert!(instance.start_task("slow", json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+        assert!(instance.start_task("slow", json!({}), Duration::from_secs(1), TaskKind::ReadOnly).is_err());
+        instance.expire_for_tests();
+        assert!(host.recycle_expired().is_empty());
+        while instance.task_snapshot(&unknown).unwrap().status == TaskStatus::Unknown && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(instance.task_snapshot(&unknown).unwrap().status, TaskStatus::Succeeded);
+        let exited = instance.start_task("ignore", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        instance.client.kill();
+        while instance.task_snapshot(&exited).unwrap().status == TaskStatus::Running && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        assert_eq!(instance.task_snapshot(&exited).unwrap().status, TaskStatus::Unknown);
+        assert!(host.recycle_expired().is_empty());
+        assert!(Arc::ptr_eq(&instance, &host.instance("global", &config).unwrap()));
+        host.shutdown_all(Duration::from_secs(1));
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).unwrap();
+        let running = instance.start_task("ignore", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        host.shutdown_all(Duration::from_millis(100));
+        assert_eq!(instance.task_snapshot(&running).unwrap().status, TaskStatus::Unknown);
+        assert!(instance.start_task("sys.capabilities", json!({}), Duration::from_secs(1), TaskKind::ReadOnly).is_err());
+        assert!(host.instance("global", &config).is_err());
+    }
+
+    #[test]
+    fn timed_out_call_keeps_activity_until_terminal() {
+        let Some(executable) = pi_bin() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let fixture = dir.path().join("fixture.mjs");
+        std::fs::write(&fixture, r#"
+export default function(pi) {
+  pi.registerCommand('pi-web:mgmt', { handler: async (args, ctx) => {
+    const [rid] = args.split(' ');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    ctx.ui.notify('PI_WEB_MGMT_V1 ' + JSON.stringify({rid, nonce: process.env.PI_WEB_MGMT_NONCE, ok: true, result: 1}), 'info');
+  }});
+}
+"#).unwrap();
+        let config = ManagementSpawnConfig { executable, agent_dir: Some(agent_dir), extensions: vec![fixture], env: vec![] };
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).unwrap();
+        let error = instance.management_call("test", json!({}), Duration::from_millis(20)).unwrap_err();
+        assert!(error.contains("outcome unknown"));
+        instance.expire_for_tests();
+        assert!(host.recycle_expired().is_empty());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while instance.state.lock().unwrap().active != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(instance.state.lock().unwrap().active, 0);
+        for task in instance.state.lock().unwrap().tasks.values() {
+            task.lock().unwrap().finished_at = Some(Instant::now() - Duration::from_secs(601));
+        }
+        instance.expire_for_tests();
+        assert_eq!(host.recycle_expired(), vec!["global"]);
+        host.shutdown_all(Duration::from_secs(1));
     }
 
     #[test]
