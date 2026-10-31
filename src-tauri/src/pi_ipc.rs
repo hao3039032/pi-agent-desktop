@@ -3980,6 +3980,19 @@ mod tests {
         let agent = dir.path().join("agent");
         let project = dir.path().join("project");
         std::fs::create_dir_all(&agent).unwrap(); std::fs::create_dir_all(&project).unwrap();
+        let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_endpoint = stalled.local_addr().unwrap();
+        stalled.set_nonblocking(true).unwrap();
+        let stall_server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match stalled.accept() {
+                    Ok((stream, _)) => { std::thread::sleep(Duration::from_secs(2)); drop(stream); return; }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+                    Err(_) => return,
+                }
+            }
+        });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -4016,7 +4029,7 @@ mod tests {
                 }
             }
         });
-        std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{"baseUrl":format!("http://{endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Test","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}).to_string()).unwrap();
+        std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{"baseUrl":format!("http://{endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Test","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]},"stall":{"baseUrl":format!("http://{stalled_endpoint}"),"apiKey":"fixture-only","api":"openai-completions","models":[{"id":"test","name":"Stall","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}).to_string()).unwrap();
         std::fs::write(agent.join("settings.json"), r#"{"defaultProvider":"fixture","defaultModel":"test"}"#).unwrap();
         let state = state();
         struct Shutdown<'a>(&'a IpcHostState);
@@ -4052,6 +4065,14 @@ mod tests {
         assert_eq!(finished.status, "succeeded", "{finished:?}");
         assert!(!finished.counts_as_failure);
         assert!(finished.error_code.is_none());
+        let stalled_session = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"], "provider": "stall", "modelId": "test" })).unwrap();
+        let stalled_session = state.registry.get(stalled_session["sessionId"].as_str().unwrap()).unwrap();
+        let timed_out = crate::scheduled_runner::run_session(&stalled_session,
+            json!({ "version": 1, "taskId": "12345678-1234-1234-1234-123456789abc", "runId": "timeout", "taskName": "fixture", "trigger": "manual" }),
+            "stalled fixture", Duration::from_millis(250), |_| Ok(()), || {});
+        assert_eq!(timed_out.status, "aborted", "{timed_out:?}");
+        assert_eq!(timed_out.error_code, Some("time-limit"));
+        stall_server.join().unwrap();
         let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
         let task_id = "12345678-1234-1234-1234-123456789abc";
         repo.mutate(|tasks| { tasks.push(json!({ "id": task_id, "name": "run now fixture", "prompt": "second fixture prompt", "cwd": project, "enabled": true, "schedule": {"kind":"manual"}, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 })); Ok(()) }).unwrap();
