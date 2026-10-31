@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, readFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -39,6 +39,21 @@ test("distro configuration stays redacted through the real management child", { 
       }
       throw new Error(`no response for ${op}`);
     }
+    const resources = join(root, "fixture-resources");
+    await mkdir(join(resources, "pi-seed"), { recursive: true });
+    await writeFile(join(resources, "pi-seed", "manifest.json"), JSON.stringify({ distro: "fixture", revision: 1, seedVersion: "fixture-1", packages: [] }));
+    const seeded = await call("distro.seed", { resourcesDir: resources });
+    assert.equal(seeded.ok, true, JSON.stringify(seeded));
+    const settingsPath = join(agent, "settings.json");
+    const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+    assert.ok(Array.isArray(settings.defaultTools));
+    delete settings.defaultTools;
+    await writeFile(settingsPath, JSON.stringify(settings));
+    const repeated = await call("distro.seed", { resourcesDir: resources });
+    assert.equal(repeated.ok, true, JSON.stringify(repeated));
+    assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).defaultTools, undefined);
+    const refusedSeed = await call("distro.seed", { resourcesDir: join(root, "missing") });
+    assert.equal(refusedSeed.ok, false);
     const initial = await call("distro.status");
     assert.equal(initial.ok, true, JSON.stringify(initial));
     assert.equal(initial.result.hasApiKey, false);
