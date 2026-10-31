@@ -712,6 +712,37 @@ impl SessionRegistry {
         operation(session.as_ref()).map_err(SessionWriterError::Operation)
     }
 
+    /// Lock a set of writers in lexical id order, then acquire their activity
+    /// guards in the same order. The closure must not re-enter any held gate.
+    /// This is for bounded local multi-session mutations, not network waits.
+    pub fn with_idle_session_writers<T, E>(
+        &self, ids: &[String], operation: impl FnOnce(&[Option<Arc<Session>>]) -> Result<T, E>,
+    ) -> Result<T, SessionWriterError<E>> {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids.dedup();
+        let locks: Vec<_> = ids.iter().map(|id| self.start_lock_for(id)).collect();
+        let _starts: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+        let sessions: Vec<_> = {
+            let registry = self.sessions.lock().unwrap();
+            ids.iter().map(|id| registry.get(id).cloned()).collect()
+        };
+        let mut activities = Vec::with_capacity(sessions.len());
+        for session in &sessions {
+            activities.push(match session {
+                Some(session) => Some(session.try_branch_activity().map_err(SessionWriterError::Busy)?),
+                None => None,
+            });
+        }
+        for (id, session) in ids.iter().zip(&sessions) {
+            if self.composer_outbox_for(id).has_pending_or_in_flight()
+                || session.as_ref().is_some_and(|session| session.run_state().is_running()) {
+                return Err(SessionWriterError::Busy("session is running or has pending messages"));
+            }
+        }
+        operation(&sessions).map_err(SessionWriterError::Operation)
+    }
+
     /// Stop an idle child without force-killing it, prove its actual exit,
     /// then run an offline writer while the same id and activity gates remain
     /// held. A timeout leaves the child registered and fails closed. The
@@ -1847,6 +1878,16 @@ mod dispatch_tests {
             writer.join().unwrap().unwrap();
             assert!(start.join().unwrap().err().unwrap().to_string().contains("session file no longer exists"));
         });
+    }
+
+    #[test]
+    fn ordered_writers_reject_any_session_with_a_pending_queue() {
+        let registry = SessionRegistry::new();
+        let ids = vec!["b".to_string(), "a".to_string(), "b".to_string()];
+        let queued = registry.composer_outbox_for("b").enqueue("pending", None).unwrap();
+        assert!(matches!(registry.with_idle_session_writers(&ids, |_| Ok::<_, ()>(())), Err(SessionWriterError::Busy(_))));
+        registry.composer_outbox_for("b").take(&queued.id);
+        assert_eq!(registry.with_idle_session_writers(&ids, |sessions| Ok::<_, ()>(sessions.len())).unwrap(), 2);
     }
 
     #[test]
