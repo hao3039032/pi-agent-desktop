@@ -102,6 +102,12 @@
       ],
       "@/lib/terminal-client": [
         "./static-frontend/src/data/terminal-client.ts"
+      ],
+      "@/lib/plugins-client": [
+        "./static-frontend/src/data/plugins-client.ts"
+      ],
+      "@/lib/skills-client": [
+        "./static-frontend/src/data/skills-client.ts"
       ]
     }
   },
