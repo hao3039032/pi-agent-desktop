@@ -19,7 +19,8 @@ pub fn acquire<F: Fn(u32) -> bool>(agent_dir: &Path, pid: u32, now_ms: i64, aliv
     }
     let now = crate::store::ms_to_iso(now_ms);
     let started = current.as_ref().filter(|_| previous_pid == Some(pid as u64))
-        .and_then(|v| v.get("startedAt")).and_then(Value::as_str).unwrap_or(&now);
+        .and_then(|v| v.get("startedAt").or_else(|| v.get("heartbeatAt")))
+        .and_then(Value::as_str).unwrap_or(&now);
     let content = format!("{}\n", json!({"pid": pid, "startedAt": started, "heartbeatAt": now}));
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);

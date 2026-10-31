@@ -8,7 +8,6 @@
 
 use base64::Engine;
 use resource_protocol::{ResourceRegistry, ResourceResponse};
-use task_scheduler::TaskStore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -1452,26 +1451,21 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
+        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" => {
+            match crate::scheduler_host::dispatch(state, &op, &args) {
+                Ok(data) => protocol_ok(&id, data),
+                Err(error) => {
+                    let mut body = json!({ "code": error.code, "message": error.message, "retryable": false });
+                    if let Some(key) = error.key { body["reason"] = json!(key); }
+                    if let Some(params) = error.params { body["details"] = json!({ "params": params }); }
+                    protocol_error_value(&id, body)
+                }
+            }
+        }
         "tasks.previewCron" => {
             match management_call(state, "tasks.previewCron", args.clone()) {
                 Ok(preview) => protocol_ok(&id, preview),
                 Err(error) => protocol_error(&id, &error.0, &error.1),
-            }
-        }
-        "tasks.list" => {
-            let agent_dir = state
-                .task_agent_dir
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(default_agent_dir);
-            let store = TaskStore::new(agent_dir);
-            match store.read_tasks() {
-                Ok(tasks) => protocol_ok(
-                    &id,
-                    json!({ "tasks": tasks.values().map(|(_, raw)| raw).collect::<Vec<_>>() }),
-                ),
-                Err(error) => protocol_error(&id, "io", &error),
             }
         }
         // Preview resources (crates/resource-protocol): grants are HOST-side
@@ -1739,7 +1733,7 @@ pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
 /// One management-op call: the instance is per-scope on demand (60 s idle
 /// recycle), and every failure is (code, message) — never a fallback that
 /// would present a disk tail as a live view or an empty context as success.
-fn management_call(
+pub(crate) fn management_call(
     state: &IpcHostState,
     op: &str,
     args: Value,
@@ -3910,20 +3904,78 @@ mod tests {
         std::fs::write(
             dir.path().join("scheduled-tasks.json"),
             serde_json::json!({ "tasks": [{
-                "id": "t1", "name": "T", "prompt": "go", "cwd": "/w",
-                "schedule": { "kind": "cron", "expr": "*/10 * * * *", "timezone": "UTC" },
+                "id": "12345678-1234-1234-1234-123456789abc", "name": "T", "prompt": "go", "cwd": "/w",
+                "schedule": { "kind": "manual" },
                 "enabled": true,
             }]})
             .to_string(),
         )
         .expect("write");
         let response = send(&state, json!({ "v": 1, "id": "k2", "op": "tasks.list" }));
-        assert_eq!(response["data"]["tasks"][0]["id"], "t1");
+        assert_eq!(response["data"]["tasks"][0]["id"], "12345678-1234-1234-1234-123456789abc");
+        assert_eq!(response["data"]["tasks"][0]["unreadRuns"], 0);
 
         // A corrupt store is an io error, never an empty success.
         std::fs::write(dir.path().join("scheduled-tasks.json"), "{ broken").expect("write");
         let response = send(&state, json!({ "v": 1, "id": "k3", "op": "tasks.list" }));
         assert_eq!(response["error"]["code"], "io");
+    }
+
+    #[test]
+    fn real_pi_scheduled_task_editing_roundtrip() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let managed = dir.path().join("managed");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        let status = std::process::Command::new("node").current_dir(&root)
+            .arg(root.join("scripts/migration/build-management-modules.mjs"))
+            .arg("--out").arg(&managed).status().unwrap();
+        assert!(status.success());
+        let state = state();
+        struct Shutdown<'a>(&'a IpcHostState);
+        impl Drop for Shutdown<'_> { fn drop(&mut self) { self.0.management.shutdown_all(Duration::from_secs(5)); } }
+        let _shutdown = Shutdown(&state);
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent),
+            extensions: vec![root.join("lib/pi-rpc/assets/pi-web-management.mjs")],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string())],
+        });
+        let call = |op: &str, args: Value| send(&state, json!({"v": 1, "id": op, "op": op, "args": args}));
+        let input = json!({ "name": "fixture", "prompt": "hello", "cwd": project,
+            "schedule": { "kind": "manual" } });
+        let created = call("tasks.create", json!({ "input": input }));
+        assert_eq!(created["ok"], true, "{created}");
+        assert_eq!(created["data"]["task"]["toolPreset"], "read-only");
+        let id = created["data"]["task"]["id"].as_str().unwrap();
+        let listed = call("tasks.list", json!({}));
+        assert_eq!(listed["data"]["tasks"].as_array().unwrap().len(), 1);
+        let duplicate = call("tasks.create", json!({ "input": input }));
+        assert_eq!(duplicate["ok"], false, "duplicate names refuse");
+        assert_eq!(duplicate["error"]["reason"], "scheduled.error.nameTaken");
+        let refused = call("tasks.update", json!({ "id": id, "patch": { "toolPreset": "full" } }));
+        assert_eq!(refused["ok"], false, "write access requires acknowledgement");
+        assert_eq!(refused["error"]["reason"], "scheduled.error.writeAck");
+        let updated = call("tasks.update", json!({ "id": id, "patch": { "name": "edited" } }));
+        assert_eq!(updated["data"]["task"]["name"], "edited", "{updated}");
+        let fetched = call("tasks.get", json!({ "id": id }));
+        assert_eq!(fetched["data"]["task"]["name"], "edited", "{fetched}");
+        let run_dir = dir.path().join("agent/scheduled-tasks/runs");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join(format!("{id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(run_dir.join(format!("{id}.archive.jsonl")), "{}\n").unwrap();
+        let removed = call("tasks.delete", json!({ "id": id }));
+        assert_eq!(removed["data"]["success"], true, "{removed}");
+        assert!(!run_dir.join(format!("{id}.jsonl")).exists());
+        assert!(!run_dir.join(format!("{id}.archive.jsonl")).exists());
+        assert_eq!(call("tasks.list", json!({}))["data"]["tasks"].as_array().unwrap().len(), 0);
     }
 
     #[test]

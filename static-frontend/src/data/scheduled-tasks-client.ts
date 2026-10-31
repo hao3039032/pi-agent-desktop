@@ -1,4 +1,4 @@
-import { IpcClient } from "../ipc/client.ts";
+import { IpcClient, IpcFailure } from "../ipc/client.ts";
 import { detectTransport } from "./transport.ts";
 import { refreshScheduledTasks } from "./scheduled-tasks-store.ts";
 import type { CronPreview, TaskInput } from "../../../lib/scheduled-tasks/client";
@@ -24,7 +24,13 @@ export class ScheduledApiError extends Error {
 let client: IpcClient | null = null;
 export function bindScheduledTasksClient(value: IpcClient): void { client = value; }
 function request<T>(op: string, args?: Record<string, unknown>): Promise<T> {
-  return (client ??= new IpcClient(detectTransport().transport)).request<T>(op, args);
+  return (client ??= new IpcClient(detectTransport().transport)).request<T>(op, args).catch((error: unknown) => {
+    if (!(error instanceof IpcFailure)) throw error;
+    const params = error.error.details?.params;
+    throw new ScheduledApiError(error.error.message, error.error.code === "not_found" ? 404 : 400,
+      error.error.code, error.error.reason,
+      params && typeof params === "object" && !Array.isArray(params) ? params as Record<string, string | number> : undefined);
+  });
 }
 async function mutation<T>(op: string, args: Record<string, unknown>): Promise<T> {
   const result = await request<T>(op, args);
@@ -33,6 +39,7 @@ async function mutation<T>(op: string, args: Record<string, unknown>): Promise<T
 }
 export const scheduledApi = {
   list: () => request<{ tasks: ScheduledTaskView[]; scheduler: { owner: boolean; ownerInfo: null } }>("tasks.list"),
+  get: (id: string) => request<{ task: ScheduledTaskView }>("tasks.get", { id }),
   create: (input: TaskInput) => mutation<{ task: ScheduledTaskView }>("tasks.create", { input }),
   update: (id: string, patch: TaskInput) => mutation<{ task: ScheduledTaskView }>("tasks.update", { id, patch }),
   remove: (id: string) => mutation<{ success: true }>("tasks.delete", { id }),

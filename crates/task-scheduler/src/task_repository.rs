@@ -36,7 +36,44 @@ impl TaskRepository {
         Ok(tasks_from(&root))
     }
 
+    pub fn runs(&self, task_id: &str) -> Result<Vec<Value>, String> {
+        if !valid_id(task_id) { return Err("Invalid task id".into()); }
+        let file = self.agent_dir.join("scheduled-tasks/runs").join(format!("{task_id}.jsonl"));
+        let content = match std::fs::read_to_string(file) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        };
+        Ok(content.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|run| run.get("runId").is_some_and(Value::is_string) && run.get("taskId").and_then(Value::as_str) == Some(task_id)).collect())
+    }
+
     pub fn mutate<T>(&self, change: impl FnOnce(&mut Vec<Value>) -> Result<T, String>) -> Result<T, String> {
+        self.mutate_with_after(change, |_| Ok(()))
+    }
+
+    pub fn delete(&self, task_id: &str) -> Result<bool, String> {
+        if !valid_id(task_id) { return Err("Invalid task id".into()); }
+        self.mutate_with_after(|tasks| {
+            let count = tasks.len();
+            tasks.retain(|task| task["id"].as_str() != Some(task_id));
+            Ok(tasks.len() != count)
+        }, |removed| {
+            if *removed {
+                let dir = self.agent_dir.join("scheduled-tasks/runs");
+                for name in [format!("{task_id}.jsonl"), format!("{task_id}.archive.jsonl")] {
+                    match std::fs::remove_file(dir.join(name)) {
+                        Ok(()) => {},
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn mutate_with_after<T>(&self, change: impl FnOnce(&mut Vec<Value>) -> Result<T, String>, after: impl FnOnce(&T) -> Result<(), String>) -> Result<T, String> {
         let _guard = TransactionLock::acquire(&self.agent_dir).map_err(|e| format!("scheduler transaction busy: {e}"))?;
         let mut root = self.read_file()?;
         let mut tasks = tasks_from(&root);
@@ -49,6 +86,7 @@ impl TaskRepository {
         root.insert("tasks".into(), Value::Array(combined));
         let serialized = format!("{}\n", serde_json::to_string_pretty(&Value::Object(root)).map_err(|e| e.to_string())?);
         write_private_atomic(&self.agent_dir.join("scheduled-tasks.json"), serialized.as_bytes())?;
+        after(&result)?;
         Ok(result)
     }
 }
@@ -85,6 +123,29 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typescript_and_rust_store_updates_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        let mut child = std::process::Command::new("node")
+            .arg(root.join("crates/task-scheduler/tests/fixtures/store-contender.mjs"))
+            .arg(&root).arg(dir.path()).spawn().unwrap();
+        let repo = TaskRepository::new(dir.path());
+        for i in 0..20 {
+            repo.mutate(|tasks| {
+                tasks.push(json!({
+                    "id": format!("22222222-2222-2222-2222-{i:012}"), "name": format!("rust-{i}"),
+                    "prompt": "fixture", "cwd": dir.path(), "enabled": true, "schedule": {"kind": "manual"}
+                }));
+                Ok(())
+            }).unwrap();
+        }
+        assert!(child.wait().unwrap().success());
+        let tasks = repo.list().unwrap();
+        assert_eq!(tasks.len(), 40);
+        assert_eq!(tasks.iter().filter(|task| task["name"].as_str().unwrap().starts_with("ts-")).count(), 20);
+    }
+
     #[test]
     fn edits_preserve_foreign_entries_and_refuse_damage() {
         let dir = tempfile::tempdir().unwrap();

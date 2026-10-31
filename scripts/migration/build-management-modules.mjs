@@ -74,7 +74,8 @@ export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-conf
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
 export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
-export { validateCron, nextCronRuns, systemTimezone } from "${ROOT}/lib/scheduled-tasks/cron.ts";
+export { validateCron, nextCronRuns, nextCronRun, systemTimezone } from "${ROOT}/lib/scheduled-tasks/cron.ts";
+export { buildTask, applyTaskPatch } from "${ROOT}/lib/scheduled-tasks/task-input.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
