@@ -17,22 +17,39 @@ import { AppShell } from "../../components/AppShell";
 import { I18nProvider } from "../../hooks/useI18n";
 import { DistroSetupGate } from "../../components/distro";
 import { bindAgentClient } from "./data/agent-client.ts";
+import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
 import { detectTransport } from "./data/transport.ts";
+import { IpcClient } from "./ipc/client.ts";
 
-// Bind the data layer to the host bridge BEFORE the tree mounts (the plan:
-// 唯一底层接线入口在传输层; every domain client flows through this).
-bindAgentClient(detectTransport().transport);
+async function boot(): Promise<void> {
+  // The data layer binds to the host bridge BEFORE the tree mounts (the
+  // plan: 唯一底层接线入口在传输层; every domain client flows through this).
+  const { transport, label } = detectTransport();
+  const client = new IpcClient(transport);
+  bindAgentClient(transport);
+  bindStateMirrorClient(client);
+  // The transition mirror imports BEFORE React mounts (plan §七.4): the
+  // exported snapshot lands in localStorage while the UI still holds no
+  // state of its own. Never invented when absent; never rolled back.
+  await importStateMirrorBeforeMount(client).catch(() => null);
+  if (label === "tauri") {
+    // eslint-disable-next-line no-console
+    console.info("[pi-desktop] static frontend booted on the Tauri IPC bridge");
+  }
 
-const container = document.getElementById("root");
-if (container === null) throw new Error("static frontend: #root missing");
+  const container = document.getElementById("root");
+  if (container === null) throw new Error("static frontend: #root missing");
 
-createRoot(container).render(
-  <StrictMode>
-    <Suspense>
-      <I18nProvider>
-        <AppShell />
-        <DistroSetupGate />
-      </I18nProvider>
-    </Suspense>
-  </StrictMode>,
-);
+  createRoot(container).render(
+    <StrictMode>
+      <Suspense>
+        <I18nProvider>
+          <AppShell />
+          <DistroSetupGate />
+        </I18nProvider>
+      </Suspense>
+    </StrictMode>,
+  );
+}
+
+void boot();

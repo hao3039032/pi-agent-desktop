@@ -225,6 +225,28 @@ fn resolve_management_config() -> Option<ManagementSpawnConfig> {
     })
 }
 
+/// Write one file with private permissions (0600): the mirror carries the
+/// user's drafts. Windows has no POSIX modes; the profile ACL covers it.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        handle.write_all(bytes)?;
+        handle.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
 /// One stream frame (docs/migration/ipc-protocol.md §3).
 fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &str, payload: Value) -> Value {
     json!({
@@ -501,6 +523,81 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 "protocol": IPC_PROTOCOL_VERSION,
             }),
         ),
+        // The transition-version state mirror (plan §七): the static app
+        // READS the mirror the legacy version wrote, before React mounts.
+        // The mirror lives under the host's agent dir; a missing or corrupt
+        // file answers explicitly (the frontend never invents an empty one).
+        "desktop.stateMirror" => {
+            let agent_dir = state.agent_dir();
+            let file = agent_dir.join("desktop-state-mirror.json");
+            match std::fs::read_to_string(&file) {
+                Ok(content) => match serde_json::from_str::<Value>(&content) {
+                    Ok(payload) => protocol_ok(&id, payload),
+                    Err(error) => protocol_error(
+                        &id,
+                        "io",
+                        &format!("the state mirror is corrupt: {error}"),
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    protocol_ok(&id, json!({ "missing": true }))
+                }
+                Err(error) => protocol_error(&id, "io", &error.to_string()),
+            }
+        }
+        // The static app's mirror WRITE (the same contract
+        // app/api/state-mirror PUT had): schema-shape checked here, the
+        // revision must strictly increase, the write is atomic + 0600 and
+        // keeps a one-deep backup.
+        "desktop.writeStateMirror" => {
+            let Some(payload) = args.get("payload").cloned() else {
+                return protocol_error(&id, "invalid_args", "payload is required");
+            };
+            // Structural checks (the full checksum recompute is the JS
+            // module's job on both ends; here we enforce the fields the
+            // atomic write needs and the strictly-increasing revision).
+            let revision = payload.get("revision").and_then(Value::as_i64);
+            let entries_ok = payload.get("entries").is_some_and(Value::is_object);
+            if revision.is_none() || !entries_ok {
+                return protocol_error(&id, "invalid_args", "the payload lacks revision or entries");
+            }
+            let revision = revision.unwrap_or(0);
+            let agent_dir = state.agent_dir();
+            let file = agent_dir.join("desktop-state-mirror.json");
+            let existing_revision = match std::fs::read_to_string(&file) {
+                Ok(content) => serde_json::from_str::<Value>(&content)
+                    .ok()
+                    .and_then(|parsed| parsed.get("revision").and_then(Value::as_i64))
+                    .unwrap_or(i64::MIN),
+                Err(_) => i64::MIN,
+            };
+            if revision <= existing_revision {
+                // The stale-rejection shape (the HTTP route's 409): the client
+                // adopts the host's revision and re-ships ahead of it.
+                return protocol_error(
+                    &id,
+                    "invalid_args",
+                    &format!("revision {revision} is not newer than {existing_revision}"),
+                );
+            }
+            if let Err(error) = std::fs::create_dir_all(&agent_dir) {
+                return protocol_error(&id, "io", &error.to_string());
+            }
+            let serialized = format!("{}\n", serde_json::to_string_pretty(&payload).unwrap_or_default());
+            let tmp = agent_dir.join(format!("desktop-state-mirror.json.tmp-{}", std::process::id()));
+            if let Err(error) = write_private(&tmp, serialized.as_bytes()) {
+                return protocol_error(&id, "io", &error.to_string());
+            }
+            // Keep the previous good payload as the one-deep backup.
+            if existing_revision != i64::MIN {
+                let backup = agent_dir.join("desktop-state-mirror.json.bak");
+                let _ = std::fs::rename(&file, &backup);
+            }
+            if let Err(error) = std::fs::rename(&tmp, &file) {
+                return protocol_error(&id, "io", &error.to_string());
+            }
+            protocol_ok(&id, json!({ "revision": revision }))
+        }
         // Session operations route through the closed table in session-host.
         // `agentDir` is stripped here: the host resolves the agent dir, the
         // frontend never chooses what directory gets scanned.
@@ -1209,6 +1306,72 @@ mod tests {
         );
         assert_eq!(response["ok"], true, "runState answers not-running for ghosts");
         assert_eq!(response["data"]["running"], false);
+    }
+
+    #[test]
+    fn state_mirror_reads_writes_backups_and_rejects_stale_revisions() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+
+        // Missing mirror: an explicit missing report, never an invented one.
+        let read = send(&state, json!({ "v": 1, "id": "sm1", "op": "desktop.stateMirror" }));
+        assert_eq!(read["data"]["missing"], true, "{read}");
+
+        // A write lands under the agent dir with the revision echoed.
+        let write = send(
+            &state,
+            json!({ "v": 1, "id": "sm2", "op": "desktop.writeStateMirror", "args": { "payload": {
+                "schemaVersion": 1, "revision": 4, "exportedAt": "2026-01-01T00:00:00.000Z",
+                "source": "t", "checksum": "x", "entries": { "pi-theme": "dark" }
+            } } }),
+        );
+        assert_eq!(write["data"]["revision"], 4, "{write}");
+        let file = dir.path().join("desktop-state-mirror.json");
+        assert!(file.is_file(), "under the agent dir directly");
+
+        // The read returns the written payload.
+        let read = send(&state, json!({ "v": 1, "id": "sm3", "op": "desktop.stateMirror" }));
+        assert_eq!(read["data"]["revision"], 4);
+        assert_eq!(read["data"]["entries"]["pi-theme"], "dark");
+
+        // A stale revision is refused (the 409 shape).
+        let stale = send(
+            &state,
+            json!({ "v": 1, "id": "sm4", "op": "desktop.writeStateMirror", "args": { "payload": {
+                "schemaVersion": 1, "revision": 4, "exportedAt": "2026-01-01T00:00:00.000Z",
+                "source": "t", "checksum": "x", "entries": {}
+            } } }),
+        );
+        assert_eq!(stale["error"]["code"], "invalid_args");
+
+        // A newer write keeps the previous payload as the backup.
+        let write = send(
+            &state,
+            json!({ "v": 1, "id": "sm5", "op": "desktop.writeStateMirror", "args": { "payload": {
+                "schemaVersion": 1, "revision": 5, "exportedAt": "2026-01-02T00:00:00.000Z",
+                "source": "t", "checksum": "y", "entries": { "pi-theme": "light" }
+            } } }),
+        );
+        assert_eq!(write["data"]["revision"], 5);
+        let backup: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("desktop-state-mirror.json.bak")).expect("backup"),
+        )
+        .expect("backup JSON");
+        assert_eq!(backup["revision"], 4, "the backup holds the previous payload");
+        // The mirror file itself is private on POSIX.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "private");
+        }
+        // A malformed payload is refused.
+        let malformed = send(
+            &state,
+            json!({ "v": 1, "id": "sm6", "op": "desktop.writeStateMirror", "args": { "payload": { "revision": 9 } } }),
+        );
+        assert_eq!(malformed["error"]["code"], "invalid_args");
     }
 
     /// The resume flow with the REAL pi child (PI_CLI_BIN, sandboxed): an

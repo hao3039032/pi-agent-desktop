@@ -41,6 +41,12 @@ export default defineConfig({
         find: /^@\/lib\/session-event-source$/,
         replacement: resolve(import.meta.dirname, "src/data/session-event-source.ts"),
       },
+      {
+        // The mirror hook swaps its HTTP flush for the IPC bridge; the
+        // import itself runs before mount in app-main.tsx.
+        find: /^@\/hooks\/useStateMirror$/,
+        replacement: resolve(import.meta.dirname, "src/data/state-mirror.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

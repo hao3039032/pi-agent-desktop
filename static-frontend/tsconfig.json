@@ -39,6 +39,9 @@
       ],
       "@/lib/session-event-source": [
         "./static-frontend/src/data/session-event-source.ts"
+      ],
+      "@/hooks/useStateMirror": [
+        "./static-frontend/src/data/state-mirror.ts"
       ]
     }
   },
