@@ -68,6 +68,8 @@ pub struct IpcHostState {
     /// Git project identity with the TS resolver's TTL cache
     /// (lib/worktree.ts resolveProject).
     pub projects: crate::session_view::ProjectResolver,
+    /// Private exported HTML directories, removed on eviction or host exit.
+    pub(crate) session_exports: Mutex<std::collections::VecDeque<tempfile::TempDir>>,
     /// The catalogue's version counter (`invalidateSessionListCache` +
     /// `getSessionListVersion`): bumped by every host-visible mutation that
     /// changes the list a client holds (a create, a rename). Clients compare
@@ -111,6 +113,7 @@ impl IpcHostState {
             },
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
+            session_exports: Mutex::new(std::collections::VecDeque::new()),
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
         }
@@ -1110,6 +1113,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
+        "sessions.export" => match crate::session_actions::export(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "sessions.rename" => match crate::session_actions::rename(state, &args) {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
             Err((code, message)) => protocol_error(&id, &code, &message),
