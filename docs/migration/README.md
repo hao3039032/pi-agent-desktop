@@ -53,13 +53,17 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | PTY 并发创建单子进程（open→spawn→insert 全程持锁） | pty-host `concurrent_creates_for_one_id_spawn_exactly_one_child` |
 | 状态镜像跨桥（读/写/备份/严格递增/挂载前导入） | pi_ipc.rs 测试 + state-mirror.test.mjs |
 | 构建产物契约（frontend-static 目录被 ignore；跟踪的 launcher 占位符还原） | git（index.html 回占位符；assets/ 不再入库） |
+| 文件树列表（files.list：git 可见性 #677、隐藏名回退、目录外链接标注） | pi_ipc.rs 3 个测试（含真实 git 仓库语义；无 git 诚实跳过） |
+| 链接目录授权（files.allowLink：显示目标校验、重指向拒绝、主机侧授权） | pi_ipc.rs files_allow_link 测试 |
+| 文件树服务 seam（lib/file-service.ts ↔ 静态 IPC 版；FileExplorer 消费） | file-service.test.mjs（3 测试） |
+| 工具选择器（agent.getTools/setTools 经 bridge；隐藏工具撤下；ToolEntry 投影） | pi_ipc.rs real_pi_agent_get_tools（真实 pi 双向） |
 
 ### 未修/未完成（明确列出，不越级打勾）
 
 | 项 | 现状 |
 |---|---|
-| 数据域迁移主体（models/MCP/插件技能/文件树/git/worktree/scheduled/appearance/desktop 的 121 处 fetch） | 未开始逐域替换；生产合规检查未过 |
-| 主机层命令（fork/fork_branch/clone/get_tools/navigate_tree/get_state 丰富化/extension_ui_response 输入） | agent.command 回 not_supported；状态机已就位但无实现 |
+| 数据域迁移主体（models/MCP/插件技能/git 状态/文件索引搜索/上传下载/worktree/scheduled/appearance/desktop） | 文件树列表/链接授权已迁（fetch 计数从 121 降）；其余未替换；生产合规检查未过 |
+| 主机层命令（fork/fork_branch/clone/navigate_tree/get_state 丰富化/extension_ui_response 输入；get_tools/setTools 已迁移） | 未实现项回 not_supported；HOST_LEVEL_COMMAND_OPS 表随迁移增长 |
 | 会话事件流 ACK/背压（有界队列、工具中间更新合并、超限 reset） | 未实现；当前无界转发 |
 | 子 UI 请求转发（agent.respondUi 等）与 pendingExtensionUiIds 权威来源 | 快照带机器视角列表（事件观测）；子进程 UI 未接入转发 |
 | 调度器生产集成（宿主 30s tick、RunSpawner、marker 确认、隐藏窗口运行） | 引擎/存储/账本就位，未接线 |
