@@ -48,6 +48,7 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | **会话事件订阅生命周期**（fan 线程持有订阅；握手失败回收子进程） | lifecycle.rs `real_pi_events_flow_after_the_handshake_returns`（真实 pi；注入旧 bug 验证测试确实失败）+ `real_pi_handshake_failure_shuts_the_child_down` |
 | agent.command 封闭载荷（按命令重建；枚举=真实子命令面；主机层命令→not_supported） | session-host dispatch 测试 + pi_ipc 测试 |
 | 会话冷启动（spawn 配置解析 + 磁盘会话 agent 操作拉起子进程） | pi_ipc.rs `real_pi_agent_op_cold_starts_an_on_disk_session` |
+| 会话扫描 = TS 扫描器（差分测试锁定） | crates/session-host/tests/scan-differential.test.mjs（8 fixtures 双实现全字段比对；两处真实分歧已被测试抓出并修复） |
 | 管理实例（nonce 宿主生成/scope 规范化/并发同 scope 单 spawn）+ cron.countSlots | management-host 真实 pi 测试 + management-extension.test.mjs |
 | 调度器局部修复（租约按认领者释放、账本 task id 消毒、ISO once 解析） | task-scheduler 测试 |
 | PTY 并发创建单子进程（open→spawn→insert 全程持锁） | pty-host `concurrent_creates_for_one_id_spawn_exactly_one_child` |
@@ -65,7 +66,7 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | 数据域迁移主体（models/MCP/插件技能/git 状态/文件索引搜索/上传下载/worktree/scheduled/appearance/desktop） | 文件树列表/链接授权已迁（fetch 计数从 121 降）；sessions.catalogue 宿主 op 已就绪但**未接 UI**（messageCount/workspaceKind/relation/running 未从头部扫描可得，接 UI 前必须补齐——README 此行即约束）；其余未替换；生产合规检查未过 |
 | 主机层命令（fork/fork_branch/clone/navigate_tree/get_state 丰富化/extension_ui_response 输入；get_tools/setTools 已迁移） | 未实现项回 not_supported；HOST_LEVEL_COMMAND_OPS 表随迁移增长 |
 | 会话事件流 ACK/背压（有界队列、工具中间更新合并、超限 reset） | 未实现；当前无界转发 |
-| 会话完整闭环（目录消费、上下文读取/投影、创建、聊天发送的队列/分支语义） | catalogue 字段子集已就绪；上下文投影（管理扩展 session.readContext）与 /api/agent/new 创建未实现 |
+| 会话完整闭环（目录消费、上下文读取/投影、创建、聊天发送的队列/分支语义） | catalogue 已是 TS 扫描器语义（差分测试 8 fixtures 全字段一致：session_info 改名、坏尾容忍、附件感知标题、活动时间 modified、完整 ISO）；上下文投影（session.readContext + buildSessionContext 的纯函数抽取）与 /api/agent/new 创建、发送闭环未实现 — 下一域 |
 | 子 UI 请求转发（agent.respondUi 等）与 pendingExtensionUiIds 权威来源 | 快照带机器视角列表（事件观测）；子进程 UI 未接入转发 |
 | 调度器生产集成（宿主 30s tick、RunSpawner、marker 确认、隐藏窗口运行） | 引擎/存储/账本就位，未接线 |
 | OAuth loopback | M0 PoC 已有（state 不匹配绝不成、取消、PKCE）；未接入宿主真实登录流 |
