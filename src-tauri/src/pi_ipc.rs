@@ -4118,7 +4118,10 @@ mod tests {
         let at = task_scheduler::store::ms_to_iso(now - 30_000);
         let catchup_id = "22222222-2222-2222-2222-222222222222";
         let dropped_id = "33333333-3333-3333-3333-333333333333";
+        let invalid_id = "00000000-0000-0000-0000-000000000000";
         repo.mutate(|tasks| {
+            tasks.push(json!({ "id": invalid_id, "name": "invalid legacy cron", "prompt": "never", "cwd": project, "enabled": true,
+                "schedule": { "kind": "cron", "expr": "bad cron", "timezone": "UTC" }, "createdAt": before, "lastScheduledFor": before }));
             for (id, due, since) in [
                 (task_id, at.clone(), before.clone()),
                 (catchup_id, task_scheduler::store::ms_to_iso(now - 3 * 86_400_000), task_scheduler::store::ms_to_iso(now - 4 * 86_400_000)),
@@ -4147,7 +4150,8 @@ mod tests {
         let dropped = repo.runs(dropped_id).unwrap();
         assert_eq!(dropped[0]["status"], "skipped");
         assert_eq!(dropped[0]["skipReason"], "app-asleep");
-        assert!(repo.list().unwrap().iter().all(|task| task["enabled"] == false));
+        assert!(repo.list().unwrap().iter().filter(|task| task["id"] != invalid_id).all(|task| task["enabled"] == false));
+        assert!(repo.runs(invalid_id).unwrap().is_empty());
         crate::scheduler_tick::tick(&state, now + 30_000).unwrap();
         assert_eq!(repo.runs(task_id).unwrap().len(), 1);
         task_scheduler::lease::release(&agent, std::process::id()).unwrap();

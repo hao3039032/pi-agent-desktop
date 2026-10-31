@@ -57,10 +57,14 @@ pub fn tick(state: &Arc<IpcHostState>, now_ms: i64) -> Result<bool, String> {
         }
     }
     for task in tasks {
-        if task["enabled"] != true || task["schedule"]["kind"] == "manual" { continue; }
+        if task["enabled"] != true || !matches!(task["schedule"]["kind"].as_str(), Some("cron" | "once")) { continue; }
         let Some(since) = task["lastScheduledFor"].as_str().or_else(|| task["createdAt"].as_str()) else { continue };
         let decision = management_call(state, "tasks.decideSlot", json!({ "task": task, "now": now, "since": since }))
             .map_err(|(_, message)| message)?;
+        if decision["valid"] != true {
+            eprintln!("skipping invalid scheduled task {}: {}", task["id"], decision["error"].as_str().unwrap_or("invalid schedule"));
+            continue;
+        }
         let action = decision["action"].as_str().unwrap_or("none");
         if action != "fire" && action != "drop" { continue; }
         let slot = decision["scheduledFor"].as_str().ok_or("slot decision omitted scheduledFor")?;
