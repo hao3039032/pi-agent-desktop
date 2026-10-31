@@ -703,3 +703,69 @@ fn read_ignored_names(directory: &Path, names: &[String]) -> Option<std::collect
     }
     Some(ignored)
 }
+
+/// The outcome of a linked-directory browse request (the
+/// /api/files allow-link contract mapped onto protocol codes).
+pub enum LinkApproval {
+    /// Approved: `target` is the resolved directory to grant.
+    Ok { target: String, already_allowed: bool },
+    /// Refused with a protocol error code and message.
+    Denied { code: &'static str, error: &'static str },
+}
+
+/// Validate an operator's request to browse a directory link's target
+/// (checkLinkedDirectoryApproval): the link must sit inside the roots after
+/// resolution (a link reached through a never-allowed link does not
+/// qualify), actually BE a symlink to a directory, and still point at the
+/// target the listing showed — a link re-aimed since the listing is
+/// refused, never granted blind.
+pub fn check_linked_directory_approval(
+    roots: &AllowedRoots,
+    link: &Path,
+    expected_target: &str,
+) -> LinkApproval {
+    if !roots.is_path_allowed(link) {
+        return LinkApproval::Denied { code: "unauthorized_scope", error: "Access denied" };
+    }
+    let Some(parent) = link.parent() else {
+        return LinkApproval::Denied { code: "unauthorized_scope", error: "Access denied" };
+    };
+    if !roots.is_existing_path_allowed(parent) {
+        return LinkApproval::Denied { code: "unauthorized_scope", error: "Access denied" };
+    }
+    let stat = match std::fs::symlink_metadata(link) {
+        Ok(stat) => stat,
+        Err(_) => return LinkApproval::Denied { code: "not_found", error: "Not found" },
+    };
+    if !stat.file_type().is_symlink() {
+        return LinkApproval::Denied { code: "invalid_args", error: "Not a linked directory" };
+    }
+    let target = match std::fs::canonicalize(link) {
+        Ok(target) => target,
+        Err(_) => return LinkApproval::Denied { code: "not_found", error: "Link target not found" },
+    };
+    match std::fs::metadata(&target) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return LinkApproval::Denied { code: "invalid_args", error: "Not a linked directory" },
+        Err(_) => return LinkApproval::Denied { code: "not_found", error: "Link target not found" },
+    }
+    let target_text = target.to_string_lossy().into_owned();
+    // Same-spelling comparison after resolution (samePath): a link re-aimed
+    // since the listing is a conflict, not a silent grant of the new target.
+    let expected = std::path::absolute(expected_target)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| expected_target.to_string());
+    let same = if cfg!(windows) {
+        target_text.eq_ignore_ascii_case(&expected)
+    } else {
+        target_text == expected
+    };
+    if !same {
+        return LinkApproval::Denied {
+            code: "invalid_args",
+            error: "Link target changed; refresh the file list",
+        };
+    }
+    let already_allowed = roots.is_existing_path_allowed(&target);
+    LinkApproval::Ok { target: target_text, already_allowed }
+}

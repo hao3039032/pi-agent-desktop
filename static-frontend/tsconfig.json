@@ -42,6 +42,9 @@
       ],
       "@/hooks/useStateMirror": [
         "./static-frontend/src/data/state-mirror.ts"
+      ],
+      "@/lib/file-service": [
+        "./static-frontend/src/data/file-service.ts"
       ]
     }
   },

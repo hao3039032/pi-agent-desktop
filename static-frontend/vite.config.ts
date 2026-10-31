@@ -54,6 +54,12 @@ export default defineConfig({
         find: /^@\/hooks\/useStateMirror$/,
         replacement: resolve(import.meta.dirname, "src/data/state-mirror.ts"),
       },
+      {
+        // The file-tree service (listing + linked-directory grant) swaps
+        // /api/files for files.list / files.allowLink over IPC.
+        find: /^@\/lib\/file-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/file-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

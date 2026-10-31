@@ -11,6 +11,10 @@ import {
   joinFilePath,
   normalizeFilePathSlashes,
 } from "@/lib/file-paths";
+import {
+  allowOutsideLink as allowOutsideLinkViaService,
+  fetchFileEntries,
+} from "@/lib/file-service";
 import type { GitFileStatus, GitFileStatusKind, GitStatusResponse } from "@/lib/git-types";
 import type { FileIndexEntry } from "@/lib/file-fuzzy";
 import { buildSearchTree, type SearchTreeNode } from "@/lib/search-tree";
@@ -97,33 +101,11 @@ async function responseError(res: Response, fallback: string): Promise<Error> {
   return new Error(message);
 }
 
-async function fetchEntries(dirPath: string): Promise<FileNode[]> {
-  const encoded = encodeFilePathForApi(dirPath);
-  const res = await fetch(`/api/files/${encoded}?type=list`);
-  if (!res.ok) throw await responseError(res, "Failed to load files");
-  const data = await res.json() as { entries?: FileEntry[] };
-  return (data.entries ?? []).map((e) => ({
-    name: e.name,
-    fullPath: joinFilePath(dirPath, e.name),
-    isDir: e.isDir,
-    size: e.size,
-    children: e.isDir ? [] : undefined,
-    loaded: !e.isDir,
-    outsideLinkTarget: e.outsideLinkTarget,
-    outsideLinkEncloses: e.outsideLinkEncloses,
-  }));
-}
-
-// Sends the target the operator was shown, so a link pointed elsewhere since
-// the listing is refused instead of granting a directory nobody looked at.
-async function allowOutsideLink(linkPath: string, target: string): Promise<void> {
-  const res = await fetch(`/api/files/${encodeFilePathForApi(linkPath)}?type=allow-link`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ target }),
-  });
-  if (!res.ok) throw await responseError(res, "Failed to allow the linked folder");
-}
+// The listing and the linked-directory grant travel through the service
+// seam (lib/file-service.ts): the static build swaps it for the typed IPC
+// bridge through a vite alias, exactly like lib/agent-client.ts.
+const fetchEntries = fetchFileEntries as (dirPath: string) => Promise<FileNode[]>;
+const allowOutsideLink = allowOutsideLinkViaService;
 
 async function fetchGitStatus(cwd: string): Promise<GitStatusResponse> {
   const params = new URLSearchParams({ cwd });

@@ -837,6 +837,39 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 }
             }
         }
+        // Browsing a directory symlink's target (the /api/files allow-link
+        // contract): an EXPLICIT operator action (the listing showed the
+        // target); the link must sit inside the roots after resolution, be a
+        // symlink to a directory, and STILL point at the target the listing
+        // showed (a link re-aimed since is refused, not granted blind).
+        "files.allowLink" => {
+            let link = args.get("link").and_then(Value::as_str).unwrap_or_default();
+            let expected_target = args.get("target").and_then(Value::as_str).unwrap_or_default();
+            if link.is_empty() || expected_target.is_empty() {
+                return protocol_error(&id, "invalid_args", "link and target are required");
+            }
+            let link_path = PathBuf::from(link);
+            let approval = {
+                let roots = state.file_roots.lock().unwrap();
+                crate::file_access::check_linked_directory_approval(&roots, &link_path, expected_target)
+            };
+            match approval {
+                crate::file_access::LinkApproval::Ok { target, already_allowed } => {
+                    if !already_allowed {
+                        // The operator explicitly chose to browse the target:
+                        // a host-side root grant (propose_path records it).
+                        state.propose_path(std::path::Path::new(&target));
+                    }
+                    protocol_ok(
+                        &id,
+                        json!({ "target": target, "alreadyAllowed": already_allowed }),
+                    )
+                }
+                crate::file_access::LinkApproval::Denied { code, error } => {
+                    protocol_error(&id, code, error)
+                }
+            }
+        }
         "files.read" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             let target = PathBuf::from(path);
@@ -1685,6 +1718,76 @@ mod tests {
         assert!(!names.contains(&"cache"), "an ignored directory hides: {names:?}");
         assert!(!names.contains(&".git"), ".git always hides: {names:?}");
         assert!(names.contains(&".gitignore"), "a tracked file lists: {names:?}");
+    }
+
+
+    #[test]
+    #[cfg(unix)]
+    fn files_allow_link_grants_only_the_shown_target() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).expect("proj");
+        let outside = dir.path().join("outside");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::create_dir_all(&other).expect("other");
+        let link = project.join("linked");
+        std::os::unix::fs::symlink(&outside, &link).expect("linked");
+        state.propose_path(&project);
+        let send_allow = |id: &str, target: &std::path::Path| {
+            send(
+                &state,
+                json!({ "v": 1, "id": id, "op": "files.allowLink", "args": {
+                    "link": link.display().to_string(),
+                    "target": target.display().to_string(),
+                } }),
+            )
+        };
+
+        // The operator was shown `outside`: approved, and the target becomes
+        // browsable (a host-side root from an explicit operator action).
+        let approved = send_allow("al1", &outside);
+        assert_eq!(approved["ok"], true, "{approved}");
+        assert_eq!(approved["data"]["alreadyAllowed"], false);
+        let listed = send(
+            &state,
+            json!({ "v": 1, "id": "al2", "op": "files.list", "args": { "path": outside.display().to_string() } }),
+        );
+        assert_eq!(listed["ok"], true, "the granted target is browsable: {listed}");
+
+        // A NEW project link aimed at `other`: the shown-target check
+        // refuses (the listing showed the old target).
+        let link2 = project.join("relinked");
+        std::os::unix::fs::symlink(&other, &link2).expect("relinked");
+        let reaimed = send(
+            &state,
+            json!({ "v": 1, "id": "al3", "op": "files.allowLink", "args": {
+                "link": link2.display().to_string(),
+                "target": outside.display().to_string(),
+            } }),
+        );
+        assert_eq!(reaimed["ok"], false, "{reaimed}");
+        assert_eq!(reaimed["error"]["code"], "invalid_args");
+        assert!(reaimed["error"]["message"].as_str().unwrap_or_default().contains("changed"));
+        // And nothing was granted.
+        let not_granted = send(
+            &state,
+            json!({ "v": 1, "id": "al4", "op": "files.list", "args": { "path": other.display().to_string() } }),
+        );
+        assert_eq!(not_granted["error"]["code"], "unauthorized_scope");
+
+        // A non-symlink path inside the roots is refused with the TS shape.
+        std::fs::write(project.join("plain.txt"), b"x").expect("plain");
+        let not_link = send(
+            &state,
+            json!({ "v": 1, "id": "al6", "op": "files.allowLink", "args": {
+                "link": project.join("plain.txt").display().to_string(),
+                "target": project.display().to_string(),
+            } }),
+        );
+        assert_eq!(not_link["error"]["code"], "invalid_args", "{not_link}");
+        assert!(not_link["error"]["message"].as_str().unwrap_or_default().contains("Not a linked"));
     }
 
     #[test]
