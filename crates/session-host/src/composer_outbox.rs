@@ -271,6 +271,7 @@ impl Session {
     /// `queue_composer` (a host-level command): enqueue, notify, wake.
     pub fn composer_enqueue(self: &Arc<Self>, message: &str, images: Option<Value>) -> Result<Value, String> {
         let _admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
+        let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
         let item = self.composer_outbox.enqueue(message, images)?;
         self.emit_composer_update();
@@ -301,6 +302,7 @@ impl Session {
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
         let admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
         let _delivery = self.composer_outbox.delivery_guard();
+        if self.client.has_exited() { return Err("session process has exited".to_string()); }
         let Some(item) = self.composer_outbox.take(id) else {
             // Missing is a normal no-op (another window won the claim).
             return Ok(self.composer_answer(None));

@@ -80,6 +80,7 @@ impl ScheduledSessionIndex {
                 };
                 if strict && (!run.is_object() || run["runId"].as_str().is_none_or(str::is_empty)
                     || (!archive && run["taskId"].as_str() != Some(id))
+                    || (!archive && !matches!(run["status"].as_str(), Some("running" | "succeeded" | "failed" | "skipped")))
                     || (run.get("sessionId").is_some_and(|value| !value.is_null() && value.as_str().is_none_or(str::is_empty)))
                     || (archive && run["sessionId"].as_str().is_none_or(str::is_empty))
                     || (!archive && run["status"].as_str() == Some("running") && run["sessionId"].as_str().is_none_or(str::is_empty))) {
@@ -116,7 +117,7 @@ mod tests {
         std::fs::create_dir_all(&runs).unwrap();
         let id = "12345678-1234-1234-1234-123456789abc";
         let file = runs.join(format!("{id}.jsonl"));
-        std::fs::write(&file, format!("{}\n", json!({"taskId":id,"runId":"r","sessionId":"target"}))).unwrap();
+        std::fs::write(&file, format!("{}\n", json!({"taskId":id,"runId":"r","status":"succeeded","sessionId":"target"}))).unwrap();
         assert!(ScheduledSessionIndex::load_for_deletion(dir.path()).unwrap().is_referenced("target"));
         for bad in ["{broken", "{}", "{\"runId\":\"r\",\"sessionId\":7}", &format!("{}", json!({"taskId":id,"runId":"r","status":"running"}))] {
             std::fs::write(&file, bad).unwrap();
