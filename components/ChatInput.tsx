@@ -2,7 +2,7 @@
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useMemo, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
-import type { SkillsResponse } from "@/lib/api-types";
+import { listSkills } from "@/lib/skills-client";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
 import type { UnavailableWorkspace } from "@/lib/workspace-availability";
 import type { TextContent, UserMessage } from "@/lib/types";
@@ -450,7 +450,7 @@ function getSlashDescription(command: SlashCommandPaletteItem, t: (key: string) 
 }
 
 // Skill slash commands are named "skill:<skillName>"; look the skill up in the
-// dormancy map fetched from /api/skills. Unknown skills are treated as active.
+// dormancy map loaded through the skills service. Unknown skills are treated as active.
 function isDormantSkillCommand(command: SlashCommandPaletteItem, dormancy: Record<string, boolean>): boolean {
   if (command.source !== "skill" || !command.name.startsWith("skill:")) return false;
   return dormancy[command.name.slice("skill:".length)] === true;
@@ -1983,11 +1983,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const requestCwd = cwd;
     let cancelled = false;
     setSkillDormancyState({ cwd: requestCwd, values: {} });
-    fetch(`/api/skills?cwd=${encodeURIComponent(requestCwd)}`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`skills fetch failed: ${res.status}`);
-        return res.json() as Promise<Partial<SkillsResponse>>;
-      })
+    listSkills(requestCwd)
       .then((data) => {
         if (cancelled) return;
         const dormancy: Record<string, boolean> = {};
