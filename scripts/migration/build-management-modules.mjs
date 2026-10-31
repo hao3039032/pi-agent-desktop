@@ -40,6 +40,7 @@ export {
 } from "${ROOT}/lib/session-projection.ts";
 export { projectTreeForResponse, toSummaryTree } from "${ROOT}/lib/project-tree.ts";
 export { computeSessionStats } from "${ROOT}/lib/session-stats.ts";
+export { extractActiveSystemPrompt } from "${ROOT}/lib/system-prompt-snapshot.ts";
 export { searchSessionContents } from "${ROOT}/lib/session-search.ts";
 export { patchExportHtml } from "${ROOT}/lib/session-export-html.ts";
 export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";

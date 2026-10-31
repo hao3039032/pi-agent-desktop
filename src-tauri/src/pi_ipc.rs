@@ -2656,6 +2656,17 @@ fn session_view_dispatch(
                     }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
                 let (extension_statuses, extension_widgets) = session.extension_ui_state();
+                // Only the child's active entries/leaf can identify a recorded prompt.
+                // A failed read or absence of a record is unknown (a spawn-time
+                // custom prompt may still exist); never invent a composed prompt.
+                let recorded_prompt = crate::session_view::live_child_snapshot(&session).ok().and_then(|(entries, leaf, tree)| {
+                    let handoff = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree).ok()?;
+                    let result = management_call(state, "session.recordedSystemPrompt", json!({"snapshotFile":handoff.display().to_string()})).ok();
+                    let _ = std::fs::remove_file(handoff);
+                    result
+                });
+                let prompt_recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool) == Some(true);
+                let prompt = recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str).unwrap_or("");
                 let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
@@ -2694,12 +2705,8 @@ fn session_view_dispatch(
                     // The context meter (null when the child cannot calculate
                     // usage — unknown is not zero).
                     "contextUsage": context_usage.unwrap_or(Value::Null),
-                    // The system panel's prompt: replaying the transcript's
-                    // system messages needs the SDK's own projection — served
-                    // with the readView family, not yet this poll (README's
-                    // unfixed list keeps it honest).
-                    "systemPrompt": "",
-                    "systemPromptStatus": "none",
+                    "systemPrompt": prompt,
+                    "systemPromptStatus": if prompt_recorded { "recorded" } else { "unknown" },
                     "extensionStatuses": extension_statuses,
                     "extensionWidgets": extension_widgets,
                 });
@@ -4026,6 +4033,51 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(replay["ok"], false, "{replay}");
         handle.join().unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(output).unwrap(), "false");
+        state.registry.remove(&id, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn real_pi_system_prompt_uses_active_leaf_projection() {
+        use std::io::Write;
+        let Ok(executable) = std::env::var("PI_CLI_BIN") else { eprintln!("skipping: PI_CLI_BIN not set"); return };
+        // Under the checkout solely so the generated bundle resolves the shared,
+        // read-only jiti dependency without copying a node_modules tree.
+        let root = tempfile::tempdir_in("..").unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let agent = root_path.join("agent");
+        let cwd = root_path.join("work");
+        let managed = root_path.join("managed");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
+        let (file, id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        for (entry, parent, text) in [("root", Value::Null, "ROOT"), ("a", json!("root"), "BRANCH A"), ("b", json!("root"), "BRANCH B")] {
+            writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
+        }
+        drop(writer);
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(), agent_dir: Some(agent.clone()),
+            extensions: vec![Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), root_path.display().to_string())],
+        });
+        let config = session_host::SessionSpawnConfig {
+            executable, agent_dir: Some(agent), session_dir: None,
+            bridge_asset: Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap(),
+            artifacts_asset: None, chat_asset: None, chat_asset_sha256: None,
+            shape: session_host::SessionSpawnShape::Project { tool_args: None },
+            initial_model: None, thinking_level: None, extra_args: Vec::new(),
+        };
+        let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
+        let read = || send(&state, json!({"v":1,"id":"state","op":"sessions.state","args":{"session":id}}));
+        let before = read();
+        assert_eq!(before["data"]["state"]["systemPromptStatus"], "recorded", "{before}");
+        assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
+        session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
+        let after = read();
+        assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
         state.registry.remove(&id, Duration::from_secs(5));
     }
 
