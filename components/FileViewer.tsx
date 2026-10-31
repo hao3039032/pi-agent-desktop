@@ -929,8 +929,9 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, initialPage, watchEnab
   const ext = getFileExt(filePath);
   const isPdf = ext === "pdf";
   const pageFragment = isPdf && initialPage && initialPage > 0 ? `#page=${initialPage}` : "";
+  const pdfUrl = useFileResourceUrl(isPdf ? filePath : undefined, sourceSessionId, bust);
   const previewUrl = isPdf
-    ? `${getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined)}${pageFragment}`
+    ? (pdfUrl ? `${pdfUrl}${pageFragment}` : undefined)
     : getFileApiUrl(filePath, "preview", sourceSessionId, bust ? { v: bust } : undefined);
 
   useEffect(() => {
