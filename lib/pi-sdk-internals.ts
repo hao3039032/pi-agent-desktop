@@ -368,14 +368,15 @@ export async function importPiSdkInternals(options: {
   const { environment = process.env, cwd = process.cwd() } = options;
   // PI_PACKAGE_DIR moves getPackageDir() away from the SDK this process
   // loaded, so file URLs would load a second copy.
-  if (environment.PI_PACKAGE_DIR) {
+  if (environment.PI_PACKAGE_DIR && !environment.PI_WEB_MANAGED_MODULES) {
     return { ok: false, reason: `PI_PACKAGE_DIR is set; MCP support loads only from the ${SDK_PACKAGE} that Pi Web runs` };
   }
 
   let packageDir: string;
   try {
-    packageDir = realpathSync(getPackageDir());
-    const resolvedDir = resolvedSdkPackageDir(cwd);
+    const managedDir = environment.PI_WEB_MANAGED_MODULES;
+    packageDir = managedDir ? realpathSync(join(managedDir, SDK_PACKAGE)) : realpathSync(getPackageDir());
+    const resolvedDir = managedDir ? packageDir : resolvedSdkPackageDir(cwd);
     if (!sameRealPath(packageDir, resolvedDir)) {
       return { ok: false, reason: `${SDK_PACKAGE} at ${packageDir} is not the package Pi Web resolves (${resolvedDir})` };
     }

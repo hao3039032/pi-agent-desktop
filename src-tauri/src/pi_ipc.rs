@@ -1270,17 +1270,60 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
-        // GET /api/project-trust's status half: the trust banner's mount
-        // probe (requiresTrust/trusted/decision/…). The MCP listing and the
-        // POST (trusting a folder) stay on the HTTP domain until their M3
-        // migration; this op covers exactly the read the UI performs on
-        // every workspace switch.
+        // GET /api/project-trust: the trust banner's mount probe and the
+        // project trust dialog.
         "trust.status" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
                 return protocol_error(&id, "invalid_params", "trust.status needs a cwd");
             };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
             let agent_dir = state.agent_dir();
-            protocol_ok(&id, crate::session_view::project_trust_status(&agent_dir, Path::new(cwd)))
+            let mut status = crate::session_view::project_trust_status(&agent_dir, Path::new(cwd));
+            {
+                let call_args = json!({ "cwd": cwd, "agentDir": agent_dir.to_string_lossy(), "allowedRoots": state.file_roots.lock().unwrap().snapshot() });
+                if let Ok(listing) = management_call(state, "trust.projectListing", call_args) {
+                    if let Some(mcp_file) = listing.get("mcpFile") {
+                        status["mcpFile"] = mcp_file.clone();
+                    }
+                    if let Some(mcp_servers) = listing.get("mcpServers") {
+                        status["mcpServers"] = mcp_servers.clone();
+                    }
+                    if let Some(mcp_error) = listing.get("mcpError") {
+                        status["mcpError"] = mcp_error.clone();
+                    }
+                } else {
+                    status["mcpServers"] = json!([]);
+                    status["mcpError"] = json!("Could not read the project's MCP listing");
+                }
+            }
+            protocol_ok(&id, status)
+        }
+        "trust.set" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
+                return protocol_error(&id, "invalid_params", "trust.set needs a cwd");
+            };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let agent_dir = state.agent_dir();
+            let current = crate::session_view::project_trust_status(&agent_dir, Path::new(cwd));
+            if current.get("requiresTrust").and_then(Value::as_bool) != Some(true) {
+                return protocol_error(&id, "trust-not-required", "This project has no resources that require trust");
+            }
+            for sid in state.registry.ids() {
+                if let Some(session) = state.registry.get(&sid) {
+                    if session.run_state().is_running() {
+                        return protocol_error(&id, "session-busy", "Wait for the active session to finish before trusting this project");
+                    }
+                }
+            }
+            let call_args = json!({ "cwd": cwd, "agentDir": agent_dir.to_string_lossy() });
+            match management_call(state, "trust.set", call_args) {
+                Ok(new_status) => mcp_management_response(&id, new_status),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
         }
         // POST /api/agent/new: a brand-new session (the factory + the
         // route's contract — cwd validation, the chat folder factory, the
@@ -1857,6 +1900,78 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 None => protocol_error(&id, "unknown_op", &format!("unknown operation: {op}")),
             }
         }
+        // --- MCP management (M3) ---
+        "mcp.test" => {
+            let Some(body) = args.as_object() else { return protocol_error(&id, "invalid_args", "Expected an MCP test object"); };
+            if body.keys().any(|key| !["scope", "name", "cwd"].contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
+                return protocol_error(&id, "invalid_args", "Invalid MCP test fields");
+            }
+            if let Some(cwd) = args.get("cwd").and_then(Value::as_str) {
+                if let Err(error) = validate_scoped_cwd(state, cwd) { return mcp_cwd_error(&id, &error); }
+            }
+            let mut payload = args.clone();
+            payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
+            payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+            match management_call(state, "mcp.test", payload) {
+                Ok(result) => mcp_management_response(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "mcp.configGet" => {
+            let cwd = args.get("cwd").and_then(Value::as_str);
+            let agent_dir = state.agent_dir();
+            let mut payload = json!({ "agentDir": agent_dir.to_string_lossy(), "allowedRoots": state.file_roots.lock().unwrap().snapshot() });
+            if let Some(cwd) = cwd {
+                if let Err(error) = validate_scoped_cwd(state, cwd) {
+                    return mcp_cwd_error(&id, &error);
+                }
+                payload["cwd"] = json!(cwd);
+                match management_call(state, "mcp.configGet", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            } else {
+                match management_call(state, "mcp.configGet", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            }
+        }
+        "mcp.configAction" => {
+            let Some(body) = args.as_object() else {
+                return protocol_error(&id, "invalid_args", "Expected an MCP action object");
+            };
+            let allowed: &[&str] = match body.get("action").and_then(Value::as_str) {
+                Some("enable" | "disable" | "remove" | "sign-out") => &["action", "cwd", "scope", "name"],
+                Some("set-exposure") => &["action", "cwd", "scope", "name", "exposure"],
+                Some("set-enabled") => &["action", "cwd", "enabled", "servers"],
+                Some("undo") => &["action", "cwd", "token"],
+                Some("add") => &["action", "cwd", "scope", "text", "values", "secretReferences", "server", "name", "rawPi", "trustFolder", "confirmHostEnv"],
+                _ => return protocol_error(&id, "invalid_args", "Unknown MCP action"),
+            };
+            if body.keys().any(|key| !allowed.contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
+                return protocol_error(&id, "invalid_args", "Invalid MCP action fields");
+            }
+            let cwd = args.get("cwd").and_then(Value::as_str);
+            let agent_dir = state.agent_dir();
+            let mut payload = args.clone();
+            payload["agentDir"] = json!(agent_dir.to_string_lossy());
+            payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+            if let Some(cwd) = cwd {
+                if let Err(error) = validate_scoped_cwd(state, cwd) {
+                    return mcp_cwd_error(&id, &error);
+                }
+                match management_call(state, "mcp.configAction", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            } else {
+                match management_call(state, "mcp.configAction", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            }
+        }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
@@ -2239,6 +2354,26 @@ pub(crate) fn management_call(
     instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
 }
 
+fn mcp_cwd_error(id: &str, error: &(String, String)) -> Value {
+    let reason = if error.0 == "access_denied" { "cwd-denied" } else { "cwd-invalid" };
+    protocol_error_value(id, json!({ "code": "invalid_args", "message": error.1, "reason": reason, "retryable": false }))
+}
+
+/// Map MCP's bounded service refusal to the ordinary IPC error envelope.
+fn mcp_management_response(id: &str, result: Value) -> Value {
+    let Some(refusal) = result.get("mcpRefusal").and_then(Value::as_object) else {
+        return protocol_ok(id, result);
+    };
+    let Some(reason) = refusal.get("reason").and_then(Value::as_str) else {
+        return protocol_error(id, "io", "Invalid MCP refusal");
+    };
+    let Some(message) = refusal.get("message").and_then(Value::as_str) else {
+        return protocol_error(id, "io", "Invalid MCP refusal");
+    };
+    let details = refusal.get("details").cloned().unwrap_or_else(|| json!({}));
+    protocol_error_value(id, json!({ "code": "io", "message": message, "reason": reason, "details": details, "retryable": false }))
+}
+
 /// The cwd gate every models op shares — the Next routes' 400/403 half:
 /// an existing directory inside the host's allowed roots. The composition
 /// and write paths live behind the seam; access control stays host-side.
@@ -2246,6 +2381,9 @@ fn validate_scoped_cwd(
     state: &IpcHostState,
     cwd: &str,
 ) -> Result<(), (String, String)> {
+    if Path::new(cwd).components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err(("access_denied".to_string(), "Access denied".to_string()));
+    }
     let folded = lexical_fold(cwd, cfg!(windows));
     let path = Path::new(&folded);
     if !path.is_dir() {
@@ -5734,6 +5872,54 @@ mod tests {
         let second = send(&state, json!({ "v": 1, "id": "list2", "op": "skills.list", "args": { "cwd": cwd } }));
         assert_eq!(second["ok"], true, "{second}");
         assert!(second["data"]["skills"].as_array().unwrap().iter().any(|s| s["filePath"] == file.as_ref() && s["disableModelInvocation"] == true));
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_pi_mcp_config_through_host() {
+        use std::os::unix::fs::symlink;
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
+        let build = std::process::Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap();
+        assert!(build.success());
+        let fixture = std::path::Path::new("../lib/__fixtures__/mcp-env-server.mjs").canonicalize().unwrap();
+        std::fs::write(project.join(".pi/mcp.json"), json!({"mcpServers": {"local": {"command": "node", "args": [fixture]}}}).to_string()).unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        state.propose_path(&project);
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
+        });
+        let cwd = project.to_string_lossy();
+        let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let listed = call("trust.status", json!({"cwd":cwd}));
+        assert_eq!(listed["data"]["mcpServers"][0]["name"], "local", "{listed}");
+        let trusted = call("trust.set", json!({"cwd":cwd}));
+        assert_eq!(trusted["data"]["trusted"], true, "{trusted}");
+        let action = json!({"cwd":cwd,"action":"add","scope":"global","text":"node fixture.js","name":"fixture"});
+        let added = call("mcp.configAction", action.clone());
+        assert_eq!(added["data"]["added"]["name"], "fixture", "{added}");
+        let refused = call("mcp.configAction", action);
+        assert_eq!(refused["error"]["reason"], "name-taken", "{refused}");
+        assert_eq!(refused["error"]["details"]["name"], "fixture", "{refused}");
+        assert!(refused["error"]["details"]["suggestedName"].is_string(), "{refused}");
+        let removed = call("mcp.configAction", json!({"cwd":cwd,"action":"remove","scope":"global","name":"fixture"}));
+        let restored = call("mcp.configAction", json!({"cwd":cwd,"action":"undo","token":removed["data"]["undo"]["token"]}));
+        assert_eq!(restored["data"]["restored"]["name"], "fixture", "{restored}");
+        let probe = call("mcp.test", json!({"cwd":cwd,"scope":"project","name":"local"}));
+        assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
+        assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
+        assert_eq!(state.management.scopes(), vec!["global".to_string()]);
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 

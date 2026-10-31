@@ -203,6 +203,12 @@ export default defineConfig({
         find: /^@\/lib\/provider-auth-login$/,
         replacement: resolve(import.meta.dirname, "src/data/provider-auth-login.ts"),
       },
+      {
+        // The MCP service swaps Settings › MCP overview and actions for
+        // mcp.configGet / mcp.configAction over IPC.
+        find: /^@\/lib\/mcp-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/mcp-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

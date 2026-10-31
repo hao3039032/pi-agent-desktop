@@ -104,7 +104,7 @@ import type { BlockingExtensionUiRequest, CacheWarmingInfo, LeafChangeOptions, S
 import { shouldShowUsageBreakdown, UNATTRIBUTED_USAGE_KEY } from "@/lib/usage-breakdown";
 import { cacheWarmingRows } from "@/lib/cache-warming-display";
 import type { McpErrorResponse, ProjectTrustStatus } from "@/lib/api-types";
-import { fetchProjectTrustStatus } from "@/lib/project-trust-client";
+import { fetchProjectTrustStatus, setProjectTrust as requestProjectTrust } from "@/lib/project-trust-client";
 import type { ChatInputHandle } from "./ChatInput";
 import type { FileExplorerHandle } from "./FileExplorer";
 import type { SessionStatsInfo } from "@/lib/pi-types";
@@ -1851,18 +1851,14 @@ export function AppShell() {
     setProjectTrustBusy(true);
     setProjectTrustError(null);
     try {
-      const response = await fetch("/api/project-trust", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: projectTrustCwd }),
-      });
-      const data = await response.json() as ProjectTrustStatus & Partial<McpErrorResponse>;
+      const response = await requestProjectTrust(projectTrustCwd);
+      const data = response.data;
       if (!response.ok || data.error) {
         // The dialog translates the reason; the English error is only its diagnostic.
         setProjectTrustError({ error: data.error ?? `HTTP ${response.status}`, ...(data.reason ? { reason: data.reason } : {}) });
         return;
       }
-      setProjectTrust(data);
+      setProjectTrust(data as ProjectTrustStatus);
       setProjectTrustDialogOpen(false);
       setModelsRefreshKey((key) => key + 1);
       setSessionKey((key) => key + 1);

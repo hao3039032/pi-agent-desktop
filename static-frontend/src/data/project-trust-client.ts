@@ -1,22 +1,29 @@
 /**
- * The static app's project-trust status client (the vite alias for
- * `@/lib/project-trust-client`): `trust.status` over IPC — the Rust host's
- * port of `getProjectTrustStatus` (requiresTrust/trusted plus the nearest
- * decision and whether it was inherited). No HTTP server exists to ask.
- *
- * The MCP listing and the trust WRITE (the dialog's POST) are not migrated
- * yet (M3); this client covers exactly the mount probe AppShell performs.
+ * The static app's project-trust client (the vite alias for
+ * `@/lib/project-trust-client`): `trust.status` and `trust.set` over IPC —
+ * the Rust host's port of `getProjectTrustStatus`, the project's MCP listing,
+ * and the trust write path.
  */
 
-import { IpcClient } from "../ipc/client.ts";
-import type { ProjectTrustStatusResult } from "../../../lib/project-trust-client";
+import { IpcClient, IpcFailure } from "../ipc/client.ts";
+import type {
+  ProjectTrustMutationResult,
+  ProjectTrustOverviewResult,
+  ProjectTrustStatusResult,
+} from "../../../lib/project-trust-client";
+import type { ProjectTrustResponse, ProjectTrustStatus, McpRefusalReason } from "../../../lib/api-types";
 
-// The bound client (app-main binds every domain to the ONE transport before
-// the tree mounts; tests inject a MockTransport).
 let boundClient: IpcClient | null = null;
 
 export function bindProjectTrustClient(client: IpcClient): void {
   boundClient = client;
+}
+
+function ensureClient(): IpcClient {
+  if (boundClient === null) {
+    throw new Error("the project-trust IPC bridge is not configured (bindProjectTrustClient)");
+  }
+  return boundClient;
 }
 
 export async function fetchProjectTrustStatus(
@@ -24,10 +31,73 @@ export async function fetchProjectTrustStatus(
   signal?: AbortSignal,
 ): Promise<ProjectTrustStatusResult> {
   if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
-  if (boundClient === null) throw new Error("the project-trust IPC bridge is not configured (bindProjectTrustClient)");
-  const status = await boundClient.request<import("../../../lib/api-types").ProjectTrustStatus>(
+  const status = await ensureClient().request<ProjectTrustStatus>(
     "trust.status",
     { cwd },
   );
   return { ok: true, ...status };
+}
+
+export async function fetchProjectTrustOverview(
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<ProjectTrustOverviewResult> {
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      status: 0,
+      data: { error: "The operation was aborted." },
+    };
+  }
+  try {
+    const data = await ensureClient().request<ProjectTrustResponse>(
+      "trust.status",
+      { cwd },
+    );
+    return { ok: true, status: 200, data };
+  } catch (error) {
+    let msg = error instanceof Error ? error.message : String(error);
+    let reason: McpRefusalReason | undefined = undefined;
+    if (error instanceof IpcFailure) {
+      msg = error.error.message || msg;
+      reason = (error.error as { reason?: McpRefusalReason }).reason;
+    }
+    return {
+      ok: false,
+      status: 500,
+      data: { error: msg, ...(reason ? { reason } : {}) },
+    };
+  }
+}
+
+export async function setProjectTrust(
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<ProjectTrustMutationResult> {
+  if (signal?.aborted) {
+    return {
+      ok: false,
+      status: 0,
+      data: { error: "The operation was aborted." },
+    };
+  }
+  try {
+    const data = await ensureClient().request<ProjectTrustStatus>(
+      "trust.set",
+      { cwd },
+    );
+    return { ok: true, status: 200, data };
+  } catch (error) {
+    let msg = error instanceof Error ? error.message : String(error);
+    let reason: McpRefusalReason | undefined = undefined;
+    if (error instanceof IpcFailure) {
+      msg = error.error.message || msg;
+      reason = (error.error as { reason?: McpRefusalReason }).reason;
+    }
+    return {
+      ok: false,
+      status: 409,
+      data: { error: msg, ...(reason ? { reason } : {}) },
+    };
+  }
 }

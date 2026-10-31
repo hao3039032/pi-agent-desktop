@@ -64,6 +64,9 @@
       "@/lib/scheduled-tasks/client": [
         "./static-frontend/src/data/scheduled-tasks-client.ts"
       ],
+      "@/lib/mcp-service": [
+        "./static-frontend/src/data/mcp-service.ts"
+      ],
       "@/lib/project-trust-client": [
         "./static-frontend/src/data/project-trust-client.ts"
       ],

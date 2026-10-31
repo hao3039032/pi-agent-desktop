@@ -27,7 +27,12 @@ const {
   retainScheduledTaskStream,
   summarizeScheduledTasks,
 } = await jiti.import("./scheduled-tasks-store.ts");
-const { bindProjectTrustClient, fetchProjectTrustStatus } = await jiti.import("./project-trust-client.ts");
+const {
+  bindProjectTrustClient,
+  fetchProjectTrustStatus,
+  fetchProjectTrustOverview,
+  setProjectTrust,
+} = await jiti.import("./project-trust-client.ts");
 const { IpcClient, MockTransport } = await jiti.import("../ipc/client.ts");
 
 function bound(handler) {
@@ -114,4 +119,37 @@ test("the trust client returns the host's status shape", async () => {
 test("the trust client surfaces the protocol error, not a JSON parse failure", async () => {
   bound({ "trust.status": () => { throw new Error("io: store locked"); } });
   await assert.rejects(() => fetchProjectTrustStatus("/tmp/x"), /io: store locked|trust\.status/);
+});
+
+test("fetchProjectTrustOverview returns mcp listing and status over IPC", async () => {
+  bound({
+    "trust.status": (args) => {
+      return {
+        requiresTrust: true,
+        trusted: false,
+        decision: null,
+        inherited: false,
+        mcpServers: [{ name: "s1" }],
+      };
+    },
+  });
+  const res = await fetchProjectTrustOverview("/tmp/repo");
+  assert.equal(res.ok, true);
+  assert.equal(res.status, 200);
+  assert.equal(res.data.requiresTrust, true);
+  assert.deepEqual(res.data.mcpServers, [{ name: "s1" }]);
+});
+
+test("setProjectTrust calls trust.set over IPC", async () => {
+  let calledCwd = null;
+  bound({
+    "trust.set": (args) => {
+      calledCwd = args.cwd;
+      return { requiresTrust: true, trusted: true, decision: true, inherited: false };
+    },
+  });
+  const res = await setProjectTrust("/tmp/repo");
+  assert.equal(res.ok, true);
+  assert.equal(calledCwd, "/tmp/repo");
+  assert.equal(res.data.trusted, true);
 });
