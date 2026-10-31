@@ -44,7 +44,7 @@ pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
     let record = json!({ "runId": run_id, "taskId": task_id, "trigger": "manual", "startedAt": now_iso(), "status": "running", "pid": std::process::id() });
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis() as i64;
     state.scheduled_active.lock().unwrap().insert(run_id.clone());
-    if let Err(error) = repo.admit_manual(task_id, record.clone(), now_ms, std::process::id()) {
+    if let Err(error) = repo.admit_manual(task_id, &task, record.clone(), now_ms, std::process::id()) {
         state.scheduled_active.lock().unwrap().remove(&run_id);
         return Err(error);
     }
@@ -60,6 +60,13 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     state.scheduled_active.lock().unwrap().insert(run_id.clone());
     let guard = ActiveGuard { active: std::sync::Arc::clone(&state.scheduled_active), run_id: run_id.clone() };
     let trigger = record["trigger"].as_str().ok_or("Run missing trigger")?.to_string();
+    let cwd = task["cwd"].as_str().unwrap_or("");
+    if !std::path::Path::new(cwd).is_dir() {
+        return finish_early(state, &agent, &task, &record, RunOutcome {
+            status: "failed", error: Some(format!("Directory does not exist: {cwd}")), error_code: Some("cwd-missing"),
+            error_params: Some(json!({ "path": cwd })), counts_as_failure: true,
+        });
+    }
     let names = match task["toolPreset"].as_str().unwrap_or("read-only") {
         "none" => vec![],
         "read-only" => vec!["read", "grep", "find", "ls"],
@@ -85,6 +92,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let duration = task["maxDurationMin"].as_u64().unwrap_or(30).clamp(1, 1440);
     let mut marker = json!({ "version": 1, "taskId": task_id, "runId": run_id, "taskName": task["name"], "trigger": trigger });
     if record["scheduledFor"].is_string() { marker["scheduledFor"] = record["scheduledFor"].clone(); }
+    let record_session = session.id.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let thread_agent = agent.clone();
     let thread_task = task_id.clone();
@@ -111,12 +119,14 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
         // Even a marker refusal produced a real session. Keep the history
         // link so that failed setup cannot leak it into the project tree.
         if outcome.status == "failed" {
-            let _ = TaskRepository::new(&thread_agent).mutate_runs(&thread_task, |runs| {
-                if let Some(run) = runs.iter_mut().find(|run| run["runId"] == thread_run) {
-                    if run.get("sessionId").is_none() { run["sessionId"] = json!(session.id); }
-                }
+            if let Err(error) = TaskRepository::new(&thread_agent).mutate_runs(&thread_task, |runs| {
+                let run = runs.iter_mut().find(|run| run["runId"] == thread_run).ok_or("Run not found")?;
+                if run.get("sessionId").is_none() { run["sessionId"] = json!(session.id); }
                 Ok(())
-            });
+            }) {
+                let _ = ready_tx.try_send(Err(format!("recording failed session link: {error}")));
+                return;
+            }
         }
         let status = outcome.status;
         let error = outcome.error.clone();
@@ -137,6 +147,11 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     });
     if let Err(error) = spawned {
         state.registry.remove(session_id, Duration::from_secs(5));
+        TaskRepository::new(&agent).mutate_runs(&task_id, |runs| {
+            let run = runs.iter_mut().find(|run| run["runId"] == run_id).ok_or("Run not found")?;
+            run["sessionId"] = json!(record_session);
+            Ok(())
+        })?;
         return finish_early(state, &agent, &task, &record, failure(format!("failed to start scheduled runner: {error}")));
     }
     ready_rx.recv_timeout(Duration::from_secs(60)).map_err(|_| "scheduled run readiness timed out; its outcome may be unknown".to_string())?
@@ -151,9 +166,13 @@ fn finish_early(state: &IpcHostState, agent: &std::path::Path, task: &Value, rec
     let run_id = record["runId"].as_str().ok_or("Run missing id")?;
     let status = outcome.status;
     let error = outcome.error.clone();
+    let error_code = outcome.error_code;
+    let error_params = outcome.error_params.clone();
     let (run, auto_paused) = finish_run(agent, task_id, run_id, outcome)?;
     let mut event = json!({ "type": "run_finished", "taskId": task_id, "taskName": task["name"], "runId": run_id, "trigger": record["trigger"], "status": status });
     if let Some(error) = error { event["error"] = json!(error); }
+    if let Some(code) = error_code { event["errorCode"] = json!(code); }
+    if let Some(params) = error_params { event["errorParams"] = params; }
     if auto_paused { event["autoPaused"] = json!(true); }
     state.scheduled_events.emit(event);
     state.scheduled_events.emit(json!({ "type": "task_changed", "taskId": task_id }));

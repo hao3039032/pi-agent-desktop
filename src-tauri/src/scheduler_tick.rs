@@ -17,6 +17,7 @@ pub(crate) fn pid_alive(_pid: u32) -> bool { true }
 pub fn tick(state: &Arc<IpcHostState>, now_ms: i64) -> Result<bool, String> {
     let agent = state.agent_dir();
     let pid = std::process::id();
+    let acquired_at = std::time::Instant::now();
     if !task_scheduler::lease::acquire(&agent, pid, now_ms, pid_alive)? { return Ok(false); }
     let repo = TaskRepository::new(&agent);
     let now = task_scheduler::store::ms_to_iso(now_ms);
@@ -51,13 +52,18 @@ pub fn tick(state: &Arc<IpcHostState>, now_ms: i64) -> Result<bool, String> {
         let mut run = json!({ "runId": run_id, "taskId": task_id, "trigger": trigger, "scheduledFor": slot,
             "startedAt": now, "status": "running", "pid": pid });
         if let Some(skipped) = decision["skippedSlots"].as_u64().filter(|n| *n > 0) { run["skippedSlots"] = json!(skipped); }
-        match repo.claim_slot(&task, slot, run, action == "drop", now_ms, pid)? {
+        let claim_now = now_ms.saturating_add(acquired_at.elapsed().as_millis().min(i64::MAX as u128) as i64);
+        state.scheduled_active.lock().unwrap().insert(run_id.clone());
+        let claim = match repo.claim_slot(&task, slot, run, action == "drop", claim_now, pid) {
+            Ok(claim) => claim,
+            Err(error) => { state.scheduled_active.lock().unwrap().remove(&run_id); return Err(error); }
+        };
+        match claim {
             SlotClaim::Fired(record) => {
                 let state = Arc::clone(state);
                 let task_for_thread = task.clone();
                 let record_for_thread = record.clone();
                 let state_for_thread = Arc::clone(&state);
-                state.scheduled_active.lock().unwrap().insert(run_id.clone());
                 if let Err(error) = std::thread::Builder::new().name(format!("scheduled-spawn-{run_id}")).spawn(move || {
                     if let Err(error) = crate::scheduled_runner::spawn_claimed(&state_for_thread, task_for_thread, record_for_thread) {
                         eprintln!("scheduled run could not complete setup: {error}");
@@ -68,11 +74,12 @@ pub fn tick(state: &Arc<IpcHostState>, now_ms: i64) -> Result<bool, String> {
                 }
             }
             SlotClaim::Skipped(record) => {
+                state.scheduled_active.lock().unwrap().remove(&run_id);
                 state.scheduled_events.emit(json!({ "type": "run_skipped", "taskId": task_id,
                     "runId": record["runId"], "skipReason": record["skipReason"] }));
                 state.scheduled_events.emit(json!({ "type": "task_changed", "taskId": task_id }));
             }
-            SlotClaim::Deferred | SlotClaim::Lost => {}
+            SlotClaim::Deferred | SlotClaim::Lost => { state.scheduled_active.lock().unwrap().remove(&run_id); }
         }
     }
     Ok(true)

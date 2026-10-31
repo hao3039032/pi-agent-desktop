@@ -57,13 +57,17 @@ impl TaskRepository {
             .filter(|run| run.get("runId").is_some_and(Value::is_string) && run.get("taskId").and_then(Value::as_str) == Some(task_id)).collect())
     }
 
-    pub fn admit_manual(&self, task_id: &str, run: Value, now_ms: i64, pid: u32) -> Result<(), String> {
+    pub fn admit_manual(&self, task_id: &str, expected_task: &Value, run: Value, now_ms: i64, pid: u32) -> Result<(), String> {
         if !valid_id(task_id) { return Err("Invalid task id".into()); }
+        let before_lock = std::time::Instant::now();
         let _guard = TransactionLock::acquire(&self.agent_dir).map_err(|e| format!("scheduler transaction busy: {e}"))?;
+        let now_ms = now_ms.saturating_add(before_lock.elapsed().as_millis().min(i64::MAX as u128) as i64);
         let lease: Value = serde_json::from_str(&std::fs::read_to_string(self.agent_dir.join("scheduled-tasks/scheduler.lock")).map_err(|_| "Scheduler is not the owner")?).map_err(|_| "Scheduler is not the owner")?;
         let heartbeat = lease["heartbeatAt"].as_str().and_then(crate::store::iso_to_ms).ok_or("Scheduler is not the owner")?;
         if lease["pid"].as_u64() != Some(pid as u64) || now_ms.saturating_sub(heartbeat) >= crate::LEASE_STALE_MS as i64 { return Err("Scheduler is not the owner".into()); }
-        if !tasks_from(&self.read_file()?).iter().any(|task| task["id"] == task_id) { return Err("Task not found".into()); }
+        let tasks = tasks_from(&self.read_file()?);
+        let task = tasks.iter().find(|task| task["id"] == task_id).ok_or("Task not found")?;
+        if task != expected_task { return Err("Task changed during run admission; reload before retrying".into()); }
         let mut runs = self.runs(task_id)?;
         if runs.iter().any(|run| run["status"] == "running") { return Err("This task is already running".into()); }
         runs.push(run);
@@ -115,7 +119,9 @@ impl TaskRepository {
     /// is durable before the run record, as in the transitional TS engine.
     pub fn claim_slot(&self, snapshot: &Value, slot: &str, run: Value, drop_slot: bool, now_ms: i64, pid: u32) -> Result<SlotClaim, String> {
         let task_id = snapshot["id"].as_str().ok_or("Invalid task id")?;
+        let before_lock = std::time::Instant::now();
         let _guard = TransactionLock::acquire(&self.agent_dir).map_err(|e| format!("scheduler transaction busy: {e}"))?;
+        let now_ms = now_ms.saturating_add(before_lock.elapsed().as_millis().min(i64::MAX as u128) as i64);
         let lease: Value = serde_json::from_str(&std::fs::read_to_string(self.agent_dir.join("scheduled-tasks/scheduler.lock")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let heartbeat = lease["heartbeatAt"].as_str().and_then(crate::store::iso_to_ms).ok_or("Invalid scheduler lease")?;
         if lease["pid"].as_u64() != Some(pid as u64) || now_ms.saturating_sub(heartbeat) >= crate::LEASE_STALE_MS as i64 { return Ok(SlotClaim::Lost); }
@@ -262,6 +268,10 @@ mod tests {
         assert!(crate::lease::acquire(dir.path(), 99, now, |_| true).unwrap());
         let record = |id: &str| json!({"runId":format!("run-{id}"),"taskId":id,"status":"running","trigger":"schedule","pid":99});
         let tasks = repo.list().unwrap();
+        let mut stale = tasks[0].clone();
+        stale["toolPreset"] = json!("full");
+        assert!(repo.admit_manual(ids[0], &stale, record(ids[0]), now, 99).is_err());
+        assert!(repo.runs(ids[0]).unwrap().is_empty());
         let slot = "2026-03-01T05:00:00.000Z";
         assert_eq!(repo.claim_slot(&tasks[0], slot, record(ids[0]), false, now, 100).unwrap(), SlotClaim::Lost);
         assert!(matches!(repo.claim_slot(&tasks[0], slot, record(ids[0]), false, now, 99).unwrap(), SlotClaim::Fired(_)));
