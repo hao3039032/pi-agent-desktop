@@ -54,7 +54,7 @@ export function customGeneratedImage(message: AgentMessage): ImageContent | null
   if (!isRecord(details) || typeof details.data !== "string" || !details.data
     || typeof details.mimeType !== "string" || !/^image\/(png|jpeg|webp|gif|bmp|avif)$/.test(details.mimeType)) return null;
   const cached = customImageCache.get(message);
-  if (cached?.source.data === details.data && cached.source.media_type === details.mimeType) return cached;
+  if (cached?.source.type === "base64" && cached.source.data === details.data && cached.source.media_type === details.mimeType) return cached;
   const image: ImageContent = { type: "image", source: { type: "base64", data: details.data, media_type: details.mimeType } };
   customImageCache.set(message, image);
   return image;

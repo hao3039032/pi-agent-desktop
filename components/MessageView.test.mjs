@@ -63,6 +63,18 @@ test("matches response model aliases and otherwise includes the provider", () =>
   assert.equal(getModelDisplayName("gateway", "unknown-model", names), "gateway/unknown-model");
 });
 
+test("history and retry labels use each response's own model, not a selected or later model", () => {
+  const message = (provider, model, text) => ({ role: "assistant", provider, model, content: [{ type: "text", text }] });
+  const earlier = renderMessage(message("fixture", "old-model", "earlier"));
+  const retried = renderMessage(message("fixture", "retry-model", "retried"));
+  const later = renderMessage(message("fixture", "new-model", "later"));
+  assert.match(earlier, /fixture\/old-model/);
+  assert.doesNotMatch(earlier, /retry-model|new-model/);
+  assert.match(retried, /fixture\/retry-model/);
+  assert.doesNotMatch(retried, /old-model|new-model/);
+  assert.match(later, /fixture\/new-model/);
+});
+
 test("previews the first thinking line and reveals the full text with the saved default", () => {
   const previousWindow = globalThis.window;
   try {

@@ -31,7 +31,7 @@ const oldUsage = { tokens: 50_000, contextWindow: 1_000_000, percent: 5 };
 const newUsage = { tokens: 120_000, contextWindow: 1_000_000, percent: 12 };
 
 function harness({ response, stats, pending } = {}) {
-  const state = { contextUsage: oldUsage, stats: null, finished: 0, panelsOpened: 0 };
+  const state = { contextUsage: oldUsage, stats: null, finished: 0, panelsOpened: 0, recentCacheDecision: null };
   const refs = {
     sessionIdRef: { current: "session-a" },
     sessionGenerationRef: { current: 1 },
@@ -49,7 +49,7 @@ function harness({ response, stats, pending } = {}) {
     fetchAgentRunningState: async () => (pending ? await pending : response),
     sendAgentCommand: async () => pending ? await pending : stats,
     encodeURIComponent,
-    syncLiveModel() {},
+    syncLiveModel(value) { state.recentCacheDecision = value?.recentCacheDecision ?? null; },
     setContextUsage(value) { state.contextUsage = value; },
     setSessionStatsOverride(value) { state.stats = value; },
     setIsCompacting() {},
@@ -70,6 +70,24 @@ function harness({ response, stats, pending } = {}) {
     sessionCommand: sessionCommandScript.runInNewContext(globals),
   };
 }
+
+test("cache proposal polling discards prior session generation and clears absent data", async () => {
+  let resolve;
+  const pending = new Promise(done => { resolve = done; });
+  const h = harness({ pending });
+  const poll = h.reconcile("session-a");
+  h.sessionGenerationRef.current = 2;
+  resolve({ running: true, state: { recentCacheDecision: { action: "warm" } } });
+  await poll;
+  assert.equal(h.state.recentCacheDecision, null);
+  const fresh = harness({ response: { running: true, state: { recentCacheDecision: { action: "stop" } } } });
+  await fresh.reconcile("session-a");
+  assert.equal(fresh.state.recentCacheDecision.action, "stop");
+  const absent = harness({ response: { running: true, state: {} } });
+  absent.state.recentCacheDecision = { action: "warm" };
+  await absent.reconcile("session-a");
+  assert.equal(absent.state.recentCacheDecision, null);
+});
 
 test("idle reconciliation cannot finish a prompt still awaiting session readiness or admission", async () => {
   const h = harness({ response: { running: false } });

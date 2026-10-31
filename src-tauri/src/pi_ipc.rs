@@ -1306,6 +1306,22 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "agent.bashOutput" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            if sid.is_empty() || path.is_empty() || path.len() > 4096 {
+                return protocol_error(&id, "invalid_args", "session and path required");
+            }
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            match file {
+                Some(file) => match management_call(state, "session.readBashOutput", json!({"file":file.display().to_string(),"sessionId":sid,"path":path})) {
+                    Ok(data) => protocol_ok(&id, data),
+                    Err((code, message)) => protocol_error(&id, &code, &message),
+                },
+                None => protocol_error(&id, "not_found", "session not found"),
+            }
+        }
         "sessions.thinking" => {
             let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
             let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
@@ -1464,6 +1480,21 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "agent.subagentsStatus" | "agent.subagentsAction" => match crate::session_fleet::dispatch(state, op, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((reason, message)) => {
+                let code = match reason.as_str() {
+                    "invalid_args" | "invalid_params" | "invalid_request" | "unsupported_method" | "unsupported_version" | "capability-unavailable" => "invalid_args",
+                    "not_found" => "not_found",
+                    "session-closed" | "invalid_state" | "no_active_session" => "busy",
+                    "unresponsive" => "timeout",
+                    "chat-workspace" => "unauthorized_scope",
+                    "not-loaded" | "unknown" => "not_supported",
+                    _ => "io",
+                };
+                protocol_error_value(&id, json!({"code":code,"reason":reason,"message":message,"retryable":false}))
+            }
+        },
         "agent.respondUi" => {
             let session_id = args.get("session").and_then(Value::as_str).unwrap_or("");
             let request_id = args.get("id").and_then(Value::as_str).unwrap_or("");
@@ -2745,6 +2776,9 @@ pub(crate) fn management_error_code(error: &str) -> (String, String) {
             "unknown_op"
                 | "invalid_args"
                 | "not_found"
+                | "too_large"
+                | "not_supported"
+                | "unauthorized_scope"
                 | "op_failed"
                 | "invalid_cron"
                 | "project_scope"
@@ -3042,6 +3076,8 @@ fn session_view_dispatch(
                     }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
                 let (extension_statuses, extension_widgets) = session.extension_ui_state();
+                let recent_cache_decision = session.bridge_request("cache.recentDecision", None, Some(Duration::from_secs(3)))
+                    .ok().and_then(|result| result.get("decision").filter(|value| value.is_object()).cloned());
                 // Only the child's active entries/leaf can identify a recorded prompt.
                 // A failed read or absence of a record is unknown (a spawn-time
                 // custom prompt may still exist); never invent a composed prompt.
@@ -3057,8 +3093,15 @@ fn session_view_dispatch(
                     let _ = std::fs::remove_file(handoff);
                     result
                 });
-                let prompt_recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool) == Some(true);
-                let prompt = recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str).unwrap_or("");
+                let recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool);
+                let (prompt, prompt_status) = match recorded {
+                    Some(true) => match recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str) {
+                        Some(text) => (text, "recorded"),
+                        None => ("", "unknown"),
+                    },
+                    Some(false) => session.configured_system_prompt().map(|text| (text, "configured")).unwrap_or(("", "unknown")),
+                    None => ("", "unknown"),
+                };
                 let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
@@ -3098,9 +3141,10 @@ fn session_view_dispatch(
                     // usage — unknown is not zero).
                     "contextUsage": context_usage.unwrap_or(Value::Null),
                     "systemPrompt": prompt,
-                    "systemPromptStatus": if prompt_recorded { "recorded" } else { "unknown" },
+                    "systemPromptStatus": prompt_status,
                     "extensionStatuses": extension_statuses,
                     "extensionWidgets": extension_widgets,
+                    "recentCacheDecision": recent_cache_decision,
                 });
                 return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
             }
@@ -4441,6 +4485,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let state = state();
         let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
         let (_sub, events, _) = session.subscribe_with_ui();
+        let cache = session.bridge_request("cache.recentDecision", None, Some(Duration::from_secs(10))).unwrap();
+        assert!(cache["decision"].is_null(), "no cache event must remain unknown: {cache}");
         let prompt = Arc::clone(&session);
         let handle = std::thread::spawn(move || prompt.command("prompt", json!({"message":"/fixture-confirm"}), Some(Duration::from_secs(10))));
         let event = loop {
@@ -4482,11 +4528,24 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(managed.join("@earendil-works")).unwrap();
         std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works/pi-coding-agent").canonicalize().unwrap(), managed.join("@earendil-works/pi-coding-agent")).unwrap();
         let (file, id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut bash = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        write!(bash, "fixture bash output").unwrap();
+        bash.flush().unwrap();
+        let unreferenced = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        let large = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        large.as_file().set_len(5 * 1024 * 1024 + 1).unwrap();
+        let link = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        std::fs::remove_file(link.path()).unwrap();
+        std::os::unix::fs::symlink(bash.path(), link.path()).unwrap();
         let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
         for (entry, parent, text) in [("root", Value::Null, "ROOT"), ("a", json!("root"), "BRANCH A"), ("b", json!("root"), "BRANCH B")] {
             writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
         }
         writeln!(writer, "{}", json!({"type":"message","id":"think","parentId":"b","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"fixture hidden reasoning"}]}})).unwrap();
+        writeln!(writer, "{}", json!({"type":"message","id":"media","parentId":"think","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"t1","content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"},{"type":"image","data":"PGh0bWw+","mimeType":"image/png"}]}})).unwrap();
+        for (entry, parent, path) in [("bash1", "media", bash.path()), ("bash2", "bash1", large.path()), ("bash3", "bash2", link.path())] {
+            writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"bashExecution","command":"fixture","output":"","exitCode":0,"fullOutputPath":path}})).unwrap();
+        }
         drop(writer);
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
@@ -4509,11 +4568,34 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
         let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
         assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
+        let read_bash = |path: &Path| send(&state, json!({"v":1,"id":"bash","op":"agent.bashOutput","args":{"session":id,"path":path}}));
+        assert_eq!(read_bash(bash.path())["data"]["output"], "fixture bash output");
+        assert_eq!(read_bash(large.path())["error"]["code"], "too_large");
+        assert_eq!(read_bash(link.path())["error"]["code"], "not_found");
+        assert_eq!(read_bash(unreferenced.path())["error"]["code"], "unauthorized_scope");
+        assert_eq!(read_bash(&root_path.join("not-allowed.log"))["error"]["code"], "invalid_args");
         let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
         assert_eq!(missing["ok"], false, "{missing}");
+        let output = root_path.join("image.bin");
+        let image = management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":0,"outputFile":output})).unwrap();
+        assert_eq!(image["mime"], "image/png");
+        assert_eq!(std::fs::read(&output).unwrap(), [137,80,78,71,13,10,26,10]);
+        assert!(management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":1,"outputFile":root_path.join("bad.bin")})).is_err());
+        assert!(management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"think","blockIndex":0,"outputFile":root_path.join("wrong-role.bin")})).is_err());
+        assert!(!root_path.join("bad.bin").exists());
         session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
         let after = read();
         assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
+        let prompt_file = root_path.join("base-prompt");
+        std::fs::write(&prompt_file, "\u{feff}FIXTURE BASE").unwrap();
+        let (other_file, other_id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut other_config = config.clone();
+        other_config.shape = session_host::SessionSpawnShape::ChatOnly { prompt_file };
+        state.registry.start(&other_id, &other_file, &other_id, &cwd, &other_config).unwrap();
+        let fallback = send(&state, json!({"v":1,"id":"base","op":"sessions.state","args":{"session":other_id}}));
+        assert_eq!(fallback["data"]["state"]["systemPromptStatus"], "configured", "{fallback}");
+        assert_eq!(fallback["data"]["state"]["systemPrompt"], "FIXTURE BASE");
+        state.registry.remove(&other_id, Duration::from_secs(5));
         state.registry.remove(&id, Duration::from_secs(5));
     }
 

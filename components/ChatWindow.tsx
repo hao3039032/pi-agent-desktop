@@ -331,7 +331,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     showScrollToBottom,
     sessionIdRef, scrollContainerRef,
     lastUserMsgRef, promptAnchorActive,
-    branchSummaryPending, handleAbortBranchSummary, routedModel,
+    branchSummaryPending, handleAbortBranchSummary, routedModel, recentCacheDecision,
     stopPending, forceStopTarget, forceStopBusy, handleForceStop, dismissForceStop,
     handleSend, handleAbort, handleAbortRetry, handleFork, handleEditContent, cancelEdit, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction, handleQueuedMessageAction,
@@ -1422,6 +1422,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
       onAbortRetry={handleAbortRetry}
       branchSummaryPending={branchSummaryPending}
       routedModel={routedModel}
+      recentCacheDecision={recentCacheDecision}
       onAbortBranchSummary={handleAbortBranchSummary}
       automation={automation}
       onSetAutomation={handleSetAutomation}

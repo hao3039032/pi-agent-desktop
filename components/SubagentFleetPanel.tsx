@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { AppSelect } from "./AppSelect";
+import { fetchSubagentFleet, sendSubagentFleetAction } from "@/lib/subagent-fleet-client";
 import type {
   PiSubagentRunRow,
   PiSubagentsStatusView,
@@ -76,12 +77,7 @@ export function SubagentFleetPanel({ sessionId }: Props) {
     const controller = inFlight.current;
     if (!controller || controller.signal.aborted) return;
     try {
-      const response = await fetch(`/api/agent/${encodeURIComponent(sessionId)}/subagents`, {
-        cache: "no-store",
-        signal: signal ?? controller.signal,
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json() as PiSubagentsStatusView;
+      const data = await fetchSubagentFleet(sessionId, signal ?? controller.signal);
       if (id !== requestId.current || controller.signal.aborted) return;
       setView(data);
       setError(null);
@@ -128,17 +124,8 @@ export function SubagentFleetPanel({ sessionId }: Props) {
     setActionError(null);
     let succeeded = false;
     try {
-      const response = await fetch(`/api/agent/${encodeURIComponent(sessionId)}/subagents`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await response.json() as { error?: string; reason?: string };
+      const data = await sendSubagentFleetAction(sessionId, body, controller.signal);
       if (controller.signal.aborted) return null;
-      if (!response.ok || data.error) {
-        throw new Error(data.error ?? `HTTP ${response.status}`);
-      }
       succeeded = true;
       return data;
     } catch (cause) {

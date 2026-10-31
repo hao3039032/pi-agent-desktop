@@ -1272,6 +1272,8 @@ fn session_writer_fence_blocks_live_admissions_and_drain() {
     assert!(registry.start(id, &file, id, &cwd, &config).is_err());
     assert!(session.command("prompt", json!({"message":"blocked"}), Some(Duration::from_secs(2))).is_err());
     assert!(session.composer_enqueue("blocked", None).is_err());
+    let steer = session.bridge_request("subagents.steer", Some(json!({"params":{"id":"run","message":"blocked"}})), Some(Duration::from_secs(2)));
+    assert!(matches!(steer, Err(pi_host::bridge::BridgeError::Op(error)) if error.code.as_deref() == Some("busy")));
     session.composer_outbox.enqueue("queued", None).unwrap();
     session.composer_wake();
     std::thread::sleep(Duration::from_millis(200));

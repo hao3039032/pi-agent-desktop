@@ -51,7 +51,7 @@ import { CODEMODE_TOOL_NAME, getCodemodeProgress } from "@/lib/codemode-view";
 import { updateExtensionWidgets } from "@/lib/extension-widgets";
 import { bareMcpOpensSettings } from "@/lib/mcp-command";
 import type { SettingsSection } from "@/lib/settings-navigation";
-import type { CacheWarmingInfo, ExtensionStatusItem, LeafChangeOptions, RoutedModelInfo } from "@/lib/types";
+import type { CacheWarmingInfo, RecentCacheWarmingDecision, ExtensionStatusItem, LeafChangeOptions, RoutedModelInfo } from "@/lib/types";
 import {
   enqueueExtensionUiRequest,
   removeExtensionUiRequest,
@@ -134,6 +134,7 @@ type AgentStateResponse = {
   extensionWidgets?: ExtensionWidgetItem[];
   routedModel?: RoutedModelInfo;
   cacheWarming?: CacheWarmingInfo;
+  recentCacheDecision?: RecentCacheWarmingDecision | null;
   queuedMessages?: { steering?: string[]; followUp?: string[]; pending?: PendingComposerMessage[]; pendingVersion?: number; frontDeliveryUnknown?: boolean } | null;
   autoCompactionEnabled?: boolean;
   autoRetryEnabled?: boolean;
@@ -411,6 +412,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // Under a virtual model: where the latest response was routed (pi's footer "auto → …").
   const [routedModel, setRoutedModel] = useState<RoutedModelInfo | null>(null);
   const [cacheWarming, setCacheWarming] = useState<CacheWarmingInfo | null>(null);
+  const [recentCacheDecision, setRecentCacheDecision] = useState<RecentCacheWarmingDecision | null>(null);
   const [pendingModel, setPendingModel] = useState<{ provider: string; modelId: string } | null>(null);
   const [modelSwitching, setModelSwitching] = useState(false);
   const [isCompacting, setIsCompacting] = useState(false);
@@ -652,6 +654,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setLiveModel(null);
     setRoutedModel(null);
     setCacheWarming(null);
+    setRecentCacheDecision(null);
     setLiveThinkingLevel(null);
   }
 
@@ -687,6 +690,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     setRoutedModel(state?.routedModel ?? null);
     setCacheWarming(state?.cacheWarming ?? null);
+    setRecentCacheDecision(state?.recentCacheDecision ?? null);
     syncAutomation(state);
   }, [syncAutomation]);
 
@@ -3281,7 +3285,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     sessionIdRef, scrollContainerRef,
     lastUserMsgRef, pendingScrollToUserRef, initialScrollDoneRef,
     // Actions
-    branchSummaryPending, handleAbortBranchSummary, routedModel,
+    branchSummaryPending, handleAbortBranchSummary, routedModel, recentCacheDecision,
     stopPending, forceStopTarget, forceStopBusy, handleForceStop,
     dismissForceStop: () => setForceStopTarget(null),
     handleSend, handleAbort, handleAbortRetry, handleFork, handleNavigate, handleModelChange,

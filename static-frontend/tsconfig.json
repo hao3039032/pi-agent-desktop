@@ -34,6 +34,9 @@
       "next/link": [
         "./static-frontend/src/shims/next/link.tsx"
       ],
+      "@/lib/subagent-fleet-client": [
+        "./static-frontend/src/data/subagent-fleet-client.ts"
+      ],
       "@/lib/agent-client": [
         "./static-frontend/src/data/agent-client.ts"
       ],

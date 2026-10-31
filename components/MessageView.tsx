@@ -6,7 +6,7 @@ import { MarkdownBody } from "./MarkdownBody";
 import { ImagePreview } from "./ImagePreview";
 import { ThinkingIcon } from "./ThinkingIcon";
 import { copyText } from "@/lib/clipboard";
-import { fetchThinkingContent } from "@/lib/session-view-service";
+import { fetchBashOutput, fetchThinkingContent } from "@/lib/session-view-service";
 import { useI18n } from "@/hooks/useI18n";
 import { useDiffViewMode } from "@/hooks/useDiffViewMode";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
@@ -2116,16 +2116,15 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
   const displayOutput = fullOutput ?? message.output;
 
   async function loadFullOutput() {
-    if (!fullOutputUrl) return;
+    if (!sessionId || !message.fullOutputPath) return;
     setLoadingFull(true);
     setFullError(null);
     try {
-      const res = await fetch(fullOutputUrl);
-      const d = await res.json() as { success?: boolean; data?: { output?: string }; error?: string };
-      if (d.success) {
-        setFullOutput(d.data?.output ?? "");
+      const result = await fetchBashOutput(sessionId, message.fullOutputPath);
+      if (result.output !== undefined) {
+        setFullOutput(result.output);
       } else {
-        setFullError(d.error ?? "failed");
+        setFullError(result.error ?? "failed");
       }
     } catch (e) {
       setFullError(String(e));

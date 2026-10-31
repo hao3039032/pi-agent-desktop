@@ -21,6 +21,7 @@ const jiti = createJiti(import.meta.url, {
 const {
   fetchSessionView,
   fetchThinkingContent,
+  fetchBashOutput,
   fetchSessionContextPage,
   fetchAgentRunningState,
   renewSessionLease,
@@ -36,6 +37,14 @@ function boundService(configure) {
   bindSessionViewService(client);
   return mock;
 }
+
+test("full bash output uses the session-bound IPC operation", async () => {
+  boundService((transport) => transport.on("agent.bashOutput", (args) => {
+    assert.deepEqual(args, { session: "s1", path: "/tmp/pi-bash-fixture.log" });
+    return { output: "fixture output" };
+  }));
+  assert.deepEqual(await fetchBashOutput("s1", "/tmp/pi-bash-fixture.log"), { output: "fixture output" });
+});
 
 test("deferred thinking uses the typed session and entry IPC operation", async () => {
   boundService((transport) => transport.on("sessions.thinking", (args) => {

@@ -3,9 +3,11 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("./SubagentFleetPanel.tsx", import.meta.url), "utf8");
+const fleetClient = await readFile(new URL("../lib/subagent-fleet-client.ts", import.meta.url), "utf8");
 
 test("polls the restricted subagents API of one session for as long as it is mounted", () => {
-  assert.match(source, /\/api\/agent\/\$\{encodeURIComponent\(sessionId\)\}\/subagents/);
+  assert.match(source, /fetchSubagentFleet\(sessionId, signal \?\? controller\.signal\)/);
+  assert.match(fleetClient, /\/api\/agent\/\$\{encodeURIComponent\(sessionId\)\}\/subagents/);
   assert.match(source, /const POLL_INTERVAL_MS = 2_500/);
   // Collapsing the tag unmounts the panel; the poll chain must stop on unmount
   // instead of keeping a timer alive.

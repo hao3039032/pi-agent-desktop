@@ -69,6 +69,12 @@ export interface SessionViewResponse {
   error?: string;
 }
 
+export async function fetchBashOutput(sessionId: string, path: string): Promise<{ output?: string; error?: string }> {
+  const response = await fetch(`/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(path)}`);
+  const data = await response.json() as { success?: boolean; data?: { output?: string }; error?: string };
+  return data.success ? { output: data.data?.output ?? "" } : { error: data.error ?? "failed" };
+}
+
 export async function fetchThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/entries/${encodeURIComponent(entryId)}/thinking?blockIndex=${blockIndex}`);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);

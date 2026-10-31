@@ -19,9 +19,11 @@ test("the composer shows the routed model next to the selector, like pi's footer
   assert.match(chatInput, /\{routedModel && routedModelName && \(\s*<span\s*className="routed-model-hint"/);
 });
 
-test("the session panel lists cost by model and cache warming, refreshed when it opens", () => {
+test("the session panel lists cost by model and cache warming, refreshed when it opens", async () => {
   assert.match(appShell, /shouldShowUsageBreakdown\(sessionStats\.costBreakdown, sessionStats\.selectedModelKey\)/);
   assert.match(appShell, /section\(translate\("session\.costByModel"\), costBreakdownRows\)/);
   assert.match(appShell, /section\(translate\("session\.cacheWarming"\), cacheWarmingSectionRows\)/);
-  assert.match(appShell, /fetch\(`\/api\/agent\/\$\{encodeURIComponent\(sessionPanelSessionId\)\}`\)/);
+  assert.match(appShell, /fetchAgentRunningState\(sessionPanelSessionId\)/);
+  const service = await read("../lib/session-view-service.ts");
+  assert.match(service, /\/api\/agent\/\$\{encodeURIComponent\(sid\)\}/);
 });

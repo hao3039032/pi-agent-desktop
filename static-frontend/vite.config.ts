@@ -41,6 +41,10 @@ export default defineConfig({
       // The data-layer swaps (M2): typed IPC implementations replace the
       // HTTP clients module-by-module. The Next app keeps the originals.
       {
+        find: /^@\/lib\/subagent-fleet-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/subagent-fleet-client.ts"),
+      },
+      {
         find: /^@\/lib\/agent-client$/,
         replacement: resolve(import.meta.dirname, "src/data/agent-client.ts"),
       },
