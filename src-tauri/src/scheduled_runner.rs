@@ -36,6 +36,7 @@ fn failure(error: impl Into<String>) -> RunOutcome {
 /// Admit one manual run and return once its session is durably linked, or its
 /// early failure is recorded. Never retries a prompt whose outcome is unknown.
 pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
+    let lifecycle = state.scheduler_lifecycle.lock().unwrap();
     if !state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst) { return Err("Scheduler is not the owner".into()); }
     let agent = state.agent_dir();
     let repo = TaskRepository::new(&agent);
@@ -48,6 +49,7 @@ pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
         state.scheduled_active.lock().unwrap().remove(&run_id);
         return Err(error);
     }
+    drop(lifecycle);
     spawn_claimed(state, task, record)
 }
 

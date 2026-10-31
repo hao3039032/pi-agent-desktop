@@ -60,6 +60,7 @@ pub struct IpcHostState {
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
     pub(crate) scheduled_active: Arc<Mutex<BTreeSet<String>>>,
+    pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
     /// The file access allow-list (the /api/files security boundary).
@@ -106,6 +107,7 @@ impl IpcHostState {
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
+            scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
@@ -124,6 +126,7 @@ impl IpcHostState {
     }
 
     pub fn start_scheduler(self: &Arc<Self>) -> Result<(), String> {
+        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
         let mut current = self.scheduler_loop.lock().unwrap();
         if current.is_none() {
             *current = Some(crate::scheduler_tick::SchedulerLoop::start(Arc::clone(self), Duration::from_secs(30))?);
@@ -132,7 +135,14 @@ impl IpcHostState {
     }
 
     pub fn stop_scheduler(&self) {
-        let scheduler = self.scheduler_loop.lock().unwrap().take();
+        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        self.stop_scheduler_locked();
+    }
+
+    fn stop_scheduler_locked(&self) {
+        let mut current = self.scheduler_loop.lock().unwrap();
+        self.scheduler_owner.store(false, Ordering::SeqCst);
+        let scheduler = current.take();
         drop(scheduler);
         self.scheduler_owner.store(false, Ordering::SeqCst);
     }
@@ -140,7 +150,8 @@ impl IpcHostState {
     /// Host shutdown: stop new claims, reap linked child sessions, then let
     /// their workers persist outcomes before management instances are closed.
     pub fn shutdown_scheduler(&self) -> Result<(), String> {
-        self.stop_scheduler();
+        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        self.stop_scheduler_locked();
         let repo = task_scheduler::task_repository::TaskRepository::new(self.agent_dir());
         let deadline = std::time::Instant::now() + Duration::from_secs(35);
         loop {

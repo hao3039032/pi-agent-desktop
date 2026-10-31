@@ -87,6 +87,7 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
             Ok(json!({ "task": view(task, next, &runs) }))
         }
         "tasks.takeover" => {
+            let _lifecycle = state.scheduler_lifecycle.lock().unwrap();
             if state.scheduler_loop.lock().unwrap().is_none() { return Err(err("not_supported", "Scheduler host is not started")); }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| err("io", e.to_string()))?.as_millis() as i64;
             let owner = task_scheduler::lease::acquire(&state.agent_dir(), std::process::id(), now, crate::scheduler_tick::pid_alive).map_err(|e| err("io", e))?;
