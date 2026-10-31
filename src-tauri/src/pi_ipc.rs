@@ -1097,6 +1097,23 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // sessionListVersion).
         "sessions.list" => {
             let agent_dir = state.agent_dir();
+            let transaction = match task_scheduler::transaction_lock::TransactionLock::acquire(&agent_dir) {
+                Ok(lock) => lock,
+                Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
+            };
+            match std::fs::symlink_metadata(agent_dir.join("session-deletion-journal")) {
+                Ok(_) => {
+                    let root = match agent_dir.join("sessions").canonicalize() {
+                        Ok(root) => root,
+                        Err(error) => return protocol_error(&id, "io", &error.to_string()),
+                    };
+                    if let Err((code, message)) = crate::session_deletion_journal::recover(state, &root) {
+                        return protocol_error(&id, &code, &message);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return protocol_error(&id, "io", &error.to_string()),
+            }
             let files = session_host::list_session_files(&agent_dir);
             // The parent-id map first (a fork's originSessionId resolves
             // from ITS header, never a filename suffix).
@@ -1110,7 +1127,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     scans.push(scan);
                 }
             }
-            let mut sessions: Vec<Value> = Vec::new();
+            let mut relations = Vec::with_capacity(scans.len());
             for scan in &scans {
                 let parent_id = scan
                     .parent_session_path
@@ -1132,8 +1149,15 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     Some(value) if value.is_object() => Some(value),
                     _ => None,
                 };
-                sessions.push(catalogue_info(state, &agent_dir, scan, parent_id, relation));
+                relations.push((parent_id, relation));
             }
+            let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
+                Ok(index) => index,
+                Err(error) => return protocol_error(&id, "io", &error.0),
+            };
+            drop(transaction);
+            let mut sessions: Vec<Value> = scans.iter().zip(relations).map(|(scan, (parent_id, relation))|
+                catalogue_info(state, &agent_dir, scan, parent_id, relation)).collect();
             // The running set the payload carries (the SSE stream's source).
             let running: Vec<String> = state
                 .registry
@@ -1157,10 +1181,6 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     sessions.push(info);
                 }
             }
-            let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
-                Ok(index) => index,
-                Err(error) => return protocol_error(&id, "io", &error.0),
-            };
             for session in &mut sessions {
                 let relation = session.get("id").and_then(Value::as_str).and_then(|id| scheduled.relation(id));
                 if let Some((task_id, run_id)) = relation {

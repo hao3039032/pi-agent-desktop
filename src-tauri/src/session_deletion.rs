@@ -47,6 +47,8 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     let agent = state.agent_dir();
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
+    let root = agent.join("sessions").canonicalize().map_err(|e| error("io", e))?;
+    crate::session_deletion_journal::recover(state, &root)?;
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
     delete_with_index(state, args, &index)
@@ -81,10 +83,11 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
     let mut files = Vec::new();
     files_in(&root, &mut files)?;
-    let mut target: Option<(PathBuf, std::fs::Metadata)> = None;
+    let mut target: Option<(PathBuf, std::fs::File)> = None;
     let mut references = Vec::new();
     for file in files {
         let handle = std::fs::File::open(&file).map_err(|e| error("io", e))?;
+        let before = handle.metadata().map_err(|e| error("io", e))?;
         let mut reader = std::io::BufReader::new(handle);
         let header = bounded_line(&mut reader, 64 * 1024)?.ok_or_else(|| error("not_supported", "Cannot verify an empty session file."))?;
         if header.get("type").and_then(Value::as_str) != Some("session") { return Err(error("not_supported", "Cannot verify a session header.")); }
@@ -109,14 +112,19 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
                 subagent_parent = Some(parent.to_string());
             }
         }
+        let after = reader.get_ref().metadata().map_err(|e| error("io", e))?;
+        if before.len() != after.len() || before.modified().map_err(|e| error("io", e))? != after.modified().map_err(|e| error("io", e))? {
+            return Err(error("busy", "Session changed while checking references"));
+        }
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
             if subagent_parent.is_some() { return Err(error("not_supported", "Subagent deletion requires the full cascade operation.")); }
-            target = Some((file.clone(), reader.get_ref().metadata().map_err(|e| error("io", e))?));
+            target = Some((file.clone(), reader.into_inner()));
         }
         references.push((child_id.to_string(), parent, subagent_parent));
     }
-    let (target, target_metadata) = target.ok_or_else(|| error("not_found", "Session not found"))?;
+    let (target, target_handle) = target.ok_or_else(|| error("not_found", "Session not found"))?;
+    let target_metadata = target_handle.metadata().map_err(|e| error("io", e))?;
     let canonical_target = target.canonicalize().map_err(|e| error("io", e))?;
     if !canonical_target.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
     for (child_id, parent, subagent_parent) in references {
@@ -131,44 +139,8 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
             }
         }
     }
-    remove_verified_file(&root, &canonical_target, &target_metadata)?;
+    crate::session_deletion_journal::remove(&root, &state.agent_dir(), id, &canonical_target, &target_metadata)?;
     Ok(json!({"ok": true, "folderTrashed": false}))
-}
-
-#[cfg(unix)]
-fn remove_verified_file(root: &Path, target: &Path, expected: &std::fs::Metadata) -> Result<(), (String, String)> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-    let relative = target.strip_prefix(root).map_err(|e| error("access_denied", e))?;
-    let mut directory = std::fs::File::open(root).map_err(|e| error("io", e))?;
-    let mut components = relative.components().peekable();
-    while let Some(component) = components.next() {
-        let std::path::Component::Normal(name) = component else { return Err(error("access_denied", "Invalid session path")); };
-        if components.peek().is_some() {
-            directory = crate::file_access::openat_directory_no_follow(&directory, name.to_str().ok_or_else(|| error("io", "Invalid session path encoding"))?)
-                .map_err(|e| error("io", e))?;
-        } else {
-            let name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|e| error("io", e))?;
-            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-            if unsafe { libc::fstatat(directory.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-                return Err(error("io", std::io::Error::last_os_error()));
-            }
-            let stat = unsafe { stat.assume_init() };
-            if stat.st_dev as u64 != expected.dev() || stat.st_ino as u64 != expected.ino() || stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(error("busy", "Session file changed during deletion"));
-            }
-            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-                return Err(error("io", std::io::Error::last_os_error()));
-            }
-            return Ok(());
-        }
-    }
-    Err(error("io", "Invalid session path"))
-}
-
-#[cfg(not(unix))]
-fn remove_verified_file(_root: &Path, _target: &Path, _expected: &std::fs::Metadata) -> Result<(), (String, String)> {
-    Err(error("not_supported", "Safe session deletion is unavailable on this platform."))
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ pub mod settings_extras;
 mod session_search;
 mod session_actions;
 mod session_deletion;
+mod session_deletion_journal;
 mod terminal_host;
 mod scheduler_host;
 mod scheduler_tick;
