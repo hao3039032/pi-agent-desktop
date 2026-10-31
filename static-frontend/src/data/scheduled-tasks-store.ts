@@ -24,7 +24,7 @@ import { useEffect, useSyncExternalStore } from "react";
 
 import { IpcClient } from "../ipc/client.ts";
 import { detectTransport } from "./transport.ts";
-import type { ScheduledTaskView } from "../../../lib/scheduled-tasks/types";
+import type { ScheduledTaskEvent, ScheduledTaskView } from "../../../lib/scheduled-tasks/types";
 
 // The bound client (app-main binds every domain to the ONE transport before
 // the tree mounts; tests inject a MockTransport).
@@ -93,8 +93,15 @@ export async function refreshScheduledTasks(): Promise<void> {
   }
 }
 
-/** No event source exists yet (M4). Kept as a no-op for the consumer surface. */
-export function onScheduledTaskEvent(): () => void {
+/**
+ * The Next hook's exact contract (a typed handler in, an unsubscriber
+ * out). No event source exists yet (M4): the handler is accepted but
+ * nothing can ever fire it — run-finished notifications honestly stay off
+ * in the static app until the host's tasks event stream lands, so this is
+ * deliberately NOT a working event subscription.
+ */
+export function onScheduledTaskEvent(handler: (event: ScheduledTaskEvent) => void): () => void {
+  void handler;
   return () => {};
 }
 

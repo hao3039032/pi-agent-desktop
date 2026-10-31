@@ -124,9 +124,10 @@ export default defineConfig({
         replacement: resolve(import.meta.dirname, "src/data/enabled-models-service.ts"),
       },
       {
-        // The models-config read swaps GET /api/models-config for
-        // modelsConfig.get over IPC (the redaction stays server-side on
-        // both paths); the panel's Save keeps the HTTP route for now.
+        // The models-config service swaps GET/PUT /api/models-config for
+        // modelsConfig.get / modelsConfig.put over IPC (the redaction and
+        // the literal-key merge stay inside the management instance's
+        // composition on both paths).
         find: /^@\/lib\/models-config-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-config-service.ts"),
       },

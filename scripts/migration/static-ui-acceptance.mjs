@@ -151,7 +151,9 @@ scripts.set("hang", async ({ res }) => {
 await new Promise((r) => providerServer.listen(0, "127.0.0.1", r));
 const providerPort = providerServer.address().port;
 
-writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+// The models.json fixture, kept verbatim so the models-config save step can
+// restore the sandbox's exact baseline after its UI round trip.
+const fixtureModelsJson = JSON.stringify({
   providers: {
     "fixture-provider": {
       name: "Fixture Provider",
@@ -166,12 +168,13 @@ writeFileSync(join(agentDir, "models.json"), JSON.stringify({
     "fixture-second": {
       name: "Fixture Second",
       baseUrl: `http://127.0.0.1:${providerPort}/v1`,
-      apiKey: "fixture-key",
+      apiKey: "fixture-second-key",
       api: "openai-completions",
       models: [{ id: "fixture-second-model", name: "Fixture Second Model" }],
     },
   },
-}, null, 2));
+}, null, 2);
+writeFileSync(join(agentDir, "models.json"), fixtureModelsJson);
 writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
   defaultProvider: "fixture-provider",
   defaultModel: "fixture-model",
@@ -746,6 +749,76 @@ try {
   assert.ok(!settingsDisk.includes("enabledModels"), `everything enabled drops the key again: ${settingsDisk}`);
   await page.keyboard.press("Escape");
   await page.waitForFunction(() => !document.querySelector(".settings-dialog-surface"), null, { timeout: 30_000 });
+
+  // ------------------------------------------- models.json edit + save
+  step("settings: Models panel — edit models.json, save over IPC, reopen: persisted, fixture restored");
+  // The REAL save path (modelsConfig.put through the management instance):
+  // the panel edits a provider KEY (rename), saves, and the write must (a)
+  // land on disk, (b) merge back the stored literal apiKey of the provider
+  // the draft never saw (GET redacts it), and (c) survive a close/reopen
+  // through a fresh modelsConfig.get. The rename is undone at the end so
+  // later readers see the original fixture.
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.locator(".settings-dialog-surface").waitFor({ timeout: 30_000 });
+  await page.locator(".settings-section-tab", { hasText: "Models" }).click();
+  await page.locator(".config-sidebar-item", { hasText: "fixture-provider" }).first().waitFor({ timeout: 30_000 });
+  // The rename flow: type a new provider key + Rename (moves the provider
+  // and records the move for the post-save resync).
+  await page.getByPlaceholder("provider-name").fill("fixture-renamed");
+  await page.getByRole("button", { name: "Rename", exact: true }).click();
+  const renamedRow = page.locator(".config-sidebar-item", { hasText: "fixture-renamed" }).first();
+  await renamedRow.waitFor({ timeout: 30_000 });
+  // Save: one modelsConfig.put request — the button goes busy then Saved.
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.waitForFunction(
+    () => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Saved"),
+    null,
+    { timeout: 60_000 },
+  );
+  let modelsDisk = readFileSync(join(agentDir, "models.json"), "utf8");
+  assert.ok(modelsDisk.includes("fixture-renamed"), `the rename landed: ${modelsDisk}`);
+  assert.ok(!/"fixture-provider"/.test(modelsDisk), `the old key is gone: ${modelsDisk}`);
+  assert.ok(
+    modelsDisk.includes("fixture-second-key"),
+    `the untouched provider's literal apiKey survived a save whose draft never saw it: ${modelsDisk}`,
+  );
+  assert.ok(!modelsDisk.includes("fixture-key\""), `the renamed provider's literal did not follow the rename (the merge's own semantics): ${modelsDisk}`);
+  // Close and reopen the dialog (a fresh modelsConfig.get): the rename
+  // must come back from DISK, not from stale UI state.
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector(".settings-dialog-surface"), null, { timeout: 30_000 });
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.locator(".settings-dialog-surface").waitFor({ timeout: 30_000 });
+  await page.locator(".settings-section-tab", { hasText: "Models" }).click();
+  await renamedRow.waitFor({ timeout: 30_000 });
+  // Restore the fixture: rename the provider back and save again. The
+  // provider KEY returns, but the merge's own name-keyed semantics mean the
+  // dropped literal does NOT come back (pinned in the seam tests) — the
+  // driver then restores the exact fixture bytes below.
+  await renamedRow.click();
+  await page.getByPlaceholder("provider-name").fill("fixture-provider");
+  await page.getByRole("button", { name: "Rename", exact: true }).click();
+  await page.locator(".config-sidebar-item", { hasText: "fixture-provider" }).first().waitFor({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.waitForFunction(
+    () => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Saved"),
+    null,
+    { timeout: 60_000 },
+  );
+  modelsDisk = readFileSync(join(agentDir, "models.json"), "utf8");
+  assert.ok(modelsDisk.includes("\"fixture-provider\""), `the fixture provider key is restored: ${modelsDisk}`);
+  assert.ok(modelsDisk.includes("fixture-second"), `the second provider survived the round trip: ${modelsDisk}`);
+  assert.ok(
+    !modelsDisk.includes("fixture-key"),
+    `the rename round trip left the renamed provider's literal behind (the merge's semantics): ${modelsDisk}`,
+  );
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.querySelector(".settings-dialog-surface"), null, { timeout: 30_000 });
+  // The sandbox's own baseline back in place (byte-for-byte, the same
+  // fixture this run started from) — no later reader of this sandbox sees
+  // the step's mutation.
+  writeFileSync(join(agentDir, "models.json"), fixtureModelsJson);
+  assert.equal(readFileSync(join(agentDir, "models.json"), "utf8"), fixtureModelsJson);
 
   // ---------------------------------------------------------------- report
   const blocking = pageErrors.filter((message) => !message.includes("Failed to load resource"));

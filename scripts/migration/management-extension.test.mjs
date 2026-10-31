@@ -708,6 +708,186 @@ test(
 );
 
 /**
+ * M3: the models-config write domain (modelsConfig.put) — the Models
+ * panel's Save over the management protocol. Differentially pinned against
+ * the repo's lib/models-config-service.server.ts (the ONE composition the
+ * Next /api/models-config route's PUT also serves) on a fixture models.json
+ * in an isolated agent dir: the stored-literal apiKey merge (restored for
+ * an untouched provider, not followed through a rename — the route's own
+ * semantics), the passthrough of unknown fields, the read refusal (a file
+ * the composition cannot read is never replaced) and arg validation.
+ */
+test(
+  "the modelsConfig.put op writes exactly the repo composition",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-models-config-"));
+    let client = null;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(join(agentDir, "sessions"), { recursive: true });
+      const original = JSON.stringify({
+        "x-future-field": { nested: true },
+        providers: {
+          "fixture-provider": {
+            name: "Fixture Provider",
+            baseUrl: "http://127.0.0.1:9/v1",
+            apiKey: "fixture-key",
+            api: "openai-completions",
+            models: [{ id: "fixture-model", name: "Fixture Model" }],
+          },
+          "fixture-second": {
+            name: "Fixture Second",
+            baseUrl: "http://127.0.0.1:9/v1",
+            apiKey: "fixture-second-key",
+            api: "openai-completions",
+            models: [{ id: "fixture-second-model" }],
+          },
+        },
+      }, null, 2);
+      await writeFile(join(agentDir, "models.json"), original, "utf8");
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      const nonce = "mgmt-nonce-models-config";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+        },
+        onLog: () => {},
+      });
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `mgmt-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 120_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+      const readModelsJson = async () => (await import("node:fs/promises")).readFile(join(agentDir, "models.json"), "utf8");
+
+      // The repo implementation (the ONE source the bundle compiles from),
+      // loaded against the SAME agent dir the child sees.
+      const { saveModelsConfig } = await jiti.import("../../lib/models-config-service.server.ts");
+      const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      try {
+        // The panel's draft after a redacted load: the renamed provider
+        // carries no apiKey (the load never shipped it), the untouched one
+        // keeps a `!` reference, an unknown field rides along and a partial
+        // cost + blank row exercise the store's own normalize/sanitize.
+        const draft = {
+          "x-future-field": { nested: true },
+          providers: {
+            "fixture-renamed": {
+              name: "Fixture Provider",
+              baseUrl: "http://127.0.0.1:9/v1",
+              api: "openai-completions",
+              models: [{ id: "fixture-model", name: "Fixture Model" }, { id: "", name: "blank" }],
+            },
+            "fixture-second": {
+              name: "Fixture Second",
+              baseUrl: "http://127.0.0.1:10/v1",
+              api: "openai-completions",
+              models: [{ id: "fixture-second-model", cost: { input: 1 } }],
+            },
+          },
+        };
+
+        // 1. The read the panel starts from: literal keys redacted, the
+        //    unknown field and the ! reference visible.
+        const read = await call("modelsConfig.get", {});
+        assert.equal(read.ok, true, JSON.stringify(read));
+        assert.equal(read.result.providers["fixture-provider"].apiKey, undefined, "the literal never ships");
+        assert.equal(read.result["x-future-field"].nested, true, "unknown fields are configuration");
+
+        // 2. The differential: the repo composition's own write (in-process)
+        //    against the same starting file is the expected bytes.
+        saveModelsConfig(draft);
+        const expected = await readModelsJson();
+        await writeFile(join(agentDir, "models.json"), original, "utf8");
+
+        // 3. The op writes byte-for-byte the same file.
+        const saved = await call("modelsConfig.put", { config: draft });
+        assert.equal(saved.ok, true, JSON.stringify(saved));
+        assert.deepEqual(JSON.parse(await readModelsJson()), JSON.parse(expected), "the exact PUT /api/models-config write");
+        const onDisk = JSON.parse(await readModelsJson());
+        assert.equal(onDisk.providers["fixture-renamed"].apiKey, undefined, "a rename does not carry the old literal (the route's merge semantics)");
+        assert.equal(onDisk.providers["fixture-second"].apiKey, "fixture-second-key", "the untouched provider's literal is merged back");
+        assert.deepEqual(
+          onDisk.providers["fixture-second"].models,
+          [{ id: "fixture-second-model", cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+          "the store's cost normalization ran",
+        );
+        assert.equal(onDisk.providers["fixture-renamed"].models.length, 1, "the blank row was dropped");
+
+        // 4. The redaction still holds after the save (the merged-back
+        //    literal never reaches a client through the read).
+        const reread = await call("modelsConfig.get", {});
+        assert.equal(reread.ok, true, JSON.stringify(reread));
+        assert.equal(reread.result.providers["fixture-second"].apiKey, undefined);
+        assert.equal(reread.result.providers["fixture-second"].baseUrl, "http://127.0.0.1:10/v1", "the edit is visible");
+
+        // 5. A models.json the composition cannot read refuses the save —
+        //    never a replacement — with the route's 409 shape.
+        const broken = '{ "providers": [ broken';
+        await writeFile(join(agentDir, "models.json"), broken, "utf8");
+        const refused = await call("modelsConfig.put", { config: draft });
+        assert.equal(refused.ok, false, JSON.stringify(refused));
+        assert.equal(refused.code, "models_config_read");
+        assert.match(refused.error, /Failed to read/);
+        assert.equal(await readModelsJson(), broken, "the unusable file is untouched");
+
+        // 6. A malformed envelope refuses with the arg code, instance usable
+        //    (restore a readable file first: the get below reads the disk).
+        await writeFile(join(agentDir, "models.json"), original, "utf8");
+        const noConfig = await call("modelsConfig.put", {});
+        assert.equal(noConfig.ok, false, JSON.stringify(noConfig));
+        assert.equal(noConfig.code, "invalid_args");
+        const stringConfig = await call("modelsConfig.put", { config: "not-an-object" });
+        assert.equal(stringConfig.ok, false);
+        assert.equal(stringConfig.code, "invalid_args");
+        const stillUsable = await call("modelsConfig.get", {});
+        assert.equal(stillUsable.ok, true, "usable after failed puts");
+      } finally {
+        if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      }
+    } finally {
+      if (client) await client.close(5_000);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+/**
  * M3: the enabledModels domain (models.enabledGet / models.enabledSet) — the
  * Models panel's switches over the management protocol. Differentially
  * pinned against the repo's lib/enabled-models-service.server.ts (the ONE

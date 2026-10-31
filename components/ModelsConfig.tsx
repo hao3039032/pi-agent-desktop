@@ -4,7 +4,7 @@ import { AppSelect } from "./AppSelect";
 
 import { useState, useEffect, useCallback, useId, useRef } from "react";
 import { useI18n } from "@/hooks/useI18n";
-import { fetchModelsConfig } from "@/lib/models-config-service";
+import { fetchModelsConfig, saveModelsConfig } from "@/lib/models-config-service";
 import type { ModelCatalogPreset, ModelCatalogRecommendation } from "@/lib/model-catalog";
 import type { DiscoveredModel } from "@/lib/model-discovery";
 import {
@@ -109,7 +109,10 @@ interface ModelEntry {
   compat?: Record<string, unknown>;
 }
 
-interface ProviderEntry {
+// A type alias (not an interface): the save seam's payload is
+// Record<string, unknown>-shaped, and TS only gives object literal TYPES an
+// implicit index signature — an interface here would not be assignable.
+type ProviderEntry = {
   baseUrl?: string;
   api?: string;
   apiKey?: string;
@@ -117,9 +120,9 @@ interface ProviderEntry {
   compat?: Record<string, unknown>;
   models?: ModelEntry[];
   modelOverrides?: Record<string, unknown>;
-}
+};
 
-interface ModelsJson {
+type ModelsJson = {
   providers?: Record<string, ProviderEntry>;
 }
 
@@ -2112,29 +2115,25 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null, onOpenMcp 
       draft = renamed;
     }
     try {
-      const res = await fetch("/api/models-config", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(draft),
-      });
-      const d = await res.json() as { success?: boolean; error?: string };
-      if (!res.ok || d.error) setSaveError(d.error ?? `HTTP ${res.status}`);
-      else {
-        setSavedOk(true);
-        setTimeout(() => setSavedOk(false), 2000);
-        // models.json just changed under the switches: providers may have been
-        // renamed, models added, deleted or renamed. Re-verify the stored
-        // patterns against the new catalog and re-read.
-        const renames = [...renamesRef.current].map(([from, to]) => ({ from, to }));
-        const modelRenames = collectModelRenames(draft, savedModelIdsRef.current, renamesRef.current);
-        savedProvidersRef.current = new Set(Object.keys(draft.providers ?? {}));
-        savedModelIdsRef.current = savedModelIds(draft);
-        setSavedConfig(draft);
-        renamesRef.current.clear();
-        enabledModels.resync(renames, modelRenames);
-      }
+      // The whole draft, through the seam: the server merges back every
+      // stored literal apiKey the redacted load never shipped (an explicit
+      // apiKey — even "" — wins) and refuses to replace a file it could not
+      // read (the route's 409 arrives here as the thrown message).
+      await saveModelsConfig(draft);
+      setSavedOk(true);
+      setTimeout(() => setSavedOk(false), 2000);
+      // models.json just changed under the switches: providers may have been
+      // renamed, models added, deleted or renamed. Re-verify the stored
+      // patterns against the new catalog and re-read.
+      const renames = [...renamesRef.current].map(([from, to]) => ({ from, to }));
+      const modelRenames = collectModelRenames(draft, savedModelIdsRef.current, renamesRef.current);
+      savedProvidersRef.current = new Set(Object.keys(draft.providers ?? {}));
+      savedModelIdsRef.current = savedModelIds(draft);
+      setSavedConfig(draft);
+      renamesRef.current.clear();
+      enabledModels.resync(renames, modelRenames);
     } catch (e) {
-      setSaveError(String(e));
+      setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }

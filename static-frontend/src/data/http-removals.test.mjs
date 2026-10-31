@@ -20,9 +20,13 @@ const jiti = createJiti(import.meta.url, {
 });
 
 const { bindDesktopConnection, probeHostIdentity } = await jiti.import("./desktop-connection.ts");
-const { bindScheduledTasksStore, refreshScheduledTasks, summarizeScheduledTasks } = await jiti.import(
-  "./scheduled-tasks-store.ts",
-);
+const {
+  bindScheduledTasksStore,
+  onScheduledTaskEvent,
+  refreshScheduledTasks,
+  retainScheduledTaskStream,
+  summarizeScheduledTasks,
+} = await jiti.import("./scheduled-tasks-store.ts");
 const { bindProjectTrustClient, fetchProjectTrustStatus } = await jiti.import("./project-trust-client.ts");
 const { IpcClient, MockTransport } = await jiti.import("../ipc/client.ts");
 
@@ -76,6 +80,22 @@ test("the scheduled store records a host failure instead of throwing", async () 
   // state (rendered by ScheduledView), never an unhandled rejection from
   // the hook's refresh path.
   await assert.doesNotReject(() => refreshScheduledTasks());
+});
+
+test("the event surface keeps the Next hook's contract while M4 events are absent", () => {
+  // The consumer (hooks/useScheduledRunNotifications, aliased into this
+  // build) subscribes with a typed handler and expects an unsubscriber; the
+  // static-frontend tsc program is the type-level regression, this pins the
+  // runtime shape: both calls answer functions, and nothing fires the
+  // handler (no event source exists yet — an event arriving would be a
+  // lie, not a feature).
+  const seen = [];
+  const off = onScheduledTaskEvent((event) => seen.push(event));
+  const release = retainScheduledTaskStream();
+  assert.equal(typeof off, "function");
+  assert.equal(typeof release, "function");
+  assert.doesNotThrow(() => { off(); release(); });
+  assert.deepEqual(seen, []);
 });
 
 test("the trust client returns the host's status shape", async () => {

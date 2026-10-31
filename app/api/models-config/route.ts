@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import { ModelsConfigReadError, readModelsConfig, readRedactedModelsConfig, writeModelsConfig } from "@/lib/models-config-store";
-import { mergeStoredLiteralApiKeys } from "@/lib/models-config-redaction";
+import { ModelsConfigReadError, readRedactedModelsConfig, saveModelsConfig } from "@/lib/models-config-service.server";
 
 export const dynamic = "force-dynamic";
 
@@ -20,16 +19,7 @@ export async function GET() {
 export async function PUT(req: Request) {
   try {
     const body = await req.json() as Record<string, unknown>;
-    const existing = readModelsConfig();
-    const incomingProviders = (body.providers ?? {}) as Record<string, Record<string, unknown>>;
-    const existingProviders = (existing.providers ?? {}) as Record<string, Record<string, unknown>>;
-    // The client never sees stored literal apiKeys (GET redacts them), so an
-    // incoming provider that omits the field must keep the stored value while
-    // the user edits unrelated settings. An explicit apiKey (even "") wins.
-    writeModelsConfig({
-      ...body,
-      providers: mergeStoredLiteralApiKeys(incomingProviders, existingProviders),
-    });
+    saveModelsConfig(body);
     return NextResponse.json({ success: true });
   } catch (error) {
     if (error instanceof ModelsConfigReadError) {

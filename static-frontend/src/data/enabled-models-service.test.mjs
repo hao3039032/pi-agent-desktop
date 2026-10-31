@@ -126,6 +126,40 @@ test("the models.json read asks modelsConfig.get and carries no HTTP path", asyn
   assert.equal(loaded.providers["fixture-provider"].models.length, 1);
 });
 
+test("the models.json save posts the whole draft once as modelsConfig.put", async () => {
+  const calls = [];
+  bound({
+    "modelsConfig.put": (args) => {
+      calls.push(args);
+      return { success: true };
+    },
+  });
+  const { saveModelsConfig } = await jiti.import("./models-config-service.ts");
+  const draft = { providers: { "fixture-provider": { models: [{ id: "m" }] } }, "x-custom": { note: "kept" } };
+  await saveModelsConfig(draft);
+  // The draft rides as `config` verbatim (unknown fields included — the
+  // file's schema is the user's), exactly one request for one save.
+  assert.deepEqual(calls, [{ config: draft }]);
+});
+
+test("the models.json save surfaces the host's refusal message, not a JSON parse failure", async () => {
+  // The read-refusal shape the host preserves (the HTTP route's 409): the
+  // reason rides the protocol's reason field and the panel renders the
+  // message, exactly like the HTTP client half did with the error body.
+  const mock = new MockTransport();
+  mock.fail("modelsConfig.put", {
+    code: "io",
+    message: "Failed to read models.json: expected a JSON object",
+    reason: "models-config-read",
+  });
+  bindModelsConfigService(new IpcClient(mock));
+  const { saveModelsConfig } = await jiti.import("./models-config-service.ts");
+  const failure = await saveModelsConfig({ providers: {} }).then(() => null, (error) => error);
+  assert.ok(failure instanceof Error, `a plain error, got ${failure}`);
+  assert.match(failure.message, /Failed to read models\.json/);
+  assert.equal(failure.message.includes("ipc"), false, "the raw envelope text never reaches the panel");
+});
+
 test("an unbound service refuses loudly instead of answering empty", async () => {
   // A fresh jiti instance: the shared module above is already bound from the
   // earlier tests, and the point here is the NEVER-bound boot state.

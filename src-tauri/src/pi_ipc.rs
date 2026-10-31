@@ -1417,6 +1417,38 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(config) => protocol_ok(&id, config),
             Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
         },
+        // The Models panel's models.json save (PUT /api/models-config's
+        // contract): ONE composition (saveModelsConfig — the stored-literal
+        // apiKey merge, cost normalization, the blank-row sanitize, the
+        // private atomic write, the read refusal). The host validates only
+        // the closed ENVELOPE shape; the draft's own fields — including
+        // unknown ones, the file's schema is the user's — pass through
+        // verbatim, so no write rule is duplicated here. Global instance,
+        // like the route's unscoped PUT.
+        "modelsConfig.put" => {
+            let config = match validated_models_config_payload(&args) {
+                Ok(config) => config,
+                Err(message) => return protocol_error(&id, "invalid_args", &message),
+            };
+            match management_call(state, "modelsConfig.put", json!({ "config": config })) {
+                Ok(result) => protocol_ok(&id, result),
+                Err((code, message)) => {
+                    // The save's shaped refusal (the route's 409: a models.json
+                    // the composition could not read must never be replaced)
+                    // rides the protocol's `reason` field, exactly like the
+                    // enabledModels refusals — the code enum stays closed.
+                    if code == "models_config_read" {
+                        return protocol_error_value(&id, json!({
+                            "code": "io",
+                            "message": message,
+                            "retryable": false,
+                            "reason": "models-config-read",
+                        }));
+                    }
+                    protocol_error(&id, &code, &message)
+                }
+            }
+        }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
@@ -1788,6 +1820,7 @@ fn management_error_code(error: &str) -> (String, String) {
                 | "invalid_cron"
                 | "project_scope"
                 | "last_model"
+                | "models_config_read"
         );
         (
             if known { code } else { "io".to_string() },
@@ -1879,6 +1912,33 @@ fn validated_enabled_models_payload(args: &Value) -> Result<Value, String> {
         }
         _ => Err("Invalid op".to_string()),
     }
+}
+
+/// The closed ENVELOPE of `modelsConfig.put`: the draft must be a JSON
+/// object, and a `providers` field — when present — must be an object of
+/// provider objects (the merge's own precondition; a non-object provider
+/// value failed the old write path too). Everything inside is user
+/// configuration (unknown fields are the file's own schema) and passes
+/// VERBATIM to the ONE composition, whose sanitize/normalize layers are
+/// the only writers of those rules — never duplicated here.
+fn validated_models_config_payload(args: &Value) -> Result<Value, String> {
+    let config = args
+        .get("config")
+        .ok_or_else(|| "config is required".to_string())?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| "config must be a JSON object".to_string())?;
+    if let Some(providers) = object.get("providers") {
+        let providers = providers
+            .as_object()
+            .ok_or_else(|| "providers must be a JSON object".to_string())?;
+        for (provider_id, provider) in providers {
+            if !provider.is_object() {
+                return Err(format!("providers.{provider_id} must be a JSON object"));
+            }
+        }
+    }
+    Ok(config.clone())
 }
 
 /// Assemble the `info` object (the SessionInfo shape the sidebar and
@@ -4723,6 +4783,188 @@ mod tests {
         );
         assert_eq!(unconfigured["ok"], false, "{unconfigured}");
         assert_eq!(unconfigured["error"]["code"], "management_unavailable");
+    }
+
+    /// `modelsConfig.put` gates its closed envelope (the draft must be a
+    /// JSON object; a present `providers` must be an object of provider
+    /// objects) before any management instance is spawned. Note the one
+    /// deliberate boundary difference: a NULL `providers` is refused here
+    /// while the old route's `?? {}` collapsed it to an empty map — a
+    /// degenerate payload no real client sends, and a silent wipe of every
+    /// provider is exactly what a closed boundary should stop.
+    #[test]
+    fn models_config_put_gates_the_envelope_before_any_instance() {
+        let state = state();
+        *state.management_config.lock().unwrap() = None;
+
+        for (label, args, message) in [
+            (
+                "config missing",
+                json!({}),
+                "config is required",
+            ),
+            (
+                "config a string",
+                json!({ "config": "x" }),
+                "config must be a JSON object",
+            ),
+            (
+                "config an array",
+                json!({ "config": [1, 2] }),
+                "config must be a JSON object",
+            ),
+            (
+                "providers a string",
+                json!({ "config": { "providers": "x" } }),
+                "providers must be a JSON object",
+            ),
+            (
+                "providers null",
+                json!({ "config": { "providers": null } }),
+                "providers must be a JSON object",
+            ),
+            (
+                "provider value a number",
+                json!({ "config": { "providers": { "p": 7 } } }),
+                "providers.p must be a JSON object",
+            ),
+            (
+                "provider value an array",
+                json!({ "config": { "providers": { "p": [1] } } }),
+                "providers.p must be a JSON object",
+            ),
+        ] {
+            let response = send(
+                &state,
+                json!({ "v": 1, "id": "mc1", "op": "modelsConfig.put", "args": args }),
+            );
+            assert_eq!(response["ok"], false, "{label}: {response}");
+            assert_eq!(response["error"]["code"], "invalid_args", "{label}: {response}");
+            assert_eq!(response["error"]["message"], message, "{label}: {response}");
+        }
+
+        // A VALID envelope (unknown fields inside are the file's own
+        // schema — they pass verbatim) reaches the instance half
+        // (management_unavailable — never a fallback, never a lie).
+        let unconfigured = send(
+            &state,
+            json!({ "v": 1, "id": "mc2", "op": "modelsConfig.put", "args": {
+                "config": { "x-future-field": { "nested": true }, "providers": {} }
+            }}),
+        );
+        assert_eq!(unconfigured["ok"], false, "{unconfigured}");
+        assert_eq!(unconfigured["error"]["code"], "management_unavailable");
+    }
+
+    /// The models.json save over the REAL pi management instance
+    /// (PI_CLI_BIN, sandboxed agent dir + a staged managed tree): the
+    /// stored-literal merge, the redaction on the read, and the shaped
+    /// read refusal with the protocol's preserved `reason` field (the full
+    /// byte-level differential against the repo composition lives in
+    /// scripts/migration/management-extension.test.mjs; this pins the
+    /// host's dispatch and the global-instance wiring).
+    #[test]
+    fn real_pi_models_config_put_saves_through_the_global_instance() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = stage_managed_tree(dir.path());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![
+                ("PI_WEB_MANAGED_MODULES".to_string(), managed.display().to_string()),
+            ],
+        });
+        // A fixture with literal apiKeys (never a real credential), an
+        // unknown top-level field and a partial cost group: the save must
+        // keep the file's own schema and run the store's normalization.
+        std::fs::write(
+            agent_dir.join("models.json"),
+            r#"{"x-future-field":{"nested":true},"providers":{
+                "fixture-provider":{"name":"Fixture Provider","baseUrl":"http://127.0.0.1:9/v1","apiKey":"fixture-key","api":"openai-completions","models":[{"id":"fixture-model"}]},
+                "fixture-second":{"name":"Fixture Second","baseUrl":"http://127.0.0.1:9/v1","apiKey":"fixture-second-key","api":"openai-completions","models":[{"id":"fixture-second-model"}]}}}"#,
+        )
+        .expect("models.json");
+
+        // 1. The read the panel starts from: literal keys redacted, the
+        //    unknown field visible.
+        let read = send(
+            &state,
+            json!({ "v": 1, "id": "mcr1", "op": "modelsConfig.get" }),
+        );
+        assert_eq!(read["ok"], true, "{read}");
+        assert_eq!(read["data"]["providers"]["fixture-provider"]["apiKey"], Value::Null, "{read}");
+        assert_eq!(read["data"]["x-future-field"]["nested"], true, "{read}");
+        // The global instance (no cwd scope — the route's unscoped PUT).
+        let scopes = state.management.scopes();
+        assert!(scopes.iter().all(|scope| scope == "global"), "no cwd scope was created: {scopes:?}");
+
+        // 2. The save: the panel's draft after the redacted load — the
+        //    renamed provider has no apiKey, the untouched one keeps its
+        //    place with the literal merged back server-side.
+        let saved = send(
+            &state,
+            json!({ "v": 1, "id": "mcp1", "op": "modelsConfig.put", "args": { "config": {
+                "x-future-field": { "nested": true },
+                "providers": {
+                    "fixture-renamed": { "name": "Fixture Provider", "baseUrl": "http://127.0.0.1:9/v1", "api": "openai-completions",
+                                          "models": [{ "id": "fixture-model" }, { "id": "" }] },
+                    "fixture-second": { "name": "Fixture Second", "baseUrl": "http://127.0.0.1:10/v1", "api": "openai-completions",
+                                         "models": [{ "id": "fixture-second-model", "cost": { "input": 1 } }] }
+                }
+            }}}),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        let disk: Value = serde_json::from_str(
+            &std::fs::read_to_string(agent_dir.join("models.json")).expect("models.json"),
+        )
+        .expect("models.json JSON");
+        assert_eq!(disk["x-future-field"]["nested"], true, "unknown field kept: {disk}");
+        assert_eq!(disk["providers"]["fixture-renamed"]["apiKey"], Value::Null, "a rename does not carry the literal: {disk}");
+        assert_eq!(disk["providers"]["fixture-second"]["apiKey"], "fixture-second-key", "the untouched literal merged back: {disk}");
+        assert_eq!(disk["providers"]["fixture-second"]["baseUrl"], "http://127.0.0.1:10/v1", "the edit landed: {disk}");
+        assert_eq!(
+            disk["providers"]["fixture-second"]["models"][0]["cost"],
+            json!({ "input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0 }),
+            "the store's cost normalization ran: {disk}"
+        );
+        assert_eq!(disk["providers"]["fixture-renamed"]["models"].as_array().unwrap().len(), 1, "blank row dropped: {disk}");
+
+        // 3. The redaction still holds after the save.
+        let reread = send(
+            &state,
+            json!({ "v": 1, "id": "mcr2", "op": "modelsConfig.get" }),
+        );
+        assert_eq!(reread["ok"], true, "{reread}");
+        assert_eq!(reread["data"]["providers"]["fixture-second"]["apiKey"], Value::Null, "{reread}");
+        assert_eq!(reread["data"]["providers"]["fixture-renamed"]["name"], "Fixture Provider", "{reread}");
+
+        // 4. A models.json the composition cannot read refuses the save —
+        //    never a replacement — with the route's 409 reason preserved.
+        let broken = "{ \"providers\": [ broken";
+        std::fs::write(agent_dir.join("models.json"), broken).expect("broken models.json");
+        let refused = send(
+            &state,
+            json!({ "v": 1, "id": "mcp2", "op": "modelsConfig.put", "args": { "config": { "providers": {} } }}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["reason"], "models-config-read", "{refused}");
+        assert!(refused["error"]["message"].as_str().unwrap().starts_with("Failed to read"), "{refused}");
+        assert_eq!(std::fs::read_to_string(agent_dir.join("models.json")).unwrap(), broken);
+
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
     /// The enabledModels domain over the REAL pi management instance
