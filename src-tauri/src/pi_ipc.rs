@@ -1394,6 +1394,29 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
+        "plugins.install.start" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
+            let Some(source) = args.get("source").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 4096) else { return protocol_error(&id, "invalid_args", "invalid source"); };
+            let Some(scope) = args.get("scope").and_then(Value::as_str).filter(|s| *s == "global" || *s == "project") else { return protocol_error(&id, "invalid_args", "invalid scope"); };
+            let Some(config) = state.management_config.lock().unwrap().clone() else { return protocol_error(&id, "management_unavailable", "management instance is not configured"); };
+            let instance = match state.management.instance("global", &config) { Ok(instance) => instance, Err(error) => return protocol_error(&id, "management_unavailable", &error) };
+            match instance.start_exclusive_task("plugins.install", json!({"cwd": lexical_fold(cwd, cfg!(windows)), "source": source, "scope": scope}), std::time::Duration::from_secs(600), config) {
+                Ok(handle) => protocol_ok(&id, json!({"handle": handle})), Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
+        "plugins.install.status" | "plugins.install.cancel" => {
+            let Some(handle) = args.get("handle").and_then(Value::as_str).filter(|s| s.starts_with("task-") && s.len() <= 64) else { return protocol_error(&id, "invalid_args", "invalid handle"); };
+            let Some(config) = state.management_config.lock().unwrap().clone() else { return protocol_error(&id, "management_unavailable", "management instance is not configured"); };
+            let instance = match state.management.instance("global", &config) { Ok(instance) => instance, Err(error) => return protocol_error(&id, "management_unavailable", &error) };
+            if op == "plugins.install.cancel" {
+                return match instance.cancel_exclusive_task(handle) { Ok(()) => protocol_ok(&id, json!({"requested": true})), Err(error) => protocol_error(&id, "io", &error) };
+            }
+            match instance.exclusive_task_snapshot(handle) {
+                Ok(snapshot) => protocol_ok(&id, json!({"status": format!("{:?}", snapshot.status).to_lowercase(), "progress": snapshot.progress, "result": snapshot.result, "error": snapshot.error})),
+                Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
         "plugins.setEnabled" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
             if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
@@ -1406,7 +1429,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 validated.push(json!({"source": source, "scope": scope}));
             }
             let cwd = lexical_fold(cwd, cfg!(windows));
-            match management_call_scoped(state, op, &json!({"cwd": cwd, "action": action, "packages": validated, "single": args.get("single").and_then(Value::as_bool).unwrap_or(false)}), Path::new(&cwd)) {
+            match management_serial_scoped_call(state, op, json!({"cwd": cwd, "action": action, "packages": validated, "single": args.get("single").and_then(Value::as_bool).unwrap_or(false)}), Path::new(&cwd)) {
                 Ok(result) => protocol_ok(&id, result), Err(error) => protocol_error(&id, &error.0, &error.1),
             }
         }
@@ -2085,9 +2108,8 @@ pub(crate) fn management_call(
         .management
         .instance("global", &config)
         .map_err(|error| ("management_unavailable".to_string(), error))?;
-    instance
-        .management_call_sync(op, args)
-        .map_err(|error| management_error_code(&error))
+    if op == "modelsConfig.put" { return management_serial_call(state, op, args); }
+    instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
 }
 
 /// The cwd gate every models op shares — the Next routes' 400/403 half:
@@ -2132,6 +2154,7 @@ fn management_call_scoped(
             "the management instance is not configured (the vendored module tree is missing)".to_string(),
         ));
     };
+    if matches!(op, "models.setDefault" | "models.enabledSet") { return management_serial_scoped_call(state, op, args.clone(), scope_cwd); }
     let scope = scope_cwd.to_string_lossy().into_owned();
     let instance = state
         .management
@@ -2140,6 +2163,31 @@ fn management_call_scoped(
     instance
         .management_call_sync(op, args.clone())
         .map_err(|error| management_error_code(&error))
+}
+
+fn management_serial_call(state: &IpcHostState, op: &str, args: Value) -> Result<Value, (String, String)> {
+    management_serial_inner(state, op, args, None)
+}
+
+fn management_serial_scoped_call(state: &IpcHostState, op: &str, args: Value, cwd: &Path) -> Result<Value, (String, String)> {
+    management_serial_inner(state, op, args, Some(cwd))
+}
+
+fn management_serial_inner(state: &IpcHostState, op: &str, args: Value, cwd: Option<&Path>) -> Result<Value, (String, String)> {
+    let config = state.management_config.lock().unwrap().clone().ok_or_else(|| ("management_unavailable".into(), "management instance is not configured".into()))?;
+    let instance = state.management.instance("global", &config).map_err(|e| ("management_unavailable".into(), e))?;
+    let handle = if let Some(cwd) = cwd {
+        let runner = state.management.instance(&cwd.to_string_lossy(), &config).map_err(|e| ("management_unavailable".into(), e))?;
+        instance.start_serial_task_on(runner, op, args, std::time::Duration::from_secs(60))
+    } else { instance.start_serial_task(op, args, std::time::Duration::from_secs(60)) }.map_err(|e| ("io".into(), e))?;
+    loop {
+        let snapshot = instance.task_snapshot(&handle).map_err(|e| ("io".into(), e))?;
+        match snapshot.status {
+            management_host::TaskStatus::Succeeded => return Ok(snapshot.result.unwrap_or(Value::Null)),
+            management_host::TaskStatus::Failed | management_host::TaskStatus::Cancelled | management_host::TaskStatus::Unknown => return Err(management_error_code(snapshot.error.as_deref().unwrap_or("management operation outcome unknown"))),
+            management_host::TaskStatus::Running => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 fn management_read_scoped(state: &IpcHostState, op: &str, args: &Value, cwd: &Path) -> Result<Value, (String, String)> {
@@ -5094,6 +5142,72 @@ mod tests {
         let second = send(&state, json!({"v": 1, "id": "second", "op": "plugins.list", "args": {"cwd": cwd}}));
         assert_eq!(second["ok"], true, "{second}");
         assert_eq!(second["data"]["packages"][0]["disabled"], true);
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_pi_plugin_install_ipc_success_and_cancel_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|v| !v.is_empty()) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let other = dir.path().join("other");
+        let package = dir.path().join("fixture");
+        let managed = dir.path().join("managed");
+        for path in [&agent, &project, &other, &package] { std::fs::create_dir_all(path).unwrap(); }
+        std::fs::write(package.join("package.json"), r#"{"name":"fixture","version":"1.0.0"}"#).unwrap();
+        let script = dir.path().join("npm-fixture");
+        let marker = dir.path().join("npm-started");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300 &\necho $! > \"$FIXTURE_MARKER\"\nwait\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(agent.join("settings.json"), json!({"npmCommand": [script]}).to_string()).unwrap();
+        assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
+        let state = state();
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent.clone()),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("FIXTURE_MARKER".into(), marker.display().to_string())],
+        });
+        state.propose_path(&project); state.propose_path(&other);
+        let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let first = call("plugins.install.start", json!({"cwd":project,"source":package,"scope":"global"}));
+        assert_eq!(first["ok"], true, "{first}");
+        let first_handle = first["data"]["handle"].as_str().unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status = call("plugins.install.status", json!({"handle":first_handle}));
+            assert_eq!(status["ok"], true, "{status}");
+            if status["data"]["status"] != "running" { assert_eq!(status["data"]["status"], "succeeded", "{status}"); break; }
+            assert!(std::time::Instant::now() < until); std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let settings: Value = serde_json::from_slice(&std::fs::read(agent.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["packages"].as_array().unwrap().len(), 1);
+        let started = call("plugins.install.start", json!({"cwd": project, "source":"npm:fixture", "scope":"global"}));
+        assert_eq!(started["ok"], true, "{started}");
+        let handle = started["data"]["handle"].as_str().unwrap();
+        while !marker.exists() { assert!(std::time::Instant::now() < until, "fixture did not start"); std::thread::sleep(std::time::Duration::from_millis(20)); }
+        let denied = call("plugins.setEnabled", json!({"cwd":other,"action":"disable","packages":[{"source":package,"scope":"global"}]}));
+        assert_eq!(denied["ok"], false, "{denied}");
+        let status = call("plugins.install.status", json!({"handle":handle}));
+        assert_eq!(status["data"]["progress"]["phase"], "running", "{status}");
+        let cancelled = call("plugins.install.cancel", json!({"handle":handle}));
+        assert_eq!(cancelled["ok"], true, "{cancelled}");
+        let status = call("plugins.install.status", json!({"handle":handle}));
+        assert_eq!(status["data"]["status"], "unknown", "{status}");
+        let descendant: u32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{descendant}/stat"));
+            if stat.as_ref().map_or(true, |s| s.rsplit_once(") ").is_some_and(|(_, fields)| fields.starts_with('Z'))) { break; }
+            assert!(std::time::Instant::now() < until, "npm descendant survived cancellation");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let status = call("plugins.install.status", json!({"handle":handle}));
+        assert_eq!(status["data"]["status"], "unknown", "{status}");
+        let denied = call("plugins.setEnabled", json!({"cwd":other,"action":"disable","packages":[{"source":package,"scope":"global"}]}));
+        assert_eq!(denied["ok"], false, "{denied}");
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 

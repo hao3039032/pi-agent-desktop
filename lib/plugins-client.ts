@@ -14,6 +14,19 @@ export async function setPluginsEnabled(cwd: string, action: "enable" | "disable
   return data;
 }
 
+export async function installPluginPackage(cwd: string, source: string, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
+  try {
+    onProgress("running");
+    const response = await fetch("/api/plugins", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, source, scope, action: "install" }), signal });
+    const data = await response.json() as PluginsResponse & { error?: string };
+    if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+    return data;
+  } catch (error) {
+    if (signal.aborted) throw new Error("Installation cancelled; outcome unknown");
+    throw error;
+  }
+}
+
 export async function listPlugins(cwd: string): Promise<PluginsResponse> {
   const response = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
   const data = await response.json() as PluginsResponse & { error?: string };

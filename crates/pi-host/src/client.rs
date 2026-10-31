@@ -202,6 +202,9 @@ struct Shared {
     log: LogFn,
     on_exit: Option<ExitFn>,
     pid: u32,
+    /// Serializes reaping with process-group signalling, so a recycled PID
+    /// can never be used after the leader was reaped.
+    reaped: Mutex<bool>,
 }
 
 impl Inner {
@@ -281,6 +284,7 @@ impl PiRpcClient {
             stdin: Mutex::new(stdin),
             exit_cv: Condvar::new(),
             readers_alive: Mutex::new(0),
+            reaped: Mutex::new(false),
             readers_done: Condvar::new(),
             exiting: AtomicBool::new(false),
             log,
@@ -561,13 +565,18 @@ impl PiRpcClient {
 
     /// Immediate termination for shutdown deadlines.
     pub fn kill(&self) {
+        self.force_kill();
+    }
+
+    /// Start shutdown and signal the group only if its leader is unreaped.
+    pub fn force_kill(&self) -> bool {
         {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.exiting = true;
             self.shared.exiting.store(true, Ordering::SeqCst);
             end_ui_attach_window_locked(&self.shared, &mut inner);
         }
-        self.kill_tree();
+        self.kill_live_tree()
     }
 
     /// Wait (up to `limit`) for the child to exit. Returns whether it exited.
@@ -614,8 +623,17 @@ impl PiRpcClient {
         }
     }
 
-    fn kill_tree(&self) {
+    /// Signal the process group only while its leader has not been reaped.
+    /// A false return does not imply that descendants have exited.
+    pub fn kill_live_tree(&self) -> bool {
+        let reaped = self.shared.reaped.lock().unwrap();
+        if *reaped { return false; }
         kill_process_tree(self.shared.pid);
+        true
+    }
+
+    fn kill_tree(&self) {
+        self.kill_live_tree();
     }
 }
 
@@ -976,7 +994,19 @@ fn stderr_loop<R: Read>(stderr: R, shared: Arc<Shared>) {
 // --- exit watcher -------------------------------------------------------------
 
 fn exit_watcher(mut child: std::process::Child, shared: Arc<Shared>) {
-    let status = child.wait();
+    let status = loop {
+        let mut reaped = shared.reaped.lock().unwrap();
+        match child.try_wait() {
+            Ok(None) => {
+                drop(reaped);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => {
+                *reaped = true;
+                break result.map(|status| status.expect("try_wait returned a status"));
+            }
+        }
+    };
     let code = status.as_ref().ok().and_then(|status| status.code());
     #[cfg(unix)]
     let signal = {

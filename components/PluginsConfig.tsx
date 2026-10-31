@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
-import { checkPlugins, listPlugins, setPluginsEnabled } from "@/lib/plugins-client";
+import { checkPlugins, installPluginPackage, listPlugins, setPluginsEnabled } from "@/lib/plugins-client";
 import type {
   PluginPackageInfo,
   PluginStandaloneExtensionInfo,
@@ -252,20 +252,24 @@ function AddPluginPanel({
   scope,
   projectResourcesLoaded,
   busy,
+  progress,
   actionError,
   onSourceChange,
   onScopeChange,
   onInstall,
+  onCancel,
 }: {
   cwd: string;
   source: string;
   scope: PluginScope;
   projectResourcesLoaded: boolean;
   busy: boolean;
+  progress: string | null;
   actionError: string | null;
   onSourceChange: (value: string) => void;
   onScopeChange: (scope: PluginScope) => void;
   onInstall: () => void;
+  onCancel: () => void;
 }) {
   const { t } = useI18n();
 
@@ -311,6 +315,8 @@ function AddPluginPanel({
       examples={PLUGIN_SOURCE_EXAMPLES}
       error={actionError}
     >
+      {busy && progress && <span role="status">{t("i18n.installing")}</span>}
+      {busy && <ConfigButton onClick={onCancel}>{t("i18n.cancel")}</ConfigButton>}
       <ConfigButton
         variant="primary"
         onClick={onInstall}
@@ -589,6 +595,8 @@ export function PluginsConfig({
   const [installSource, setInstallSource] = useState("");
   const [installScope, setInstallScope] = useState<PluginScope>("global");
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  const installController = useRef<AbortController | null>(null);
+  const [installProgress, setInstallProgress] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   // What the last group switch left undone, shown under that scope's heading.
@@ -826,14 +834,11 @@ export function PluginsConfig({
     setActionError(null);
     setActionMessage(null);
     setGroupStatus(null);
+    const controller = new AbortController();
+    installController.current = controller;
+    setInstallProgress(null);
     try {
-      const res = await fetch("/api/plugins", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "install", source, scope: installScope, cwd }),
-      });
-      const next = (await res.json()) as PluginsResponse & { error?: string };
-      if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
+      const next = await installPluginPackage(cwd, source, installScope, controller.signal, setInstallProgress);
       setData(next);
       const installed = findInstalledPackage(next.packages, source, installScope);
       setSelected(installed ? packageKey(installed) : key);
@@ -843,6 +848,7 @@ export function PluginsConfig({
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
+      if (installController.current === controller) installController.current = null;
       setBusyKey(null);
     }
   }, [cwd, installScope, installSource, t]);
@@ -996,10 +1002,12 @@ export function PluginsConfig({
                 scope={installScope}
                 projectResourcesLoaded={projectResourcesLoaded}
                 busy={addBusy}
+                progress={installProgress}
                 actionError={actionError}
                 onSourceChange={setInstallSource}
                 onScopeChange={setInstallScope}
                 onInstall={installPlugin}
+                onCancel={() => installController.current?.abort()}
               />
             ) : loading ? null : selectedExtension ? (
               <StandaloneExtensionDetail extension={selectedExtension} />
