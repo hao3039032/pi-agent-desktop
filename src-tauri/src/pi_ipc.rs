@@ -2991,8 +2991,14 @@ fn session_view_dispatch(
                 // Only the child's active entries/leaf can identify a recorded prompt.
                 // A failed read or absence of a record is unknown (a spawn-time
                 // custom prompt may still exist); never invent a composed prompt.
-                let recorded_prompt = crate::session_view::live_child_snapshot(&session).ok().and_then(|(entries, leaf, tree)| {
-                    let handoff = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree).ok()?;
+                let recorded_prompt = session.command("get_entries", json!({}), Some(Duration::from_secs(10))).ok().and_then(|snapshot| {
+                    let entries = snapshot.get("entries")?.as_array()?;
+                    let leaf = match snapshot.get("leafId")? {
+                        Value::Null => None,
+                        Value::String(id) if entries.iter().any(|entry| entry.get("id").and_then(Value::as_str) == Some(id)) => Some(id.as_str()),
+                        _ => return None,
+                    };
+                    let handoff = crate::session_view::write_snapshot_handoff(entries, leaf, &[]).ok()?;
                     let result = management_call(state, "session.recordedSystemPrompt", json!({"snapshotFile":handoff.display().to_string()})).ok();
                     let _ = std::fs::remove_file(handoff);
                     result
