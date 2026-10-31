@@ -62,9 +62,10 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 
 | 项 | 现状 |
 |---|---|
-| 数据域迁移主体（models/MCP/插件技能/git 状态/文件索引搜索/上传下载/worktree/scheduled/appearance/desktop） | 文件树列表/链接授权已迁（fetch 计数从 121 降）；其余未替换；生产合规检查未过 |
+| 数据域迁移主体（models/MCP/插件技能/git 状态/文件索引搜索/上传下载/worktree/scheduled/appearance/desktop） | 文件树列表/链接授权已迁（fetch 计数从 121 降）；sessions.catalogue 宿主 op 已就绪但**未接 UI**（messageCount/workspaceKind/relation/running 未从头部扫描可得，接 UI 前必须补齐——README 此行即约束）；其余未替换；生产合规检查未过 |
 | 主机层命令（fork/fork_branch/clone/navigate_tree/get_state 丰富化/extension_ui_response 输入；get_tools/setTools 已迁移） | 未实现项回 not_supported；HOST_LEVEL_COMMAND_OPS 表随迁移增长 |
 | 会话事件流 ACK/背压（有界队列、工具中间更新合并、超限 reset） | 未实现；当前无界转发 |
+| 会话完整闭环（目录消费、上下文读取/投影、创建、聊天发送的队列/分支语义） | catalogue 字段子集已就绪；上下文投影（管理扩展 session.readContext）与 /api/agent/new 创建未实现 |
 | 子 UI 请求转发（agent.respondUi 等）与 pendingExtensionUiIds 权威来源 | 快照带机器视角列表（事件观测）；子进程 UI 未接入转发 |
 | 调度器生产集成（宿主 30s tick、RunSpawner、marker 确认、隐藏窗口运行） | 引擎/存储/账本就位，未接线 |
 | OAuth loopback | M0 PoC 已有（state 不匹配绝不成、取消、PKCE）；未接入宿主真实登录流 |
