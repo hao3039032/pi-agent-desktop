@@ -688,6 +688,71 @@ pub fn dispatch_session_op(
                 .command(command_type, payload, Some(Duration::from_secs(120)))
                 .map_err(DispatchError::Transport)
         }
+        // The tool picker's surface (the wrapper's get_tools): the BRIDGE's
+        // authoritative tools.list (the child's real registry — descriptions
+        // the loadout hooks rewrote, exposure/source info) plus the active
+        // set, projected onto the ToolEntry shape the UI consumes. Hidden
+        // tools are withdrawn (pi ignores them when setting the active set).
+        "agent.getTools" => {
+            let session = resolve_or_start(registry, session_id, "agent.getTools")?;
+            let result = session
+                .bridge_request("tools.list", None, Some(Duration::from_secs(30)))
+                .map_err(DispatchError::Bridge)?;
+            let active: Vec<String> = result
+                .get("active")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tools = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|tool| {
+                    // A hidden tool is withdrawn: never listed, never settable.
+                    tool.get("exposure").and_then(Value::as_str) != Some("hidden")
+                })
+                .map(|mut tool| {
+                    let name = tool.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let is_active = active.iter().any(|active_name| *active_name == name);
+                    if let Some(object) = tool.as_object_mut() {
+                        object.insert("active".into(), json!(is_active));
+                    }
+                    tool
+                })
+                .collect::<Vec<_>>();
+            // The wrapper's get_tools answered a plain ToolEntry[] (the UI's
+            // sendAgentCommand<ToolEntry[]>), not an envelope.
+            Ok(Value::Array(tools))
+        }
+        // Setting the active tools (the wrapper's setActiveToolSelection):
+        // the bridge validates names and applies atomically; the pin travels
+        // with tools.apply when the UI wants the selection persisted.
+        "agent.setTools" => {
+            let names = args
+                .get("names")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<String>>()
+                })
+                .ok_or_else(|| DispatchError::invalid("setTools requires a names array"))?;
+            let session = resolve_or_start(registry, session_id, "agent.setTools")?;
+            let result = session
+                .bridge_request("tools.set", Some(json!({ "names": names })), Some(Duration::from_secs(30)))
+                .map_err(DispatchError::Bridge)?;
+            Ok(result)
+        }
         // The projected run state (the message-level machine's view).
         "agent.runState" => {
             let session = resolve_or_start(registry, session_id, "agent.runState")?;
@@ -888,6 +953,8 @@ pub enum DispatchError {
     /// Starting the session child failed.
     Spawn(SessionHostError, String),
     Transport(pi_host::PiRpcError),
+    /// A host-level operation the BRIDGE refused (tools.list, tools.set…).
+    Bridge(pi_host::bridge::BridgeError),
 }
 
 impl DispatchError {
@@ -920,6 +987,7 @@ impl DispatchError {
                 pi_host::ErrorKind::Command => "agent_child_error",
                 _ => "io",
             },
+            DispatchError::Bridge(_) => "bridge_op",
         }
     }
 }
@@ -932,6 +1000,7 @@ impl std::fmt::Display for DispatchError {
             | DispatchError::Unsupported(message) => write!(f, "{message}"),
             DispatchError::Spawn(error, op) => write!(f, "{op}: {error}"),
             DispatchError::Transport(error) => write!(f, "{error}"),
+            DispatchError::Bridge(error) => write!(f, "{error}"),
         }
     }
 }

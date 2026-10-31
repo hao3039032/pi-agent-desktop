@@ -68,6 +68,16 @@ function toAgentCommandError(failure: IpcFailure): AgentCommandError {
   );
 }
 
+/**
+ * HOST-LEVEL commands the UI sends as agent commands but the HOST answers
+ * (the wrapper's semantics): routed to their dedicated IPC ops instead of a
+ * blind forward into the child (which would answer a wrong shape or fail
+ * opaquely). Grows as the Rust host implements more of the wrapper surface.
+ */
+const HOST_LEVEL_COMMAND_OPS: Record<string, string> = {
+  get_tools: "agent.getTools",
+};
+
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
@@ -79,6 +89,10 @@ export async function sendAgentCommand<T = unknown>(
   if (options?.signal?.aborted) {
     throw new AgentCommandError("the command was aborted before it was sent", 0);
   }
+  // A host-level command takes its dedicated op (the wrapper answered
+  // these host-side; the child never saw them).
+  const commandType = typeof command.type === "string" ? command.type : null;
+  const hostOp = commandType !== null ? HOST_LEVEL_COMMAND_OPS[commandType] : undefined;
   let onAbort: (() => void) | null = null;
   const abort = new Promise<never>((_, reject) => {
     const signal = options?.signal;
@@ -88,15 +102,21 @@ export async function sendAgentCommand<T = unknown>(
   });
   try {
     return await Promise.race([
-      // agent.command takes the closed command enum; the session id rides in
-      // args (the Rust side correlates both).
-      ensureClient().request<T>(
-        "agent.command",
-        { ...command, session: sessionId },
-        // Prompt-class commands legitimately run long: the child's run may
-        // outlive the admission; the admission itself answers fast.
-        { timeoutMs: 130_000 },
-      ),
+      hostOp !== undefined
+        ? ensureClient().request<T>(
+            hostOp,
+            { ...command, session: sessionId },
+            { timeoutMs: 60_000 },
+          )
+        // agent.command takes the closed command enum; the session id rides in
+        // args (the Rust side correlates both).
+        : ensureClient().request<T>(
+            "agent.command",
+            { ...command, session: sessionId },
+            // Prompt-class commands legitimately run long: the child's run may
+            // outlive the admission; the admission itself answers fast.
+            { timeoutMs: 130_000 },
+          ),
       abort,
     ]);
   } catch (caught) {

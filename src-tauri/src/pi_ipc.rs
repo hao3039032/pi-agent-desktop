@@ -619,7 +619,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             protocol_ok(&id, data)
         }
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
-        | "agent.eventsSnapshot" | "agent.command" => {
+        | "agent.eventsSnapshot" | "agent.command" | "agent.getTools" | "agent.setTools" => {
             // The resume path: an op on an on-disk session may cold-start its
             // child (the POST /api/agent/[id] contract) — only when the host
             // resolved a spawn config; otherwise not_found stays honest.
@@ -1576,6 +1576,75 @@ mod tests {
             json!({ "v": 1, "id": "sm6", "op": "desktop.writeStateMirror", "args": { "payload": { "revision": 9 } } }),
         );
         assert_eq!(malformed["error"]["code"], "invalid_args");
+    }
+
+    /// The tool picker over the REAL bridge (PI_CLI_BIN, sandboxed): the
+    /// child's authoritative registry lists with active flags, and setting
+    /// the active set round-trips.
+    #[test]
+    fn real_pi_agent_get_tools_and_set_tools_over_the_bridge() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let sessions = agent_dir.join("sessions").join("proj");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let (file, file_id) = session_host::create_session_file(&sessions, &cwd).expect("create");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_config.lock().unwrap() = Some(session_host::SessionSpawnConfig {
+            executable,
+            agent_dir: Some(agent_dir),
+            session_dir: Some(sessions),
+            bridge_asset: bridge,
+            extra_args: Vec::new(),
+        });
+
+        let tools = send(
+            &state,
+            json!({ "v": 1, "id": "gt1", "op": "agent.getTools", "args": { "session": file_id } }),
+        );
+        assert_eq!(tools["ok"], true, "the bridge answers the tool registry: {tools}");
+        let list = tools["data"].as_array().expect("a plain ToolEntry array (the wrapper's get_tools shape)");
+        assert!(!list.is_empty(), "the child has a tool registry");
+        // Every entry carries the ToolEntry projection (name + active flag).
+        for tool in list {
+            assert!(tool.get("name").is_some(), "an entry without a name: {tool}");
+            assert!(tool.get("active").is_some(), "an entry without an active flag: {tool}");
+            // Hidden tools never list (withdrawn).
+            assert_ne!(tool.get("exposure").and_then(Value::as_str), Some("hidden"));
+        }
+        // The built-in read tool exists and reports a boolean active state.
+        let read = list
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("read"))
+            .expect("the built-in read tool lists");
+        assert!(read["active"].is_boolean());
+
+        // Setting the active set round-trips through the bridge: the names
+        // that reported active.
+        let active_names: Vec<String> = list
+            .iter()
+            .filter(|tool| tool.get("active").and_then(Value::as_bool) == Some(true))
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let set = send(
+            &state,
+            json!({ "v": 1, "id": "gt2", "op": "agent.setTools", "args": {
+                "session": file_id, "names": if active_names.is_empty() { vec!["read".to_string()] } else { active_names }
+            } }),
+        );
+        assert_eq!(set["ok"], true, "tools.set applies: {set}");
+
+        state.registry.remove(&file_id, std::time::Duration::from_secs(5));
     }
 
     /// The resume flow with the REAL pi child (PI_CLI_BIN, sandboxed): an
