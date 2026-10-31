@@ -90,6 +90,7 @@ interface LoginFlow {
   liveTokens: Set<PendingPrompt>;
   abort: AbortController;
   lastPolled: number;
+  inputCleaner?: () => void;
 }
 
 const flows = new Map<string, LoginFlow>();
@@ -130,6 +131,10 @@ function finishFlow(flow: LoginFlow, terminal: OAuthLoginEvent): void {
   flow.seq += 1;
   flow.events.push({ seq: flow.seq, event: terminal });
   flow.abort.abort();
+  if (flow.inputCleaner) {
+    flow.inputCleaner();
+    flow.inputCleaner = undefined;
+  }
   for (const pending of flow.liveTokens) {
     if (!pending.settled) {
       pending.settled = true;
@@ -202,17 +207,17 @@ function desensitizeProgress(event: OAuthLoginEvent, provider: string): Record<s
     case "auth":
       return { type: "auth", provider, hasInstructions: Boolean(event.instructions) };
     case "device_code":
-      return { type: "device_code", provider, userCode: event.userCode };
+      return { type: "device_code", provider };
     case "prompt_request":
       return { type: "prompt_request", provider };
     case "select_request":
       return { type: "select_request", provider, optionCount: event.options.length };
     case "progress":
-      return { type: "progress", provider, message: event.message };
+      return { type: "progress", provider };
     case "success":
       return { type: "success", provider };
     case "error":
-      return { type: "error", provider, message: event.message };
+      return { type: "error", provider };
     case "cancelled":
       return { type: "cancelled", provider };
   }
@@ -230,7 +235,7 @@ function desensitizeProgress(event: OAuthLoginEvent, provider: string): Record<s
 export async function startLoginFlow(
   flowId: string,
   provider: string,
-  opContext?: { signal?: AbortSignal; progress?: (value: unknown) => void },
+  opContext?: { signal?: AbortSignal; progress?: (value: unknown) => void; onInput?: (handler: ((data: unknown) => OAuthLoginSubmitResult) | null) => void },
 ): Promise<StartLoginFlowResult> {
   if (flows.has(flowId)) return { started: false, message: "A login flow is already running" };
   const modelRuntime = await createModelRuntimeWithExtensions();
@@ -265,6 +270,29 @@ export async function startLoginFlow(
       }, { once: true });
     }
   }
+
+  // Register task-associated input handler for interactive code/selection control
+  if (opContext?.onInput && !flow.done) {
+    opContext.onInput((data: unknown) => {
+      if (typeof data !== "object" || data === null) {
+        throw new Error("input data must be an object");
+      }
+      const record = data as Record<string, unknown>;
+      const { provider: prov, token, code } = record;
+      if (typeof prov !== "string" || typeof token !== "string" || typeof code !== "string" || !prov || !token || !code) {
+        throw new Error("provider, token, and code are required");
+      }
+      const pending = tokens.get(token);
+      if (!pending || !flow.liveTokens.has(pending) || flow.done) {
+        return { status: "no_pending", message: "No pending login for token" };
+      }
+      return submitLoginCode(prov, token, code);
+    });
+    flow.inputCleaner = () => opContext.onInput?.(null);
+  }
+
+  // Report initial desensitized progress to establish task liveness
+  opContext?.progress?.(desensitizeProgress({ type: "progress", message: "Connecting" }, provider));
 
   const getManualInputRequest = (): { pending: PendingPrompt; answer: Promise<string> } => {
     // One manual-code handshake reused across auth_url + manual_code (the
@@ -353,7 +381,7 @@ export async function startLoginFlow(
         (err as any).code = "cancelled";
         throw err;
       }
-      throw error;
+      throw new Error("Login failed");
     } finally {
       retireFlow(flowId, flow);
     }

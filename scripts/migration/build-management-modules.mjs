@@ -105,6 +105,8 @@ export { runPluginMutationTask } from "${ROOT}/lib/plugins-mutation-task.server.
 export { runSkillMutationTask } from "${ROOT}/lib/skills-mutation-task.server.ts";
 export { searchSkills } from "${ROOT}/lib/skills-search.server.ts";
 export { checkManagedPluginUpdates, checkManagedSkillUpdates } from "${ROOT}/lib/updates-management.server.ts";
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
+registerBunOAuthFlows();
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
@@ -119,6 +121,9 @@ export async function bundleProjectionModules() {
       sourcefile: "management-projection-entry.ts",
     },
     bundle: true,
+    // Jiti resolves its Babel transformer relative to its own package; bundling
+    // it relocates that lookup into the projection and breaks extensions.
+    external: ["jiti"],
     format: "esm",
     platform: "node",
     target: "node20",

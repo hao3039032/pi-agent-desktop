@@ -70,6 +70,7 @@ pub(crate) struct LoginRelayHandle {
     pub flow_id: String,
     /// The management task handle for cooperative cancellation and activity guard.
     pub task_handle: String,
+    pub tokens: std::collections::HashSet<String>,
 }
 
 /// The login-stream relays by subscription id (pi_ipc's event_relays
@@ -226,9 +227,9 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
                 },
             )
         }
-        // POST /api/auth/login/[provider]'s body: answer a pending login
-        // prompt through its token (the old 404/400 messages ride the
-        // statuses). A one-shot mutation — never auto-resent.
+        // POST /api/auth/login/[provider]'s body: deliver code or prompt answer
+        // to the active login task via the task-associated control channel (submit_task_input),
+        // completely bypassing mutation task admission and unknown-outcome scope isolation.
         "auth.loginManualCode" | "auth.loginSubmit" => {
             let (provider, token, code) =
                 match (validated_provider_arg(args), string_arg(args, "token"), string_arg(args, "code")) {
@@ -241,12 +242,41 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
                         ));
                     }
                 };
+
+            let task_handle = {
+                let relays = state.login_relays.relays.lock().unwrap();
+                relays.values().find(|h| h.tokens.contains(&token)).map(|h| h.task_handle.clone())
+            };
+
+            let Some(task_handle) = task_handle else {
+                return Some(crate::pi_ipc::protocol_error(
+                    id,
+                    "not_found",
+                    "No active login task for provider",
+                ));
+            };
+
+            let config = match state.management_config.lock().unwrap().clone() {
+                Some(config) => config,
+                None => {
+                    return Some(crate::pi_ipc::protocol_error(
+                        id,
+                        "management_unavailable",
+                        "the management instance is not configured",
+                    ));
+                }
+            };
+            let instance = match state.management.instance("global", &config) {
+                Ok(inst) => inst,
+                Err(error) => {
+                    return Some(crate::pi_ipc::protocol_error(id, "management_unavailable", &error));
+                }
+            };
+
             Some(
-                match management_call_bounded(
-                    state,
-                    "auth.loginSubmit",
+                match instance.submit_task_input(
+                    &task_handle,
                     json!({ "provider": provider, "token": token, "code": code }),
-                    std::time::Duration::from_secs(60),
                 ) {
                     Ok(result) => {
                         if let Some(status) = result.get("status").and_then(Value::as_str) {
@@ -261,7 +291,10 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
                         }
                         crate::pi_ipc::protocol_ok(id, result)
                     }
-                    Err((code, message)) => crate::pi_ipc::protocol_error(id, &code, &message),
+                    Err(error) => {
+                        let (code, message) = crate::pi_ipc::management_error_code(&error);
+                        crate::pi_ipc::protocol_error(id, &code, &message)
+                    }
                 },
             )
         }
@@ -340,6 +373,7 @@ fn login_relay(
             stop: Arc::clone(&stop),
             flow_id: flow_id.clone(),
             task_handle: task_handle.clone(),
+            tokens: Default::default(),
         },
     );
     let relays = Arc::clone(&state.login_relays);
@@ -378,10 +412,11 @@ fn login_relay(
                 };
 
                 // 2. Poll buffered user-facing events:
-                let poll = instance.management_call(
+                let poll = instance.management_call_kind(
                     "auth.loginPoll",
                     json!({ "flowId": flow_id, "since": since }),
                     LOGIN_POLL_TIMEOUT,
+                    management_host::TaskKind::ReadOnly,
                 );
                 match poll {
                     Ok(snapshot) => {
@@ -389,6 +424,11 @@ fn login_relay(
                         if let Some(events) = snapshot.get("events").and_then(Value::as_array) {
                             for queued in events {
                                 let Some(event) = queued.get("event") else { continue };
+                                if let Some(token) = event.get("token").and_then(Value::as_str) {
+                                    if let Some(relay) = relays.relays.lock().unwrap().get_mut(&subscription_id) {
+                                        relay.tokens.insert(token.to_string());
+                                    }
+                                }
                                 if !send(&mut frame_seq, "event", event.clone()) {
                                     // The WebView is gone: cancel and detach.
                                     stop.store(true, Ordering::SeqCst);
@@ -788,6 +828,197 @@ mod tests {
             snap.status
         );
         let _ = instance.cancel_task(&task_handle);
+    }
+
+    /// A running OAuth login task can accept input via submit_task_input even when
+    /// another mutation in the same management scope has an Unknown outcome (which
+    /// blocks ordinary new mutations like auth.apiKeyStore). Also verifies that
+    /// wrong handle, bad/repeated token, and submission after cancel all reject.
+    #[test]
+    fn login_input_bypasses_scope_mutation_isolation_and_enforces_task_guards() {
+        let Some(executable) = std::env::var("PI_CLI_BIN")
+            .ok()
+            .filter(|value| !value.is_empty())
+        else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let state = crate::pi_ipc::IpcHostState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let managed = stage_managed_tree(dir.path());
+        write_fixture_auth(&agent_dir, "sk-test-key-scope");
+        std::fs::create_dir_all(agent_dir.join("extensions")).unwrap();
+        std::fs::write(agent_dir.join("extensions/fixture.js"), r#"
+export default function(pi) {
+  for (const id of ['fixture-oauth', 'fixture-stuck']) pi.registerProvider({
+    id, name: id, auth: { oauth: {
+      name: id,
+      login: async (interaction) => {
+        if (id === 'fixture-stuck') return await new Promise(() => {});
+        interaction.notify({ type: 'auth_url', url: 'https://example.invalid/?state=fixture', instructions: 'Fixture' });
+        const code = await interaction.prompt({ type: 'manual_code', message: 'Fixture code' });
+        if (code === 'bad') throw new Error('Fixture rejected');
+        return { type: 'oauth', access: 'fixture-access', refresh: 'fixture-refresh', expires: Date.now() + 3600000 };
+      },
+      refresh: async () => ({ access: 'fixture-access', refresh: 'fixture-refresh', expires: Date.now() + 3600000 }),
+      toAuth: async (cred) => ({ apiKey: cred.access }),
+    } }, getModels: () => [{ id: 'fixture', name: 'Fixture' }], models: [{ id: 'fixture', name: 'Fixture' }],
+  });
+}
+"#).unwrap();
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable,
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![
+                ("PI_WEB_MANAGED_MODULES".to_string(), managed.display().to_string()),
+                ("PI_OFFLINE".to_string(), "1".to_string()),
+            ],
+        });
+
+        let config = state.management_config.lock().unwrap().clone().unwrap();
+        let instance = state.management.instance("global", &config).unwrap();
+
+        // 1. Start a real OAuth login task using the isolated fixture provider:
+        let login_task = instance
+            .start_task(
+                "auth.loginStart",
+                json!({ "flowId": "flow-input-test-1", "provider": "fixture-oauth" }),
+                LOGIN_FLOW_DEADLINE,
+                management_host::TaskKind::Mutation,
+            )
+            .expect("login task starts");
+
+        // Register the active relay in state:
+        state.login_relays.insert(
+            "sub-input-1",
+            LoginRelayHandle {
+                stop: Arc::new(AtomicBool::new(false)),
+                flow_id: "flow-input-test-1".to_string(),
+                task_handle: login_task.clone(),
+                tokens: Default::default(),
+            },
+        );
+
+        // Verify task is running and has established presence in the child:
+        let ready_until = std::time::Instant::now() + Duration::from_secs(10);
+        while instance.task_snapshot(&login_task).unwrap().progress.is_none()
+            && std::time::Instant::now() < ready_until
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(instance.task_snapshot(&login_task).unwrap().progress.is_some(), "login task has started in child: {:?}", instance.task_snapshot(&login_task).unwrap());
+        let snap = instance.task_snapshot(&login_task).unwrap();
+        assert_eq!(
+            snap.status,
+            management_host::TaskStatus::Running,
+            "login_task failed with error: {:?}",
+            snap.error
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let token = loop {
+            let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":"flow-input-test-1"}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
+            if let Some(token) = poll["events"].as_array().unwrap().iter().find_map(|e| e["event"]["token"].as_str()) { break token.to_string(); }
+            assert!(std::time::Instant::now() < deadline, "fixture prompt missing");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        state.login_relays.relays.lock().unwrap().get_mut("sub-input-1").unwrap().tokens.insert(token.clone());
+        let invalid = instance.submit_task_input(&login_task, json!({"provider":"fixture-oauth", "token":"wrong", "code":"fixture"})).unwrap();
+        assert_eq!(invalid["status"], "no_pending");
+        assert!(instance.submit_task_input(&login_task, json!({"data":"x".repeat(4096)})).is_err());
+        let other = state.management.instance("other", &config).unwrap();
+        assert!(other.submit_task_input(&login_task, json!({})).is_err());
+
+        // Two further fixture flows exercise provider error and cooperative cancel.
+        for (flow, answer) in [("flow-error", Some("bad")), ("flow-cancel", None)] {
+            let handle = instance.start_task("auth.loginStart", json!({"flowId":flow, "provider":"fixture-oauth"}), LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation).unwrap();
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            let prompt_token = loop {
+                let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":flow}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
+                if let Some(token) = poll["events"].as_array().unwrap().iter().find_map(|e| e["event"]["token"].as_str()) { break token.to_string(); }
+                assert!(std::time::Instant::now() < until, "fixture prompt missing");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            if let Some(code) = answer {
+                assert_eq!(instance.submit_task_input(&handle, json!({"provider":"fixture-oauth", "token":prompt_token, "code":code})).unwrap()["status"], "accepted");
+            } else {
+                instance.cancel_task(&handle).unwrap();
+            }
+            while instance.task_snapshot(&handle).unwrap().status == management_host::TaskStatus::Running && std::time::Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+            assert_eq!(instance.task_snapshot(&handle).unwrap().status, if answer.is_some() { management_host::TaskStatus::Failed } else { management_host::TaskStatus::Cancelled });
+            assert!(instance.submit_task_input(&handle, json!({"provider":"fixture-oauth", "token":prompt_token, "code":"fixture"})).is_err());
+        }
+
+        // 2. Introduce an Unknown-outcome mutation task in the SAME management scope:
+        // A bounded synchronous call expires while its fixture login is still running.
+        let timeout_error = instance.management_call(
+            "auth.loginStart",
+            json!({ "flowId": "flow-timeout-fake", "provider": "fixture-stuck" }),
+            Duration::from_millis(1),
+        ).unwrap_err();
+        let unknown_task = timeout_error.split("(task ").nth(1).unwrap().trim_end_matches(')').to_string();
+        assert_eq!(
+            instance.task_snapshot(&unknown_task).unwrap().status,
+            management_host::TaskStatus::Unknown,
+            "the scope now has an Unknown outcome"
+        );
+
+        // 3. Verify that ordinary new mutations are blocked by the Unknown task in the scope:
+        let blocked_mutation = instance.start_task(
+            "auth.apiKeyStore",
+            json!({ "provider": "openai", "apiKey": "sk-new" }),
+            Duration::from_secs(60),
+            management_host::TaskKind::Mutation,
+        );
+        assert!(blocked_mutation.is_err(), "ordinary mutations are blocked by scope write isolation");
+        assert_eq!(blocked_mutation.unwrap_err(), "management scope has an unknown outcome");
+        let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":"flow-input-test-1"}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
+        assert!(poll["events"].as_array().unwrap().iter().any(|event| event["event"]["url"].as_str() == Some("https://example.invalid/?state=fixture")));
+
+        // Input is delivered through the same dispatch used by the WebView, despite unknown isolation.
+        let input_res = dispatch(&state, "auth.loginManualCode", "input", &json!({"provider":"fixture-oauth", "token":token, "code":"fixture-code"})).unwrap();
+        assert_eq!(input_res["ok"], true, "{input_res}");
+        let repeated = dispatch(&state, "auth.loginManualCode", "repeat", &json!({"provider":"fixture-oauth", "token":token, "code":"fixture-code"})).unwrap();
+        assert_eq!(repeated["ok"], false);
+
+        // 5. Wrong handle is rejected:
+        let wrong_handle_res = instance.submit_task_input(
+            "task-nonexistent-handle",
+            json!({ "provider": "anthropic", "token": "t", "code": "c" }),
+        );
+        assert!(wrong_handle_res.is_err());
+        assert_eq!(wrong_handle_res.unwrap_err(), "management task not found");
+
+        // 6. Unknown/terminal target task is rejected:
+        let unknown_target_res = instance.submit_task_input(
+            &unknown_task,
+            json!({ "provider": "anthropic", "token": "t", "code": "c" }),
+        );
+        assert!(unknown_target_res.is_err());
+        let unknown_err = unknown_target_res.unwrap_err();
+        assert!(
+            unknown_err.contains("terminal") || unknown_err.contains("not running"),
+            "unknown_err: {unknown_err}"
+        );
+
+        // 7. Verify subsequent input is rejected after completion or cancellation:
+        let _ = instance.cancel_task(&login_task);
+        let after_cancel_input = instance.submit_task_input(
+            &login_task,
+            json!({ "provider": "anthropic", "token": "t", "code": "c" }),
+        );
+        assert!(after_cancel_input.is_err(), "input after cancel must be rejected");
+        let err = after_cancel_input.unwrap_err();
+        assert!(
+            err.contains("cancel requested") || err.contains("not running") || err.contains("terminal"),
+            "err: {err}"
+        );
     }
 
     /// A custom models.json provider stays out of the API-key list even with
