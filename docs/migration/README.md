@@ -2,7 +2,7 @@
 
 总计划见 `plans/2026-10-31-去-next-js-静态前端-tauri-rust-应用宿主完整迁移计划.md`。本目录存放迁移的落地工件；按里程碑（M0–M5）推进，每个阶段的验证门槛以计划 §八–§九 为准。
 
-## 当前状态（M0 进行中）
+## 当前状态（M0 完成主体；见下方「当前状态（M0–M2 进行中）」最新进展）
 
 | 项 | 状态 | 工件 |
 |---|---|---|
@@ -28,7 +28,27 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 
 所有真实 pi 测试都跑在隔离沙箱（临时 `PI_CODING_AGENT_DIR`、临时 cwd），不碰真实 `~/.pi/agent` 数据。
 
-## 当前状态（M0–M1 进行中）补充
+## 当前状态（M0–M2 进行中；审计修复已落地）
+
+| 项 | 状态 | 工件 |
+|---|---|---|
+| 传输层真实接线（唯一接线点 + 真 Channel + 宿主退订） | ✅ 落地 | `lib/desktop-native.ts`（唯一底层接线：hasTauriHostBridge/tauriHostInvoke/tauriHostChannel）+ `static-frontend/src/data/transport.ts`（取消型超时、`agent.unsubscribeEvents` 宿主退订、MissingHostTransport 显式失败——不再默认 mock） |
+| 会话事件流帧→AgentEvent 适配 | ✅ 落地 | `static-frontend/src/data/session-event-source.ts`：快照帧合成 `connected` AgentEvent（AgentEventConnection 的握手要求）、epoch 重基、陈旧 seq 丢弃、reset→error、close 退订 |
+| agent-client IPC 版对齐 | ✅ 落地 | 构造参数序（message, status, code, accepted, instanceId）与原版一致；spawn/handshake 失败→prompt_rejected+accepted:false；AbortSignal 停等待不重发 |
+| pi-ipc capability 隔离 | ✅ 落地 | `capabilities/desktop-pi-ipc.json`（仅可信 WebView，无 loopback remote）；旧 wildcard 不再暴露 pi_ipc/订阅命令 |
+| 文件边界收紧 | ✅ 落地 | 前端无 `files.allowRoot`（根由宿主从会话索引派生，`propose_path`）；`resources.grantFile` 仅确认宿主提出过的路径；写走解析后父目录包含（symlink 逃逸/`..` 拒绝）；终端 cwd 校验；sessions.list agentDir 宿主解析 |
+| pi-host 泄漏/竞态修复 | ✅ 落地 | Bridge Drop 退订 notify（router/exit 线程终止）；重复 in-flight id 拒绝；64MiB stdout 上限；退出等待管道排空（有界 2s）后再 fail_all（"先答后死"回归测试） |
+| agent.command 封闭载荷 | ✅ 落地 | 按命令重建子进程载荷（session/type/未知字段不透传）；枚举=真实子命令面（lib/pi-rpc/session.ts）；主机层命令（fork/get_tools/navigate_tree…）→`not_supported` 不盲转发 |
+| 会话冷启动恢复 | ✅ 落地 | spawn/management 配置启动时解析（PI_CLI_BIN→打包→dev）；磁盘会话的 agent 操作冷启动子进程（POST /api/agent/[id] 契约）；真实 pi 测试断言 get_state 回文件 sessionId |
+| 管理实例加固 + cron.countSlots | ✅ 落地 | nonce 宿主每次 spawn 生成；scope 规范化；并发同 scope 共享一次 spawn；`cron.countSlots`（(since,until] 语义、一年窗口上限）真实 pi 实测 |
+| 调度器修复 | ✅ 落地 | finish_run 以认领者身份释放租约；运行账本 task id 消毒（路径穿越拒绝）；once 调度解析 ISO |
+| 状态镜像跨桥 | ✅ 落地 | `desktop.stateMirror`/`desktop.writeStateMirror`（严格递增 revision、0600 原子写、一层 .bak）；静态端 React 挂载前导入（仅缺失键，不回滚新值）；静态构建的 useStateMirror 别名到 IPC 版 |
+| M2/M3 其余数据域（models/MCP/插件技能/文件树/git/scheduled 目录） | ⬜ 逐域迁移 | 44 个文件 121 处 fetch 仍待迁移（生产合规检查未过）；文件树 files.list、模型面板经管理实例、MCP 面板等是主体 |
+| 主机层命令语义（fork/clone/get_tools/navigate_tree 的 Rust 实现） | ⬜ M2 主体 | 现回答 not_supported；状态机已就位 |
+| 定时器接线（宿主 30s tick + 执行器） | ⬜ M4 | 引擎/存储/账本已就位 |
+| 打包验收（真实 standalone 布局、四平台） | ⬜ M5 | 本机 PI_CLI_BIN 是本地托管安装，非打包验收 |
+
+### 里程碑补充（历史条目，按域划分）
 
 M1 项：
 
@@ -70,7 +90,7 @@ M2 项：
 | 剩余命令面（树导航、fork/clone、统计缓存、fleet 监控、自动命名桥接） | ⬜ 逐命令迁移 | 状态机与分发表已就位，按清单 op 逐个落 |
 | 会话历史索引 + sessions.list + 侧栏视图 | ✅ 落地 | `crates/session-host/src/history.rs`（只读扫描、项目分组、按时间排序、坏文件跳过带原因、ISO→epoch）；dispatch + pi_ipc 的 sessions.list；静态前端 SessionsView（首个迁移 UI 组件，typed IPC 驱动） |
 | 全量 UI 迁移机制 | ✅ 落地 | `static-frontend`：整棵现有组件树（3636 模块）经 Vite 构建进 desktop/frontend，tsc 0 错误。Next 客户端 API 四件套经 shim（navigation→History/URLSearchParams 适配、image→img、dynamic→lazy、link→anchor）；CSS 级联按 layout 顺序（katex/globals/settings/native-theme）；主题首屏内联、Google 字体移除（系统回退） |
-| 数据层逐域替换 | 🔶 已开工 | `agent.command`（封闭命令枚举 + 形状校验，错误→协议码）+ agent-client IPC 版（同表面：AgentCommandError/code/accepted/instanceId）；会话事件流 SSE→IPC Channel（快照/事件帧、seq/epoch、reset→重连、close 即分离）；传输层唯一接线点 `src/data/transport.ts`。⚠️ 其余领域（sessions 目录、models、MCP、插件技能、文件、git/worktree、scheduled、appearance、desktop）仍走 fetch——生产合规检查（无 /api、无 EventSource）尚未通过，逐域对齐响应形状是 M2/M3 主体 |
+| 数据层逐域替换 | 🔶 已开工（核心会话面已通） | `agent.command`（封闭命令枚举 + 按命令重建载荷）+ agent-client IPC 版（原参数序/accepted/instanceId/AbortSignal）+ 会话事件流 SSE→IPC Channel（快照合成 connected、seq/epoch、reset→重连、close 即退订）+ 传输层真实接线（真 Channel、取消型超时、宿主退订）。⚠️ 其余领域（sessions 目录、models、MCP、插件技能、文件树、git/worktree、scheduled、appearance、desktop）仍走 fetch——生产合规检查（无 /api、无 EventSource）尚未通过，逐域对齐响应形状是 M2/M3 主体 |
 | 消息层状态机 | ✅ 核心已移植 |
 | Tauri IPC 桥（`pi_ipc` 命令） | ✅ 垂直切片落地 | `src-tauri/src/pi_ipc.rs`：协议 v1 信封校验（版本/结构/参数对象）、封闭操作表（`desktop.identity` 先于任何子进程应答；会话操作路由 session-host 的分发表）、`unknown_op`/`not_found` 协议错误码。`allow-pi-ipc` 权限（desktop-shell.toml）+ 主窗口 capability；静态 BootPage 的 Tauri 探测路径真实可用（客户端超时，超时不重发）。src-tauri 24 测试全绿 |
 
