@@ -31,6 +31,7 @@ import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
+import { bindSessionActionsService } from "./data/session-actions-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
 import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
 import { bindToolSettingsService } from "./data/tool-settings-service.ts";
@@ -58,6 +59,7 @@ async function boot(): Promise<void> {
   bindModelsExtrasService(client);
   bindSessionViewService(client);
   bindSessionListService(client);
+  bindSessionActionsService(client);
   bindWorkspaceService(client);
   bindWorktreeService(client);
   bindDesktopConnection(client);

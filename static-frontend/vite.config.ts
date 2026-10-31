@@ -69,6 +69,10 @@ export default defineConfig({
         replacement: resolve(import.meta.dirname, "src/data/session-view-service.ts"),
       },
       {
+        find: /^@\/lib\/session-actions-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/session-actions-service.ts"),
+      },
+      {
         // The session-list service (catalogue load, running-set stream,
         // home dir) swaps /api/sessions, /api/agent/running/events and
         // /api/home for sessions.list / agent.subscribeRunning / cwd.home.

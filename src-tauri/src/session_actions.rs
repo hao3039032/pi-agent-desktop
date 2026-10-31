@@ -4,6 +4,21 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use crate::pi_ipc::{dispatch_with_resume, management_call, IpcHostState};
 
+pub(crate) fn rename(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let id = args.get("session").and_then(Value::as_str).filter(|id| !id.is_empty())
+        .ok_or_else(|| ("invalid_args".into(), "session is required".into()))?;
+    let name = args.get("name").and_then(Value::as_str)
+        .ok_or_else(|| ("invalid_args".into(), "name is required".into()))?;
+    dispatch_with_resume(state, "agent.command", &json!({"session": id, "type": "get_state"}))?;
+    let session = state.registry.get(id).ok_or_else(|| ("not_found".into(), "session not found".into()))?;
+    let _guard = session.try_branch_activity().map_err(|message| ("busy".into(), message.into()))?;
+    if session.run_state().is_running() || !session.composer_outbox.snapshot().0.is_empty() {
+        return Err(("busy".into(), "Wait for the current response and queued messages before renaming.".into()));
+    }
+    session.bridge_request("session.rename", Some(json!({"name": name})), Some(Duration::from_secs(30)))
+        .map_err(|error| ("op_failed".into(), format!("Rename failed or its outcome is unknown; refresh the session list before trying again: {error}")))
+}
+
 pub(crate) fn branch(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
     let kind = args.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "navigate_tree" && args.get("summarize").is_some_and(|value| !value.is_boolean()) {
@@ -134,6 +149,12 @@ mod tests {
         *state.spawn_base.lock().unwrap() = Some(SpawnBase { executable: executable.clone(), bridge_asset: Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap(), artifacts_asset: None, chat_asset: None });
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig { executable, agent_dir: Some(agent), extensions: vec![Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()], env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.to_string_lossy().into_owned())] });
         let call = |op: &str, args: Value| dispatch_envelope(&state, json!({"v":1,"id":"test","op":op,"args":args}));
+        let renamed = call("sessions.rename", json!({"session":"branch-source","name":"  fixture title  "}));
+        assert_eq!(renamed["ok"], true, "{renamed}");
+        let named = call("sessions.get", json!({"session":"branch-source"}));
+        assert_eq!(named["data"]["info"]["name"], "fixture title", "{named}");
+        let cleared = call("sessions.rename", json!({"session":"branch-source","name":""}));
+        assert_eq!(cleared["ok"], true, "clearing the title is supported: {cleared}");
         let nav = call("agent.command", json!({"session":"branch-source","type":"navigate_tree","targetId":"aa"}));
         assert_eq!(nav["ok"], true, "{nav}");
         let live = call("sessions.get", json!({"session":"branch-source"}));
@@ -183,6 +204,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(state.registry.get("branch-source").unwrap().run_state().is_running(), "fixture run did not start");
+        let busy_rename = call("sessions.rename", json!({"session":"branch-source","name":"should not write"}));
+        assert_eq!(busy_rename["error"]["code"], "busy", "{busy_rename}");
         for kind in ["fork", "fork_branch", "clone", "navigate_tree"] {
             let blocked = call("agent.command", json!({"session":"branch-source","type":kind,"entryId":"aa","targetId":"aa"}));
             assert_eq!(blocked["error"]["code"], "busy", "{kind}: {blocked}");

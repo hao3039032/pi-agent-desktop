@@ -245,7 +245,7 @@ impl Session {
         data: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
-        let _admission = if matches!(command, "prompt" | "bash" | "compact") {
+        let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_lock().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
         let result = self.client.command(command, data, timeout);
@@ -1323,6 +1323,7 @@ pub fn dispatch_session_op(
                 })
                 .ok_or_else(|| DispatchError::invalid("setTools requires a names array"))?;
             let session = resolve_or_start(registry, session_id, "agent.setTools")?;
+            let _guard = session.try_branch_activity().map_err(DispatchError::invalid)?;
             let result = session
                 .bridge_request("tools.set", Some(json!({ "names": names })), Some(Duration::from_secs(30)))
                 .map_err(DispatchError::Bridge)?;
