@@ -185,6 +185,12 @@ class HostBridgeTransport implements IpcTransport {
         const ack = await invoke(command, payload);
         if (closed) {
           handle.stopLocalDelivery();
+          const parsed = parseSubscribeAck(ack);
+          if ("subscriptionId" in parsed && command === "pi_ipc_subscribe_scheduled") {
+            try {
+              await invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `unsubscribe-${parsed.subscriptionId}`, op: "tasks.unsubscribe", args: { subscriptionId: parsed.subscriptionId } } });
+            } catch { /* the host may already be gone */ }
+          }
           return;
         }
         const parsed = parseSubscribeAck(ack);
