@@ -43,6 +43,20 @@ impl ScheduledReferences for crate::scheduled_session_index::ScheduledSessionInd
     fn is_referenced(&self, id: &str) -> bool { self.is_referenced(id) }
 }
 
+#[derive(Debug)]
+struct DeletePreflight { path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata }
+#[derive(Debug)]
+enum DeleteOutcome { Preflight(DeletePreflight), Deleted(Value) }
+
+#[cfg(unix)]
+fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len()
+        && left.mtime() == right.mtime() && left.mtime_nsec() == right.mtime_nsec()
+}
+#[cfg(not(unix))]
+fn same_file_version(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool { false }
+
 pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
     let _policy = state.policy_gate.try_read().map_err(|_| error("busy", "Session policy change is in progress"))?;
     let agent = state.agent_dir();
@@ -54,6 +68,7 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     if args.get("trashChatFolder").is_some_and(|value| !value.is_boolean()) {
         return Err(error("invalid_args", "trashChatFolder must be a boolean"));
     }
+    let mut preflight_proof = None;
     if state.registry.get(id).is_some() {
         // Check every disk-side refusal before closing an idle child. The
         // actual deletion repeats all checks after the child really exits.
@@ -63,7 +78,10 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
             crate::session_deletion_journal::recover_pending(state, &agent)?;
             let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
                 .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
-            delete_with_index(state, args, &index, true)?;
+            match delete_with_index(state, args, &index, true, None)? {
+                DeleteOutcome::Preflight(proof) => preflight_proof = Some(proof),
+                DeleteOutcome::Deleted(_) => return Err(error("io", "Unexpected deletion preflight result")),
+            }
         }
         state.registry.with_offline_session_writer(id, std::time::Duration::from_secs(5), || Ok::<_, (String, String)>(()))
             .map_err(|failure| match failure {
@@ -76,25 +94,28 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     crate::session_deletion_journal::recover_pending(state, &agent)?;
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
-    delete_with_index(state, args, &index, false)
+    match delete_with_index(state, args, &index, false, preflight_proof.as_ref())? {
+        DeleteOutcome::Deleted(result) => Ok(result),
+        DeleteOutcome::Preflight(_) => Err(error("io", "Unexpected deletion result")),
+    }
 }
 
 
-fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences, preflight: bool) -> Result<Value, (String, String)> {
+fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences, preflight: bool, proof: Option<&DeletePreflight>) -> Result<DeleteOutcome, (String, String)> {
     let id = args.get("session").and_then(Value::as_str).filter(|v| !v.is_empty())
         .ok_or_else(|| error("invalid_args", "session is required"))?;
     if args.get("trashChatFolder").is_some_and(|v| !v.is_boolean()) {
         return Err(error("invalid_args", "trashChatFolder must be a boolean"));
     }
     let trash_chat_folder = args.get("trashChatFolder").and_then(Value::as_bool) == Some(true);
-    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled, trash_chat_folder, preflight))
+    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled, trash_chat_folder, preflight, proof))
         .map_err(|error| match error {
             session_host::SessionWriterError::Busy(message) => self::error("busy", message),
             session_host::SessionWriterError::Operation(error) => error,
         })
 }
 
-fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool, preflight: bool) -> Result<Value, (String, String)> {
+fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool, preflight: bool, proof: Option<&DeletePreflight>) -> Result<DeleteOutcome, (String, String)> {
     if scheduled.is_referenced(id) {
         return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
     }
@@ -158,6 +179,13 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     let target_metadata = target_handle.metadata().map_err(|e| error("io", e))?;
     let canonical_target = target.canonicalize().map_err(|e| error("io", e))?;
     if !canonical_target.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
+    if let Some(proof) = proof {
+        let original = proof.file.metadata().map_err(|e| error("io", e))?;
+        if !same_path(&proof.path, &canonical_target) || !same_file_version(&proof.metadata, &original)
+            || !same_file_version(&proof.metadata, &target_metadata) {
+            return Err(error("busy", "Session file changed after deletion preflight"));
+        }
+    }
     for (child_id, parent, subagent_parent) in references {
         if child_id == id { continue; }
         if subagent_parent.as_deref() == Some(id) { return Err(error("not_supported", "Session has subagents and requires the full cascade operation.")); }
@@ -178,9 +206,9 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
             }
         }
     }
-    if preflight { return Ok(json!({"ok": true, "folderTrashed": false})); }
+    if preflight { return Ok(DeleteOutcome::Preflight(DeletePreflight { path: canonical_target, file: target_handle, metadata: target_metadata })); }
     crate::session_deletion_journal::remove(&root, &state.agent_dir(), id, &canonical_target, &target_metadata)?;
-    Ok(json!({"ok": true, "folderTrashed": false}))
+    Ok(DeleteOutcome::Deleted(json!({"ok": true, "folderTrashed": false})))
 }
 
 #[cfg(test)]
@@ -192,7 +220,10 @@ mod tests {
         fn is_referenced(&self, id: &str) -> bool { self.0.iter().any(|entry| entry == id) }
     }
     fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
-        delete_with_index(state, args, &FixtureIndex(Vec::new()), false)
+        match delete_with_index(state, args, &FixtureIndex(Vec::new()), false, None)? {
+            DeleteOutcome::Deleted(result) => Ok(result),
+            DeleteOutcome::Preflight(_) => Err(error("io", "Unexpected test deletion result")),
+        }
     }
 
     fn fixture() -> (tempfile::TempDir, IpcHostState, PathBuf) {
@@ -214,7 +245,7 @@ mod tests {
         let (_dir, state, root) = fixture();
         let target = session(&root, "target", None);
         let args = json!({"session":"target"});
-        assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["target".into()]), false).unwrap_err().0, "not_supported");
+        assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["target".into()]), false, None).unwrap_err().0, "not_supported");
         assert!(target.exists());
     }
     #[cfg(unix)]
@@ -276,6 +307,22 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(state.registry.get("target").is_none());
         assert!(!target.exists());
         drop(live);
+    }
+    #[test]
+    fn deletion_preflight_keeps_identity_across_replacement() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let args = json!({"session":"target"});
+        let index = FixtureIndex(Vec::new());
+        let proof = match delete_with_index(&state, &args, &index, true, None).unwrap() {
+            DeleteOutcome::Preflight(proof) => proof,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        std::fs::rename(&target, root.join("original.saved")).unwrap();
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":root,"replacement":true}))).unwrap();
+        assert_eq!(delete_with_index(&state, &args, &index, false, Some(&proof)).unwrap_err().0, "busy");
+        assert!(std::fs::read_to_string(&target).unwrap().contains("replacement"));
+        assert!(root.join("original.saved").exists());
     }
     #[test]
     fn production_delete_rejects_policy_and_unresolved_writer_fences() {
