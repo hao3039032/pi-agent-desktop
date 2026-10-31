@@ -15,7 +15,14 @@
 
 import { tauriHostChannel, tauriHostInvoke, hasTauriHostBridge } from "../../../lib/desktop-native";
 import { IpcTimeoutError, MockTransport, type IpcTransport } from "../ipc/client.ts";
-import { IPC_PROTOCOL_VERSION, type IpcError, type IpcRequest, type IpcStreamMessage } from "../ipc/protocol.ts";
+import {
+  IPC_ERROR_CODES,
+  IPC_PROTOCOL_VERSION,
+  type IpcError,
+  type IpcErrorCode,
+  type IpcRequest,
+  type IpcStreamMessage,
+} from "../ipc/protocol.ts";
 
 /** A transport without a host: every request fails with a diagnosable code. */
 export class MissingHostTransport implements IpcTransport {
@@ -55,6 +62,51 @@ export function detectTransport(): { transport: IpcTransport; label: string } {
 /** Test seam: force a transport (mock tests inject theirs; resets on undefined). */
 export function overrideTransportForTests(replacement: { transport: IpcTransport; label: string } | undefined): void {
   cached = replacement ?? null;
+}
+
+/** Parse a subscribe command's ACK.
+ *
+ * The host's subscribe commands resolve (never throw) with EITHER the
+ * success shape (`{subscriptionId, ...}`) OR a full protocol error envelope
+ * (`{ok:false, error:{code,message,retryable}}` — a missing session, a
+ * relay that could not start). The transport must route the latter to
+ * `onError`: treating it as "no subscriptionId yet" parks the subscription
+ * in CONNECTING forever, with no reconnect and no error surface.
+ */
+export function parseSubscribeAck(ack: unknown): { subscriptionId: string } | { error: IpcError } {
+  if (isRecord(ack) && ack.ok === false && isRecord(ack.error)) {
+    // The subscribe commands' envelopes are built outside dispatch's code
+    // table (e.g. an "internal" relay failure), so the code maps through the
+    // same tolerance parseIpcResponse applies: an unrecognized code reads as
+    // `io` (the message still says what happened).
+    const rawCode = typeof ack.error.code === "string" ? ack.error.code : "";
+    const code = IPC_ERROR_CODES.includes(rawCode as IpcErrorCode)
+      ? (rawCode as IpcErrorCode)
+      : "io";
+    return {
+      error: {
+        code,
+        message: typeof ack.error.message === "string"
+          ? ack.error.message
+          : "the stream was refused by the host",
+        retryable: ack.error.retryable === true,
+      },
+    };
+  }
+  if (isRecord(ack) && typeof ack.subscriptionId === "string") {
+    return { subscriptionId: ack.subscriptionId };
+  }
+  return {
+    error: {
+      code: "io",
+      message: "the stream ack carried no subscriptionId",
+      retryable: false,
+    },
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 /** The real host-bridge transport. */
@@ -126,14 +178,18 @@ class HostBridgeTransport implements IpcTransport {
             : command === "pi_ipc_subscribe_running"
               ? { onFrame: handle.channel }
               : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
-        const ack = (await invoke(command, payload)) as {
-          subscriptionId?: string;
-        } | undefined;
+        const ack = await invoke(command, payload);
         if (closed) {
           handle.stopLocalDelivery();
           return;
         }
-        const subscriptionId = typeof ack?.subscriptionId === "string" ? ack.subscriptionId : null;
+        const parsed = parseSubscribeAck(ack);
+        if ("error" in parsed) {
+          handle.stopLocalDelivery();
+          onError(parsed.error);
+          return;
+        }
+        const subscriptionId = parsed.subscriptionId;
         subscription = {
           stopLocalDelivery: () => handle.stopLocalDelivery(),
           unsubscribe: async () => {

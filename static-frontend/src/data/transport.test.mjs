@@ -9,6 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
@@ -224,4 +225,50 @@ test("agent-client failures keep the HTTP-shaped error contract", async () => {
     .then(() => null, (caught) => caught);
   assert.ok(aborted instanceof AgentCommandError, String(aborted));
   assert.match(aborted.message, /aborted/);
+});
+
+// --- the subscribe ACK contract (a refused stream must reach onError) ------
+
+test("a protocol-error subscribe ACK becomes an onError, never a silent wait", async () => {
+  const { parseSubscribeAck } = transportModule;
+  // The host's pi_ipc_subscribe_* commands RESOLVE with a protocol error
+  // envelope when the session is gone (or the relay failed to start):
+  // {v, id, ok:false, error:{code,message,retryable}}.
+  const refused = parseSubscribeAck({
+    v: 1, id: "?", ok: false,
+    error: { code: "not_found", message: "no running session ghost", retryable: false },
+  });
+  assert.ok("error" in refused, "the refusal is an error, not a subscription");
+  assert.equal(refused.error.code, "not_found");
+  assert.equal(refused.error.retryable, false);
+
+  // A relay-spawn failure carries a code outside the TS table (the Rust
+  // subscribe commands build their envelopes directly): it reads as `io`
+  // (the same tolerance parseIpcResponse applies), never a silent wait.
+  const internal = parseSubscribeAck({
+    v: 1, id: "?", ok: false,
+    error: { code: "internal", message: "relay failed to start", retryable: false },
+  });
+  assert.equal(internal.error.code, "io");
+  assert.match(internal.error.message, /relay failed to start/);
+
+  // The success shape is the subscriptionId.
+  const ok = parseSubscribeAck({ subscriptionId: "sub-9", epoch: 3 });
+  assert.deepEqual(ok, { subscriptionId: "sub-9" });
+
+  // Anything else (a truncated/hostile ack) must NOT park the subscription
+  // in CONNECTING — it surfaces as a protocol error.
+  const malformed = parseSubscribeAck({ something: "else" });
+  assert.ok("error" in malformed);
+  assert.equal(malformed.error.code, "io");
+  assert.match(malformed.error.message, /no subscriptionId/);
+
+  // Source guard: the transport routes the parsed error to onError instead
+  // of only reading subscriptionId (the P1 fix this freezes).
+  const source = readFileSync(
+    resolve(repoRoot, "static-frontend/src/data/transport.ts"),
+    "utf8",
+  );
+  assert.match(source, /parseSubscribeAck\(ack\)/, "the subscribe path parses the ACK");
+  assert.match(source, /onError\(parsed\.error\)/, "a refused ack reaches onError");
 });

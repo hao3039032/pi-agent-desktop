@@ -47,6 +47,55 @@ use serde_json::{json, Value};
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// One running session (its child, its bridge, its subscribers).
+/// The running-set change signal (the event-driven running stream).
+///
+/// Every session in a registry shares ONE signal: a run-state TRANSITION
+/// (start, settle, child exit, removal) bumps the epoch and wakes every
+/// waiter, so the running-set relay derives on the change instead of
+/// sampling on a cadence — a run that starts AND settles inside one old
+/// cadence tick is still observed at its transitions.
+pub struct RunningSignal {
+    epoch: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl Default for RunningSignal {
+    fn default() -> Self {
+        Self { epoch: std::sync::Mutex::new(0), cv: std::sync::Condvar::new() }
+    }
+}
+
+impl RunningSignal {
+    /// Wake every waiter (call on anything that may change the running SET).
+    pub fn notify(&self) {
+        let mut epoch = self.epoch.lock().unwrap();
+        *epoch += 1;
+        drop(epoch);
+        self.cv.notify_all();
+    }
+
+    /// The current epoch (a waiter's change-token).
+    pub fn epoch(&self) -> u64 {
+        *self.epoch.lock().unwrap()
+    }
+
+    /// Block until the epoch moves past `seen` or the timeout passes;
+    /// answers the epoch observed (unchanged on timeout).
+    pub fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        let mut epoch = self.epoch.lock().unwrap();
+        while *epoch == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                return *epoch;
+            }
+            let (guard, _) = self.cv.wait_timeout(epoch, deadline - now).unwrap();
+            epoch = guard;
+        }
+        *epoch
+    }
+}
+
 pub struct Session {
     /// The registry key (the URL-facing session id).
     pub id: String,
@@ -72,6 +121,8 @@ pub struct Session {
     composer_delivering: Mutex<bool>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
+    /// The registry-wide running-set signal (shared with the relay).
+    running_signal: Arc<RunningSignal>,
 }
 
 struct SessionState {
@@ -182,9 +233,16 @@ impl Session {
         // 1. The state machine eats first (it may request follow-ups).
         let follow_up = {
             let mut machine = self.machine.lock().unwrap();
+            let was_running = machine.state.is_running();
             let follow_up = machine.apply_event(&record);
             if matches!(follow_up, crate::machine::FollowUp::RefreshAfterSettle { .. }) {
                 self.settle_cv.notify_all();
+            }
+            // A run-state TRANSITION (start/settle) is what the running-set
+            // stream derives on: signal the relay instead of letting it
+            // sample for the change (the event-driven half of the stream).
+            if machine.state.is_running() != was_running {
+                self.running_signal.notify();
             }
             follow_up
         };
@@ -233,7 +291,13 @@ impl Session {
     /// Merge one get_state snapshot into the machine (epoch-guarded for the
     /// volatile run flags).
     pub fn apply_snapshot(&self, snapshot: Value, captured_epoch: u64) {
+        let was_running = self.machine.lock().unwrap().state.is_running();
         self.machine.lock().unwrap().apply_state_snapshot(&snapshot, captured_epoch);
+        // A state merge can move the run flags too (the settle refresh, a
+        // cold get_state): a transition wakes the running-set relay.
+        if self.machine.lock().unwrap().state.is_running() != was_running {
+            self.running_signal.notify();
+        }
     }
 
     /// Pull one get_state NOW and merge it at the current epoch (stable
@@ -438,6 +502,8 @@ pub struct SessionRegistry {
     /// Session objects (the Next `__piComposerQueues` registry: a queued
     /// message survives idle eviction and a remove-then-resume).
     composer_outboxes: Mutex<HashMap<String, Arc<composer_outbox::ComposerOutbox>>>,
+    /// The running-set change signal the running stream derives on.
+    running_signal: Arc<RunningSignal>,
 }
 
 impl Default for SessionRegistry {
@@ -452,7 +518,14 @@ impl SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
             composer_outboxes: Mutex::new(HashMap::new()),
+            running_signal: Arc::new(RunningSignal::default()),
         }
+    }
+
+    /// The registry-wide running-set signal (the running stream waits on
+    /// it instead of sampling).
+    pub fn running_signal(&self) -> Arc<RunningSignal> {
+        Arc::clone(&self.running_signal)
     }
 
     /// The session-id-keyed composer outbox (created on first use, kept
@@ -486,14 +559,30 @@ impl SessionRegistry {
         let _guard = lock.lock().unwrap();
         // Won the lock: re-check (another caller may have finished spawning).
         if let Some(existing) = self.get(id) {
-            if !existing.is_idle_expired() {
+            if existing.is_idle_expired() {
+                // The old child must die BEFORE the replacement spawns: both
+                // would share this session id's composer outbox, and a still-
+                // living old child (or its in-flight drain) could consume or
+                // duplicate a queued delivery the new child should own. The
+                // shutdown is synchronous — stdin EOF, then a grace kill —
+                // and its drain observes the exit and stops.
+                let _ = self.remove(id, Duration::from_secs(5));
+            } else {
                 return Ok(existing);
             }
         }
         // The composer outbox comes from the session-id store: a resumed
         // session inherits the queue an evicted child left behind.
         let composer_outbox = self.composer_outbox_for(id);
-        let session = spawn_session(id, session_file, session_file_id, cwd, config, composer_outbox)?;
+        let session = spawn_session(
+            id,
+            session_file,
+            session_file_id,
+            cwd,
+            config,
+            composer_outbox,
+            Arc::clone(&self.running_signal),
+        )?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
         Ok(session)
     }
@@ -510,7 +599,11 @@ impl SessionRegistry {
     /// Detach and shut a session down; returns its exit code.
     pub fn remove(&self, id: &str, grace: Duration) -> Option<Option<i32>> {
         let session = self.sessions.lock().unwrap().remove(id)?;
-        Some(session.shutdown(grace))
+        let exit = session.shutdown(grace);
+        // A running session's removal changes the running SET: wake the
+        // relay whatever the child's state was (it derives either way).
+        self.running_signal.notify();
+        Some(exit)
     }
 
     /// Evict sessions whose lease expired; returns the evicted ids. The
@@ -575,6 +668,7 @@ fn spawn_session(
     cwd: &Path,
     config: &SessionSpawnConfig,
     composer_outbox: Arc<composer_outbox::ComposerOutbox>,
+    running_signal: Arc<RunningSignal>,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -722,6 +816,7 @@ fn spawn_session(
         composer_outbox,
         composer_delivering: Mutex::new(false),
         settle_cv: std::sync::Condvar::new(),
+        running_signal,
     });
     {
         let fan = Arc::clone(&state);
@@ -735,6 +830,10 @@ fn spawn_session(
                 while let Ok(record) = events.recv() {
                     fan.fan_out(record);
                 }
+                // The child is gone: a running session left the running SET
+                // with no further record to carry the news — wake the relay
+                // (its derive filters the exited session out).
+                fan.running_signal.notify();
             })
             .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
     }
@@ -761,6 +860,25 @@ fn spawn_session(
             return Err(SessionHostError::Handshake(
                 "the shipped bridge asset did not register pi-web:bridge in the child".to_string(),
             ));
+        }
+        // The chat policy asset's readiness proof — for the CHAT shape only
+        // (the asset rides every config as the shipped path, but only a
+        // Chat child loads it): `is_file()` alone just proves a path
+        // exists — a wrong, empty or corrupted-but-loadable module would
+        // hand the chat its `--tools` loadout with NO before_agent_start /
+        // tool_call enforcement (fail-open). The child must have registered
+        // pi-web:chat-policy ATTRIBUTED to the expected asset path (the
+        // sourceInfo attribution is pi's own, and find_bridge_commands
+        // matches it against the shipped path).
+        if let (Some(chat_asset), SessionSpawnShape::Chat { .. }) = (&config.chat_asset, &config.shape) {
+            let chat_commands = find_bridge_commands(&commands, chat_asset);
+            if !chat_commands.iter().any(|name| name == "pi-web:chat-policy") {
+                return Err(SessionHostError::Handshake(format!(
+                    "the chat policy asset did not register pi-web:chat-policy in the child; \
+                     a chat cannot start without its policy (asset: {})",
+                    chat_asset.display()
+                )));
+            }
         }
         Ok(())
     };

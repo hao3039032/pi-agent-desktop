@@ -172,3 +172,51 @@ test("createAgentSession surfaces the host's refusal without inventing success",
   assert.equal(refused.status, 500);
   assert.match(refused.error ?? "", /sessions\.create/, "the honest unknown-op error reaches the composer");
 });
+
+test("createAgentSession preserves the prompt trichotomy's details", async () => {
+  // A first prompt sent through agent.create that ends UNKNOWN answers
+  // op_failed with error.details {code:"prompt_unknown", accepted:null,
+  // sessionId} (src-tauri pi_ipc). The details MUST survive the service
+  // mapping: the caller needs the session identity to query the state
+  // instead of re-sending, and prompt_rejected's accepted:false to restore
+  // the draft. MockTransport.fail carries no details, so this drives the
+  // transport interface directly.
+  const failing = {
+    send: (request) => Promise.resolve({
+      v: 1,
+      id: request.id,
+      ok: false,
+      error: {
+        code: "op_failed",
+        message: "the prompt's outcome is unknown; query the state before resending",
+        retryable: false,
+        details: { code: "prompt_unknown", accepted: null, sessionId: "s-42" },
+      },
+    }),
+    subscribe: () => () => {},
+  };
+  bindSessionViewService(new IpcClient(failing));
+  const unknown = await createAgentSession({ cwd: "/w", type: "prompt", message: "hi" });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.status, 500);
+  assert.deepEqual(unknown.details, { code: "prompt_unknown", accepted: null, sessionId: "s-42" });
+
+  const rejected = {
+    send: (request) => Promise.resolve({
+      v: 1,
+      id: request.id,
+      ok: false,
+      error: {
+        code: "op_failed",
+        message: "the child refused the prompt",
+        retryable: false,
+        details: { code: "prompt_rejected", accepted: false },
+      },
+    }),
+    subscribe: () => () => {},
+  };
+  bindSessionViewService(new IpcClient(rejected));
+  const refused = await createAgentSession({ cwd: "/w", type: "prompt", message: "" });
+  assert.equal(refused.ok, false);
+  assert.deepEqual(refused.details, { code: "prompt_rejected", accepted: false });
+});

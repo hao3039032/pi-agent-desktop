@@ -16,6 +16,7 @@ publish = false
 # (queueing, compaction, steering, fleet monitoring) builds on this crate.
 
 [dependencies]
+base64 = "0.22"
 pi-host = { path = "../pi-host" }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

@@ -9153,6 +9153,26 @@ html.native-desktop :is(
   color: var(--text) !important;
 }
 .composer-outbox-image-count { color: var(--text-dim); }
+/* An outcome-UNKNOWN delivery: possibly already executed. The row warns and
+ * the send becomes a two-click confirm (see ComposerOutbox.tsx). */
+.composer-outbox-row-unknown .composer-outbox-mark { color: var(--warning); }
+.composer-outbox-unknown {
+  flex: 0 0 auto;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 8px;
+  border-radius: var(--radius-md);
+  border: var(--hairline) solid var(--border);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: var(--fs-small);
+}
+.composer-outbox-row-unknown .composer-outbox-send {
+  border: var(--hairline) solid var(--border);
+  background: var(--bg-panel);
+}
 .composer-outbox-actions { display: flex; flex-shrink: 0; align-items: center; gap: 4px; }
 .composer-outbox-actions button {
   display: inline-flex;

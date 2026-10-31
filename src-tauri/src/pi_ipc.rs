@@ -137,7 +137,12 @@ impl IpcHostState {
 
 /// Bump the catalogue version (a list-changing mutation happened).
 fn bump_session_list_version(state: &IpcHostState) -> u64 {
-    state.session_list_version.fetch_add(1, Ordering::SeqCst) + 1
+    let version = state.session_list_version.fetch_add(1, Ordering::SeqCst) + 1;
+    // The catalogue version rides the running stream's frames: wake the
+    // relay so a rename (or any list change) reaches subscribers at once —
+    // the stream no longer samples on a cadence that would catch it.
+    state.registry.running_signal().notify();
+    version
 }
 
 /// The pi executable the host spawns (lib/pi-rpc/factory.ts's resolution,
@@ -467,29 +472,29 @@ fn derive_running_snapshot(registry: &SessionRegistry, version: &AtomicU64) -> R
     RunningSnapshot { running, version: version.load(Ordering::SeqCst) }
 }
 
-/// The running stream's derive cadence (how often the relay re-checks the
-/// registry) and its channel probe (how often a quiet stream is re-sent so
-/// a dead Channel — a page reload that never unsubscribed — is detected
-/// and the relay reaped instead of leaking forever).
+/// The running stream's channel probe: how often a quiet stream re-sends
+/// its (unchanged) observation so a dead Channel — a page reload that never
+/// unsubscribed — is detected and the relay reaped instead of leaking
+/// forever. Changes themselves arrive on the registry's running signal
+/// (session-host's RunningSignal): every run-state TRANSITION (start,
+/// settle, child exit, removal) wakes the relay at once — no cadence
+/// sampling, so a run shorter than any cadence is still observed at its
+/// transitions.
 ///
-/// KNOWN LIMIT (deliberate, until the event-driven rework): the stream is
-/// sampled, not event-fed — a run that starts AND settles inside one
-/// cadence tick can pass unobserved (the sidebar then shows the session as
-/// not-running until the next list load). Runs shorter than the cadence are
-/// rare in practice (a model round-trip), and the client's own state poll
-/// covers the gap; the honest trade was cadence cost vs a per-machine
-/// broadcast hook. Revisit when run-state transitions emit host events.
-const RUNNING_DERIVE_CADENCE: Duration = Duration::from_millis(1_000);
+/// KNOWN LIMIT (honest, and the reviewer's accepted alternative for it): a
+/// run that starts AND settles between two of the relay's derivations —
+/// only possible while a frame send is still in flight — is observed as
+/// "not running"; the transitions are not replayable from the set. The
+/// client's own state poll covers that corner.
 const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(30);
 
 /// Subscribe to the RUNNING set's stream (the `agent.subscribeRunning` op;
 /// GET /api/agent/running/events): the first frame is the observation at
 /// subscribe time, then a frame whenever the set or the catalogue version
-/// changes. The relay re-derives the observation on a short cadence (a
-/// cheap in-memory check over the live registry) — the same liveness the
-/// SSE stream's pushOnChange carried, without a per-event broadcast hook
-/// through every session's machine. Every path out of the relay detaches:
-/// unsubscribe, a failed Channel send, or the 30s probe on a dead channel.
+/// changes. The relay sleeps on the registry's running-change signal (every
+/// run-state transition wakes it) and wakes on the probe deadline; every
+/// path out of the relay detaches: unsubscribe, a failed Channel send, or
+/// the probe on a dead channel.
 #[tauri::command]
 pub fn pi_ipc_subscribe_running(
     state: State<'_, IpcHostState>,
@@ -515,6 +520,7 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
     let registry = Arc::clone(&state.registry);
     let version_counter = Arc::clone(&state.session_list_version);
     let relays_for_thread = Arc::clone(&state.event_relays);
+    let running_signal = registry.running_signal();
     let subscription_for_relay = subscription_id.clone();
     let relay = std::thread::Builder::new()
         .name("ipc-running".into())
@@ -526,6 +532,7 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
             let mut last_sent: Option<RunningSnapshot> = None;
             let mut last_sent_at = std::time::Instant::now();
             let mut seq: u64 = 0;
+            let mut signal_epoch = running_signal.epoch();
             loop {
                 if stop.load(Ordering::SeqCst) {
                     detach();
@@ -559,7 +566,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                         return;
                     }
                 }
-                std::thread::sleep(RUNNING_DERIVE_CADENCE);
+                // Event-driven: sleep until a run-state TRANSITION (start,
+                // settle, exit, removal) moves the signal, or the probe
+                // deadline passes (the dead-channel reaper). No cadence
+                // sampling — the signal IS the change notification.
+                signal_epoch = running_signal.wait_for_change(signal_epoch, probe_after);
             }
         });
     match relay {
@@ -1011,6 +1022,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        // GET /api/project-trust's status half: the trust banner's mount
+        // probe (requiresTrust/trusted/decision/…). The MCP listing and the
+        // POST (trusting a folder) stay on the HTTP domain until their M3
+        // migration; this op covers exactly the read the UI performs on
+        // every workspace switch.
+        "trust.status" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
+                return protocol_error(&id, "invalid_params", "trust.status needs a cwd");
+            };
+            let agent_dir = state.agent_dir();
+            protocol_ok(&id, crate::session_view::project_trust_status(&agent_dir, Path::new(cwd)))
+        }
         // POST /api/agent/new: a brand-new session (the factory + the
         // route's contract — cwd validation, the chat folder factory, the
         // spawn plan, ensure_session vs the first command, and the honest
@@ -1540,6 +1563,11 @@ fn session_view_dispatch(
                     "followUp": machine.follow_up_queue,
                     "pending": pending,
                     "pendingVersion": pending_version,
+                    // The unknown-outcome barrier's state wire (P1-5B): a
+                    // reload/reconnect must still see which delivery needs
+                    // the user's confirmation before any resend — without
+                    // this the parked item looks like a plain pending row.
+                    "frontDeliveryUnknown": session.composer_outbox.front_is_unknown(),
                 });
                 let state_json = json!({
                     "sessionId": raw.get("sessionId").cloned().unwrap_or(json!(session_id)),
@@ -1582,6 +1610,26 @@ fn session_view_dispatch(
             // exactly like the route (never an invented empty state).
             if session_host::history::find_session_by_id(&agent_dir, session_id).is_none() {
                 return Err(("not_found".to_string(), format!("Session not found: {session_id}")));
+            }
+            // The composer outbox OUTLIVES the child (the session-id store):
+            // a reload after an eviction — or after a delivery whose outcome
+            // went UNKNOWN and the child died — must still see the queue and
+            // its unknown barrier (the HTTP route answered the same shape).
+            let outbox = state.registry.composer_outbox_for(session_id);
+            if outbox.has_items() {
+                let (pending, pending_version) = outbox.snapshot();
+                return Ok(json!({
+                    "running": false,
+                    "state": {
+                        "queuedMessages": {
+                            "steering": [],
+                            "followUp": [],
+                            "pending": pending,
+                            "pendingVersion": pending_version,
+                            "frontDeliveryUnknown": outbox.front_is_unknown(),
+                        },
+                    },
+                }));
             }
             Ok(json!({ "running": false }))
         }
@@ -2200,6 +2248,55 @@ fn command_type(args: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The user's home directory (lib/user-home.ts's rule: PI_AGENT_HOME
+/// overrides, the OS home otherwise).
+fn user_home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("PI_AGENT_HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home);
+        }
+    }
+    #[cfg(unix)]
+    {
+        std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        PathBuf::from(".")
+    }
+}
+
+/// The HTTP route's `normalizeCwd` (app/api/cwd/validate/route.ts), ported
+/// so the static host answers `~`, `~/foo` and relative paths exactly like
+/// the server did: `~` → the user home, `~/foo` → joined onto it, anything
+/// else absolute as-is and relative resolved against the process cwd.
+fn normalize_cwd(raw: &str) -> PathBuf {
+    normalize_cwd_with_home(raw, user_home_dir())
+}
+
+/// `normalize_cwd` against an explicit home (the pure core, testable
+/// without the process-global env).
+fn normalize_cwd_with_home(raw: &str, home: PathBuf) -> PathBuf {
+    if raw == "~" {
+        return home;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+    }
+}
+
 /// POST /api/cwd/validate (the `workspace.validateCwd` op): validate (and
 /// select) a cwd. A chat root maps onto the hidden chat cwd; a real
 /// directory is probed for readability (a permission-denied folder is
@@ -2213,7 +2310,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
     if cwd_text.is_empty() {
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
-    let cwd = PathBuf::from(cwd_text);
+    let cwd = normalize_cwd(cwd_text);
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
         // A chat's own folder (or the legacy shared cwd) stays what it is;
@@ -2539,6 +2636,66 @@ mod tests {
 
     fn send(state: &IpcHostState, request: Value) -> Value {
         dispatch_envelope(state, request)
+    }
+
+    #[test]
+    fn cwd_validation_normalizes_like_the_http_route() {
+        // The HTTP route's normalizeCwd (app/api/cwd/validate/route.ts):
+        // `~` and `~/foo` expand against the user home, relative paths
+        // resolve against the process cwd, absolute paths stay. The static
+        // host must answer the same directory the server did — a `~/project`
+        // the user types must not become a missing relative path.
+        let home = PathBuf::from("/home/fixture-user");
+        assert_eq!(normalize_cwd_with_home("~", home.clone()), home);
+        assert_eq!(
+            normalize_cwd_with_home("~/work", home.clone()),
+            PathBuf::from("/home/fixture-user/work")
+        );
+        let absolute = normalize_cwd_with_home("/opt/projects", home.clone());
+        assert_eq!(absolute, PathBuf::from("/opt/projects"));
+        let cwd = std::env::current_dir().expect("the test process has a cwd");
+        let relative = normalize_cwd_with_home("some/relative", home);
+        assert_eq!(relative, cwd.join("some/relative"));
+    }
+
+    #[test]
+    fn cwd_validate_op_answers_the_normalized_directory() {
+        // End to end through the dispatch table: an absolute temp directory
+        // validates and answers itself (the `~` expansion is covered by the
+        // unit test above — the op path shares normalize_cwd).
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("project");
+        std::fs::create_dir_all(&target).expect("target");
+        let response = send(
+            &state,
+            json!({ "v": 1, "id": "cv1", "op": "cwd.validate", "args": { "cwd": target.to_string_lossy() } }),
+        );
+        assert_eq!(response["ok"], true, "{response}");
+        let data = &response["data"];
+        assert_eq!(data["success"], true);
+        assert_eq!(
+            data["cwd"].as_str().map(str::to_string),
+            Some(target.to_string_lossy().into_owned()),
+            "the answered cwd is the validated directory itself"
+        );
+
+        // A `~/…` path under a home that does not exist must fail as a
+        // MISSING directory (not a protocol error): the message shape the
+        // ProjectPicker surfaces is the route's.
+        let response = send(
+            &state,
+            json!({ "v": 1, "id": "cv2", "op": "cwd.validate", "args": { "cwd": "~/definitely-not-here-918273" } }),
+        );
+        assert_eq!(response["ok"], false, "{response}");
+        assert_eq!(response["error"]["code"], "invalid_args");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not exist")),
+            "the honest missing-directory message: {}",
+            response["error"]["message"]
+        );
     }
 
     #[test]
@@ -3767,13 +3924,17 @@ mod tests {
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
-        // A pending change exists (the version bumped) — after unsubscribe
-        // it must NOT be delivered: the relay is stopped.
-        bump_session_list_version(&state);
+        let delivered = frames.lock().unwrap().len();
+        // The relay must be stoppable with a PENDING change behind it: after
+        // the unsubscribe, a version bump (which would otherwise notify the
+        // relay to send) must NOT be delivered — the stop flag wins over the
+        // change. The bump comes AFTER the unsubscribe so the interleaving
+        // is deterministic under the event-driven relay (a bump that raced
+        // the unsubscribe could wake the relay first and lawfully send).
         let done = unsubscribe_running(&state, &subscription_id);
         assert_eq!(done["ok"], true, "{done}");
         assert!(!state.event_relays.lock().unwrap().contains_key(&subscription_id));
-        let delivered = frames.lock().unwrap().len();
+        bump_session_list_version(&state);
         std::thread::sleep(Duration::from_millis(2_400));
         assert_eq!(
             frames.lock().unwrap().len(),
@@ -3785,6 +3946,7 @@ mod tests {
         let again = unsubscribe_running(&state, &subscription_id);
         assert_eq!(again["error"]["code"], "not_found", "{again}");
     }
+
 
     /// The tool picker over the REAL bridge (PI_CLI_BIN, sandboxed): the
     /// child's authoritative registry lists with active flags, and setting
@@ -4456,6 +4618,177 @@ mod tests {
         }
     }
 
+    /// The event-driven relay must observe a run SHORTER than any sampling
+    /// cadence (the reviewer's P2-1 question): with a 60 s probe, only the
+    /// registry's running SIGNAL can carry the start and the settle inside
+    /// the test window. A fast fixture provider answers at once, so the run
+    /// starts and settles well under a second.
+    #[test]
+    fn real_pi_running_stream_observes_a_short_run_start_and_settle() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        // A fast openai-completions endpoint: one streamed completion,
+        // written the moment the request arrives.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    // Read the request head + body (best effort; the answer
+                    // does not depend on it).
+                    use std::io::{BufRead, BufReader, Read, Write};
+                    let Ok(clone) = stream.try_clone() else { return };
+                    let mut reader = BufReader::new(clone);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if let Some((name, value)) = trimmed.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    if content_length > 0 {
+                        let mut body = vec![0u8; content_length];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                    }
+                    let chunks = [
+                        "{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}".to_string(),
+                        "{\"choices\":[{\"delta\":{\"content\":\"done\"}}]}".to_string(),
+                        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}".to_string(),
+                        "[DONE]".to_string(),
+                    ];
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    );
+                    for chunk in chunks {
+                        let _ = stream.write_all(format!("data: {chunk}\n\n").as_bytes());
+                    }
+                    let _ = stream.flush();
+                });
+            }
+        });
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
+        let models = json!({
+            "providers": {
+                "fast": {
+                    "baseUrl": format!("http://{endpoint}"),
+                    "apiKey": "fast-not-a-credential",
+                    "api": "openai-completions",
+                    "models": [{
+                        "id": "quick", "name": "Quick", "reasoning": false,
+                        "input": ["text"], "contextWindow": 200000, "maxTokens": 4096,
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+                    }]
+                }
+            }
+        });
+        std::fs::write(agent_dir.join("models.json"), models.to_string()).expect("models");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProvider":"fast","defaultModel":"quick"}"#,
+        )
+        .expect("settings");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+
+        // The session exists (and its child is up) BEFORE the subscription,
+        // so the first frame is a settled observation and the ONLY later
+        // changes are the prompt's start and settle transitions.
+        let created = send(
+            &state,
+            json!({ "v": 1, "id": "sr-c0", "op": "agent.create", "args": {
+                "cwd": cwd.display().to_string(), "type": "ensure_session",
+            }}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let session_id = created["data"]["sessionId"].as_str().expect("id").to_string();
+
+        let (channel, frames) = recording_channel();
+        // A 60 s probe: within the test window ONLY the running signal can
+        // deliver a frame — this is exactly what the test asserts.
+        let ack = subscribe_running(&state, channel, Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
+        assert_eq!(
+            frames.lock().unwrap()[0]["payload"]["runningSessionIds"],
+            json!([]),
+            "the first observation is settled: {:?}",
+            frames.lock().unwrap()
+        );
+
+        // The prompt: a run that starts and settles within ~a second.
+        let prompted = send(
+            &state,
+            json!({ "v": 1, "id": "sr-p0", "op": "agent.command", "args": {
+                "session": session_id, "type": "prompt", "message": "finish fast",
+            }}),
+        );
+        assert_eq!(prompted["ok"], true, "the prompt was accepted: {prompted}");
+
+        // Transition 1: the session appears in the running set.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut saw_running = false;
+        while std::time::Instant::now() < deadline {
+            if frames.lock().unwrap().iter().any(|frame| {
+                frame["payload"]["runningSessionIds"] == json!([session_id])
+            }) {
+                saw_running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            saw_running,
+            "the short run's START was observed without any cadence: {:?}",
+            frames.lock().unwrap()
+        );
+        // Transition 2: the settle — a later frame without the id.
+        let mut saw_settled = false;
+        while std::time::Instant::now() < deadline {
+            let frames_now = frames.lock().unwrap();
+            if frames_now.iter().any(|frame| {
+                frame["seq"].as_u64().unwrap_or(0) > 1
+                    && frame["payload"]["runningSessionIds"] == json!([])
+            }) {
+                saw_settled = true;
+                break;
+            }
+            drop(frames_now);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            saw_settled,
+            "the short run's SETTLE was observed without any cadence: {:?}",
+            frames.lock().unwrap()
+        );
+
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        state.registry.remove(&session_id, std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn files_list_shows_the_wire_shape_and_refuses_outside_roots() {
         let state = state();
@@ -4876,5 +5209,75 @@ mod tests {
         // Cleanup: the management child and the session child.
         state.management.recycle_expired();
         state.registry.remove("view-s1", std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn trust_status_op_answers_the_get_project_trust_status_shape() {
+        // The mount probe's op: a folder with nothing trust-requiring is
+        // trusted with no decision; an ancestor decision is inherited; an
+        // explicit false is untrusted; a broken trust.json surfaces as
+        // decisionError for the no-trust folder (the TS contract).
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        // The agent dir with a trust store that trusts the PARENT (so the
+        // project inherits it).
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        std::fs::write(
+            agent_dir.join("trust.json"),
+            serde_json::to_string(&serde_json::json!({
+                dir.path().to_string_lossy(): true,
+                project.to_string_lossy(): false,
+            }))
+            .expect("serialize"),
+        )
+        .expect("write trust.json");
+        // HOME must not make ~/.agents/skills inside the temp tree count.
+        let ask = |cwd: &std::path::Path| {
+            send(
+                &state,
+                json!({ "v": 1, "id": "t1", "op": "trust.status", "args": { "cwd": cwd.to_string_lossy() } }),
+            )
+        };
+        // 1. Fresh folder (no trust-requiring resources): trusted, exact
+        // false decision reported, not inherited.
+        let response = ask(&project);
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["data"]["requiresTrust"], false);
+        assert_eq!(response["data"]["trusted"], true);
+        assert_eq!(response["data"]["decision"], false);
+        assert_eq!(response["data"]["inherited"], false);
+        // 2. A child of the trusted parent inherits the parent's decision.
+        let child = project.join("nested");
+        std::fs::create_dir_all(&child).expect("nested");
+        // (remove the exact false so only the ancestor decision remains)
+        std::fs::write(
+            agent_dir.join("trust.json"),
+            serde_json::to_string(&serde_json::json!({
+                dir.path().to_string_lossy(): true,
+            }))
+            .expect("serialize"),
+        )
+        .expect("rewrite trust.json");
+        let response = ask(&child);
+        assert_eq!(response["data"]["decision"], true);
+        assert_eq!(response["data"]["inherited"], true, "{response}");
+        // 3. No store at all: no decision, no error.
+        std::fs::remove_file(agent_dir.join("trust.json")).expect("remove");
+        let response = ask(&child);
+        assert_eq!(response["data"]["decision"], serde_json::Value::Null);
+        assert_eq!(response["data"]["trusted"], true);
+        assert!(response["data"].get("decisionError").is_none());
+        // 4. Broken store on a no-trust folder: decisionError, still trusted.
+        std::fs::write(agent_dir.join("trust.json"), "{ broken").expect("write broken");
+        let response = ask(&child);
+        assert_eq!(response["data"]["trusted"], true);
+        assert!(
+            response["data"]["decisionError"].is_string(),
+            "the unparsable store is reported: {response}"
+        );
     }
 }

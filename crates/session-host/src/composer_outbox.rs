@@ -25,6 +25,12 @@ pub struct PendingComposerMessage {
     pub id: String,
     pub message: String,
     pub images: Option<Value>,
+    /// This item's last delivery ended UNKNOWN (it may already be running):
+    /// it is never re-delivered automatically — a resend is the user's
+    /// explicit choice after checking the session. The flag rides the ITEM
+    /// (not a front-position bool), so a later `restore_front` inserting at
+    /// position 0 cannot silently unmark it.
+    pub unknown: bool,
 }
 
 impl PendingComposerMessage {
@@ -37,6 +43,11 @@ impl PendingComposerMessage {
             .filter(|items| !items.is_empty())
         {
             item["images"] = json!(images);
+        }
+        if self.unknown {
+            // The UI's unknown-outcome marker (a plain pending row must not
+            // look resendable-without-thought).
+            item["unknown"] = json!(true);
         }
         item
     }
@@ -53,9 +64,6 @@ struct OutboxState {
     /// the items beside it.
     version: u64,
     paused: bool,
-    /// The front item's last delivery ended UNKNOWN (may have executed):
-    /// shown in the state answer so the UI asks before any resend.
-    unknown_front: bool,
 }
 
 impl OutboxState {
@@ -92,19 +100,33 @@ impl ComposerOutbox {
             id: uuid::Uuid::new_v4().to_string(),
             message: message.to_string(),
             images: if image_count > 0 { images } else { None },
+            unknown: false,
         };
         state.items.push(item.clone());
-        state.paused = false;
+        // A new enqueue unpauses the queue (the Next semantics: a refused
+        // item may retry once the user acts again) — UNLESS the front item
+        // is parked as outcome-unknown: that barrier is the user's to clear
+        // (take/edit/delete or an explicit send-now), never a side effect of
+        // queueing another message behind it.
+        if !state.front_is_unknown_locked() {
+            state.paused = false;
+        }
         state.changed();
         Ok(item)
     }
 
     /// Remove one item by id (`take`): a missing id is a normal no-op (idle
     /// delivery, another window or a rapid second click may win the claim).
+    /// Taking the UNKNOWN front resolves the barrier it holds: the user has
+    /// acted on it, so the rest of the queue may deliver again.
     pub fn take(&self, id: &str) -> Option<PendingComposerMessage> {
         let mut state = self.state.lock().unwrap();
         let index = state.items.iter().position(|item| item.id == id)?;
+        let was_unknown_front = index == 0 && state.items[index].unknown;
         let item = state.items.remove(index);
+        if was_unknown_front {
+            state.paused = false;
+        }
         state.changed();
         Some(item)
     }
@@ -127,21 +149,21 @@ impl ComposerOutbox {
 
     /// A delivery whose outcome is UNKNOWN (timeout, transport loss, child
     /// exit after the prompt may have reached it): the item is parked back
-    /// — visible, editable — with an `unknown` marker, and the queue stays
-    /// paused. It is NEVER re-delivered automatically; resending is the
-    /// user's explicit choice after checking the session.
-    pub fn park_unknown(&self, item: PendingComposerMessage) {
+    /// — visible, editable — marked `unknown`, and the queue stays paused.
+    /// It is NEVER re-delivered automatically; resending is the user's
+    /// explicit choice after checking the session.
+    pub fn park_unknown(&self, mut item: PendingComposerMessage) {
         let mut state = self.state.lock().unwrap();
+        item.unknown = true;
         state.items.insert(0, item);
         state.paused = true;
-        state.unknown_front = true;
         state.changed();
     }
 
     /// Whether the front item is parked as outcome-unknown (the state
     /// answer tells the UI which confirmation to show).
     pub fn front_is_unknown(&self) -> bool {
-        self.state.lock().unwrap().unknown_front
+        self.state.lock().unwrap().front_is_unknown_locked()
     }
 
     pub fn is_paused(&self) -> bool {
@@ -158,9 +180,14 @@ impl ComposerOutbox {
             return None;
         }
         let item = state.items.remove(0);
-        state.unknown_front = false;
         state.changed();
         Some(item)
+    }
+}
+
+impl OutboxState {
+    fn front_is_unknown_locked(&self) -> bool {
+        self.items.first().is_some_and(|item| item.unknown)
     }
 }
 
@@ -290,11 +317,19 @@ impl Session {
     }
 
     /// Wake idle delivery (the wrapper's 0-tick timer): while items wait,
-    /// the queue is not paused and the session is idle, deliver them as
-    /// follow-ups. Off the dispatch path — a slow prompt must not stall the
-    /// caller (and only one drain runs at a time).
+    /// the queue is not paused, the front is not an unknown-parked item and
+    /// the session is idle, deliver them as follow-ups. Off the dispatch
+    /// path — a slow prompt must not stall the caller (and only one drain
+    /// runs at a time).
+    ///
+    /// The wake is delivered through `drain_once`'s exit re-check, not just
+    /// the spawn: a drain that is about to finish clears the flag and then
+    /// RE-CHECKS for deliverable work under the same lock, so an enqueue
+    /// whose spawned thread found `delivering == true` and gave up cannot
+    /// strand its item (the JS original closed this race by being
+    /// single-threaded — `drain`'s `finally { this.wake() }`).
     pub fn composer_wake(self: &Arc<Self>) {
-        if self.composer_outbox.is_paused() || !self.composer_outbox.has_items() {
+        if !self.composer_can_deliver_front() {
             return;
         }
         let session = Arc::clone(self);
@@ -304,39 +339,66 @@ impl Session {
             .ok();
     }
 
-    /// One drain pass under the delivering flag.
+    /// The drain's and the wake's shared precondition: there is an item,
+    /// the queue is not paused, and the front is not parked as
+    /// outcome-unknown (that one is re-sent only by an explicit user
+    /// action — `composer_send_now`).
+    fn composer_can_deliver_front(&self) -> bool {
+        !self.composer_outbox.is_paused() && !self.composer_outbox.front_is_unknown()
+    }
+
+    /// One drain pass under the delivering flag. The exit path re-checks
+    /// for late work UNDER THE FLAG'S LOCK: either this thread continues
+    /// draining, or a later waker sees `delivering == false` and drains
+    /// itself — one of the two always observes the queued item.
     fn drain_once(&self) {
-        {
-            let mut delivering = self.composer_delivering.lock().unwrap();
-            if *delivering {
-                return;
-            }
-            *delivering = true;
-        }
         loop {
-            if self.composer_outbox.is_paused() || !self.composer_outbox.has_items() {
-                break;
-            }
-            // canDeliver: alive and not running (the machine's view).
-            if self.run_state().is_running() || self.client.has_exited() {
-                break;
-            }
-            let Some(item) = self.composer_outbox.pop_front() else { break };
-            self.emit_composer_update();
-            if let Err(error) = self.deliver_composer(&item, "followUp") {
-                match error.kind {
-                    pi_host::ErrorKind::Command | pi_host::ErrorKind::Spawn
-                    | pi_host::ErrorKind::Invalid | pi_host::ErrorKind::Closing => {
-                        self.composer_outbox.restore_front(item);
-                    }
-                    _ => self.composer_outbox.park_unknown(item),
+            {
+                let mut delivering = self.composer_delivering.lock().unwrap();
+                if *delivering {
+                    return;
                 }
-                self.emit_composer_update();
-                self.emit_prompt_error(&error.to_string());
-                break;
+                *delivering = true;
             }
+            loop {
+                if !self.composer_can_deliver_front() || !self.composer_outbox.has_items() {
+                    break;
+                }
+                // canDeliver: alive and not running (the machine's view).
+                if self.run_state().is_running() || self.client.has_exited() {
+                    break;
+                }
+                let Some(item) = self.composer_outbox.pop_front() else { break };
+                self.emit_composer_update();
+                if let Err(error) = self.deliver_composer(&item, "followUp") {
+                    match error.kind {
+                        pi_host::ErrorKind::Command | pi_host::ErrorKind::Spawn
+                        | pi_host::ErrorKind::Invalid | pi_host::ErrorKind::Closing => {
+                            self.composer_outbox.restore_front(item);
+                        }
+                        _ => self.composer_outbox.park_unknown(item),
+                    }
+                    self.emit_composer_update();
+                    self.emit_prompt_error(&error.to_string());
+                    break;
+                }
+            }
+            // Exit: clear the flag and re-check under the SAME lock. Work
+            // that arrived after the loop's last check but whose waker saw
+            // `delivering == true` (and returned) is caught here.
+            {
+                let mut delivering = self.composer_delivering.lock().unwrap();
+                *delivering = false;
+                if self.composer_can_deliver_front()
+                    && self.composer_outbox.has_items()
+                    && !self.run_state().is_running()
+                    && !self.client.has_exited()
+                {
+                    continue; // late work: this thread stays the deliverer
+                }
+            }
+            return;
         }
-        *self.composer_delivering.lock().unwrap() = false;
     }
 }
 
@@ -371,8 +433,78 @@ mod tests {
         let (items, v4) = outbox.snapshot();
         assert_eq!(v4, 5, "park_unknown bumps the version");
         assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["unknown"], json!(true), "the parked item carries its unknown marker on the wire");
         assert!(outbox.front_is_unknown(), "the parked front is marked unknown");
         assert!(outbox.is_paused(), "an unknown delivery pauses the queue");
+    }
+
+    #[test]
+    fn an_unknown_front_is_never_auto_delivered_behind_a_new_enqueue() {
+        // The P1 fix (Terra P1-5A): after park_unknown(A) the user queues B;
+        // A must NOT re-enter delivery and the queue must stay paused.
+        let outbox = ComposerOutbox::new();
+        let a = outbox.enqueue("A", None).expect("A");
+        // The delivery path popped A before its outcome turned unknown —
+        // park_unknown is what puts it BACK.
+        outbox.take(&a.id.clone()).expect("pop A for delivery");
+        outbox.park_unknown(a);
+        assert!(outbox.is_paused());
+
+        outbox.enqueue("B", None).expect("B");
+        assert!(
+            outbox.is_paused(),
+            "enqueuing behind an unknown front must not resume the queue"
+        );
+        let (items, _) = outbox.snapshot();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["message"], "A", "the unknown item stays at the front");
+        assert_eq!(items[0]["unknown"], json!(true));
+        assert_eq!(items[1]["unknown"], Value::Null, "B is a plain pending item");
+
+        // pop_front (what a drain would do) is barred by the caller's
+        // front-unknown check — verified here by the state the check reads.
+        assert!(outbox.front_is_unknown());
+    }
+
+    #[test]
+    fn taking_the_unknown_front_resumes_the_queue() {
+        // The user acted on the unknown item (edit/delete): the barrier it
+        // held is resolved, the rest of the queue may deliver again.
+        let outbox = ComposerOutbox::new();
+        let a = outbox.enqueue("A", None).expect("A");
+        let a_id = a.id.clone();
+        outbox.enqueue("B", None).expect("B");
+        outbox.park_unknown(a);
+        assert!(outbox.is_paused());
+
+        let taken = outbox.take(&a_id).expect("the user takes the unknown item");
+        assert!(taken.unknown, "the taken item still reports its unknown outcome (the edit path can warn)");
+        assert!(!outbox.is_paused(), "the user resolving the barrier unpauses the queue");
+        assert!(!outbox.front_is_unknown());
+
+        // Taking a NON-front unknown item must not unpause (send_now on a
+        // later item while the front is parked unknown leaves the barrier).
+        let c = outbox.enqueue("C", None).expect("C");
+        outbox.park_unknown(outbox.take(&c.id).expect("take C"));
+        assert!(outbox.is_paused());
+    }
+
+    #[test]
+    fn the_unknown_marker_survives_a_restore_front_insertion() {
+        // The marker rides the item, not the front position: a known-refused
+        // delivery restored at position 0 cannot unmark the parked item.
+        let outbox = ComposerOutbox::new();
+        let a = outbox.enqueue("A", None).expect("A");
+        outbox.park_unknown(a);
+        let refused = outbox.enqueue("C", None).expect("C");
+        // A send_now on C failed with an explicit refusal: C returns to the
+        // front (queue paused — it already was).
+        outbox.restore_front(refused);
+        let (items, _) = outbox.snapshot();
+        assert_eq!(items[0]["message"], "C");
+        assert_eq!(items[1]["message"], "A");
+        assert_eq!(items[1]["unknown"], json!(true), "A keeps its unknown marker even off the front");
+        assert_eq!(items[0]["unknown"], Value::Null, "C is a plain refused item");
     }
 
     #[test]

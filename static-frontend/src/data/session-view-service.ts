@@ -122,7 +122,7 @@ export async function fetchAgentRunningState(sid: string): Promise<AgentRunningS
 
 export async function createAgentSession(
   body: Record<string, unknown>,
-): Promise<{ ok: boolean; status: number; data: unknown; error?: string }> {
+): Promise<{ ok: boolean; status: number; data: unknown; error?: string; details?: Record<string, unknown> }> {
   // The create op arrives with the spawn-plan increment; until then the host
   // answers unknown_op and the composer surfaces the honest error instead of
   // a half-created session.
@@ -131,7 +131,19 @@ export async function createAgentSession(
     return { ok: true, status: 200, data };
   } catch (caught) {
     if (caught instanceof IpcFailure) {
-      return { ok: false, status: failureStatus(caught), data: null, error: caught.error.message };
+      // The trichotomy's details MUST survive (the Rust agent.create puts
+      // code/accepted/sessionId there): a caller that sends its first prompt
+      // through agent.create needs `prompt_unknown`'s session identity to
+      // query the state instead of blindly re-sending, and `prompt_rejected`
+      // with accepted:false to restore the draft. Dropping them degrades
+      // every unknown outcome to a plain Error.
+      return {
+        ok: false,
+        status: failureStatus(caught),
+        data: null,
+        error: caught.error.message,
+        ...(caught.error.details ? { details: caught.error.details } : {}),
+      };
     }
     return {
       ok: false,

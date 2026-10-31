@@ -223,6 +223,7 @@ dependencies = [
 name = "session-host"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "pi-host",
  "serde_json",
  "tempfile",

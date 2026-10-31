@@ -127,7 +127,7 @@ type AgentStateResponse = {
   extensionWidgets?: ExtensionWidgetItem[];
   routedModel?: RoutedModelInfo;
   cacheWarming?: CacheWarmingInfo;
-  queuedMessages?: { steering?: string[]; followUp?: string[]; pending?: PendingComposerMessage[]; pendingVersion?: number } | null;
+  queuedMessages?: { steering?: string[]; followUp?: string[]; pending?: PendingComposerMessage[]; pendingVersion?: number; frontDeliveryUnknown?: boolean } | null;
   autoCompactionEnabled?: boolean;
   autoRetryEnabled?: boolean;
   steeringMode?: string;
@@ -144,6 +144,9 @@ export interface QueuedMessages {
   followUp: string[];
   pending?: PendingComposerMessage[];
   pendingVersion?: number;
+  /** The front queued item's delivery ended UNKNOWN: the outbox is paused
+   * until the user acts on it — the UI asks before any resend. */
+  frontDeliveryUnknown?: boolean;
 }
 
 function mergeQueuedMessages(previous: QueuedMessages, q?: AgentStateResponse["queuedMessages"]): QueuedMessages {
@@ -1910,6 +1913,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "composer_queue_update":
         setQueuedMessages(previous => ({ ...previous, ...mergeComposerQueueSnapshot(previous, {
           pending: event.items as PendingComposerMessage[], pendingVersion: event.pendingVersion as number | undefined,
+          frontDeliveryUnknown: event.frontDeliveryUnknown === true,
         }) }));
         break;
       case "auto_retry_start":
