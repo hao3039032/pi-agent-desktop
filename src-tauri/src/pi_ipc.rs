@@ -235,7 +235,7 @@ impl IpcHostState {
     }
 
     /// Whether the host itself proposed this exact path.
-    fn is_proposed(&self, path: &str) -> bool {
+    pub(crate) fn is_proposed(&self, path: &str) -> bool {
         self.proposed_paths.lock().unwrap().contains(path)
     }
 
@@ -1233,6 +1233,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // exists. All host-side (the home dir, the hidden chat root, the
         // scratch cwd, project validation) — the frontend never chooses what
         // gets proposed for browsing.
+        "cwd.status" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str) else { return protocol_error(&id, "invalid_args", "An absolute cwd is required"); };
+            match crate::workspace_status::status(&state.file_roots.lock().unwrap(), cwd) {
+                Ok(result) => protocol_ok(&id, result),
+                Err((code, message)) => protocol_error(&id, code, message),
+            }
+        }
         "cwd.home" => {
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
@@ -3181,6 +3188,15 @@ pub(crate) fn create_session(
 
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
+    if chat_workspace && !chat_root && (!state.is_proposed(&requested_cwd.to_string_lossy())
+        || !crate::worktrees::is_chat_area(&requested_cwd, &agent_dir)
+        || !state.file_roots.lock().unwrap().is_existing_path_allowed(&requested_cwd)) {
+        return Err(("unauthorized_scope".into(), "Chat folder is not a host-known workspace".into(), None));
+    }
+    if !chat_workspace && (crate::worktrees::is_chat_area(&requested_cwd, &agent_dir)
+        || !state.file_roots.lock().unwrap().is_existing_path_allowed(&requested_cwd)) {
+        return Err(("unauthorized_scope".into(), "Choose this folder using the native project picker first".into(), None));
+    }
     if chat_workspace {
         // ensureChatWorkspace runs before the folder factory (both private).
         crate::session_view::ensure_chat_workspace(&agent_dir)
@@ -3639,6 +3655,12 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
     let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
+        if !crate::session_view::is_chat_root_path(&cwd, &agent_dir)
+            && (!state.is_proposed(&cwd.to_string_lossy())
+                || !crate::worktrees::is_chat_area(&cwd, &agent_dir)
+                || !state.file_roots.lock().unwrap().is_existing_path_allowed(&cwd)) {
+            return Err(("unauthorized_scope".into(), "Chat folder is not a host-known workspace".into()));
+        }
         // A chat's own folder (or the legacy shared cwd) stays what it is;
         // only the root maps onto the hidden chat cwd.
         let chat_cwd = if crate::session_view::is_chat_root_path(&cwd, &agent_dir) {
@@ -3649,7 +3671,6 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
                 .map_err(|error| ("io".to_string(), error.to_string()))?;
             cwd.clone()
         };
-        state.propose_path(&chat_cwd);
         return Ok(json!({
             "success": true,
             "cwd": chat_cwd.display().to_string(),
@@ -3659,6 +3680,9 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         }));
     }
 
+    if crate::worktrees::is_chat_area(&cwd, &agent_dir) || !state.file_roots.lock().unwrap().is_existing_path_allowed(&cwd) {
+        return Err(("unauthorized_scope".into(), "Choose this folder using the native project picker first".into()));
+    }
     // A real directory (stat first: missing and not-a-directory answer
     // differently; a permission error at selection time, not later).
     let meta = std::fs::metadata(&cwd).map_err(|error| {
@@ -3678,7 +3702,6 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
             format!("Directory cannot be read: {cwd_text}"),
         ));
     }
-    state.propose_path(&cwd);
     let project = state.projects.resolve(&cwd);
     Ok(json!({
         "success": true,
@@ -4230,6 +4253,7 @@ mod tests {
         std::fs::create_dir_all(&folder).expect("folder");
         std::fs::create_dir_all(dir.path().join("elsewhere")).expect("elsewhere");
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        state.propose_path(&folder);
 
         let dotted = format!(
             "{}/../chats/20260101-120000-abcd",
@@ -4254,6 +4278,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("project");
         std::fs::create_dir_all(&target).expect("target");
+        state.propose_path(&target);
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv1", "op": "cwd.validate", "args": { "cwd": target.to_string_lossy() } }),

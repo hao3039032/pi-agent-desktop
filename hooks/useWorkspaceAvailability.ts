@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import type { UnavailableWorkspace, WorkspaceAvailability } from "@/lib/workspace-availability";
+import { fetchWorkspaceStatus } from "@/lib/workspace-service";
 
 export function useWorkspaceAvailability(
   cwd: string | null,
@@ -23,11 +24,7 @@ export function useWorkspaceAvailability(
     if (!cwd) return;
     const probedCwd = cwd;
     const controller = new AbortController();
-    fetch(`/api/cwd/status?cwd=${encodeURIComponent(probedCwd)}`, { signal: controller.signal })
-      .then(async (response) => {
-        const data = await response.json() as { availability?: WorkspaceAvailability };
-        return response.ok && data.availability ? data.availability : "unknown" as const;
-      })
+    fetchWorkspaceStatus(probedCwd, { signal: controller.signal })
       .catch((error) => (error instanceof DOMException && error.name === "AbortError" ? null : "unknown" as const))
       .then((availability) => {
         if (!availability || controller.signal.aborted) return;

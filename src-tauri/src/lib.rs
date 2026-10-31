@@ -48,6 +48,8 @@ mod scheduled_events;
 pub mod scheduled_session_index;
 mod shell;
 mod update_install;
+mod workspace_status;
+mod workspace_picker;
 
 use logging::{desktop_log, install_panic_hook, mark_process_start, since_process_start_ms};
 use native_prefs::{
@@ -1410,6 +1412,7 @@ pub fn run() {
         .manage(PopupMenuSelection::default())
         .manage(DesktopApiToken(desktop_api_token))
         .invoke_handler(tauri::generate_handler![
+            workspace_picker::select_project_directory,
             pi_ipc::pi_ipc,
             pi_ipc::pi_ipc_subscribe_events,
             pi_ipc::pi_ipc_subscribe_scheduled,

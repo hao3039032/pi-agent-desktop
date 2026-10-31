@@ -4,8 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { AnimatedDropdown, PathLabel, displayCwd } from "./path-ui";
 import { isTauriDesktop } from "@/lib/desktop-updater";
-import { createDefaultWorkspaceCwd, validateWorkspaceCwd } from "@/lib/workspace-service";
-import { selectDirectoryNative } from "@/lib/desktop-window";
+import { chooseProjectDirectory, createDefaultWorkspaceCwd, validateWorkspaceCwd } from "@/lib/workspace-service";
 import { isImeComposing } from "@/lib/ime";
 
 interface ProjectPickerProps {
@@ -59,7 +58,7 @@ export function shouldShowProjectFilter(recentProjects: string[]): boolean {
 
 /** Open the desktop folder dialog and return the server-validated project path. */
 export async function selectProjectDirectoryNative(selectedCwd: string | null, homeDir: string): Promise<string | null> {
-  const path = await selectDirectoryNative(selectedCwd ?? (homeDir || undefined));
+  const path = await chooseProjectDirectory(selectedCwd ?? (homeDir || undefined));
   if (path === null) return null;
 
   const data = await validateWorkspaceCwd(path);

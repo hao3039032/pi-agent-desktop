@@ -12,13 +12,14 @@
 //! - Windows case/UNC normalization is delegated to the caller's
 //!   canonicalization (dunce-style), the containment rules are identical.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 /// The allowed-root set (normalized, forward-slash, trailing-slash-free).
 #[derive(Debug, Default, Clone)]
 pub struct AllowedRoots {
     roots: BTreeSet<String>,
+    resolved_roots: BTreeMap<String, PathBuf>,
 }
 
 impl AllowedRoots {
@@ -30,8 +31,17 @@ impl AllowedRoots {
     /// relative roots are ignored — an allow-list root is absolute).
     pub fn add(&mut self, root: &Path) {
         if let Some(normalized) = normalize_root(root) {
+            if let Ok(canonical) = std::fs::canonicalize(root) {
+                self.resolved_roots.insert(normalized.clone(), canonical);
+            }
             self.roots.insert(normalized);
         }
+    }
+
+    fn unchanged_root(&self, root: &str) -> Option<PathBuf> {
+        let original = self.resolved_roots.get(root)?;
+        let current = std::fs::canonicalize(root).ok()?;
+        (current == *original).then_some(current)
     }
 
     /// The `~/pi-cwd` and `~/pi-cwd-YYYYMMDD` scan roots (the legacy
@@ -107,8 +117,7 @@ impl AllowedRoots {
             return false
         };
         for root in &self.roots {
-            let root_path = PathBuf::from(root);
-            let Ok(resolved_root) = std::fs::canonicalize(&root_path) else {
+            let Some(resolved_root) = self.unchanged_root(root) else {
                 continue;
             };
             if resolved_target.starts_with(&resolved_root) {
@@ -154,7 +163,7 @@ impl AllowedRoots {
         let parent = target.parent()?;
         let resolved = std::fs::canonicalize(parent).ok()?;
         for root in &self.roots {
-            let Ok(resolved_root) = std::fs::canonicalize(PathBuf::from(root)) else {
+            let Some(resolved_root) = self.unchanged_root(root) else {
                 continue;
             };
             if resolved.starts_with(&resolved_root) {
@@ -936,7 +945,7 @@ pub fn resolved_read_target_with_root(
     }
     let resolved = std::fs::canonicalize(target).ok()?;
     for root in &roots.roots {
-        let Ok(resolved_root) = std::fs::canonicalize(PathBuf::from(root)) else {
+        let Some(resolved_root) = roots.unchanged_root(root) else {
             continue;
         };
         if resolved.starts_with(&resolved_root) {

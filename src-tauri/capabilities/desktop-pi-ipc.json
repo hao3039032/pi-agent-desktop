@@ -5,6 +5,7 @@
   "windows": ["main"],
   "local": true,
   "permissions": [
+    "allow-select-project-directory",
     "allow-pi-ipc",
     "allow-pi-ipc-subscribe-events",
     "allow-pi-ipc-subscribe-running",
