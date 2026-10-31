@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
-import { checkPlugins, listPlugins } from "@/lib/plugins-client";
+import { checkPlugins, listPlugins, setPluginsEnabled } from "@/lib/plugins-client";
 import type {
   PluginPackageInfo,
   PluginStandaloneExtensionInfo,
@@ -722,13 +722,19 @@ export function PluginsConfig({
     setActionMessage(null);
     setGroupStatus(null);
     try {
-      const res = await fetch("/api/plugins", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, source: pkg.source, scope: pkg.scope, cwd }),
-      });
-      const next = (await res.json()) as PluginsResponse & { error?: string };
-      if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
+      let next: PluginsResponse;
+      if (action === "enable" || action === "disable") {
+        next = await setPluginsEnabled(cwd, action, [{ source: pkg.source, scope: pkg.scope }], true);
+      } else {
+        const res = await fetch("/api/plugins", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, source: pkg.source, scope: pkg.scope, cwd }),
+        });
+        const data = (await res.json()) as PluginsResponse & { error?: string };
+        if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+        next = data;
+      }
       setData(next);
       if (action === "remove") {
         setSelected(next.packages[0]
@@ -785,17 +791,8 @@ export function PluginsConfig({
     const action = enabled ? "enable" : "disable";
     setBusyKey(`bulk:${scope}`);
     try {
-      const res = await fetch("/api/plugins", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action,
-          cwd,
-          packages: targets.map(({ source }) => ({ source, scope })),
-        }),
-      });
-      const next = (await res.json()) as Partial<PluginsBulkResponse> & { error?: string };
-      if (!res.ok || next.error || !next.results) throw new Error(next.error ?? `HTTP ${res.status}`);
+      const next = await setPluginsEnabled(cwd, action, targets.map(({ source }) => ({ source, scope }))) as Partial<PluginsBulkResponse>;
+      if (!next.results) throw new Error("Package toggle results missing");
       const { results, ...plugins } = next as PluginsBulkResponse;
       setData(plugins);
       const failures = results.filter((result) => result.error);

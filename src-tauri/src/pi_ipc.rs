@@ -1312,6 +1312,22 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
+        "plugins.setEnabled" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
+            let Some(action) = args.get("action").and_then(Value::as_str).filter(|action| *action == "enable" || *action == "disable") else { return protocol_error(&id, "invalid_args", "invalid action"); };
+            let Some(packages) = args.get("packages").and_then(Value::as_array).filter(|p| !p.is_empty() && p.len() <= 512) else { return protocol_error(&id, "invalid_args", "invalid packages"); };
+            let mut validated = Vec::new();
+            for package in packages {
+                let Some(source) = package.get("source").and_then(Value::as_str).filter(|s| !s.trim().is_empty() && s.len() <= 4096) else { return protocol_error(&id, "invalid_args", "invalid source"); };
+                let Some(scope) = package.get("scope").and_then(Value::as_str).filter(|s| *s == "global" || *s == "project") else { return protocol_error(&id, "invalid_args", "invalid scope"); };
+                validated.push(json!({"source": source, "scope": scope}));
+            }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            match management_call_scoped(state, op, &json!({"cwd": cwd, "action": action, "packages": validated, "single": args.get("single").and_then(Value::as_bool).unwrap_or(false)}), Path::new(&cwd)) {
+                Ok(result) => protocol_ok(&id, result), Err(error) => protocol_error(&id, &error.0, &error.1),
+            }
+        }
         "plugins.check" | "skills.check" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
             if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
@@ -4715,7 +4731,9 @@ mod tests {
         let check = send(&state, json!({"v": 1, "id": "check", "op": "plugins.check", "args": {"cwd": cwd}}));
         assert_eq!(check["ok"], true, "{check}");
         assert_eq!(check["data"]["updates"][0]["state"], "unsupported");
-        std::fs::write(agent.join("settings.json"), json!({"packages": [{"source": package, "extensions": [], "skills": [], "prompts": [], "themes": []}]}).to_string()).unwrap();
+        let changed = send(&state, json!({"v": 1, "id": "toggle", "op": "plugins.setEnabled", "args": {"cwd": cwd, "action": "disable", "packages": [{"source": package, "scope": "global"}]}}));
+        assert_eq!(changed["ok"], true, "{changed}");
+        assert_eq!(changed["data"]["results"][0].get("error"), None);
         let second = send(&state, json!({"v": 1, "id": "second", "op": "plugins.list", "args": {"cwd": cwd}}));
         assert_eq!(second["ok"], true, "{second}");
         assert_eq!(second["data"]["packages"][0]["disabled"], true);
