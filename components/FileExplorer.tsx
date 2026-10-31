@@ -19,7 +19,6 @@ import {
 } from "@/lib/file-service";
 import type { GitFileStatus, GitFileStatusKind } from "@/lib/git-types";
 import { fetchGitStatus } from "@/lib/git-status-service";
-import type { FileIndexEntry } from "@/lib/file-fuzzy";
 import { buildSearchTree, type SearchTreeNode } from "@/lib/search-tree";
 import { useI18n } from "@/hooks/useI18n";
 import { isImeComposing } from "@/lib/ime";
@@ -751,14 +750,8 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     setSearchLoading(true);
     setSearchError(false);
     const timer = setTimeout(() => {
-      const url = `/api/file-index?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}`;
-      const request = typeof window !== "undefined" && (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
-        ? searchFileIndex(cwd, query, controller.signal)
-        : fetch(url, { signal: controller.signal })
-            .then((response) => response.ok ? response.json() as Promise<{ matches?: FileIndexEntry[] }> : Promise.reject(new Error("Search failed")))
-            .then((data) => data.matches ?? []);
-      request
-        .then((matches) => setSearchPaths((matches ?? []).filter((entry) => !entry.isDir).map((entry) => entry.path)))
+      searchFileIndex(cwd, query, controller.signal)
+        .then((matches) => { if (!controller.signal.aborted) setSearchPaths(matches.filter((entry) => !entry.isDir).map((entry) => entry.path)); })
         .catch(() => {
           if (!controller.signal.aborted) {
             setSearchPaths([]);

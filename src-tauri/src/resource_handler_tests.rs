@@ -22,6 +22,20 @@ fn token_range_revoke_and_expiry() {
     assert_eq!(respond(&registry, request(&expired).body(vec![]).unwrap()).status(), StatusCode::NOT_FOUND);
 }
 
+#[test]
+fn raster_image_handle_uses_the_same_protocol_and_ranges() {
+    let registry = ResourceRegistry::new();
+    let handle = registry.grant_image_bytes(b"012345".to_vec(), "image/png", Duration::from_secs(30)).unwrap();
+    let request = Request::builder().uri(format!("pi-resource://localhost/{handle}"))
+        .header("Range", "bytes=2-4").body(vec![]).unwrap();
+    let response = respond(&registry, request);
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-type"], "image/png");
+    assert_eq!(response.headers()["content-length"], "3");
+    assert_eq!(response.headers()["content-range"], "bytes 2-4/6");
+    assert_eq!(response.body(), b"234");
+}
+
 #[cfg(unix)]
 #[test]
 fn preview_directory_resolves_assets_but_not_symlinks_or_traversal() {

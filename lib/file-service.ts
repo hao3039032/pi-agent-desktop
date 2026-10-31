@@ -112,6 +112,29 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   return { mime, data: btoa(binary) };
 }
 
+export async function fetchRevealSupport(): Promise<{ supported: boolean; reason: string | null; platform: string }> {
+  const { isTauriDesktop } = await import("@/lib/desktop-updater");
+  if (isTauriDesktop()) {
+    const { getDesktopPlatform } = await import("@/lib/desktop-window");
+    const platform = getDesktopPlatform();
+    return { supported: true, reason: null, platform: platform === "macos" ? "darwin" : platform === "windows" ? "win32" : "linux" };
+  }
+  const response = await fetch("/api/open-in-explorer");
+  if (!response.ok) throw await responseError(response, "File manager unavailable");
+  return response.json();
+}
+
+export async function revealDirectory(cwd: string): Promise<void> {
+  const { isTauriDesktop } = await import("@/lib/desktop-updater");
+  if (isTauriDesktop()) {
+    const { revealItemInDirNative } = await import("@/lib/desktop-native");
+    await revealItemInDirNative(cwd);
+    return;
+  }
+  const response = await fetch("/api/open-in-explorer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd }) });
+  if (!response.ok) throw await responseError(response, `HTTP ${response.status}`);
+}
+
 export async function fileExists(filePath: string): Promise<boolean> {
   try { return (await fetch(`/api/files/${encodeFilePathForApi(filePath)}?type=meta`)).ok; }
   catch { return false; }

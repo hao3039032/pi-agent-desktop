@@ -24,6 +24,8 @@ const {
   readFileContent,
   fetchTextFileChunk,
   grantFilePreview,
+  fetchRevealSupport,
+  revealDirectory,
   grantFileResource,
   readFileResource,
   revokeFileResource,
@@ -170,6 +172,14 @@ test("text previews use bounded resource reads and revoke the handle", async () 
   assert.equal(result.language, "html");
   assert.equal(result.truncated, false);
   assert.equal(revoked, true);
+});
+
+test("directory reveal uses host support and scoped operation", async () => {
+  const mock = boundService(null);
+  mock.on("files.revealSupport", () => ({ supported: true, reason: null, platform: "linux" }));
+  mock.on("files.reveal", (args) => { assert.deepEqual(args, { cwd: "/proj" }); return { opened: true }; });
+  assert.equal((await fetchRevealSupport()).supported, true);
+  await revealDirectory("/proj");
 });
 
 test("preview directory grant is scoped by the host", async () => {

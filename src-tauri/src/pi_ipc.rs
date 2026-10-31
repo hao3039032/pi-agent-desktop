@@ -2268,6 +2268,30 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 }
             }
         }
+        "files.revealSupport" => {
+            let platform = if cfg!(target_os = "macos") { "darwin" } else if cfg!(target_os = "windows") { "win32" } else { "linux" };
+            protocol_ok(&id, json!({ "supported": cfg!(unix), "reason": if cfg!(unix) { None } else { Some("unsupported-platform") }, "platform": platform }))
+        }
+        "files.reveal" => {
+            let path = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
+            #[cfg(unix)]
+            {
+                let resolved = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, path)
+                };
+                let Some((target, root)) = resolved else { return protocol_error(&id, "unauthorized_scope", "access-denied") };
+                if crate::file_access::open_directory_beneath_root(&root, &target).is_err() {
+                    return protocol_error(&id, "unauthorized_scope", "not-a-directory");
+                }
+                match crate::open_path_with_default_app(&target) {
+                    Ok(()) => protocol_ok(&id, json!({ "opened": true })),
+                    Err(error) => protocol_error(&id, "io", &error),
+                }
+            }
+            #[cfg(not(unix))]
+            { let _ = path; protocol_error(&id, "not_supported", "Secure directory reveal is not supported on this platform") }
+        }
         "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
         "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(&id, &args),
         "desktop.readImages" => crate::file_resources::handle_desktop_read_images(&id, &args),
@@ -5510,6 +5534,16 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("secret"), &png).unwrap();
         let pinned = send(&state, json!({ "v": 1, "id": "g4", "op": "resources.read", "args": { "handle": handle } }));
         assert_eq!(pinned["data"]["totalLen"], 8, "grant retains original inode");
+    }
+
+    #[test]
+    fn reveal_directory_rejects_an_unapproved_root() {
+        let state = state();
+        let outside = tempfile::tempdir().unwrap();
+        let support = send(&state, json!({ "v": 1, "id": "support", "op": "files.revealSupport", "args": {} }));
+        assert_eq!(support["data"]["supported"], cfg!(unix));
+        let denied = send(&state, json!({ "v": 1, "id": "reveal", "op": "files.reveal", "args": { "cwd": outside.path() } }));
+        assert_eq!(denied["ok"], false);
     }
 
     #[test]

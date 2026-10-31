@@ -238,10 +238,13 @@ test("the project context menu reveals the project in the OS file manager", asyn
   // goes through /api/open-in-explorer, which the menu only offers after the
   // availability probe answered. A failure stays visible inside the menu.
   assert.match(source, /const revealProjectInFileManager = useCallback/);
-  assert.match(source, /isTauriDesktop\(\) \|\| fileManagerAvailability\?\.supported/);
-  assert.match(source, /revealItemInDirNative\(root\)/);
-  assert.match(source, /fetch\("\/api\/open-in-explorer", \{\s*method: "POST"/);
-  assert.match(source, /FILE_MANAGER_ERROR_KEYS\[data\.error \?\? ""\]/);
+  assert.match(source, /fileManagerAvailability\?\.supported === true/);
+  assert.match(source, /fetchRevealSupport\(\)/);
+  assert.match(source, /revealDirectory\(root\)/);
+  assert.match(source, /FILE_MANAGER_ERROR_KEYS\[message\]/);
+  const fileService = await readFile(new URL("../lib/file-service.ts", import.meta.url), "utf8");
+  assert.match(fileService, /fetch\("\/api\/open-in-explorer", \{ method: "POST"/);
+  assert.match(fileService, /revealItemInDirNative\(cwd\)/);
   // The menu itself is fork-owned (components/ProjectContextMenu.tsx).
   const menuSource = await readFile(new URL("./ProjectContextMenu.tsx", import.meta.url), "utf8");
   assert.match(menuSource, /\{projectRevealError && \(/);

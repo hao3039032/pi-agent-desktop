@@ -119,6 +119,14 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   }
 }
 
+export async function fetchRevealSupport(): Promise<{ supported: boolean; reason: string | null; platform: string }> {
+  return ensureClient().request("files.revealSupport", {}, { timeoutMs: 15_000 });
+}
+
+export async function revealDirectory(cwd: string): Promise<void> {
+  await ensureClient().request("files.reveal", { cwd }, { timeoutMs: 15_000 });
+}
+
 export async function fileExists(filePath: string): Promise<boolean> {
   try {
     const handle = await grantFileResource(filePath);
