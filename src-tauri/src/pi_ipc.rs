@@ -4998,6 +4998,52 @@ mod tests {
         assert_eq!(response["error"]["code"], "management_unavailable", "{response}");
     }
 
+    #[test]
+    fn real_pi_skills_list_toggle_and_relist() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let managed = dir.path().join("managed");
+        let skill = agent.join("skills/fixture/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(&skill, "---\nname: fixture\ndescription: isolated fixture\n---\nbody\n").unwrap();
+        let build = std::process::Command::new("node")
+            .args(["../scripts/migration/build-management-modules.mjs", "--out"])
+            .arg(&managed)
+            .status().expect("build management projection");
+        assert!(build.success());
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable,
+            agent_dir: Some(agent),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![
+                ("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()),
+                ("HOME".into(), dir.path().display().to_string()),
+                ("USERPROFILE".into(), dir.path().display().to_string()),
+            ],
+        });
+        state.propose_path(&project);
+        let cwd = project.to_string_lossy();
+        let file = skill.to_string_lossy();
+        let first = send(&state, json!({ "v": 1, "id": "list1", "op": "skills.list", "args": { "cwd": cwd } }));
+        assert_eq!(first["ok"], true, "{first}");
+        assert!(first["data"]["skills"].as_array().unwrap().iter().any(|s| s["filePath"] == file.as_ref()));
+        let changed = send(&state, json!({ "v": 1, "id": "toggle", "op": "skills.setDisabled", "args": { "cwd": cwd, "filePaths": [file], "disableModelInvocation": true } }));
+        assert_eq!(changed["ok"], true, "{changed}");
+        assert!(changed["data"][0].get("error").is_none(), "{changed}");
+        let second = send(&state, json!({ "v": 1, "id": "list2", "op": "skills.list", "args": { "cwd": cwd } }));
+        assert_eq!(second["ok"], true, "{second}");
+        assert!(second["data"]["skills"].as_array().unwrap().iter().any(|s| s["filePath"] == file.as_ref() && s["disableModelInvocation"] == true));
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
     /// The models domain over the REAL pi management instance (PI_CLI_BIN,
     /// sandboxed agent dir + a staged managed tree): models.list answers the
     /// full /api/models contract through the host's cwd gate and the
