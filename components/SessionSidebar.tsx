@@ -7,6 +7,7 @@ import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { fetchHomeDirectory, fetchSessionList, subscribeRunningSessions } from "@/lib/session-list-service";
+import { renameSession } from "@/lib/session-actions-service";
 import { useI18n } from "@/hooks/useI18n";
 import { formatCompactRelativeTime, formatRelativeTime } from "@/lib/i18n/format";
 import { createPortal } from "react-dom";
@@ -2592,15 +2593,7 @@ function SessionItem({
     // a skill-invoked session stays a no-op instead of persisting raw XML.)
     if (renameValue === title || name === (session.name ?? "")) return;
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      });
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({})) as { error?: string };
-        throw new Error(d.error ?? `HTTP ${res.status}`);
-      }
+      await renameSession(session.id, name);
       onRenamed?.();
     } catch (e) {
       reportActionError(t("sidebar.renameFailed", { error: e instanceof Error ? e.message : String(e) }));
