@@ -22,6 +22,12 @@ export interface SessionListPayload {
   chatWorkspaceCwd?: string | null;
 }
 
+export async function searchSessions(query: string, signal?: AbortSignal): Promise<import("./session-search").SessionSearchResponse> {
+  const res = await fetch(`/api/sessions/search?${new URLSearchParams({ q: query })}`, { signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json() as import("./session-search").SessionSearchResponse;
+}
+
 /** One frame of the running-set stream (the SSE data payload). */
 export interface RunningSetFrame {
   runningSessionIds: string[];

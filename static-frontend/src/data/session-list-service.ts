@@ -22,6 +22,10 @@ function ensureClient(): IpcClient {
   return client;
 }
 
+export async function searchSessions(query: string, _signal?: AbortSignal): Promise<import("../../../lib/session-search").SessionSearchResponse> {
+  return ensureClient().request("sessions.search", { query }, { timeoutMs: 30_000 });
+}
+
 /**
  * The catalogue over IPC. The host's catalogue always scans (there is no
  * server-side cache to bypass), so `summary`/`force` are accepted for

@@ -1110,6 +1110,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
+        "sessions.search" => match crate::session_search::search(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
@@ -1733,7 +1737,7 @@ pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
 /// One management-op call: the instance is per-scope on demand (60 s idle
 /// recycle), and every failure is (code, message) — never a fallback that
 /// would present a disk tail as a live view or an empty context as success.
-fn management_call(
+pub(crate) fn management_call(
     state: &IpcHostState,
     op: &str,
     args: Value,
@@ -3109,7 +3113,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
 /// modified time, the resolved parent id, the relation and the workspace
 /// classification. `session_info_json` (the detail view) differs only in
 /// its modified source (the file mtime there).
-fn catalogue_info(
+pub(crate) fn catalogue_info(
     state: &IpcHostState,
     agent_dir: &Path,
     scan: &session_host::history::ScannedSession,
@@ -3285,7 +3289,7 @@ fn chrono_parse_iso(timestamp: &str) -> Option<i64> {
 }
 
 /// The map key for parent-id resolution (the file's absolute path).
-fn key_of(path: &Path) -> String {
+pub(crate) fn key_of(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
@@ -3327,7 +3331,7 @@ fn dispatch_with_resume(
 
 
 /// Epoch ms → ISO-8601 Zulu (the catalogue's created/modified strings).
-fn ms_to_iso(ms: i64) -> String {
+pub(crate) fn ms_to_iso(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);
