@@ -87,6 +87,8 @@ export {
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
 export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
+registerBunOAuthFlows();
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
@@ -101,6 +103,9 @@ export async function bundleProjectionModules() {
       sourcefile: "management-projection-entry.ts",
     },
     bundle: true,
+    // Jiti resolves its Babel transformer relative to its own package; bundling
+    // it relocates that lookup into the projection and breaks extensions.
+    external: ["jiti"],
     format: "esm",
     platform: "node",
     target: "node20",

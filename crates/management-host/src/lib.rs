@@ -120,7 +120,11 @@ impl ManagementInstance {
     /// The general form: send `/pi-web:mgmt <rid> <b64url>` and await the
     /// PI_WEB_MGMT_V1 envelope with matching rid and the spawning nonce.
     pub fn management_call(&self, op: &str, args: Value, timeout: Duration) -> Result<Value, String> {
-        let handle = self.start_task(op, args, Duration::from_secs(600), TaskKind::Mutation)?;
+        self.management_call_kind(op, args, timeout, TaskKind::Mutation)
+    }
+
+    pub fn management_call_kind(&self, op: &str, args: Value, timeout: Duration, kind: TaskKind) -> Result<Value, String> {
+        let handle = self.start_task(op, args, Duration::from_secs(600), kind)?;
         let until = Instant::now() + timeout;
         loop {
             let snapshot = self.task_snapshot(&handle)?;
@@ -191,7 +195,7 @@ impl ManagementInstance {
             "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
             "session.readHeader" | "session.readEntries" | "session.readContext" | "session.readView" |
             "session.projectSnapshot" | "chat.systemPrompt" | "session.chatOnlyPrompt" |
-            "models.list" | "models.enabledGet" | "modelsConfig.get") {
+            "models.list" | "models.enabledGet" | "modelsConfig.get" | "auth.loginPoll") {
             return Err("operation is not approved as read-only".into());
         }
         let handle = format!("task-{}", uuid::Uuid::new_v4());
@@ -276,6 +280,96 @@ impl ManagementInstance {
             task.snapshot.cancel_requested = true;
         }
         self.send_cancel(handle)
+    }
+
+    /// Deliver task-associated control input (e.g. OAuth code submission or
+    /// interactive selection) directly to a running task. Verifies that the task
+    /// belongs to this instance and is actively running. Rejects input if the target
+    /// is missing, terminal, unknown, or has cancel requested, preventing arbitrary
+    /// writes from bypassing unknown-outcome scope isolation. Input data is bounded
+    /// to 4096 bytes.
+    pub fn submit_task_input(&self, handle: &str, data: Value) -> Result<Value, String> {
+        let task = {
+            let state = self.state.lock().unwrap();
+            if state.closing || self.client.has_exited() {
+                return Err("management instance is closing".into());
+            }
+            let task = state.tasks.get(handle).ok_or("management task not found")?;
+            let t = task.lock().unwrap();
+            if t.finished_at.is_some() {
+                return Err("management task is terminal".into());
+            }
+            if t.snapshot.status != TaskStatus::Running {
+                return Err(format!("management task is not running: {:?}", t.snapshot.status));
+            }
+            if t.snapshot.cancel_requested {
+                return Err("management task has cancel requested".into());
+            }
+            Arc::clone(task)
+        };
+
+        let data_bytes = serde_json::to_vec(&data).map_err(|e| format!("invalid task input payload: {e}"))?;
+        if data_bytes.is_empty() || data_bytes.len() > 4096 {
+            return Err("management task input must be non-empty and bounded to 4096 bytes".into());
+        }
+
+        let request_id = format!("input-{}", uuid::Uuid::new_v4());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingTask {
+                tx,
+                task,
+                nonce: self.nonce.clone(),
+            },
+        );
+
+        let token = base64_url_no_pad(
+            &json!({
+                "op": "__input",
+                "args": { "rid": handle, "data": data },
+                "nonce": self.nonce
+            })
+            .to_string(),
+        );
+
+        let result = (|| -> Result<Value, String> {
+            let ack = self
+                .client
+                .command(
+                    "prompt",
+                    json!({ "message": format!("/pi-web:mgmt {request_id} {token}") }),
+                    Some(Duration::from_secs(10)),
+                )
+                .map_err(|e| format!("management input prompt failed: {e}"))?;
+            if ack.get("disposition").and_then(Value::as_str) != Some("handled") {
+                return Err("the management input command was not handled".to_string());
+            }
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                if Instant::now() >= until { return Err("management input outcome unknown: timed out".into()); }
+                match rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(envelope) => {
+                        if envelope.get("nonce").and_then(Value::as_str) != Some(self.nonce.as_str()) {
+                            return Err("the management envelope carried the wrong nonce".to_string());
+                        }
+                        if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+                            return Ok(envelope.get("result").cloned().unwrap_or(Value::Null));
+                        } else {
+                            let code = envelope.get("code").and_then(Value::as_str).unwrap_or("op_failed");
+                            let error = envelope.get("error").and_then(Value::as_str).unwrap_or("unknown error");
+                            return Err(format!("[{code}] {error}"));
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !self.client.has_exited() => continue,
+                    Err(_) => return Err("management input outcome unknown: child exited".to_string()),
+                }
+            }
+        })();
+
+        self.pending.lock().unwrap().remove(&request_id);
+        self.touch();
+        result
     }
 
     fn send_cancel(&self, handle: &str) -> Result<(), String> {
