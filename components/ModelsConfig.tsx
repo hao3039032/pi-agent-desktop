@@ -5,6 +5,14 @@ import { AppSelect } from "./AppSelect";
 import { useState, useEffect, useCallback, useId, useRef } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { fetchModelsConfig, saveModelsConfig } from "@/lib/models-config-service";
+import {
+  deleteProviderApiKey,
+  fetchAuthProviders,
+  logoutProvider,
+  storeProviderApiKey,
+  type ApiKeyProvider,
+  type OAuthProvider,
+} from "@/lib/provider-auth-service";
 import type { ModelCatalogPreset, ModelCatalogRecommendation } from "@/lib/model-catalog";
 import type { DiscoveredModel } from "@/lib/model-discovery";
 import {
@@ -65,24 +73,8 @@ import { ProviderUsageSummary } from "./ProviderUsageSummary";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface OAuthProvider {
-  id: string;
-  name: string;
-  usesCallbackServer: boolean;
-  loggedIn: boolean;
-  /** Provider also accepts an API key, so it appears in both picker sections. */
-  supportsApiKey?: boolean;
-}
-
-interface ApiKeyProvider {
-  id: string;
-  displayName: string;
-  configured: boolean;
-  source?: string;
-  modelCount: number;
-  /** Provider also supports OAuth, so it appears in both picker sections. */
-  supportsOAuth?: boolean;
-}
+// OAuthProvider / ApiKeyProvider: the provider-list wire shapes, owned by
+// the provider-auth seam (@/lib/provider-auth-service).
 
 type OAuthLoginState =
   | { phase: "idle" }
@@ -1462,7 +1454,15 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
   }, [provider.id, onRefresh]);
 
   const handleLogout = useCallback(async () => {
-    await fetch(`/api/auth/logout/${encodeURIComponent(provider.id)}`, { method: "POST" });
+    // A refusal (the provider is API-key authenticated, or unknown) shows
+    // in the detail's own error slot instead of vanishing — the seam throws
+    // the route's message; the old inline call ignored it.
+    try {
+      await logoutProvider(provider.id);
+    } catch (e) {
+      setLoginState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     setLoginState({ phase: "idle" });
     onRefresh();
   }, [provider.id, onRefresh]);
@@ -1663,22 +1663,13 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels }: {
     setError(null);
     setSavedOk(false);
     try {
-      const res = await fetch(`/api/auth/api-key/${encodeURIComponent(provider.id)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: apiKey.trim() }),
-      });
-      const d = await res.json() as { success?: boolean; error?: string };
-      if (!res.ok || d.error) {
-        setError(d.error ?? `HTTP ${res.status}`);
-      } else {
-        setApiKey("");
-        setSavedOk(true);
-        setTimeout(() => setSavedOk(false), 2000);
-        onRefresh();
-      }
+      await storeProviderApiKey(provider.id, apiKey.trim());
+      setApiKey("");
+      setSavedOk(true);
+      setTimeout(() => setSavedOk(false), 2000);
+      onRefresh();
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
@@ -1688,12 +1679,10 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels }: {
     setRemoving(true);
     setError(null);
     try {
-      const res = await fetch(`/api/auth/api-key/${encodeURIComponent(provider.id)}`, { method: "DELETE" });
-      const d = await res.json() as { success?: boolean; error?: string };
-      if (!res.ok || d.error) setError(d.error ?? `HTTP ${res.status}`);
-      else onRefresh();
+      await deleteProviderApiKey(provider.id);
+      onRefresh();
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setRemoving(false);
     }
@@ -1955,11 +1944,10 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null, onOpenMcp 
   const [providerNameDraft, setProviderNameDraft] = useState<{ provider: string; name: string } | null>(null);
 
   const refreshAuthProviders = useCallback(() => {
-    fetch("/api/auth/providers")
-      .then((r) => r.json())
-      .then((d: { oauthProviders?: OAuthProvider[]; apiKeyProviders?: ApiKeyProvider[] }) => {
-        if (Array.isArray(d.oauthProviders)) setOauthProviders(d.oauthProviders);
-        if (Array.isArray(d.apiKeyProviders)) setApiKeyProviders(d.apiKeyProviders);
+    fetchAuthProviders()
+      .then((d) => {
+        setOauthProviders(d.oauthProviders);
+        setApiKeyProviders(d.apiKeyProviders);
       })
       .catch(() => {});
   }, []);

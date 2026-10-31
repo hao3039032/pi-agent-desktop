@@ -131,6 +131,15 @@ export default defineConfig({
         find: /^@\/lib\/models-config-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-config-service.ts"),
       },
+      {
+        // The provider-auth service swaps the /api/auth/providers, api-key
+        // and logout routes for auth.providers / auth.apiKeyStore /
+        // auth.apiKeyDelete / auth.logout over IPC — the same compositions
+        // the Next routes serve (capability-driven listing, type-gated
+        // credential delete, no secret crossing the wire).
+        find: /^@\/lib\/provider-auth-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/provider-auth-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

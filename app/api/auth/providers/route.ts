@@ -1,23 +1,12 @@
-import { buildApiKeyProviderList, buildOAuthProviderList } from "@/lib/provider-listing";
-import {
-  collectProviderListingInputs,
-  customModelsJsonProviderIds,
-} from "@/lib/provider-listing-runtime";
-import { createModelRuntimeWithExtensions } from "@/lib/model-runtime";
+import { composeProviderLists } from "@/lib/provider-auth-service.server";
 
 export const dynamic = "force-dynamic";
 
 // Providers that declare an OAuth login method, including anthropic
-// (Claude Pro/Max) — see lib/provider-listing.ts (#309).
+// (Claude Pro/Max) — see lib/provider-listing.ts (#309). The composition
+// (extension providers included, custom models.json ids excluded from the
+// API-key list) is lib/provider-auth-service.server.ts, shared with the
+// management instance's auth.providers op.
 export async function GET() {
-  const modelRuntime = await createModelRuntimeWithExtensions();
-  // ModelsConfig renders custom models.json providers itself. Pass their ids
-  // so an auth.json credential cannot also put them in the API-key list.
-  const inputs = await collectProviderListingInputs(
-    modelRuntime,
-    customModelsJsonProviderIds(),
-  );
-  const oauthProviders = buildOAuthProviderList(inputs);
-  const apiKeyProviders = buildApiKeyProviderList(inputs);
-  return Response.json({ providers: oauthProviders, oauthProviders, apiKeyProviders });
+  return Response.json(await composeProviderLists());
 }
