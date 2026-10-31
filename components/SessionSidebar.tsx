@@ -9,6 +9,7 @@ import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { fetchHomeDirectory, fetchSessionList, subscribeRunningSessions } from "@/lib/session-list-service";
 import { listWorktrees, switchWorktreeBranch } from "@/lib/worktree-service";
 import { deleteSession, renameSession } from "@/lib/session-actions-service";
+import { continueChatInProject as continueChatInProjectRequest } from "@/lib/chat-session-service";
 import { useI18n } from "@/hooks/useI18n";
 import { formatCompactRelativeTime, formatRelativeTime } from "@/lib/i18n/format";
 import { createPortal } from "react-dom";
@@ -1141,13 +1142,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const continueChatInProject = useCallback(async (chat: SessionInfo, cwd: string) => {
     setContinueChat(null);
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(chat.id)}/continue-in-project`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd }),
-      });
-      const data = await res.json().catch(() => ({})) as { sessionId?: string; path?: string | null; cwd?: string; chatFolder?: string | null; error?: string };
-      if (!res.ok || !data.sessionId) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const data = await continueChatInProjectRequest(chat.id, cwd);
       // The project session starts without the files the chat made; say where they are.
       if (data.chatFolder) appNotify.info({ message: t("sidebar.continueInProjectFolderNote", { path: data.chatFolder }) });
       const now = new Date().toISOString();

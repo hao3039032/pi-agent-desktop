@@ -91,10 +91,21 @@ pub struct IpcHostState {
     /// changes the list a client holds (a create, a rename). Clients compare
     /// and refetch — the cross-window staleness contract.
     session_list_version: Arc<AtomicU64>,
+    /// Set only by a future packaged static-app startup path, never by IPC.
+    chat_unlock_policy: ChatUnlockPolicy,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
     dispatch_gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatUnlockPolicy {
+    Denied,
+    // Reserved for the packaged WebviewUrl::App startup, not the current
+    // external Next window or the HTTP test harness.
+    #[allow(dead_code)]
+    StaticPackaged,
 }
 
 /// Handle that ends one event-stream relay thread on unsubscribe.
@@ -145,6 +156,7 @@ impl IpcHostState {
             session_exports: Mutex::new(std::collections::VecDeque::new()),
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
+            chat_unlock_policy: ChatUnlockPolicy::Denied,
         }
     }
 
@@ -3098,10 +3110,10 @@ fn build_spawn_plan(
         // workspace policy decides, server-side). Unlocking lets a chat use
         // the computer, so a persisted marker is honoured ONLY for a folder
         // chat (the Next factory's gate: a legacy shared-workspace session
-        // file that carries the marker keeps the locked loadout; the desktop
-        // host is local-only, so the network-exposure half of the old gate
-        // is structural here).
-        let unlocked = chat_folder
+        // file that carries the marker keeps the locked loadout). Legacy
+        // windows and the test harness cannot honour a stored unlock.
+        let unlocked = state.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
+            && chat_folder
             && session_host::spawn_plan::read_chat_unlocked(session_file);
         // Chats read Settings › Chats while they are still empty.
         let (chat_model, chat_thinking) = if file_has_messages(session_file) {
@@ -6718,7 +6730,7 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_unlock_marker_is_honoured_only_for_a_folder_chat() {
+    fn a_persisted_unlock_marker_requires_static_host_and_folder_chat() {
         // The Next factory's gate (rpc-manager): chatFolder && marker. A
         // LEGACY shared-workspace session file that carries the marker keeps
         // the locked loadout — a persisted input must not widen its rights.
@@ -6728,7 +6740,7 @@ mod tests {
             eprintln!("skipping: PI_CLI_BIN not set");
             return;
         };
-        let state = state();
+        let mut state = state();
         let dir = tempfile::tempdir().expect("tempdir");
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -6762,7 +6774,7 @@ mod tests {
         let request = SpawnRequest::default();
         let base = state.spawn_base.lock().unwrap().clone().expect("base");
 
-        // 1. A FOLDER chat (a child of <agent_dir>/chats) with the marker: unlocked.
+        // A legacy host or harness must not honour even a folder marker.
         let folder_cwd = agent_dir.join("chats").join("20260101_120000_abcd");
         std::fs::create_dir_all(&folder_cwd).expect("folder");
         let folder_file = dir.path().join("folder.jsonl");
@@ -6770,9 +6782,14 @@ mod tests {
         let plan = build_spawn_plan(&state, &base, &folder_cwd, &folder_file, &request, false)
             .expect("the folder chat plan");
         match plan.shape {
-            session_host::SessionSpawnShape::Chat { unlocked, .. } => {
-                assert!(unlocked, "a folder chat's persisted unlock is honoured");
-            }
+            session_host::SessionSpawnShape::Chat { unlocked, .. } => assert!(!unlocked),
+            _ => panic!("a chat shape, not another kind"),
+        }
+        // Test-only simulation of a future trusted static startup.
+        state.chat_unlock_policy = ChatUnlockPolicy::StaticPackaged;
+        let plan = build_spawn_plan(&state, &base, &folder_cwd, &folder_file, &request, false).unwrap();
+        match plan.shape {
+            session_host::SessionSpawnShape::Chat { unlocked, .. } => assert!(unlocked),
             _ => panic!("a chat shape, not another kind"),
         }
 

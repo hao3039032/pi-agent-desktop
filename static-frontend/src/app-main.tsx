@@ -19,6 +19,7 @@ import { DistroSetupGate } from "../../components/distro";
 import { bindAgentClient } from "./data/agent-client.ts";
 import { bindArtifactsSettingsService } from "./data/artifact-settings-service.ts";
 import { bindChatSettingsService } from "./data/chat-settings-service.ts";
+import { bindChatSessionService } from "./data/chat-session-service.ts";
 import { bindCustomCssService, applyCustomCssToDocument } from "./data/custom-css-service.ts";
 import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindEnabledModelsService } from "./data/enabled-models-service.ts";
@@ -65,6 +66,7 @@ async function boot(): Promise<void> {
   bindToolSettingsService(client);
   bindArtifactsSettingsService(client);
   bindChatSettingsService(client);
+  bindChatSessionService(client);
   bindCustomCssService(client);
   bindModelsExtrasService(client);
   bindProviderAuthService(client);
