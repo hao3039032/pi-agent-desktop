@@ -86,7 +86,8 @@ fn snapshot(state: &IpcHostState) -> Result<SearchSnapshot, Failure> {
         .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
     let root = match agent.join("sessions").canonicalize() {
         Ok(root) => root,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !agent.join("session-deletion-journal").exists() => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            && matches!(std::fs::symlink_metadata(agent.join("session-deletion-journal")), Err(ref missing) if missing.kind() == std::io::ErrorKind::NotFound) => {
             return Ok(SearchSnapshot { _directory: directory, candidates: Vec::new(), by_snapshot: HashMap::new(), truncated: false });
         }
         Err(e) => return Err(io(e)),
@@ -180,7 +181,8 @@ pub(crate) fn search(state: &IpcHostState, args: &Value) -> Result<Value, Failur
     let agent = state.agent_dir();
     let root = match agent.join("sessions").canonicalize() {
         Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(json!({"results": [], "truncated": false})),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && matches!(std::fs::symlink_metadata(agent.join("session-deletion-journal")), Err(ref missing) if missing.kind() == std::io::ErrorKind::NotFound) => return Ok(json!({"results": [], "truncated": false})),
         Err(error) => return Err(io(error)),
     };
     crate::session_deletion_journal::recover(state, &root)?;
