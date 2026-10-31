@@ -44,6 +44,7 @@ test("scheduled event subscribers receive real host events and detach", () => {
   transport.emit({ subscriptionId: "sub", epoch: 1, seq: 1, kind: "event", payload: event });
   assert.deepEqual(seen, [event]);
   assert.equal(isScheduledRunSession("session"), true);
+  transport.emit({ subscriptionId: "sub", epoch: 1, seq: 2, kind: "reset", payload: { reason: "overflow" } });
   release();
   transport.emit({ subscriptionId: "sub", epoch: 1, seq: 2, kind: "event", payload: event });
   assert.equal(seen.length, 1);

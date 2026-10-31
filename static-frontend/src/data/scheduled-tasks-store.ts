@@ -90,6 +90,12 @@ export function retainScheduledTaskStream(): () => void {
   streamRefs += 1;
   if (streamRefs === 1) {
     stopStream = clientForTasks().subscribe<ScheduledTaskEvent>("tasks.subscribeEvents", undefined, (frame) => {
+      if (frame.kind === "reset") {
+        streamError = "Scheduled task event stream overflowed; reload to reconnect";
+        setState({ error: streamError, runningTaskIds: new Set() });
+        void refreshScheduledTasks();
+        return;
+      }
       if (frame.kind !== "event" || !frame.payload || typeof frame.payload.type !== "string") return;
       streamError = null;
       const event = frame.payload;
