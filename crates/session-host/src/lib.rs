@@ -505,7 +505,12 @@ impl Session {
 
     /// Orderly shutdown: stdin EOF then grace kill (pi-host close).
     pub fn shutdown(&self, grace: Duration) -> Option<i32> {
-        self.client.close(grace)
+        // A shutdown while a settle waiter sleeps must wake it at once (the
+        // fan thread's exit wake covers a child-side exit; this covers the
+        // host-ordered one — remove/evict during an in-flight delivery).
+        let exit = self.client.close(grace);
+        self.settle_cv.notify_all();
+        exit
     }
 
     /// Test seam: shorten the lease to force the idle path deterministically.
@@ -516,6 +521,12 @@ impl Session {
     /// Test seam: whether the child process exited.
     pub fn client_has_exited_for_tests(&self) -> bool {
         self.client.has_exited()
+    }
+
+    /// Test seam: SIGKILL the child (deterministically reproducing a child
+    /// crash while a delivery or settle waiter is in flight).
+    pub fn client_kill_for_tests(&self) {
+        self.client.kill();
     }
 }
 
@@ -970,6 +981,13 @@ fn spawn_session(
                 // with no further record to carry the news — record the
                 // exit so a blocked relay still replays it.
                 fan.running_signal.notify_transition(&fan.id, false);
+                // And wake every settle waiter at once: `wait_for_settle`
+                // re-checks `has_exited()` only when notified (its timeout
+                // is the 600 s settle deadline), so without this wake a
+                // prompt delivery in flight when the child died would hang
+                // the full deadline before reporting the exit (found by the
+                // static-UI acceptance's child-kill step).
+                fan.settle_cv.notify_all();
             })
             .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
     }

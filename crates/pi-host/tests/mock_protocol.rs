@@ -583,3 +583,37 @@ fn bridge_drop_detaches_the_notify_handler_and_ends_its_threads() {
     );
     client.close(Duration::from_secs(5));
 }
+
+/// A dead child must CLOSE the event channels: the transport is gone, so a
+/// subscriber blocked in `recv()` has to learn the session is over. Before
+/// the exit watcher dropped `event_listeners`, the senders lived on inside
+/// the client's shared state and every event listener's thread blocked in
+/// recv() FOREVER (leaking it and whatever the subscription kept alive) —
+/// found by the static-UI acceptance's child-kill step, whose settle waiter
+/// never woke because the session-host fan thread never exited.
+#[test]
+fn a_child_exit_closes_the_event_channels() {
+    let client = spawn_mock(None);
+    let (events, subscription) = client.on_event();
+    let state = client.command("get_state", json!({}), Some(SHORT)).expect("handshake");
+    assert_eq!(state["sessionId"], "mock-session-id");
+    // Kill (not close): the exit watcher runs while the subscription is
+    // still HELD — the worst case for the old leak.
+    client.kill();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the event channel never closed after the child died (the listener leaks)"
+                );
+            }
+            Ok(record) => panic!("no record can arrive from a dead child: {record}"),
+        }
+    }
+    drop(subscription);
+    // Reap the mock so no test process lingers.
+    let _ = client.wait_exit(Some(Duration::from_secs(5)));
+}

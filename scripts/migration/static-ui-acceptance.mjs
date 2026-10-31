@@ -8,6 +8,10 @@
  * credentials, no real network model):
  *
  *   project create → send → stream → stop → queue edit/send → reopen
+ *   unknown park: the session child dies mid-delivery → the row reappears
+ *   outcome-unknown → the first click only arms → the second confirms the
+ *   re-send (the real two-click confirmation, driven by a real SIGKILL of
+ *   the pi child — the production trigger for an unknown outcome)
  *   chat create → send → stream → answer
  *
  * The only replaced layer is Tauri's own WebView invoke/Channel plumbing
@@ -25,7 +29,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -356,6 +360,54 @@ function killHarnessTree(signal) {
   }
 }
 
+/** SIGKILL the pi session child(ren) serving this run's sandbox. The pi
+ * CLI REWRITES its process title (`process.title = "pi-rpc"` in
+ * rpc-entry.js), so /proc/<pid>/cmdline no longer holds `--session` — the
+ * unique, stable identifier is the process's WORKING DIRECTORY: a session
+ * child runs in its session cwd (the sandbox's project folder), and nothing
+ * outside this sandbox ever does. Never match by process name alone (an
+ * unrelated run's or the user's pi must never be touched); the harness
+ * itself runs in the checkout, and the browser/renderer processes match
+ * neither the cwd nor the pi title. */
+function killSessionChildren() {
+  if (process.platform !== "linux" || !existsSync("/proc")) {
+    throw new Error(`the unknown-park step needs a Linux /proc to target the session child (platform: ${process.platform}) — extend the driver for this platform instead of skipping the step`);
+  }
+  const killed = [];
+  const sandboxes = []; // diagnostics: every process whose cwd sits in this sandbox
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    let cwd;
+    try {
+      cwd = readlinkSync(`/proc/${entry}/cwd`);
+    } catch {
+      continue; // not ours, a kernel thread, or already gone
+    }
+    if (!cwd.startsWith(sandbox)) continue;
+    sandboxes.push(`[${entry}] cwd=${cwd}`);
+    let argv;
+    try {
+      argv = readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0").filter(Boolean);
+    } catch {
+      continue;
+    }
+    // The rewritten title of a pi rpc child (session or management) begins
+    // with "pi"; anything else living in the sandbox cwd (none today) is
+    // not ours to kill.
+    if (!argv[0]?.startsWith("pi")) continue;
+    try {
+      process.kill(Number(entry), "SIGKILL");
+      killed.push(Number(entry));
+    } catch {
+      // ESRCH: exited between the read and the kill.
+    }
+  }
+  if (killed.length === 0 && sandboxes.length > 0) {
+    console.error("[acceptance] /proc scan saw these sandbox-cwd processes but no pi match:\n  " + sandboxes.join("\n  "));
+  }
+  return killed;
+}
+
 function waitForExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -497,6 +549,87 @@ try {
     return button && button.getAttribute("data-action") === "stop";
   }, null, { timeout: 30_000 });
   await page.locator(".composer-send-button").click();
+  await page.waitForFunction(() => {
+    const button = document.querySelector(".composer-send-button");
+    return button && button.getAttribute("data-action") !== "stop";
+  }, null, { timeout: 60_000 });
+
+  // ------------------------------------------------- unknown park + confirm
+  step("project: child dies mid-delivery → row parks unknown → two-click confirm");
+  // 1. Another hanging run (the delivery will block on its settle).
+  currentScript = "hang";
+  await composer.fill("hang for the unknown park");
+  await composer.press("Enter");
+  await userMessage(page, "hang for the unknown park").waitFor({ timeout: 60_000 });
+  await page.waitForFunction(() => {
+    const button = document.querySelector(".composer-send-button");
+    return button && button.getAttribute("data-action") === "stop";
+  }, null, { timeout: 30_000 });
+  // 2. Queue a message behind the hanging run (the pending row).
+  await composer.fill("possibly executed message");
+  await page.waitForFunction(() => {
+    const button = document.querySelector(".composer-send-button");
+    return button && button.getAttribute("data-action") === "queue";
+  }, null, { timeout: 30_000 });
+  await page.locator(".composer-send-button").click();
+  const pendingRow = page.locator(".composer-outbox-row").filter({ hasText: "possibly executed message" });
+  await pendingRow.waitFor({ timeout: 30_000 });
+  // 3. Send now: the host takes the row and delivers it behind the hanging
+  //    run — the row disappears and the delivery blocks on the settle wait.
+  await pendingRow.getByRole("button", { name: "Send now", exact: true }).click();
+  await page.waitForFunction(
+    () => !document.querySelector(".composer-outbox-row"),
+    null,
+    { timeout: 30_000 },
+  );
+  //    The prompt round-trip is fast; give it a beat, then kill the session
+  //    child — the REAL production trigger for an outcome-unknown delivery.
+  await delay(500);
+  const killed = killSessionChildren();
+  assert.ok(
+    killed.length >= 1,
+    "found and killed the hanging session child (no --session argv under the sandbox agentDir matched)",
+  );
+  // 4. The settle wait observes the exit: the row REAPPEARS parked unknown.
+  const unknownRow = page
+    .locator(".composer-outbox-row-unknown")
+    .filter({ hasText: "possibly executed message" });
+  await unknownRow.waitFor({ timeout: 60_000 });
+  const badge = (await unknownRow.locator(".composer-outbox-unknown").textContent()) ?? "";
+  assert.ok(
+    badge.includes("Send result unknown"),
+    `the unknown badge renders (got: ${badge.trim()})`,
+  );
+  // 5. The send button on an unknown row says "Confirm send": the FIRST
+  //    click only arms — it must not deliver.
+  const confirmButton = unknownRow.getByRole("button", { name: "Confirm send", exact: true });
+  await confirmButton.waitFor({ timeout: 10_000 });
+  await confirmButton.click();
+  await page.waitForFunction(() => {
+    const row = document.querySelector(".composer-outbox-row-unknown");
+    if (!row) return false;
+    const badgeText = row.querySelector(".composer-outbox-unknown")?.textContent ?? "";
+    const armed = [...row.querySelectorAll("button")].some(
+      (button) => button.getAttribute("aria-label") === "Send now",
+    );
+    return badgeText.includes("Send again?") && armed;
+  }, null, { timeout: 10_000 });
+  assert.equal(
+    await userMessage(page, "possibly executed message").count(),
+    0,
+    "the armed first click must not deliver the possibly-executed message",
+  );
+  // 6. The confirmed SECOND click sends for real: the dead session
+  //    cold-restarts from disk and the message delivers + settles.
+  currentScript = "default";
+  await unknownRow.getByRole("button", { name: "Send now", exact: true }).click();
+  await userMessage(page, "possibly executed message").waitFor({ timeout: 120_000 });
+  await assistantText(page, "FIXTURE-REPLY").waitFor({ timeout: 120_000 });
+  await page.waitForFunction(
+    () => !document.querySelector(".composer-outbox-row"),
+    null,
+    { timeout: 60_000 },
+  );
   await page.waitForFunction(() => {
     const button = document.querySelector(".composer-send-button");
     return button && button.getAttribute("data-action") !== "stop";

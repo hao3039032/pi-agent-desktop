@@ -1013,6 +1013,13 @@ fn exit_watcher(mut child: std::process::Child, shared: Arc<Shared>) {
         // child is gone, and writing a cancel to its dead pipe only risks
         // EPIPE).
         inner.discard_ui_buffer();
+        // The transport is closed: no further record can EVER arrive, so
+        // the event channels must close too — dropping the senders is the
+        // only way a subscriber blocked in `recv()` learns the session is
+        // over (before this, a dead child leaked every event listener's
+        // thread: the receiver blocked forever holding whatever the
+        // subscription kept alive).
+        inner.event_listeners.clear();
         let error = PiRpcError::exit(message.clone());
         if inner.fatal.is_none() {
             inner.fatal = Some(error.clone());
