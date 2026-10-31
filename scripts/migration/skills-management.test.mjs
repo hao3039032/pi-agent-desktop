@@ -20,12 +20,17 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
     await mkdir(dir, { recursive: true });
     const skill = join(dir, "SKILL.md");
     await writeFile(skill, "---\nname: fixture\ndescription: isolated fixture\n---\nbody\n");
+    const externalDir = join(root, "external");
+    await mkdir(externalDir);
+    const external = join(externalDir, "extra.md");
+    await writeFile(external, "---\nname: extra\ndescription: external fixture\n---\nbody\n");
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ skills: [external] }));
     await buildProjectionInto(managed);
     const nonce = "skills-test-nonce";
     client = new PiRpcClient(executable, {
       cwd,
       args: ["--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", join(import.meta.dirname, "../../lib/pi-rpc/assets/pi-web-management.mjs")],
-      env: { ...process.env, HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce },
+      env: { ...process.env, HOME: root, USERPROFILE: root, PI_AGENT_HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce },
       onLog: () => {},
     });
     const replies = [];
@@ -48,10 +53,13 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
     const first = await call("skills.list", { cwd });
     assert.equal(first.ok, true, JSON.stringify(first));
     assert.ok(first.result.skills.some((entry) => entry.filePath === skill));
-    const toggle = await call("skills.setDisabled", { cwd, filePaths: [skill, join(root, "other.md")], disableModelInvocation: true });
+    assert.ok(first.result.skills.some((entry) => entry.filePath === external));
+    const toggle = await call("skills.setDisabled", { cwd, filePaths: [skill, join(root, "other.md"), external], disableModelInvocation: true });
     assert.equal(toggle.ok, true, JSON.stringify(toggle));
     assert.equal(toggle.result[0].error, undefined);
     assert.match(toggle.result[1].error, /not visible/);
+    assert.match(toggle.result[2].error, /Access denied/);
+    assert.doesNotMatch(await readFile(external, "utf8"), /disable-model-invocation/);
     assert.match(await readFile(skill, "utf8"), /disable-model-invocation: true/);
     const second = await call("skills.list", { cwd });
     assert.equal(second.ok, true, JSON.stringify(second));

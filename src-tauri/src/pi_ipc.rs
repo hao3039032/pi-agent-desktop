@@ -1412,6 +1412,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 };
                 payload["filePaths"] = json!(paths);
                 payload["disableModelInvocation"] = json!(disabled);
+                payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
             }
             match management_call_scoped(state, op, &payload, Path::new(&cwd)) {
                 Ok(result) => protocol_ok(&id, result),
@@ -5027,6 +5028,7 @@ mod tests {
                 ("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()),
                 ("HOME".into(), dir.path().display().to_string()),
                 ("USERPROFILE".into(), dir.path().display().to_string()),
+                ("PI_AGENT_HOME".into(), dir.path().display().to_string()),
             ],
         });
         state.propose_path(&project);

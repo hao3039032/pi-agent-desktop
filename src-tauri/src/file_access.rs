@@ -52,6 +52,11 @@ impl AllowedRoots {
         }
     }
 
+    /// Snapshot of host-authorized roots for scoped management operations.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.roots.iter().cloned().collect()
+    }
+
     /// Lexical authorization: the path is inside a root by spelling (no
     /// filesystem access; `..` never escapes, separators normalize).
     pub fn is_path_allowed(&self, target: &Path) -> bool {
