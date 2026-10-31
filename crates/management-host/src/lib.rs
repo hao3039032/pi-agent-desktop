@@ -64,6 +64,19 @@ pub struct ManagementInstance {
 struct InstanceState {
     lease_until: Instant,
     last_used: Instant,
+    active: usize,
+    closing: bool,
+}
+
+struct Activity<'a>(&'a ManagementInstance);
+
+impl Drop for Activity<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.active -= 1;
+        state.last_used = Instant::now();
+        state.lease_until = state.last_used + IDLE_RECYCLE;
+    }
 }
 
 impl ManagementInstance {
@@ -78,6 +91,7 @@ impl ManagementInstance {
     /// PI_WEB_MGMT_V1 envelope with matching rid and the spawning nonce.
     pub fn management_call(&self, op: &str, args: Value, timeout: Duration) -> Result<Value, String> {
         use std::sync::mpsc;
+        let _activity = self.admit()?;
         let nonce = self.nonce.clone();
         let request_id = format!("call-{}", uuid::Uuid::new_v4());
         let payload = json!({ "op": op, "args": args, "nonce": nonce });
@@ -115,6 +129,25 @@ impl ManagementInstance {
         result
     }
 
+    fn admit(&self) -> Result<Activity<'_>, String> {
+        let mut state = self.state.lock().unwrap();
+        if state.closing || self.client.has_exited() {
+            return Err("management instance is closing".into());
+        }
+        state.active += 1;
+        Ok(Activity(self))
+    }
+
+    fn retire_if_expired(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if self.client.has_exited() || (!state.closing && state.active == 0 && state.lease_until <= Instant::now()) {
+            state.closing = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Take the lease (a login/install/test is running).
     pub fn lease(&self) {
         let mut state = self.state.lock().unwrap();
@@ -123,7 +156,8 @@ impl ManagementInstance {
 
     /// Whether this instance should be recycled now.
     pub fn is_expired(&self) -> bool {
-        self.state.lock().unwrap().lease_until <= Instant::now() || self.client.has_exited()
+        let state = self.state.lock().unwrap();
+        self.client.has_exited() || state.closing || (state.active == 0 && state.lease_until <= Instant::now())
     }
 
     /// Provider/model enumeration: the child's own registry, which includes
@@ -154,6 +188,7 @@ impl ManagementInstance {
 
     /// Orderly shutdown.
     pub fn shutdown(&self, grace: Duration) -> Option<i32> {
+        self.state.lock().unwrap().closing = true;
         self.client.close(grace)
     }
 
@@ -181,6 +216,7 @@ pub struct ManagementHost {
     /// without it, two concurrent `instance()` calls for one scope both
     /// spawn a child and one becomes an orphan that is never recycled.
     start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ManagementHost {
@@ -194,6 +230,7 @@ impl ManagementHost {
         Self {
             instances: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -205,6 +242,9 @@ impl ManagementHost {
         config: &ManagementSpawnConfig,
     ) -> Result<Arc<ManagementInstance>, String> {
         let scope = canonical_scope(scope);
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("management host is shutting down".into());
+        }
         if let Some(existing) = self.live_instance(&scope) {
             return Ok(existing);
         }
@@ -218,34 +258,42 @@ impl ManagementHost {
             return Ok(existing);
         }
         let instance = spawn_management(&scope, config)?;
-        self.instances
-            .lock()
-            .unwrap()
-            .insert(scope.clone(), Arc::clone(&instance));
+        let mut instances = self.instances.lock().unwrap();
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(instances);
+            instance.shutdown(Duration::from_secs(5));
+            return Err("management host is shutting down".into());
+        }
+        if let Some(old) = instances.insert(scope.clone(), Arc::clone(&instance)) {
+            drop(instances);
+            old.shutdown(Duration::from_secs(5));
+        }
         Ok(instance)
     }
 
     fn live_instance(&self, scope: &str) -> Option<Arc<ManagementInstance>> {
-        let instances = self.instances.lock().unwrap();
-        instances.get(scope).filter(|instance| !instance.is_expired()).cloned()
+        let mut instances = self.instances.lock().unwrap();
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) { return None; }
+        if let Some(instance) = instances.get(scope) {
+            if !instance.retire_if_expired() { return Some(Arc::clone(instance)); }
+        }
+        if let Some(old) = instances.remove(scope) {
+            drop(instances);
+            old.shutdown(Duration::from_secs(5));
+        }
+        None
     }
 
     /// Recycle expired instances; returns the recycled scopes.
     pub fn recycle_expired(&self) -> Vec<String> {
-        let expired: Vec<String> = {
-            let instances = self.instances.lock().unwrap();
-            instances
-                .iter()
-                .filter(|(_, instance)| instance.is_expired())
-                .map(|(scope, _)| scope.clone())
-                .collect()
+        let removed = {
+            let mut instances = self.instances.lock().unwrap();
+            let scopes: Vec<_> = instances.iter().filter(|(_, instance)| instance.retire_if_expired())
+                .map(|(scope, _)| scope.clone()).collect();
+            scopes.into_iter().filter_map(|scope| instances.remove(&scope).map(|instance| (scope, instance))).collect::<Vec<_>>()
         };
-        for scope in &expired {
-            if let Some(instance) = self.instances.lock().unwrap().remove(scope) {
-                instance.shutdown(Duration::from_secs(5));
-            }
-        }
-        expired
+        for (_, instance) in &removed { instance.shutdown(Duration::from_secs(5)); }
+        removed.into_iter().map(|(scope, _)| scope).collect()
     }
 
     /// Live scopes (diagnostics/tests).
@@ -265,8 +313,12 @@ impl ManagementHost {
     /// exit only until its 60 s recycle timer — and nothing recycles when the
     /// process is about to die.
     pub fn shutdown_all(&self, grace: Duration) {
-        let instances: Vec<Arc<ManagementInstance>> =
-            self.instances.lock().unwrap().drain().map(|(_, value)| value).collect();
+        let instances: Vec<Arc<ManagementInstance>> = {
+            let mut instances = self.instances.lock().unwrap();
+            self.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+            for instance in instances.values() { instance.state.lock().unwrap().closing = true; }
+            instances.drain().map(|(_, value)| value).collect()
+        };
         for instance in instances {
             instance.shutdown(grace);
         }
@@ -375,6 +427,8 @@ fn spawn_management(
         state: Mutex::new(InstanceState {
             lease_until: Instant::now() + IDLE_RECYCLE,
             last_used: Instant::now(),
+            active: 0,
+            closing: false,
         }),
     }))
 }
@@ -607,13 +661,21 @@ export default function managementFixture(pi) {
             "management instances write no session files"
         );
 
-        // Recycle: expire the project instance; global holds via lease.
+        // An admitted operation excludes recycle even past the idle deadline.
+        let activity = project.admit().unwrap();
         project.expire_for_tests();
+        assert!(host.recycle_expired().is_empty());
+        drop(activity);
+        project.expire_for_tests();
+        // Recycle: expire the project instance; global holds via lease.
         global.lease();
         let recycled = host.recycle_expired();
         assert_eq!(recycled, vec!["/tmp/some-project".to_string()]);
         assert_eq!(host.scopes(), vec!["global".to_string()]);
+        assert!(project.admit().is_err(), "retired handles cannot admit work");
         host.recycle_expired_all_for_tests();
+        assert!(global.admit().is_err());
+        assert!(host.instance("global", &config).is_err());
     }
 
     #[test]
