@@ -24,6 +24,7 @@ import { bindModelsConfigService } from "./data/models-config-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
+import { bindScheduledTasksClient } from "./data/scheduled-tasks-client.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
 import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
@@ -46,6 +47,7 @@ async function boot(): Promise<void> {
   bindWorkspaceService(client);
   bindDesktopConnection(client);
   bindScheduledTasksStore(client);
+  bindScheduledTasksClient(client);
   bindProjectTrustClient(client);
   bindStateMirrorClient(client);
   // The transition mirror imports BEFORE React mounts (plan §七.4): the

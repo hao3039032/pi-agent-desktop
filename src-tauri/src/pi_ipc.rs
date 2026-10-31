@@ -1452,6 +1452,12 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
+        "tasks.previewCron" => {
+            match management_call(state, "tasks.previewCron", args.clone()) {
+                Ok(preview) => protocol_ok(&id, preview),
+                Err(error) => protocol_error(&id, &error.0, &error.1),
+            }
+        }
         "tasks.list" => {
             let agent_dir = state
                 .task_agent_dir
