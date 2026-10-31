@@ -126,7 +126,6 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         }
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
-            if subagent_parent.is_some() { return Err(error("not_supported", "Subagent deletion requires the full cascade operation.")); }
             target_cwd = cwd.clone();
             target = Some((file.clone(), reader.into_inner()));
         }
@@ -298,6 +297,18 @@ mod tests {
         let result = super::delete(&state, &json!({"session":"child","trashChatFolder":true})).unwrap();
         assert_eq!(result["folderTrashed"], false);
         assert!(parent.exists() && chat.join("kept.txt").exists());
+        assert!(!child.exists());
+    }
+    #[test]
+    fn deletes_an_offline_leaf_subagent_without_touching_its_parent() {
+        let (_dir, state, root) = fixture();
+        let parent = session(&root, "parent", None);
+        let child = session(&root, "sub", None);
+        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"parent"}});
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&child).unwrap(), "{marker}").unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"sub"})).unwrap()["ok"], true);
+        assert!(parent.exists());
         assert!(!child.exists());
     }
     #[test]
