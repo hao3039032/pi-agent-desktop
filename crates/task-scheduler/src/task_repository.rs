@@ -12,7 +12,7 @@ fn valid_id(id: &str) -> bool {
     })
 }
 
-fn is_task(value: &Value) -> bool {
+pub fn is_task(value: &Value) -> bool {
     value.get("id").and_then(Value::as_str).is_some_and(valid_id)
         && ["name", "prompt", "cwd"].iter().all(|key| value.get(key).is_some_and(Value::is_string))
         && value.get("schedule").is_some_and(Value::is_object)

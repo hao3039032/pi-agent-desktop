@@ -2,10 +2,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use serde_json::Value;
-use task_scheduler::task_repository::TaskRepository;
+use task_scheduler::task_repository::is_task;
 
 #[derive(Debug)]
 pub struct IndexError(pub String);
+impl std::fmt::Display for IndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for IndexError {}
 
 pub struct ScheduledSessionIndex {
     referenced: HashSet<String>,
@@ -21,8 +25,21 @@ fn valid_id(id: &str) -> bool {
 
 impl ScheduledSessionIndex {
     pub fn load(agent_dir: &Path) -> Result<Self, IndexError> {
-        let tasks = TaskRepository::new(agent_dir).list().map_err(IndexError)?;
-        let existing: HashSet<String> = tasks.iter().filter_map(|task| task["id"].as_str().map(str::to_string)).collect();
+        let task_file = agent_dir.join("scheduled-tasks.json");
+        let existing: HashSet<String> = match std::fs::read_to_string(task_file) {
+            Ok(content) => {
+                let root: Value = serde_json::from_str(&content).map_err(|e| IndexError(e.to_string()))?;
+                let object = root.as_object().ok_or_else(|| IndexError("Invalid scheduled tasks file: expected object".into()))?;
+                if object.get("tasks").is_some_and(|tasks| !tasks.is_array()) {
+                    return Err(IndexError("Invalid scheduled tasks file: tasks is not an array".into()));
+                }
+                object.get("tasks").and_then(Value::as_array).into_iter().flatten()
+                    .filter(|task| is_task(task))
+                    .filter_map(|task| task["id"].as_str().map(str::to_string)).collect()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(error) => return Err(IndexError(error.to_string())),
+        };
         let mut result = Self { referenced: HashSet::new(), hidden: HashSet::new(), relations: HashMap::new() };
         let directory = agent_dir.join("scheduled-tasks/runs");
         let entries = match std::fs::read_dir(&directory) {
@@ -80,6 +97,8 @@ mod tests {
         assert!(!index.hidden_session_ids().contains("orphan"));
         assert_eq!(index.relation("running"), Some((id, "r1")));
         std::fs::write(dir.path().join("scheduled-tasks.json"), "{broken").unwrap();
+        assert!(ScheduledSessionIndex::load(dir.path()).is_err());
+        std::fs::write(dir.path().join("scheduled-tasks.json"), "{\"tasks\":17}").unwrap();
         assert!(ScheduledSessionIndex::load(dir.path()).is_err());
     }
 }
