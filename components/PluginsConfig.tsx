@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
+import { listPlugins } from "@/lib/plugins-client";
 import type {
   PluginPackageInfo,
   PluginStandaloneExtensionInfo,
@@ -615,9 +616,7 @@ export function PluginsConfig({
     setError(null);
     setGroupStatus(null);
     try {
-      const res = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
-      const next = (await res.json()) as PluginsResponse & { error?: string };
-      if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
+      const next = await listPlugins(cwd);
       setData(next);
       setAddMode((current) => (next.packages.length === 0 && next.standaloneExtensions.length === 0) || current);
       setSelected((current) => {
