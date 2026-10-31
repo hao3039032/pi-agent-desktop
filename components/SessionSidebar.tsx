@@ -7,6 +7,7 @@ import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { fetchHomeDirectory, fetchSessionList, subscribeRunningSessions } from "@/lib/session-list-service";
+import { listWorktrees, switchWorktreeBranch } from "@/lib/worktree-service";
 import { useI18n } from "@/hooks/useI18n";
 import { formatCompactRelativeTime, formatRelativeTime } from "@/lib/i18n/format";
 import { createPortal } from "react-dom";
@@ -918,8 +919,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       return;
     }
     let cancelled = false;
-    fetch(`/api/worktrees?cwd=${encodeURIComponent(selectedCwd)}`)
-      .then((r) => r.json())
+    listWorktrees(selectedCwd)
       .then((d: { projectRoot?: string; projectKey?: string; isGit?: boolean; isTopLevel?: boolean; currentWorktreePath?: string | null; worktrees?: WorktreeEntry[]; error?: string }) => {
         if (cancelled) return;
         if (d.error || !d.projectRoot) {
@@ -1106,14 +1106,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     worktreeActions.setError(null);
     let failure: string | null = null;
     try {
-      const res = await fetch("/api/worktrees", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, branch }),
-      });
-      const data = await res.json().catch(() => ({})) as { branch?: string; error?: string };
-      if (!res.ok || data.error || !data.branch) {
-        failure = data.error ?? `HTTP ${res.status}`;
+      const data = await switchWorktreeBranch(cwd, branch);
+      if (!data.branch) {
+        failure = "Branch switch returned no branch";
       } else {
         setSelectedCwd(cwd);
         closeProjectMenu();

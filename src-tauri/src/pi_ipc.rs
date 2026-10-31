@@ -1521,6 +1521,50 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // index scan, default-cwd layouts, later: dialog picks and validated
         // cwds) — there is deliberately NO frontend-facing allowRoot op: the
         // WebView must not be able to widen its own file access.
+        "git.status" | "git.diff" => {
+            let cwd = PathBuf::from(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
+            let path = PathBuf::from(args.get("path").and_then(Value::as_str).unwrap_or_default());
+            let roots = state.file_roots.lock().unwrap().clone();
+            if !roots.is_existing_path_allowed(&cwd)
+                || crate::worktrees::is_chat_area(&cwd, &state.agent_dir())
+                || (op == "git.diff" && (!roots.is_path_allowed(&path) || path.components().any(|c| matches!(c, std::path::Component::ParentDir)))) {
+                return protocol_error(&id, "unauthorized_scope", "Access denied");
+            }
+            let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            let result = if op == "git.status" { crate::git_changes::status(&roots, &cwd) } else { crate::git_changes::diff(&roots, &cwd, &path) };
+            match result { Ok(data) => protocol_ok(&id, data), Err(message) => protocol_error(&id, "io", &message) }
+        }
+        "worktrees.list" | "worktrees.create" | "worktrees.switch" | "worktrees.delete" | "worktrees.fetch" => {
+            let cwd = PathBuf::from(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
+            let roots = state.file_roots.lock().unwrap().clone();
+            let existing_allowed = roots.is_existing_path_allowed(&cwd);
+            let missing_candidate = op == "worktrees.list" && !cwd.exists() && roots.is_path_allowed(&cwd);
+            let target_is_chat = op == "worktrees.delete" && args.get("path").and_then(Value::as_str)
+                .is_some_and(|path| crate::worktrees::is_chat_area(Path::new(path), &state.agent_dir()));
+            if (!existing_allowed && !missing_candidate) || crate::worktrees::is_chat_area(&cwd, &state.agent_dir()) || target_is_chat
+            {
+                return protocol_error(&id, "unauthorized_scope", "Access denied");
+            }
+            let project = if existing_allowed {
+                match crate::worktrees::project(&cwd) { Ok(project) => project, Err(message) => return protocol_error(&id, "io", &message) }
+            } else { state.projects.resolve(&cwd) };
+            if !existing_allowed && (!project.is_worktree || !roots.is_existing_path_allowed(&project.project_root)) {
+                return protocol_error(&id, "unauthorized_scope", "Access denied");
+            }
+            match crate::worktrees::execute(op, &cwd, &args, &project) {
+                Ok((data, grants)) => {
+                    for path in grants {
+                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) { state.propose_path(&path); }
+                    }
+                    if matches!(op, "worktrees.create" | "worktrees.switch" | "worktrees.delete") { state.projects.invalidate(); }
+                    protocol_ok(&id, data)
+                }
+                Err(message) => {
+                    let dirty = op == "worktrees.delete" && ["contains modified or untracked files", "is dirty", "containing submodules"].iter().any(|part| message.to_lowercase().contains(part));
+                    protocol_error_value(&id, json!({"code":"io", "message":message, "retryable":false, "details":{"dirty":dirty}}))
+                }
+            }
+        }
         "files.list" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             let directory = PathBuf::from(path);
@@ -3378,6 +3422,26 @@ mod tests {
 
     fn send(state: &IpcHostState, request: Value) -> Value {
         dispatch_envelope(state, request)
+    }
+
+    #[test]
+    fn git_and_worktrees_refuse_ungranted_and_chat_paths() {
+        let state = state();
+        let temp = tempfile::tempdir().unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(temp.path().join("agent"));
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let chat = temp.path().join("agent/chats/chat/subdir");
+        std::fs::create_dir_all(&chat).unwrap();
+        for op in ["git.status", "worktrees.list", "worktrees.fetch"] {
+            let result = send(&state, json!({"v":1,"id":"denied","op":op,"args":{"cwd":outside}}));
+            assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
+        }
+        state.propose_path(&chat);
+        for op in ["git.status", "worktrees.list", "worktrees.fetch"] {
+            let result = send(&state, json!({"v":1,"id":"chat","op":op,"args":{"cwd":chat}}));
+            assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
+        }
     }
 
     #[test]

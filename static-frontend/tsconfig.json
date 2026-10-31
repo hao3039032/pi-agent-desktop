@@ -70,6 +70,12 @@
       "@/lib/enabled-models-service": [
         "./static-frontend/src/data/enabled-models-service.ts"
       ],
+      "@/lib/git-status-service": [
+        "./static-frontend/src/data/git-status-service.ts"
+      ],
+      "@/lib/worktree-service": [
+        "./static-frontend/src/data/worktree-service.ts"
+      ],
       "@/lib/models-config-service": [
         "./static-frontend/src/data/models-config-service.ts"
       ]

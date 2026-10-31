@@ -312,7 +312,7 @@ fn openat_directory_no_follow_by_path(path: &Path) -> std::io::Result<std::fs::F
 /// Open one DIRECTORY component beneath `parent`, refusing a component that
 /// is a symlink (O_NOFOLLOW: ELOOP) — the beneath-walk's every step.
 #[cfg(unix)]
-fn openat_directory_no_follow(
+pub(crate) fn openat_directory_no_follow(
     parent: &std::fs::File,
     name: &str,
 ) -> std::io::Result<std::fs::File> {
