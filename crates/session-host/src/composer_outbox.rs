@@ -270,6 +270,7 @@ impl OutboxState {
 impl Session {
     /// `queue_composer` (a host-level command): enqueue, notify, wake.
     pub fn composer_enqueue(self: &Arc<Self>, message: &str, images: Option<Value>) -> Result<Value, String> {
+        let _policy = self.policy_gate.try_read().map_err(|_| "session policy change is in progress".to_string())?;
         let _admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
         let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
@@ -300,6 +301,7 @@ impl Session {
     /// may already be running) is parked with the unknown marker — never
     /// silently re-delivered.
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
+        let policy = self.policy_gate.try_read().map_err(|_| "session policy change is in progress".to_string())?;
         let admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
         let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
@@ -308,7 +310,7 @@ impl Session {
             return Ok(self.composer_answer(None));
         };
         self.emit_composer_update();
-        match self.deliver_composer(&item, "steer", admission) {
+        match self.deliver_composer(&item, "steer", admission, policy) {
             Ok(()) => Ok(self.composer_answer(None)),
             Err(error) => {
                 match error.kind {
@@ -352,6 +354,7 @@ impl Session {
         item: &PendingComposerMessage,
         behavior: &str,
         admission: std::sync::RwLockReadGuard<'_, ()>,
+        policy: std::sync::RwLockReadGuard<'_, ()>,
     ) -> Result<(), pi_host::PiRpcError> {
         let mut payload = json!({ "message": item.message, "streamingBehavior": behavior });
         if let Some(images) = item.images.as_ref().and_then(Value::as_array).filter(|items| !items.is_empty()) {
@@ -360,6 +363,7 @@ impl Session {
         let epoch_at_send = self.machine.lock().unwrap().epoch();
         let response = self.client.command("prompt", payload, Some(std::time::Duration::from_secs(120)))?;
         drop(admission);
+        drop(policy);
         let disposition = match response.get("disposition").and_then(Value::as_str) {
             Some("queued") => "queued",
             Some("handled") => "handled",
@@ -457,6 +461,10 @@ impl Session {
                 // same call fences this drain once its session was replaced:
                 // a drain parked between its alive-check and its claim must
                 // not take the replacement's queue (Terra round-4).
+                let policy = match self.policy_gate.try_read() {
+                    Ok(guard) => guard,
+                    Err(_) => { std::thread::sleep(std::time::Duration::from_millis(20)); continue; }
+                };
                 let admission = self.activity_gate.read().unwrap();
                 if self.client.has_exited() { break; }
                 let _delivery = self.composer_outbox.delivery_guard();
@@ -467,7 +475,7 @@ impl Session {
                     break;
                 };
                 self.emit_composer_update();
-                if let Err(error) = self.deliver_composer(&item, "followUp", admission) {
+                if let Err(error) = self.deliver_composer(&item, "followUp", admission, policy) {
                     // The delivery's result is about to land on the shared
                     // outbox (restore or park) — the deterministic seam for
                     // the replacement interleavings: a drain whose child died

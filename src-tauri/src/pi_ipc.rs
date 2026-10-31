@@ -32,6 +32,8 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// outlive the request that opened them.
 pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
+    /// Global policy transaction gate shared with session admission and drains.
+    pub(crate) policy_gate: Arc<std::sync::RwLock<()>>,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -62,6 +64,7 @@ pub struct IpcHostState {
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
+    mcp_signin_tasks: Mutex<BTreeSet<String>>,
     /// The scheduled-task store root (the agent dir the host runs against).
     pub task_agent_dir: Mutex<Option<PathBuf>>,
     pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
@@ -119,8 +122,10 @@ struct EventRelayHandle {
 impl IpcHostState {
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
+        let policy_gate = Arc::new(std::sync::RwLock::new(()));
         Self {
-            registry: Arc::new(SessionRegistry::new()),
+            registry: Arc::new(SessionRegistry::with_policy_gate(Arc::clone(&policy_gate))),
+            policy_gate,
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -133,6 +138,7 @@ impl IpcHostState {
             terminal_test_shell: Mutex::new(None),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
+            mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir: Mutex::new(None),
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
             scheduler_loop: Mutex::new(None),
@@ -1313,6 +1319,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             protocol_ok(&id, status)
         }
         "trust.set" => {
+            let _policy = match state.policy_gate.try_write() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session admission is in progress"),
+            };
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
                 return protocol_error(&id, "invalid_params", "trust.set needs a cwd");
             };
@@ -1913,6 +1923,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
         }
         // --- MCP management (M3) ---
+        "mcp.signInStart" | "mcp.signInStatus" | "mcp.signInSubmit" | "mcp.signInCancel" => {
+            mcp_signin_dispatch(state, op, &id, &args)
+        }
         "mcp.test" => {
             let Some(body) = args.as_object() else { return protocol_error(&id, "invalid_args", "Expected an MCP test object"); };
             if body.keys().any(|key| !["scope", "name", "cwd"].contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
@@ -2364,6 +2377,109 @@ pub(crate) fn management_call(
         .map_err(|error| ("management_unavailable".to_string(), error))?;
     if op == "modelsConfig.put" { return management_serial_call(state, op, args); }
     instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
+}
+
+fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Value {
+    let Some(config) = state.management_config.lock().unwrap().clone() else {
+        return protocol_error(id, "management_unavailable", "Management instance is not configured");
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => return protocol_error(id, "management_unavailable", &error),
+    };
+    if op == "mcp.signInStart" {
+        let Some(body) = args.as_object() else { return protocol_error(id, "invalid_args", "Expected a sign-in object"); };
+        if body.keys().any(|key| !["scope", "name", "cwd"].contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
+            return protocol_error(id, "invalid_args", "Invalid sign-in fields");
+        }
+        if let Some(cwd) = args.get("cwd").and_then(Value::as_str) {
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return mcp_cwd_error(id, &error); }
+        }
+        let Some(scope) = args.get("scope").and_then(Value::as_str).filter(|v| *v == "global" || *v == "project") else { return protocol_error(id, "invalid_args", "Invalid MCP scope"); };
+        let Some(name) = args.get("name").and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 1024) else { return protocol_error(id, "invalid_args", "Invalid MCP server name"); };
+        let mut payload = args.clone();
+        payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
+        payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+        let handle = match instance.start_task("mcp.signInStart", payload, Duration::from_secs(600), management_host::TaskKind::Mutation) {
+            Ok(handle) => handle,
+            Err(error) => return protocol_error(id, "io", &error),
+        };
+        {
+            let mut handles = state.mcp_signin_tasks.lock().unwrap();
+            handles.retain(|handle| instance.task_snapshot(handle).is_ok());
+            handles.insert(handle.clone());
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match instance.task_snapshot(&handle) {
+                Ok(snapshot) => {
+                    if snapshot.status == management_host::TaskStatus::Unknown {
+                        return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown"));
+                    }
+                    if let Some(flow) = snapshot.result.or(snapshot.progress) { return mcp_signin_flow_response(id, &handle, flow); }
+                    if matches!(snapshot.status, management_host::TaskStatus::Failed | management_host::TaskStatus::Cancelled) {
+                        return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown"));
+                    }
+                }
+                Err(error) => return protocol_error(id, "io", &error),
+            }
+            if std::time::Instant::now() >= until {
+                return protocol_ok(id, json!({"flowId":handle, "phase":"starting", "scope":scope, "name":name, "expiresInMs":300000}));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let Some(body) = args.as_object() else { return protocol_error(id, "invalid_args", "Expected sign-in control fields"); };
+    let allowed: &[&str] = if op == "mcp.signInSubmit" { &["flowId", "redirectUrl"] } else { &["flowId"] };
+    if body.keys().any(|key| !allowed.contains(&key.as_str())) { return protocol_error(id, "invalid_args", "Invalid sign-in control fields"); }
+    let Some(handle) = args.get("flowId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 100) else {
+        return protocol_error(id, "invalid_args", "A sign-in flowId is required");
+    };
+    if !state.mcp_signin_tasks.lock().unwrap().contains(handle) {
+        return protocol_error_value(id, json!({"code":"not_found", "message":"No sign-in has that id", "reason":"sign-in-unknown", "retryable":false}));
+    }
+    if op == "mcp.signInStatus" {
+        return match instance.task_snapshot(handle) {
+            Ok(snapshot) => {
+                if snapshot.status == management_host::TaskStatus::Unknown {
+                    return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown; retry status"));
+                }
+                match snapshot.result.or(snapshot.progress) {
+                    Some(flow) => mcp_signin_flow_response(id, handle, flow),
+                    None => protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in status unavailable")),
+                }
+            },
+            Err(_) => protocol_error_value(id, json!({"code":"not_found", "message":"No sign-in has that id", "reason":"sign-in-unknown", "retryable":false})),
+        };
+    }
+    let input = if op == "mcp.signInSubmit" {
+        let Some(redirect) = args.get("redirectUrl").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 3500) else {
+            return protocol_error(id, "invalid_args", "Invalid redirect address");
+        };
+        json!({"action":"submit", "redirectUrl":redirect})
+    } else { json!({"action":"cancel"}) };
+    match instance.submit_task_input(handle, input) {
+        Ok(flow) => mcp_signin_flow_response(id, handle, flow),
+        Err(error) => {
+            if op == "mcp.signInCancel" {
+                if let Ok(snapshot) = instance.task_snapshot(handle) {
+                    if snapshot.status == management_host::TaskStatus::Succeeded {
+                        if let Some(flow) = snapshot.result { return mcp_signin_flow_response(id, handle, flow); }
+                    }
+                }
+            }
+            protocol_error(id, "io", &error)
+        }
+    }
+}
+
+fn mcp_signin_flow_response(id: &str, handle: &str, mut flow: Value) -> Value {
+    if flow.get("mcpRefusal").is_some() { return mcp_management_response(id, flow); }
+    if !flow.is_object() || flow.get("phase").and_then(Value::as_str).is_none() {
+        return protocol_error(id, "io", "Invalid MCP sign-in response");
+    }
+    flow["flowId"] = json!(handle);
+    protocol_ok(id, flow)
 }
 
 fn mcp_cwd_error(id: &str, error: &(String, String)) -> Value {
@@ -3275,6 +3391,10 @@ pub(crate) fn create_session(
     state: &IpcHostState,
     args: &Value,
 ) -> Result<Value, (String, String, Option<Value>)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| (
+        "busy".to_string(), "Session policy change is in progress".to_string(),
+        (command_type(args).as_deref() == Some("prompt")).then(|| json!({ "code": "prompt_rejected", "accepted": false })),
+    ))?;
     let invalid = |message: &str, command_type: Option<&str>| -> (String, String, Option<Value>) {
         let rejected = command_type == Some("prompt");
         (
@@ -4014,6 +4134,12 @@ pub(crate) fn dispatch_with_resume(
     op: &str,
     args: &Value,
 ) -> Result<Value, (String, String)> {
+    // Stop remains available during a policy change, but never cold-starts a child.
+    if op == "agent.interrupt" || (op == "agent.command" && matches!(args.get("type").and_then(Value::as_str), Some("abort" | "abort_bash" | "abort_retry"))) {
+        return session_host::dispatch_session_op(&state.registry, op, args, None)
+            .map_err(|error| (error.code().to_string(), error.to_string()));
+    }
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".to_string(), "Session policy change is in progress".to_string()))?;
     let base = state.spawn_base.lock().unwrap().clone();
     let agent_dir = state.agent_dir();
     let Some(base) = base else {
@@ -5933,6 +6059,87 @@ mod tests {
         assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
         assert_eq!(state.management.scopes(), vec!["global".to_string()]);
         state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_pi_mcp_oauth_through_ipc() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let mut fixture = Fixture(Command::new("node").arg("../scripts/migration/mcp-oauth-fixture.mjs").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut url = String::new();
+        BufReader::new(fixture.0.stdout.take().unwrap()).read_line(&mut url).unwrap();
+        let url = url.trim();
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
+        assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"cancel":{"url":url},"signout":{"url":url}}}).to_string()).unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent.clone()),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
+        });
+        let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let start = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
+        assert_eq!(start["ok"], true, "{start}");
+        let handle = start["data"]["flowId"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let waiting = loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            assert_eq!(status["ok"], true, "{status}");
+            if status["data"]["phase"] == "authorize" { break status; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let page = waiting["data"]["authorizationUrl"].as_str().unwrap();
+        let result = Command::new("node").arg("-e").arg("fetch(process.argv[1],{redirect:'manual'}).then(r=>console.log(r.headers.get('location'))) ").arg(page).output().unwrap();
+        assert!(result.status.success());
+        let redirect = String::from_utf8(result.stdout).unwrap();
+        let invalid = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":"http://localhost/?code=x&state=wrong"}));
+        assert_eq!(invalid["error"]["reason"], "redirect-state-mismatch", "{invalid}");
+        let submitted = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":redirect.trim()}));
+        assert_eq!(submitted["ok"], true, "{submitted}");
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            assert_eq!(status["ok"], true, "{status}");
+            if status["data"]["phase"] == "done" { assert_eq!(status["data"]["result"]["state"], "connected", "{status}"); break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"fixture"}));
+        assert_eq!(out["data"]["signedOut"]["removed"], true, "{out}");
+        let start = call("mcp.signInStart", json!({"scope":"global","name":"cancel"}));
+        let cancelled = call("mcp.signInCancel", json!({"flowId":start["data"]["flowId"]}));
+        assert_eq!(cancelled["data"]["phase"], "cancelled", "{cancelled}");
+        let start = call("mcp.signInStart", json!({"scope":"global","name":"signout"}));
+        assert_eq!(start["ok"], true, "{start}");
+        let handle = start["data"]["flowId"].as_str().unwrap();
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            if status["data"]["phase"] == "authorize" { break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let signout = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"signout"}));
+        assert_eq!(signout["ok"], true, "{signout}");
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            if status["data"]["phase"] == "cancelled" { break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        state.management.shutdown_all(Duration::from_secs(5));
     }
 
     /// The models domain over the REAL pi management instance (PI_CLI_BIN,
@@ -7940,6 +8147,44 @@ mod tests {
         );
 
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn policy_gate_blocks_real_admission_and_defers_background_delivery() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = dir.path().join("delivered");
+        std::fs::write(agent.join("extensions/fixture.js"), format!("export default function(pi) {{ pi.registerCommand('fixture-mark', {{ handler: async () => {{ require('fs').writeFileSync({:?}, 'yes'); }} }}); }}", marker.to_string_lossy())).unwrap();
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent);
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        let created = create_session(&state, &json!({"cwd":cwd,"type":"ensure_session"})).unwrap();
+        let sid = created["sessionId"].as_str().unwrap();
+        let session = state.registry.get(sid).unwrap();
+        let policy = state.policy_gate.try_write().unwrap();
+        assert_eq!(create_session(&state, &json!({"cwd":cwd,"type":"ensure_session"})).unwrap_err().0, "busy");
+        assert_eq!(dispatch_with_resume(&state, "agent.command", &json!({"session":sid,"type":"get_state"})).unwrap_err().0, "busy");
+        assert!(dispatch_with_resume(&state, "agent.interrupt", &json!({"session":sid})).is_ok(), "Stop remains available");
+        assert!(session.command("prompt", json!({"message":"/fixture-mark"}), Some(Duration::from_secs(3))).is_err());
+        session.composer_outbox.enqueue("/fixture-mark", None).unwrap();
+        session.composer_wake();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!marker.exists(), "a parked drain must not send across policy exclusion");
+        assert!(session.composer_outbox.has_items());
+        drop(policy);
+        let admission = state.policy_gate.try_read().unwrap();
+        let trust = send(&state, json!({"v":1,"id":"trust-race","op":"trust.set","args":{"cwd":cwd}}));
+        assert_eq!(trust["error"]["code"], "busy", "{trust}");
+        drop(admission);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(marker.exists(), "deferred delivery resumes after policy unlock");
+        state.registry.remove(sid, Duration::from_secs(5));
     }
 
     /// The composer outbox (queue_composer / take / send) and the state

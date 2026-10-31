@@ -5,6 +5,7 @@ import {
   cancelMcpSignIn,
   createMcpSignInDeps,
   mcpOAuthUrl,
+  mcpSignInCompletion,
   pasteMcpSignInRedirect,
   readMcpSignIn,
   startMcpSignIn,
@@ -27,6 +28,12 @@ export async function startManagedMcpSignIn(options: { body: unknown; agentDir: 
 }
 
 const UNKNOWN = "No sign-in has that id: it ended over a minute ago, or Pi Web restarted";
+
+export function waitManagedMcpSignIn(flowId: string): Promise<void> {
+  const completion = mcpSignInCompletion(flowId);
+  if (!completion) throw new McpServiceError(404, "sign-in-unknown", UNKNOWN);
+  return completion;
+}
 
 export function readManagedMcpSignIn(flowId: string) {
   const flow = readMcpSignIn(flowId);

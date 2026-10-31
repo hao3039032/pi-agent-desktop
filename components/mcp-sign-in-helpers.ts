@@ -1,3 +1,4 @@
+import { requestMcpSignIn as serviceRequestMcpSignIn } from "@/lib/mcp-sign-in-client";
 import type {
   McpRefusalReason,
   McpResponse,
@@ -289,7 +290,13 @@ function isFlowInfo(value: unknown): value is McpSignInFlowInfo {
     && (flow.scope === "global" || flow.scope === "project") && typeof flow.expiresInMs === "number";
 }
 
+const DEFAULT_SIGN_IN_FETCH: FetchLike = (input, init) => fetch(input, init);
+
 async function requestSignIn(url: string, init: RequestInit, fetchImpl: FetchLike, signal: AbortSignal): Promise<McpSignInRequestResult> {
+  if (fetchImpl === DEFAULT_SIGN_IN_FETCH) {
+    const result = await serviceRequestMcpSignIn(url, init, signal);
+    return result.ok && !isFlowInfo(result.data) ? { ok: false, error: { error: "Unexpected sign-in response" } } : result;
+  }
   let response: Awaited<ReturnType<FetchLike>>;
   try {
     response = await fetchImpl(url, { ...init, cache: "no-store", signal });
@@ -342,7 +349,7 @@ function flowUrl(flowId: string): string {
 export function postMcpSignIn(
   server: McpServerRef,
   cwd: string | null,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_SIGN_IN_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_SIGN_IN_REQUEST_TIMEOUT_MS,
 ): Promise<McpSignInRequestResult> {
@@ -356,7 +363,7 @@ export function postMcpSignIn(
 /** Where a sign-in stands; aborting the poll changes nothing on the server. */
 export function getMcpSignIn(
   flowId: string,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_SIGN_IN_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_SIGN_IN_REQUEST_TIMEOUT_MS,
 ): Promise<McpSignInRequestResult> {
@@ -367,7 +374,7 @@ export function getMcpSignIn(
 export function pasteMcpSignIn(
   flowId: string,
   redirectUrl: string,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_SIGN_IN_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_SIGN_IN_REQUEST_TIMEOUT_MS,
 ): Promise<McpSignInRequestResult> {
@@ -381,7 +388,7 @@ export function pasteMcpSignIn(
 /** Cancels a sign-in. */
 export function cancelMcpSignInFlow(
   flowId: string,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_SIGN_IN_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_SIGN_IN_REQUEST_TIMEOUT_MS,
 ): Promise<McpSignInRequestResult> {
