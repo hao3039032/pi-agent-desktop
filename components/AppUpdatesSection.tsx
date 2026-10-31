@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { AppComponentReleaseInfo, AppUpdatesResponse } from "@/lib/app-update-types";
+import type { AppComponentReleaseInfo } from "@/lib/app-update-types";
+import { checkAppUpdates } from "@/lib/update-service";
 import {
   APP_DISTRIBUTION_NAME,
   APP_RELEASES_URL,
@@ -36,11 +37,7 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch("/api/updates?refresh=1", { cache: "no-store", signal: controller.signal })
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json() as Promise<AppUpdatesResponse>;
-      })
+    checkAppUpdates({ refresh: true, signal: controller.signal })
       .then((data) => {
         setComponents(Array.isArray(data.components) ? data.components : []);
         setLoadError(null);

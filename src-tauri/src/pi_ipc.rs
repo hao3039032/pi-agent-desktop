@@ -1718,6 +1718,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // (readRedactedModelsConfig), so a stored literal apiKey can never
         // reach the frontend. No cwd scope — models.json is a global file
         // read, like the route's bare GET.
+        "updates.check" => {
+            let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+            match crate::update_check::check(&state.agent_dir(), refresh) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(message) => protocol_error(&id, "io", &message),
+            }
+        },
         "distro.status" => match management_call(state, "distro.status", json!({})) {
             Ok(status) => protocol_ok(&id, status),
             Err((code, message)) => protocol_error(&id, &code, &message),

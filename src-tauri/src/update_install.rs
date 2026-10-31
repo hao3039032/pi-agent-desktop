@@ -187,7 +187,7 @@ fn normalize_mirror_host(value: &str) -> Option<String> {
 }
 
 /// Validated mirror origins in try order: trimmed, de-duplicated, capped.
-fn parse_mirrors(raw: Option<&str>) -> Vec<String> {
+pub(crate) fn parse_mirrors(raw: Option<&str>) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
     for part in raw.unwrap_or("").split(',') {
         let Some(host) = normalize_mirror_host(part) else {
@@ -203,7 +203,7 @@ fn parse_mirrors(raw: Option<&str>) -> Vec<String> {
     hosts
 }
 
-fn configured_mirrors() -> Vec<String> {
+pub(crate) fn configured_mirrors() -> Vec<String> {
     parse_mirrors(MIRRORS)
 }
 

@@ -48,6 +48,7 @@ mod scheduled_events;
 pub mod scheduled_session_index;
 mod shell;
 mod update_install;
+mod update_check;
 mod workspace_status;
 mod workspace_picker;
 
