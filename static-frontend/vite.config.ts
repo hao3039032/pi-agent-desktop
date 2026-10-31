@@ -131,6 +131,13 @@ export default defineConfig({
         find: /^@\/lib\/models-config-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-config-service.ts"),
       },
+      {
+        // The models-extras service swaps catalog presets, discovery, model
+        // test, nonchat models, catalog refresh and provider usage for
+        // typed IPC over pi_ipc.
+        find: /^@\/lib\/models-extras-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/models-extras-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

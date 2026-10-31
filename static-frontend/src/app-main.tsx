@@ -21,6 +21,7 @@ import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindEnabledModelsService } from "./data/enabled-models-service.ts";
 import { bindFileService } from "./data/file-service.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
+import { bindModelsExtrasService } from "./data/models-extras-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindProjectTrustClient } from "./data/project-trust-client.ts";
 import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
@@ -41,6 +42,7 @@ async function boot(): Promise<void> {
   bindModelsService(client);
   bindEnabledModelsService(client);
   bindModelsConfigService(client);
+  bindModelsExtrasService(client);
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);

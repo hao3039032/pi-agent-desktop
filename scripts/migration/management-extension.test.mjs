@@ -1120,3 +1120,190 @@ test(
     }
   },
 );
+
+/**
+ * M3: models extras (modelsConfig.catalog, modelsConfig.discover,
+ * modelsConfig.test, models.nonchat, models.refreshCatalog, models.providerUsage)
+ * over the management protocol inside a real pi process.
+ */
+test(
+  "the models-extras ops answer through the management protocol",
+  { skip: executable ? false : "PI_CLI_BIN not set" },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-web-mgmt-models-extras-"));
+    let client = null;
+    let fixtureServer = null;
+    try {
+      const cwd = join(root, "work");
+      const agentDir = join(root, "agent");
+      await mkdir(cwd, { recursive: true });
+      await mkdir(join(agentDir, "sessions"), { recursive: true });
+      await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: {} }), "utf8");
+
+      const managed = join(root, "managed", "node_modules");
+      await stageVendoredTree(managed);
+
+      const { createServer } = await import("node:http");
+      fixtureServer = createServer((req, res) => {
+        if (req.url.startsWith("/api.json")) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            openai: {
+              name: "OpenAI",
+              models: {
+                "gpt-4o-mini": { name: "GPT-4o mini", pricing: { input: 0.15, output: 0.6 } },
+              },
+            },
+          }));
+          return;
+        }
+        if (req.url.startsWith("/v1/models")) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            object: "list",
+            data: [{ id: "mock-model-1" }],
+          }));
+          return;
+        }
+        if (req.url.startsWith("/v1/chat/completions")) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
+          res.write('data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n');
+          res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+          res.write("data: [DONE]\n\n");
+          res.end();
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+
+      await new Promise((resolve) => fixtureServer.listen(0, "127.0.0.1", resolve));
+      const port = fixtureServer.address().port;
+
+      const nonce = "mgmt-nonce-models-extras";
+      client = new PiRpcClient(executable, {
+        cwd,
+        args: [
+          "--no-session",
+          "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
+          "--extension", join(HERE, "../../lib/pi-rpc/assets/pi-web-management.mjs"),
+        ],
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PI_WEB_MANAGED_MODULES: managed,
+          PI_WEB_MGMT_NONCE: nonce,
+          PI_MODELS_DEV_URL: `http://127.0.0.1:${port}/api.json`,
+        },
+        onLog: () => {},
+      });
+
+      const envelopes = [];
+      client.onUi("notify", (record) => {
+        if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) {
+          envelopes.push(JSON.parse(record.message.slice("PI_WEB_MGMT_V1 ".length)));
+        }
+        return undefined;
+      });
+      const call = async (op, args) => {
+        const requestId = `mgmt-${Math.random().toString(36).slice(2)}`;
+        const token = Buffer.from(JSON.stringify({ op, args, nonce }), "utf8").toString("base64url");
+        const ack = await client.command("prompt", { message: `/pi-web:mgmt ${requestId} ${token}` }, 120_000);
+        assert.equal(ack?.disposition, "handled", `the child consumed the command (${op})`);
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+          const envelope = envelopes.find((entry) => entry.rid === requestId);
+          if (envelope) {
+            envelopes.splice(envelopes.indexOf(envelope), 1);
+            return envelope;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error(`management op ${op} never answered`);
+      };
+
+      // 1. sys.capabilities lists the new ops
+      const caps = await call("sys.capabilities", {});
+      assert.equal(caps.ok, true);
+      for (const expectedOp of [
+        "modelsConfig.catalog",
+        "modelsConfig.discover",
+        "modelsConfig.test",
+        "models.nonchat",
+        "models.refreshCatalog",
+        "models.providerUsage",
+      ]) {
+        assert.ok(caps.result.ops.includes(expectedOp), `capabilities must include ${expectedOp}`);
+      }
+
+      // 2. modelsConfig.catalog returns presets
+      const catalog = await call("modelsConfig.catalog", { q: "mini", limit: 5 });
+      assert.equal(catalog.ok, true, JSON.stringify(catalog));
+      assert.ok(Array.isArray(catalog.result.models));
+
+      // 3. modelsConfig.discover
+      const badDiscover = await call("modelsConfig.discover", {});
+      assert.equal(badDiscover.ok, false);
+      assert.equal(badDiscover.code, "invalid_args");
+
+      const discover = await call("modelsConfig.discover", {
+        providerName: "mock-prov",
+        provider: {
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          api: "openai-completions",
+          apiKey: "token",
+        },
+      });
+      assert.equal(discover.ok, true, JSON.stringify(discover));
+      assert.equal(discover.result.models.length, 1);
+      assert.equal(discover.result.models[0].id, "mock-model-1");
+
+      // 4. modelsConfig.test
+      const badTest = await call("modelsConfig.test", {});
+      assert.equal(badTest.ok, false);
+      assert.equal(badTest.code, "invalid_args");
+
+      const testRes = await call("modelsConfig.test", {
+        providerName: "mock-prov",
+        provider: {
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          api: "openai-completions",
+          apiKey: "token",
+        },
+        model: { id: "mock-model-1" },
+      });
+      assert.equal(testRes.ok, true, JSON.stringify(testRes));
+      assert.equal(testRes.result.ok, true);
+      assert.equal(testRes.result.responseText, "OK");
+
+      // 5. models.nonchat
+      const nonchat = await call("models.nonchat", {});
+      assert.equal(nonchat.ok, true, JSON.stringify(nonchat));
+      assert.ok(Array.isArray(nonchat.result.classifier));
+      assert.ok(Array.isArray(nonchat.result.image));
+
+      // 6. models.refreshCatalog
+      const refresh = await call("models.refreshCatalog", {});
+      assert.equal(refresh.ok, true, JSON.stringify(refresh));
+      assert.equal(typeof refresh.result.completed, "boolean");
+
+      // 7. models.providerUsage
+      const badUsage = await call("models.providerUsage", {});
+      assert.equal(badUsage.ok, false);
+      assert.equal(badUsage.code, "invalid_args");
+
+      const usage = await call("models.providerUsage", { providerId: "deepseek" });
+      assert.equal(usage.ok, true, JSON.stringify(usage));
+      assert.equal(usage.result.providerId, "deepseek");
+    } finally {
+      if (fixtureServer) fixtureServer.close();
+      if (client) await client.close(5_000).catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+

@@ -1,4 +1,4 @@
-import { shareModelCatalogRefresh } from "@/lib/model-catalog-refresh";
+import { refreshProviderCatalogs } from "@/lib/models-extras-service.server";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +16,7 @@ export const dynamic = "force-dynamic";
 export async function POST(req: Request) {
   let provider: string | undefined;
   try {
-    const body = await req.json() as { provider?: unknown };
+    const body = (await req.json()) as { provider?: unknown };
     if (typeof body?.provider === "string" && body.provider.trim()) {
       provider = body.provider.trim();
     }
@@ -24,6 +24,6 @@ export async function POST(req: Request) {
     // An empty body means "every provider", the same as no provider field.
   }
 
-  const result = await shareModelCatalogRefresh(provider ? { providers: [provider] } : {});
+  const result = await refreshProviderCatalogs({ provider });
   return Response.json(result);
 }
