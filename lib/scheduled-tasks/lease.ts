@@ -38,13 +38,19 @@ export function isPidAlive(pid: number): boolean {
 }
 
 function readLease(path: string): Lease | null {
+  let content: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<Lease>;
-    if (typeof parsed.pid !== "number" || typeof parsed.heartbeatAt !== "string") return null;
-    return { pid: parsed.pid, startedAt: String(parsed.startedAt ?? parsed.heartbeatAt), heartbeatAt: parsed.heartbeatAt };
-  } catch {
-    return null;
+    content = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
   }
+  const parsed = JSON.parse(content) as Partial<Lease>;
+  if (!Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0 || typeof parsed.heartbeatAt !== "string"
+    || Number.isNaN(new Date(parsed.heartbeatAt).getTime())) {
+    throw new Error("Invalid scheduler lease");
+  }
+  return { pid: parsed.pid!, startedAt: String(parsed.startedAt ?? parsed.heartbeatAt), heartbeatAt: parsed.heartbeatAt };
 }
 
 /** Read the current owner without trying to acquire its lease. */

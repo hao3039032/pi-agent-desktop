@@ -69,7 +69,14 @@ pub fn release(agent_dir: &Path, pid: u32) -> Result<(), String> {
 
 fn read(path: &Path) -> Result<Option<Value>, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => Ok(serde_json::from_str(&text).ok()),
+        Ok(text) => {
+            let value: Value = serde_json::from_str(&text).map_err(|error| format!("invalid scheduler lease: {error}"))?;
+            if value.get("pid").and_then(Value::as_u64).is_none()
+                || value.get("heartbeatAt").and_then(Value::as_str).and_then(crate::store::iso_to_ms).is_none() {
+                return Err("invalid scheduler lease fields".into());
+            }
+            Ok(Some(value))
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
@@ -95,6 +102,17 @@ mod tests {
         let path = dir.path().join("scheduled-tasks/scheduler.lock");
         let stored: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(stored["pid"], if rust_won { 456 } else { 123 });
+    }
+
+    #[test]
+    fn damaged_lease_is_not_claimed_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("scheduled-tasks")).unwrap();
+        let path = dir.path().join("scheduled-tasks/scheduler.lock");
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(acquire(dir.path(), 456, 1000, |_| true).is_err());
+        assert!(release(dir.path(), 456).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{broken");
     }
 
     #[test]
