@@ -34,6 +34,8 @@ pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
     /// Global policy transaction gate shared with session admission and drains.
     pub(crate) policy_gate: Arc<std::sync::RwLock<()>>,
+    #[cfg(test)]
+    pub(crate) deletion_recovery_exclusive: std::sync::atomic::AtomicBool,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -120,6 +122,13 @@ struct EventRelayHandle {
 }
 
 impl IpcHostState {
+    pub(crate) fn deletion_recovery_permitted(&self) -> bool {
+        #[cfg(test)]
+        { return self.deletion_recovery_exclusive.load(std::sync::atomic::Ordering::SeqCst); }
+        #[cfg(not(test))]
+        { false }
+    }
+
     pub(crate) fn chat_unlock_permitted(&self) -> bool {
         self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
     }
@@ -151,6 +160,8 @@ impl IpcHostState {
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
+            #[cfg(test)]
+            deletion_recovery_exclusive: std::sync::atomic::AtomicBool::new(false),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1143,8 +1154,48 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // per-cwd scan with skipped-file reasons. `sessions.list` below is
         // the real GET /api/sessions (the inventory's name for it).
         "sessions.index" => {
+            let _policy = match state.policy_gate.try_read() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session policy change is in progress"),
+            };
             let agent_dir = state.agent_dir();
-            let index = session_host::scan_sessions(&agent_dir);
+            if crate::trust_policy_fence::is_pending(&agent_dir) {
+                return protocol_error(&id, "busy", "Trust policy outcome is unresolved");
+            }
+            let transaction = match task_scheduler::transaction_lock::TransactionLock::acquire(&agent_dir) {
+                Ok(lock) => lock,
+                Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
+            };
+            match std::fs::symlink_metadata(agent_dir.join("session-deletion-journal")) {
+                Ok(_) => {
+                    let root = match agent_dir.join("sessions").canonicalize() {
+                        Ok(root) => root,
+                        Err(error) => return protocol_error(&id, "io", &error.to_string()),
+                    };
+                    if let Err((code, message)) = crate::session_deletion_journal::recover(state, &root) {
+                        return protocol_error(&id, &code, &message);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return protocol_error(&id, "io", &error.to_string()),
+            }
+            let initial = session_host::scan_sessions(&agent_dir);
+            let mut identities: Vec<_> = initial.projects.values().flatten().map(|session| (session.file.clone(), session.id.clone())).collect();
+            identities.sort();
+            let ids: Vec<_> = identities.iter().map(|(_, id)| id.clone()).collect();
+            let index = match state.registry.with_session_snapshot_gates(&ids, || {
+                let index = session_host::scan_sessions(&agent_dir);
+                let mut current: Vec<_> = index.projects.values().flatten().map(|session| (session.file.clone(), session.id.clone())).collect();
+                current.sort();
+                if current != identities { return Err(("busy".to_string(), "Sessions changed during index scan".to_string())); }
+                Ok(index)
+            }) {
+                Ok(index) => index,
+                Err(session_host::SessionWriterError::Busy(message)) => return protocol_error(&id, "busy", message),
+                Err(session_host::SessionWriterError::Operation((code, message))) => return protocol_error(&id, &code, &message),
+            };
+            drop(transaction);
+            drop(_policy);
             // The /api/files semantics: session cwds (and the chat roots)
             // become browsable roots, derived host-side.
             for (cwd, _) in index.projects.iter() {
@@ -1165,7 +1216,14 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // completionNotificationSuppressedSessionIds, chatWorkspaceCwd,
         // sessionListVersion).
         "sessions.list" => {
+            let _policy = match state.policy_gate.try_read() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session policy change is in progress"),
+            };
             let agent_dir = state.agent_dir();
+            if crate::trust_policy_fence::is_pending(&agent_dir) {
+                return protocol_error(&id, "busy", "Trust policy outcome is unresolved");
+            }
             let transaction = match task_scheduler::transaction_lock::TransactionLock::acquire(&agent_dir) {
                 Ok(lock) => lock,
                 Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
@@ -1184,47 +1242,38 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => return protocol_error(&id, "io", &error.to_string()),
             }
             let files = session_host::list_session_files(&agent_dir);
-            // The parent-id map first (a fork's originSessionId resolves
-            // from ITS header, never a filename suffix).
-            let mut id_by_file: HashMap<String, String> = HashMap::new();
-            let mut scans: Vec<session_host::history::ScannedSession> = Vec::new();
-            for file in &files {
-                if let Some(scan) = session_host::scan_session_file_info(file) {
-                    if let Some(id) = session_host::history::read_header_id(file) {
-                        id_by_file.insert(key_of(file), id);
-                    }
+            // Discover ids first, then fence them in stable order and re-read
+            // every row: unknown Chat writers must not race the final scan.
+            let initial: Vec<_> = files.iter().filter_map(|file| session_host::scan_session_file_info(file)).collect();
+            let session_ids: Vec<_> = initial.iter().map(|scan| scan.id.clone()).collect();
+            let (scans, relations) = match state.registry.with_session_snapshot_gates(&session_ids, || {
+                let mut scans = Vec::with_capacity(initial.len());
+                for old in &initial {
+                    let scan = session_host::scan_session_file_info(&old.path)
+                        .ok_or_else(|| ("busy".to_string(), "Session changed during catalogue scan".to_string()))?;
+                    if scan.id != old.id { return Err(("busy".to_string(), "Session identity changed during catalogue scan".to_string())); }
                     scans.push(scan);
                 }
-            }
-            let mut relations = Vec::with_capacity(scans.len());
-            for scan in &scans {
-                let parent_id = scan
-                    .parent_session_path
-                    .as_deref()
-                    .map(Path::new)
-                    .and_then(|parent| id_by_file.get(&key_of(parent)).cloned());
-                // The subagent relation reads the file's bounded prefix/tail;
-                // a fork falls back to the parent link alone (the origin id
-                // present only when the parent file itself still resolves).
-                let relation = session_host::history::read_subagent_relation(&scan.path).or_else(|| {
-                    scan.parent_session_path.as_deref().map(|_| {
-                        json!({
-                            "kind": "fork",
-                            "originSessionId": parent_id.clone().map(Value::String).unwrap_or(Value::Null),
-                        })
-                    })
-                });
-                let relation = match relation {
-                    Some(value) if value.is_object() => Some(value),
-                    _ => None,
-                };
-                relations.push((parent_id, relation));
-            }
+                let id_by_file: HashMap<_, _> = scans.iter().map(|scan| (key_of(&scan.path), scan.id.clone())).collect();
+                let relations: Vec<_> = scans.iter().map(|scan| {
+                    let parent_id = scan.parent_session_path.as_deref().map(Path::new).and_then(|parent| id_by_file.get(&key_of(parent)).cloned());
+                    let relation = session_host::history::read_subagent_relation(&scan.path).or_else(|| {
+                        scan.parent_session_path.as_deref().map(|_| json!({"kind":"fork", "originSessionId":parent_id}))
+                    }).filter(Value::is_object);
+                    (parent_id, relation)
+                }).collect();
+                Ok::<_, (String, String)>((scans, relations))
+            }) {
+                Ok(result) => result,
+                Err(session_host::SessionWriterError::Busy(message)) => return protocol_error(&id, "busy", message),
+                Err(session_host::SessionWriterError::Operation((code, message))) => return protocol_error(&id, &code, &message),
+            };
             let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
                 Ok(index) => index,
                 Err(error) => return protocol_error(&id, "io", &error.0),
             };
             drop(transaction);
+            drop(_policy);
             let mut sessions: Vec<Value> = scans.iter().zip(relations).map(|(scan, (parent_id, relation))|
                 catalogue_info(state, &agent_dir, scan, parent_id, relation)).collect();
             // The running set the payload carries (the SSE stream's source).

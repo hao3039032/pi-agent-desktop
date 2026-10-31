@@ -80,7 +80,11 @@ fn snapshot(state: &IpcHostState) -> Result<SearchSnapshot, Failure> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     let start = std::time::Instant::now();
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
     let agent = state.agent_dir();
+    if crate::trust_policy_fence::is_pending(&agent) {
+        return Err(("busy".into(), "Trust policy outcome is unresolved".into()));
+    }
     let directory = tempfile::Builder::new().prefix("pi-session-search-").tempdir().map_err(io)?;
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
@@ -116,6 +120,8 @@ fn snapshot(state: &IpcHostState) -> Result<SearchSnapshot, Failure> {
         scans.push((scan, relation, handle, before));
     }
     scans.sort_by(|a, b| b.0.modified_ms.cmp(&a.0.modified_ms));
+    let session_ids: Vec<_> = scans.iter().map(|(scan, _, _, _)| scan.id.clone()).collect();
+    state.registry.with_session_snapshot_gates(&session_ids, || {
     let ids: HashMap<_, _> = scans.iter().map(|(scan, _, _, _)| (key_of(&scan.path), scan.id.clone())).collect();
     let mut candidates = Vec::new();
     let mut by_snapshot = HashMap::new();
@@ -142,6 +148,10 @@ fn snapshot(state: &IpcHostState) -> Result<SearchSnapshot, Failure> {
         by_snapshot.insert(key_of(&snapshot), (scan, parent_id, relation));
     }
     Ok(SearchSnapshot { _directory: directory, candidates, by_snapshot, truncated })
+    }).map_err(|error| match error {
+        session_host::SessionWriterError::Busy(message) => ("busy".into(), message.into()),
+        session_host::SessionWriterError::Operation(error) => error,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -178,7 +188,11 @@ pub(crate) fn search(state: &IpcHostState, args: &Value) -> Result<Value, Failur
     let query = args.get("query").and_then(Value::as_str).ok_or_else(|| ("invalid_args".into(), "query is required".into()))?.trim();
     if query.encode_utf16().count() > 200 { return Err(("invalid_args".into(), "Search query exceeds 200 characters".into())); }
     if query.is_empty() { return Ok(json!({"results": [], "truncated": false})); }
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
     let agent = state.agent_dir();
+    if crate::trust_policy_fence::is_pending(&agent) { return Err(("busy".into(), "Trust policy outcome is unresolved".into())); }
+    let transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
+        .map_err(|e| ("busy".into(), format!("Scheduler transaction unavailable: {e}")))?;
     let root = match agent.join("sessions").canonicalize() {
         Ok(root) => root,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
@@ -186,6 +200,8 @@ pub(crate) fn search(state: &IpcHostState, args: &Value) -> Result<Value, Failur
         Err(error) => return Err(io(error)),
     };
     crate::session_deletion_journal::recover(state, &root)?;
+    drop(transaction);
+    drop(_policy);
     let mut scans: Vec<_> = session_host::list_session_files(&agent).iter()
         .filter_map(|file| session_file_within_root(file, &root))
         .filter_map(|file| session_host::scan_session_file_info(&file)).collect();
@@ -271,6 +287,25 @@ mod tests {
         }).unwrap_err();
         assert_eq!(error.0, "timeout");
         assert!(!saved.borrow().exists());
+    }
+    #[test]
+    fn snapshot_rejects_policy_and_unresolved_session_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions/p"); std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("a.jsonl");
+        std::fs::write(&file, "{\"type\":\"session\",\"id\":\"a\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n").unwrap();
+        let state = IpcHostState::new(); *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let policy = state.policy_gate.try_write().unwrap();
+        assert_eq!(snapshot(&state).err().unwrap().0, "busy");
+        drop(policy);
+        crate::session_writer_fence::begin(dir.path(), "a", "op", "chat", &file, None).unwrap();
+        assert_eq!(snapshot(&state).err().unwrap().0, "busy");
+        for op in ["sessions.index", "sessions.list"] {
+            let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"test","op":op,"args":{}}));
+            assert_eq!(response["error"]["code"], "busy", "{op}: {response}");
+        }
+        crate::session_writer_fence::finish(dir.path(), "a", "op").unwrap();
+        assert!(snapshot(&state).is_ok());
     }
     #[test]
     fn snapshot_limits_are_explicit_and_candidate_cap_sets_truncated() {

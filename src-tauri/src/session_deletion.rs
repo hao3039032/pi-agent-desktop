@@ -44,7 +44,11 @@ impl ScheduledReferences for crate::scheduled_session_index::ScheduledSessionInd
 }
 
 pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| error("busy", "Session policy change is in progress"))?;
     let agent = state.agent_dir();
+    if crate::trust_policy_fence::is_pending(&agent) {
+        return Err(error("busy", "Trust policy outcome is unresolved"));
+    }
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
     let root = agent.join("sessions").canonicalize().map_err(|e| error("io", e))?;
@@ -55,7 +59,7 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
 }
 
 
-pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences) -> Result<Value, (String, String)> {
+fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences) -> Result<Value, (String, String)> {
     let id = args.get("session").and_then(Value::as_str).filter(|v| !v.is_empty())
         .ok_or_else(|| error("invalid_args", "session is required"))?;
     if args.get("trashChatFolder").is_some_and(|v| !v.is_boolean()) {
@@ -64,7 +68,7 @@ pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &
     if args.get("trashChatFolder").and_then(Value::as_bool) == Some(true) {
         return Err(error("not_supported", "Deleting a chat folder requires recoverable multi-file deletion, which is not available yet."));
     }
-    state.registry.with_idle_session_writer(id, |_| delete_locked(state, id, scheduled))
+    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled))
         .map_err(|error| match error {
             session_host::SessionWriterError::Busy(message) => self::error("busy", message),
             session_host::SessionWriterError::Operation(error) => error,
@@ -175,6 +179,27 @@ mod tests {
         let target = session(&root, "target", None);
         let args = json!({"session":"target"});
         assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["target".into()])).unwrap_err().0, "not_supported");
+        assert!(target.exists());
+    }
+    #[test]
+    fn production_delete_rejects_policy_and_unresolved_writer_fences() {
+        let (dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let args = json!({"session":"target"});
+        let policy = state.policy_gate.try_write().unwrap();
+        assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
+        drop(policy);
+        let lock = state.registry.start_lock_for("target");
+        let writer = lock.lock().unwrap();
+        assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
+        drop(writer);
+        crate::session_writer_fence::begin(dir.path(), "target", "op", "chat", &target, None).unwrap();
+        assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
+        assert!(target.exists());
+        crate::session_writer_fence::finish(dir.path(), "target", "op").unwrap();
+        let trust = crate::trust_policy_fence::marker_path(dir.path());
+        std::fs::write(&trust, "corrupt").unwrap();
+        assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
         assert!(target.exists());
     }
     #[test]

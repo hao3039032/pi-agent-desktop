@@ -1280,6 +1280,40 @@ fn session_writer_fence_blocks_live_admissions_and_drain() {
     registry.remove(id, Duration::from_secs(5));
 }
 
+#[test]
+fn retained_exited_session_cannot_enqueue_during_offline_delete_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&dir.path().join("agent"), &["--mock-session-id", &id, "--mock-commands", &commands]);
+    let registry = SessionRegistry::new();
+    let stale = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    registry.remove(&id, Duration::from_secs(5));
+    assert!(stale.client_has_exited_for_tests());
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let writer_registry = &registry;
+        let writer_id = &id;
+        let writer_file = &file;
+        let writer = scope.spawn(move || writer_registry.with_idle_session_writer(writer_id, |_| {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert!(!writer_registry.composer_outbox_for(writer_id).has_pending_or_in_flight());
+            std::fs::remove_file(writer_file).unwrap();
+            Ok::<_, ()>(())
+        }));
+        held_rx.recv().unwrap();
+        assert!(stale.composer_enqueue("must not be queued", None).is_err());
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+    });
+    assert!(!file.exists());
+    assert!(!registry.composer_outbox_for(&id).has_items());
+}
+
 /// Terra round-4 (the reviewer's exact window): an old drain parked between
 /// its ALIVE-CHECK and its CLAIM while the session is replaced underneath
 /// it. The replacement owns the shared outbox now; the new session queues

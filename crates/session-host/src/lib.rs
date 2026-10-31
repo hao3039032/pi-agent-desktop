@@ -808,9 +808,9 @@ impl SessionRegistry {
         operation(session.as_ref()).map_err(SessionWriterError::Operation)
     }
 
-    /// Lock a set of writers in lexical id order, then acquire their activity
-    /// guards in the same order. The closure must not re-enter any held gate.
-    /// This is for bounded local multi-session mutations, not network waits.
+    /// Try to lock writers in lexical id order, then acquire their activity
+    /// guards in the same order. Busy gates refuse instead of waiting while a
+    /// caller may hold a scheduler transaction. The closure must not re-enter.
     pub fn with_idle_session_writers<T, E>(
         &self, ids: &[String], operation: impl FnOnce(&[Option<Arc<Session>>]) -> Result<T, E>,
     ) -> Result<T, SessionWriterError<E>> {
@@ -818,7 +818,10 @@ impl SessionRegistry {
         ids.sort();
         ids.dedup();
         let locks: Vec<_> = ids.iter().map(|id| self.start_lock_for(id)).collect();
-        let _starts: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
+        let mut starts = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            starts.push(lock.try_lock().map_err(|_| SessionWriterError::Busy("session writer is busy"))?);
+        }
         let sessions: Vec<_> = {
             let registry = self.sessions.lock().unwrap();
             ids.iter().map(|id| registry.get(id).cloned()).collect()
@@ -838,6 +841,26 @@ impl SessionRegistry {
             }
         }
         operation(&sessions).map_err(SessionWriterError::Operation)
+    }
+
+    /// Hold ordered session start gates and check their persistent fences for a
+    /// bounded read snapshot. Live sessions remain searchable; callers must
+    /// detect concurrent in-place writes while copying and never mutate files.
+    pub fn with_session_snapshot_gates<T, E>(
+        &self, ids: &[String], operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, SessionWriterError<E>> {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids.dedup();
+        let locks: Vec<_> = ids.iter().map(|id| self.start_lock_for(id)).collect();
+        let mut starts = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            starts.push(lock.try_lock().map_err(|_| SessionWriterError::Busy("session writer is busy"))?);
+        }
+        for id in &ids {
+            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+        }
+        operation().map_err(SessionWriterError::Operation)
     }
 
     /// Stop an idle child without force-killing it, prove its actual exit,
@@ -1967,6 +1990,19 @@ mod dispatch_tests {
         fn new() -> super::SessionRegistry {
             super::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
         }
+    }
+
+    #[test]
+    fn snapshot_and_multi_writer_gates_refuse_busy_and_pending_without_waiting() {
+        let registry = super::SessionRegistry::with_fence_checker(Arc::new(|id| {
+            if id == "fenced" { Err("unknown".into()) } else { Ok(()) }
+        }));
+        let lock = registry.start_lock_for("held");
+        let _guard = lock.lock().unwrap();
+        assert!(matches!(registry.with_session_snapshot_gates(&["held".into()], || Ok::<_, ()>(())), Err(SessionWriterError::Busy(_))));
+        assert!(matches!(registry.with_idle_session_writers(&["held".into()], |_| Ok::<_, ()>(())), Err(SessionWriterError::Busy(_))));
+        assert!(matches!(registry.with_session_snapshot_gates(&["fenced".into()], || Ok::<_, ()>(())), Err(SessionWriterError::Busy(_))));
+        assert!(registry.with_session_snapshot_gates(&["other".into()], || Ok::<_, ()>(())).is_ok());
     }
 
     #[test]

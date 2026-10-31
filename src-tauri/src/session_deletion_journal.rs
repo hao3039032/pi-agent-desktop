@@ -175,46 +175,70 @@ mod linux {
             Err(_) if matches!(std::fs::symlink_metadata(&path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let entries = std::fs::read_dir(format!("/proc/self/fd/{}", journal_root.as_raw_fd())).map_err(io)?;
-        for entry in entries {
+        let mut entries = std::fs::read_dir(format!("/proc/self/fd/{}", journal_root.as_raw_fd())).map_err(io)?;
+        let Some(first) = entries.next() else { return Ok(()); };
+        if !state.deletion_recovery_permitted() {
+            return Err(fail("busy", "Session deletion recovery is pending exclusive maintenance"));
+        }
+        enum Pending { Preparation(String, bool), Done(String), Active(String, Journal) }
+        let mut pending = Vec::new();
+        let mut ids = Vec::new();
+        for entry in std::iter::once(first).chain(entries) {
             let entry = entry.map_err(io)?;
             let token = entry.file_name().into_string().map_err(|_| fail("io", "Invalid deletion journal name"))?;
-            if let Some(id) = token.strip_prefix(".prepare-") {
-                if !valid_token(id) || !entry.file_type().map_err(io)?.is_dir() { return Err(fail("io", "Invalid deletion preparation")); }
-                let preparation = open_directory(&journal_root, &token)?;
-                let mut entries = std::fs::read_dir(format!("/proc/self/fd/{}", preparation.as_raw_fd())).map_err(io)?;
-                if let Some(entry) = entries.next() {
-                    let entry = entry.map_err(io)?;
-                    if entry.file_name() != "journal" || !entry.file_type().map_err(io)?.is_file() || entries.next().is_some() {
-                        return Err(fail("io", "Invalid deletion preparation"));
-                    }
-                    let journal: Journal = serde_json::from_slice(&read_file(&preparation, "journal")?).map_err(io)?;
-                    verify_journal(&journal, id)?;
-                    unlink(&preparation, "journal", 0)?;
-                    preparation.sync_all().map_err(io)?;
-                }
-                unlink(&journal_root, &token, libc::AT_REMOVEDIR)?;
-                journal_root.sync_all().map_err(io)?;
-                continue;
-            }
-            if let Some(id) = token.strip_suffix(".done") {
-                if !valid_token(id) || !entry.file_type().map_err(io)?.is_dir() { return Err(fail("io", "Invalid deletion tombstone")); }
-                cleanup_done(&journal_root, &token)?;
-                continue;
-            }
-            if !valid_token(&token) || !entry.file_type().map_err(io)?.is_dir() { return Err(fail("io", "Invalid deletion journal entry")); }
+            if !entry.file_type().map_err(io)?.is_dir() { return Err(fail("io", "Invalid deletion journal entry")); }
+            let (id, kind) = if let Some(id) = token.strip_prefix(".prepare-") { (id, 0) }
+                else if let Some(id) = token.strip_suffix(".done") { (id, 1) }
+                else { (token.as_str(), 2) };
+            if !valid_token(id) { return Err(fail("io", "Invalid deletion journal name")); }
             let transaction = open_directory(&journal_root, &token)?;
-            let journal: Journal = serde_json::from_slice(&read_file(&transaction, "journal")?).map_err(io)?;
-            verify_journal(&journal, &token)?;
-            state.registry.with_idle_session_writer(&journal.session, |_| {
-                if state.registry.get(&journal.session).is_some() { return Err(fail("busy", "Session is active during deletion recovery")); }
-                finish(&agent, root, &token, &journal)
-            }).map_err(|error| match error {
-                session_host::SessionWriterError::Busy(message) => fail("busy", message),
-                session_host::SessionWriterError::Operation(error) => error,
-            })?;
+            let mut has_journal = false;
+            let mut has_commit = false;
+            for child in std::fs::read_dir(format!("/proc/self/fd/{}", transaction.as_raw_fd())).map_err(io)? {
+                let child = child.map_err(io)?;
+                let name = child.file_name().into_string().map_err(|_| fail("io", "Invalid deletion journal entry"))?;
+                if !child.file_type().map_err(io)?.is_file() { return Err(fail("io", "Invalid deletion journal entry")); }
+                match name.as_str() {
+                    "journal" => has_journal = true,
+                    "commit" if kind != 0 => has_commit = true,
+                    _ => return Err(fail("io", "Invalid deletion journal entry")),
+                }
+            }
+            if has_commit && read_file(&transaction, "commit")? != b"commit\n" { return Err(fail("io", "Invalid deletion commit marker")); }
+            let journal = if has_journal {
+                let journal: Journal = serde_json::from_slice(&read_file(&transaction, "journal")?).map_err(io)?;
+                verify_journal(&journal, id)?;
+                parent_and_name(root, &journal.source)?;
+                ids.push(journal.session.clone());
+                Some(journal)
+            } else { None };
+            match kind {
+                0 => pending.push(Pending::Preparation(token, has_journal)),
+                1 => pending.push(Pending::Done(token)),
+                _ => pending.push(Pending::Active(token, journal.ok_or_else(|| fail("io", "Missing deletion journal"))?)),
+            }
         }
-        Ok(())
+        state.registry.with_idle_session_writers(&ids, |_| {
+            if ids.iter().any(|id| state.registry.get(id).is_some()) {
+                return Err(fail("busy", "Session is active during deletion recovery"));
+            }
+            for item in pending {
+                match item {
+                    Pending::Preparation(token, has_journal) => {
+                        let preparation = open_directory(&journal_root, &token)?;
+                        if has_journal { unlink(&preparation, "journal", 0)?; preparation.sync_all().map_err(io)?; }
+                        unlink(&journal_root, &token, libc::AT_REMOVEDIR)?;
+                        journal_root.sync_all().map_err(io)?;
+                    }
+                    Pending::Done(token) => cleanup_done(&journal_root, &token)?,
+                    Pending::Active(token, journal) => finish(&agent, root, &token, &journal)?,
+                }
+            }
+            Ok(())
+        }).map_err(|error| match error {
+            session_host::SessionWriterError::Busy(message) => fail("busy", message),
+            session_host::SessionWriterError::Operation(error) => error,
+        })
     }
 
     pub(crate) fn remove(root: &Path, agent: &Path, session: &str, target: &Path, expected: &std::fs::Metadata) -> Result<(), Failure> {
@@ -267,6 +291,7 @@ mod linux {
             std::fs::write(&source, format!("{}\n", json!({"type":"session","id":"a"}))).unwrap();
             let state = crate::pi_ipc::IpcHostState::new();
             *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+            state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
             (dir, state, root, source)
         }
         #[test]
@@ -313,6 +338,40 @@ mod linux {
                 assert_eq!(source.exists(), phase != "committed", "{phase}");
                 recover(&state, &root).unwrap();
             }
+        }
+        #[test]
+        fn pending_journal_requires_explicit_isolated_maintenance() {
+            let (dir, state, root, source) = fixture();
+            let metadata = std::fs::metadata(&source).unwrap();
+            assert!(remove_with_hook(&root, dir.path(), "a", &source, &metadata, |at| if at == "isolated" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            state.deletion_recovery_exclusive.store(false, std::sync::atomic::Ordering::SeqCst);
+            for op in ["sessions.index", "sessions.list", "sessions.search", "sessions.delete"] {
+                let args = match op { "sessions.search" => json!({"query":"x"}), "sessions.delete" => json!({"session":"a"}), _ => json!({}) };
+                let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"test","op":op,"args":args}));
+                assert_eq!(response["error"]["code"], "busy", "{op}: {response}");
+                assert!(response["error"]["message"].as_str().unwrap().contains("exclusive maintenance"));
+                assert!(!source.exists());
+            }
+            state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _policy = state.policy_gate.try_read().unwrap();
+            let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+            recover(&state, &root).unwrap();
+            assert!(source.exists());
+        }
+        #[test]
+        fn isolated_maintenance_still_respects_persistent_session_fence() {
+            let (dir, state, root, source) = fixture();
+            let metadata = std::fs::metadata(&source).unwrap();
+            assert!(remove_with_hook(&root, dir.path(), "a", &source, &metadata, |at| if at == "isolated" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            crate::session_writer_fence::begin(dir.path(), "a", "op", "chat", &source, None).unwrap();
+            let _policy = state.policy_gate.try_read().unwrap();
+            let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+            assert_eq!(recover(&state, &root).unwrap_err().0, "busy");
+            assert!(!source.exists());
+            assert!(crate::session_writer_fence::fence_path(dir.path(), "a").exists());
+            crate::session_writer_fence::finish(dir.path(), "a", "op").unwrap();
+            recover(&state, &root).unwrap();
+            assert!(source.exists());
         }
         #[test]
         fn catalogue_recovers_before_scanning_an_isolated_session() {
@@ -364,6 +423,21 @@ mod linux {
             std::fs::create_dir(&preparation).unwrap();
             std::fs::write(preparation.join("journal"), "{broken").unwrap();
             assert_eq!(recover(&state, &root).unwrap_err().0, "io");
+            assert!(source.exists());
+        }
+        #[test]
+        fn corrupt_second_journal_prevents_any_recovery_mutation() {
+            let (dir, state, root, source) = fixture();
+            let metadata = std::fs::metadata(&source).unwrap();
+            assert!(remove_with_hook(&root, dir.path(), "a", &source, &metadata, |at| if at == "isolated" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            let bad = dir.path().join("session-deletion-journal/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            std::fs::create_dir(&bad).unwrap();
+            std::fs::write(bad.join("journal"), "{broken").unwrap();
+            assert_eq!(recover(&state, &root).unwrap_err().0, "io");
+            assert!(!source.exists());
+            std::fs::remove_file(bad.join("journal")).unwrap();
+            std::fs::remove_dir(bad).unwrap();
+            recover(&state, &root).unwrap();
             assert!(source.exists());
         }
         #[test]
