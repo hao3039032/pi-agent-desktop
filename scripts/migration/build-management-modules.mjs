@@ -118,6 +118,7 @@ export {
   trustProjectFolder,
 } from "${ROOT}/lib/mcp-service.server.ts";
 export { probeMcpServer } from "${ROOT}/lib/mcp-probe-service.server.ts";
+export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn } from "${ROOT}/lib/mcp-sign-in-service.server.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";

@@ -26,6 +26,7 @@ import { bindFileService } from "./data/file-service.ts";
 import { bindFontService } from "./data/font-service.ts";
 import { bindGitStatusService } from "./data/git-status-service.ts";
 import { bindMcpService } from "./data/mcp-service.ts";
+import { bindMcpSignInClient } from "./data/mcp-sign-in-client.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
 import { bindModelsExtrasService } from "./data/models-extras-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
@@ -79,6 +80,7 @@ async function boot(): Promise<void> {
   bindScheduledTasksClient(client);
   bindProjectTrustClient(client);
   bindMcpService(client);
+  bindMcpSignInClient(client);
   bindStateMirrorClient(client);
   void applyCustomCssToDocument();
   // The transition mirror imports BEFORE React mounts (plan §七.4): the

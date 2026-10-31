@@ -209,6 +209,10 @@ export default defineConfig({
         find: /^@\/lib\/mcp-service$/,
         replacement: resolve(import.meta.dirname, "src/data/mcp-service.ts"),
       },
+      {
+        find: /^@\/lib\/mcp-sign-in-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/mcp-sign-in-client.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],
