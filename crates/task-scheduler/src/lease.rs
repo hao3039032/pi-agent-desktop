@@ -26,7 +26,7 @@ pub fn acquire<F: Fn(u32) -> bool>(agent_dir: &Path, pid: u32, now_ms: i64, aliv
     if let (Some(lease), Some(owner)) = (&current, previous_pid) {
         if owner != pid as u64 {
             let heartbeat = lease.get("heartbeatAt").and_then(Value::as_str).and_then(crate::store::iso_to_ms);
-            let fresh = heartbeat.is_some_and(|time| now_ms - time < crate::LEASE_STALE_MS as i64);
+            let fresh = heartbeat.is_some_and(|time| now_ms.saturating_sub(time) < crate::LEASE_STALE_MS as i64);
             if fresh && u32::try_from(owner).ok().is_some_and(&alive) { return Ok(false); }
         }
     }
