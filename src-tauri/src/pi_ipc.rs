@@ -4429,6 +4429,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
         }
         writeln!(writer, "{}", json!({"type":"message","id":"think","parentId":"b","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"fixture hidden reasoning"}]}})).unwrap();
+        writeln!(writer, "{}", json!({"type":"message","id":"media","parentId":"think","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"t1","content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"},{"type":"image","data":"PGh0bWw+","mimeType":"image/png"}]}})).unwrap();
         drop(writer);
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
@@ -4453,6 +4454,13 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
         let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
         assert_eq!(missing["ok"], false, "{missing}");
+        let output = root_path.join("image.bin");
+        let image = management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":0,"outputFile":output})).unwrap();
+        assert_eq!(image["mime"], "image/png");
+        assert_eq!(std::fs::read(&output).unwrap(), [137,80,78,71,13,10,26,10]);
+        assert!(management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":1,"outputFile":root_path.join("bad.bin")})).is_err());
+        assert!(management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"think","blockIndex":0,"outputFile":root_path.join("wrong-role.bin")})).is_err());
+        assert!(!root_path.join("bad.bin").exists());
         session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
         let after = read();
         assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
