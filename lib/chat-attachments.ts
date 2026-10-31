@@ -61,6 +61,39 @@ export function isChatDocxAttachment(file: { name: string; type?: string }): boo
 
 /** Ask the server for a Word document's text; throws a rejection reason on failure. */
 export async function extractDocxText(file: File): Promise<string> {
+  if (typeof window !== "undefined") {
+    try {
+      const { hasTauriHostBridge, tauriHostInvoke } = await import("@/lib/desktop-native");
+      if (hasTauriHostBridge()) {
+        const invoke = tauriHostInvoke();
+        if (invoke) {
+          const buffer = await file.arrayBuffer();
+          let binary = "";
+          const bytes = new Uint8Array(buffer);
+          for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          const base64 = btoa(binary);
+          const id = `req-${Math.random().toString(36).slice(2)}`;
+          const raw = (await invoke("pi_ipc", {
+            request: { v: 1, id, op: "chats.extractAttachmentText", args: { data: base64 } },
+          })) as { ok?: boolean; data?: { text?: string }; error?: { code?: string; message?: string } } | null;
+          if (raw?.ok && typeof raw.data?.text === "string") {
+            return raw.data.text;
+          }
+          if (raw?.error?.code === "payload_too_large" || raw?.error?.message === "too-large") {
+            throw new Error("too-large");
+          }
+          throw new Error("not-text");
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && (err.message === "too-large" || err.message === "not-text")) {
+        throw err;
+      }
+    }
+  }
+
   const response = await fetch("/api/chat-attachments/extract", {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },

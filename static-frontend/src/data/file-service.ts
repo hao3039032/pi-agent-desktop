@@ -8,6 +8,7 @@
 import { IpcClient, IpcFailure } from "../ipc/client.ts";
 import { joinFilePath } from "../../../lib/file-paths";
 import type { FileEntry, FileNodeEntry } from "../../../lib/file-service";
+import type { FileIndexEntry } from "../../../lib/file-fuzzy";
 
 let client: IpcClient | null = null;
 
@@ -61,6 +62,109 @@ export async function allowOutsideLink(linkPath: string, target: string): Promis
     );
   } catch (caught) {
     if (caught instanceof IpcFailure) throw toError(caught, "Failed to allow the linked folder");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+/** Search files in cwd using server fuzzy search (?q=) over files.index IPC. */
+export async function searchFileIndex(
+  cwd: string,
+  query: string,
+  _signal?: AbortSignal,
+): Promise<FileIndexEntry[]> {
+  try {
+    const data = await ensureClient().request<{ matches?: FileIndexEntry[] }>(
+      "files.index",
+      { cwd, q: query },
+      { timeoutMs: 15_000 },
+    );
+    return data.matches ?? [];
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to search file index");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+/** Fetch full file index for cwd over files.index IPC. */
+export async function fetchFileIndex(
+  cwd: string,
+): Promise<{ files: string[]; truncated: boolean }> {
+  try {
+    const data = await ensureClient().request<{ files?: string[]; truncated?: boolean }>(
+      "files.index",
+      { cwd },
+      { timeoutMs: 15_000 },
+    );
+    return { files: data.files ?? [], truncated: Boolean(data.truncated) };
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to fetch file index");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+/** Read full file content over files.read IPC. */
+export async function readFileContent(filePath: string): Promise<{ mime: string; data: string }> {
+  try {
+    return await ensureClient().request<{ mime: string; data: string }>(
+      "files.read",
+      { path: filePath },
+      { timeoutMs: 15_000 },
+    );
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to read file");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+/** Grant a preview resource handle for an allowed file. */
+export async function grantFileResource(filePath: string): Promise<string> {
+  try {
+    const data = await ensureClient().request<{ handle: string }>(
+      "resources.grantFile",
+      { path: filePath },
+      { timeoutMs: 15_000 },
+    );
+    return data.handle;
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to grant resource");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+/** Read resource by handle over resources.read IPC. */
+export async function readFileResource(
+  handle: string,
+  subpath?: string,
+  range?: { start: number; end: number },
+): Promise<{ mime: string; data: string; totalLen?: number; rangeApplied?: boolean }> {
+  try {
+    return await ensureClient().request<{
+      mime: string;
+      data: string;
+      totalLen?: number;
+      rangeApplied?: boolean;
+    }>(
+      "resources.read",
+      { handle, subpath: subpath ?? "", start: range?.start, end: range?.end },
+      { timeoutMs: 15_000 },
+    );
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to read resource");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+/** Revoke preview resource handle over resources.revoke IPC. */
+export async function revokeFileResource(handle: string): Promise<boolean> {
+  try {
+    const data = await ensureClient().request<{ revoked: boolean }>(
+      "resources.revoke",
+      { handle },
+      { timeoutMs: 15_000 },
+    );
+    return data.revoked;
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to revoke resource");
     throw caught instanceof Error ? caught : new Error(String(caught));
   }
 }

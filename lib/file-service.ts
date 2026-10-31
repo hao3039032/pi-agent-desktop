@@ -14,6 +14,7 @@
  */
 
 import { encodeFilePathForApi, joinFilePath } from "./file-paths";
+import type { FileIndexEntry } from "./file-fuzzy";
 
 export interface FileEntry {
   name: string;
@@ -69,4 +70,62 @@ export async function allowOutsideLink(linkPath: string, target: string): Promis
     body: JSON.stringify({ target }),
   });
   if (!res.ok) throw await responseError(res, "Failed to allow the linked folder");
+}
+
+/** Search files in cwd using server fuzzy search (?q=). */
+export async function searchFileIndex(
+  cwd: string,
+  query: string,
+  signal?: AbortSignal,
+): Promise<FileIndexEntry[]> {
+  const res = await fetch(
+    `/api/file-index?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}`,
+    { signal },
+  );
+  if (!res.ok) throw await responseError(res, "Failed to search file index");
+  const data = (await res.json()) as { matches?: FileIndexEntry[] };
+  return data.matches ?? [];
+}
+
+/** Fetch full file index for cwd. */
+export async function fetchFileIndex(
+  cwd: string,
+): Promise<{ files: string[]; truncated: boolean }> {
+  const res = await fetch(`/api/file-index?cwd=${encodeURIComponent(cwd)}`);
+  if (!res.ok) throw await responseError(res, "Failed to fetch file index");
+  const data = (await res.json()) as { files?: string[]; truncated?: boolean };
+  return { files: data.files ?? [], truncated: Boolean(data.truncated) };
+}
+
+/** Read full file content (raw bytes encoded as base64). */
+export async function readFileContent(filePath: string): Promise<{ mime: string; data: string }> {
+  const encoded = encodeFilePathForApi(filePath);
+  const res = await fetch(`/api/files/${encoded}?type=read`);
+  if (!res.ok) throw await responseError(res, "Failed to read file");
+  const mime = res.headers.get("content-type") ?? "application/octet-stream";
+  const buffer = await res.arrayBuffer();
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return { mime, data: btoa(binary) };
+}
+
+/** Grant a preview resource handle for an allowed file. */
+export async function grantFileResource(filePath: string): Promise<string> {
+  return filePath;
+}
+
+/** Read resource by handle. */
+export async function readFileResource(
+  handle: string,
+): Promise<{ mime: string; data: string }> {
+  return readFileContent(handle);
+}
+
+/** Revoke preview resource handle. */
+export async function revokeFileResource(handle?: string): Promise<boolean> {
+  void handle;
+  return true;
 }

@@ -275,6 +275,20 @@ export async function downloadUrlAsFile(url: string, defaultFileName: string): P
   return true;
 }
 
+async function ipcInvoke<T>(op: string, args: Record<string, unknown>): Promise<T | null> {
+  const invoke = tauriHostInvoke();
+  if (!invoke) return null;
+  const id = `req-${Math.random().toString(36).slice(2)}`;
+  const raw = await invoke("pi_ipc", {
+    request: { v: 1, id, op, args },
+  }) as { ok?: boolean; data?: T; error?: { message?: string } } | null;
+  if (!raw || typeof raw !== "object") return null;
+  if (!raw.ok) {
+    throw new Error(raw.error?.message ?? `IPC request ${op} failed`);
+  }
+  return (raw.data ?? null) as T | null;
+}
+
 /**
  * Desktop: save-dialog + server-side copy of an allowed local file.
  * Web: trigger download via the files API.
@@ -287,6 +301,19 @@ export async function saveLocalFileAs(
   if (!isTauriDesktop()) {
     triggerBrowserDownload(downloadUrl, defaultFileName);
     return true;
+  }
+
+  if (hasTauriHostBridge()) {
+    try {
+      const res = await ipcInvoke<{ ok?: boolean; cancelled?: boolean }>(
+        "desktop.saveFile",
+        { sourcePath, defaultFileName },
+      );
+      if (res?.cancelled) return false;
+      if (res?.ok) return true;
+    } catch {
+      // Fall through to native dialog + HTTP save
+    }
   }
 
   const destPath = await selectSavePathNative({ defaultPath: defaultFileName });
@@ -317,6 +344,14 @@ export type DesktopDropPathInfo = {
 /** Describe absolute paths dropped onto the desktop window (kind + image-ness). */
 export async function describeDroppedPaths(paths: string[]): Promise<DesktopDropPathInfo[]> {
   if (paths.length === 0) return [];
+  if (hasTauriHostBridge()) {
+    try {
+      const data = await ipcInvoke<{ items?: DesktopDropPathInfo[] }>("desktop.describePaths", { paths });
+      if (data && Array.isArray(data.items)) return data.items;
+    } catch {
+      // Fall through to HTTP fetch
+    }
+  }
   const response = await fetch("/api/desktop/describe-paths", {
     method: "POST",
     headers: await desktopApiHeaders({ "Content-Type": "application/json" }),
@@ -342,6 +377,22 @@ export type DesktopImageAttachment = {
 /** Read image files selected via native dialog into chat attachment payloads. */
 export async function readDesktopImageAttachments(paths: string[]): Promise<DesktopImageAttachment[]> {
   if (paths.length === 0) return [];
+  if (hasTauriHostBridge()) {
+    try {
+      const data = await ipcInvoke<{ files?: Array<{ name: string; mimeType: string; data: string }> }>(
+        "desktop.readImages",
+        { paths },
+      );
+      if (data && Array.isArray(data.files)) {
+        return data.files.map((file) => ({
+          ...file,
+          previewUrl: `data:${file.mimeType};base64,${file.data}`,
+        }));
+      }
+    } catch {
+      // Fall through to HTTP fetch
+    }
+  }
   const response = await fetch("/api/desktop/read-images", {
     method: "POST",
     headers: await desktopApiHeaders({ "Content-Type": "application/json" }),
@@ -358,6 +409,34 @@ export async function readDesktopImageAttachments(paths: string[]): Promise<Desk
     ...file,
     previewUrl: `data:${file.mimeType};base64,${file.data}`,
   }));
+}
+
+/** Reveal a chat's own folder in the OS file manager. */
+export async function revealChatFolderNative(sessionId: string): Promise<boolean> {
+  if (hasTauriHostBridge()) {
+    const res = await ipcInvoke<{ opened?: boolean }>("chats.revealFolder", { sessionId });
+    return Boolean(res?.opened);
+  }
+  const response = await fetch("/api/chat-folder/reveal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId }),
+  });
+  return response.ok;
+}
+
+/** Reveal a chat's saved download in the OS file manager. */
+export async function revealChatDownloadNative(path: string): Promise<boolean> {
+  if (hasTauriHostBridge()) {
+    const res = await ipcInvoke<{ opened?: boolean }>("chats.revealDownload", { path });
+    return Boolean(res?.opened);
+  }
+  const response = await fetch("/api/chat-downloads/reveal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+  return response.ok;
 }
 
 export type DesktopImportResult = {

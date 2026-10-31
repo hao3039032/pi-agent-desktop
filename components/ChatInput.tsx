@@ -25,6 +25,7 @@ import {
   filterFileEntries,
   type AtQueryMatch, type FileIndexEntry,
 } from "@/lib/file-fuzzy";
+import { fetchFileIndex, searchFileIndex } from "@/lib/file-service";
 import { resolveSessionReferences } from "@/lib/session-reference";
 import type { RoutedModelInfo } from "@/lib/types";
 import { getMarkdownListContinuation } from "@/lib/markdown-list-continuation";
@@ -1510,12 +1511,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const fetchCwd = cwd;
     const query = atQueryText;
     const timer = setTimeout(() => {
-      fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}&q=${encodeURIComponent(query)}`)
-        .then((res) => {
-          if (!res.ok) throw new Error(`file search failed: ${res.status}`);
-          return res.json() as Promise<{ matches?: FileIndexEntry[] }>;
-        })
-        .then((data) => setAtServerResult({ cwd: fetchCwd, query, matches: data.matches ?? [] }))
+      searchFileIndex(fetchCwd, query)
+        .then((matches) => setAtServerResult({ cwd: fetchCwd, query, matches: matches ?? [] }))
         .catch(() => {
           // Keep showing local matches; the next keystroke retries.
         });
@@ -1553,11 +1550,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     fileIndexFetchingRef.current = cwd;
     const fetchCwd = cwd;
     setFileIndexLoading(true);
-    fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`file index failed: ${res.status}`);
-        return res.json() as Promise<{ files?: string[]; truncated?: boolean }>;
-      })
+    fetchFileIndex(fetchCwd)
       .then((data) => {
         setFileIndex({ cwd: fetchCwd, entries: buildEntriesFromFiles(data.files ?? []), truncated: !!data.truncated });
         fileIndexMetaRef.current = { cwd: fetchCwd, fetchedAt: Date.now() };
