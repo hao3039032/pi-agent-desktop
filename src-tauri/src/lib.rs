@@ -39,6 +39,7 @@ mod session_view;
 pub mod settings_extras;
 mod session_search;
 mod session_actions;
+mod trust_policy_fence;
 mod chat_sessions;
 mod session_deletion;
 mod terminal_host;
