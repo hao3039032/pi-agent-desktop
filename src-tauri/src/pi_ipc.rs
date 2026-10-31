@@ -1423,6 +1423,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "agent.subagentsStatus" | "agent.subagentsAction" => match crate::session_fleet::dispatch(state, op, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "agent.respondUi" => {
             let session_id = args.get("session").and_then(Value::as_str).unwrap_or("");
             let request_id = args.get("id").and_then(Value::as_str).unwrap_or("");

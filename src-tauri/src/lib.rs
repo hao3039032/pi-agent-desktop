@@ -38,6 +38,7 @@ pub mod pi_ipc;
 mod session_view;
 pub mod settings_extras;
 mod session_search;
+mod session_fleet;
 mod session_actions;
 mod chat_sessions;
 mod session_deletion;
