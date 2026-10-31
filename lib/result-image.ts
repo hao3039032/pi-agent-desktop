@@ -27,7 +27,7 @@ const sourceCache = new WeakMap<object, { payload: string | undefined; type: str
  */
 export function imageSource(img: { source?: { type?: string; media_type?: string; data?: string; url?: string } }): string {
   const flat = img as { data?: string; mimeType?: string };
-  const payload = img.source ? (img.source.type === "base64" ? img.source.data : img.source.url) : flat.data;
+  const payload = img.source ? (img.source.type === "base64" ? img.source.data : img.source.type === "url" ? img.source.url : undefined) : flat.data;
   const type = img.source?.type ?? "flat";
   const mediaType = img.source ? img.source.media_type : flat.mimeType;
   const cached = sourceCache.get(img);
@@ -35,7 +35,7 @@ export function imageSource(img: { source?: { type?: string; media_type?: string
   const src = img.source
     ? img.source.type === "base64"
       ? `data:${mediaType};base64,${payload}`
-      : payload ?? ""
+      : img.source.type === "url" ? payload ?? "" : ""
     : payload
       ? `data:${mediaType};base64,${payload}`
       : "";

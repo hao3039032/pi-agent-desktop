@@ -80,8 +80,10 @@ export interface BuildSessionContextOptions {
    * ancestor chain (the documented route contract, pinned by e2e).
    */
   wholeTurns?: boolean;
-  /** Session id used to build lazy URLs for historical tool-result images. */
+  /** Session id used to build lazy references for historical tool-result images. */
   sessionId?: string;
+  /** Static desktop uses structured references resolved through its resource host. */
+  sessionImageReferences?: boolean;
 }
 
 export function buildSessionContext(
@@ -238,6 +240,7 @@ function deferToolResultBase64Images(
   message: AgentMessage,
   sessionId: string | undefined,
   entryId: string,
+  sessionImageReferences: boolean,
 ): AgentMessage {
   if (message.role !== "toolResult") return message;
 
@@ -259,11 +262,9 @@ function deferToolResultBase64Images(
       image.bytes > 0 &&
       image.bytes <= MAX_TOOL_RESULT_IMAGE_BYTES
     ) {
-      const source: ImageContent["source"] = {
-        type: "url",
-        media_type: image.mime,
-        url: `/api/sessions/${encodeURIComponent(sessionId)}/entries/${encodeURIComponent(entryId)}/tool-result-image?blockIndex=${blockIndex}`,
-      };
+      const source: ImageContent["source"] = sessionImageReferences
+        ? { type: "session", media_type: image.mime, sessionId, entryId, blockIndex }
+        : { type: "url", media_type: image.mime, url: `/api/sessions/${encodeURIComponent(sessionId)}/entries/${encodeURIComponent(entryId)}/tool-result-image?blockIndex=${blockIndex}` };
       return [{ type: "image", source } satisfies ImageContent];
     }
 
@@ -315,7 +316,7 @@ function entryToUiMessage(
       // extensions can persist megabytes there (see lib/tool-result-details.ts).
       const normalized = slimToolResultMessage(normalizeToolCalls(entry.message));
       let message = options.deferToolResultImages
-        ? deferToolResultBase64Images(normalized, options.sessionId, entry.id)
+        ? deferToolResultBase64Images(normalized, options.sessionId, entry.id, options.sessionImageReferences === true)
         : normalized;
       const legacyContent = message.role === "assistant" ? (message as { content: unknown }).content : undefined;
       if (typeof legacyContent === "string") {

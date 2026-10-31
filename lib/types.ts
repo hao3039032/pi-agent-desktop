@@ -23,12 +23,10 @@ export interface TextContent {
 
 export interface ImageContent {
   type: "image";
-  source: {
-    type: "base64" | "url";
-    media_type?: string;
-    data?: string;
-    url?: string;
-  };
+  source:
+    | { type: "base64"; media_type?: string; data?: string }
+    | { type: "url"; media_type?: string; url?: string }
+    | { type: "session"; media_type?: string; sessionId: string; entryId: string; blockIndex: number };
 }
 
 export interface ThinkingContent {
