@@ -117,6 +117,15 @@ struct EventRelayHandle {
 }
 
 impl IpcHostState {
+    pub(crate) fn chat_unlock_permitted(&self) -> bool {
+        self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_chat_unlock_for_test(&mut self) {
+        self.chat_unlock_policy = ChatUnlockPolicy::StaticPackaged;
+    }
+
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
         let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
@@ -1240,6 +1249,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         },
         "sessions.rename" => match crate::session_actions::rename(state, &args) {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.chatAccessGet" => match crate::chat_sessions::get_access(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
         "sessions.search" => match crate::session_search::search(state, &args) {

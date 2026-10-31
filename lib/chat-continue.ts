@@ -14,8 +14,8 @@ export function setOfflineChatUnlock(file: string, unlocked: boolean): boolean {
 }
 
 /** Caller must validate both paths and hold exclusive admission for the source. */
-export function copyChatToProject(file: string, cwd: string): { sessionId: string; path: string | null } {
-  const manager = SessionManager.forkFrom(file, cwd);
+export function copyChatToProject(file: string, cwd: string, targetId?: string): { sessionId: string; path: string | null } {
+  const manager = SessionManager.forkFrom(file, cwd, undefined, targetId ? { id: targetId } : undefined);
   const copiedFile = manager.getSessionFile();
   if (!copiedFile) throw new Error("The copied session has no file");
   // forkFrom creates its target with exclusive create. Never modify or clean
@@ -68,7 +68,12 @@ export function forgetChatSystemPrompt(file: string): void {
   });
   const survivor = (id: string | null | undefined): string | null => {
     let current = id ?? null;
-    while (current !== null && parents.has(current)) current = parents.get(current) ?? null;
+    const visited = new Set<string>();
+    while (current !== null && parents.has(current)) {
+      if (visited.has(current)) throw new Error("This chat's transcript has a cycle and cannot be continued in a project");
+      visited.add(current);
+      current = parents.get(current) ?? null;
+    }
     return current;
   };
   const rewritten = kept.map((entry) => (
