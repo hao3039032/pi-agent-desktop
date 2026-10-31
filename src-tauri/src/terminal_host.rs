@@ -38,6 +38,28 @@ pub fn authorize_cwd(
     Ok(resolved)
 }
 
+/// Pin the directory and recheck the descriptor's resolved identity before
+/// handing it to portable-pty. Subsequent path replacement cannot retarget it.
+#[cfg(target_os = "linux")]
+pub fn pin_cwd(
+    roots: &AllowedRoots,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<std::fs::File, &'static str> {
+    use std::os::fd::AsRawFd;
+    let (resolved, directory) = roots
+        .open_terminal_directory(cwd)
+        .ok_or("unauthorized_scope")?;
+    let actual = std::fs::canonicalize(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .map_err(|_| "unauthorized_scope")?;
+    if actual != resolved || actual != cwd {
+        return Err("unauthorized_scope");
+    }
+    let actual_text = actual.to_str().ok_or("unauthorized_scope")?;
+    authorize_cwd(roots, agent_dir, actual_text)?;
+    Ok(directory)
+}
+
 const LEASE: Duration = Duration::from_secs(120);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -415,6 +437,105 @@ mod tests {
             }
         }
         streams.close("reset");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_pinned_directory_survives_parent_swap_without_fd_leak() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let parent = dir.path().join("project");
+        let cwd = parent.join("work");
+        let moved = dir.path().join("moved");
+        let chat = agent.join("chats/folder");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(chat.join("work")).unwrap();
+        std::fs::write(cwd.join("marker"), "SAFE_PROJECT_MARKER\n").unwrap();
+        std::fs::write(chat.join("work/marker"), "CHAT_MARKER\n").unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(dir.path());
+        let authorized = authorize_cwd(&roots, &agent, cwd.to_str().unwrap()).unwrap();
+        let normal_handle = pin_cwd(&roots, &agent, &authorized).unwrap();
+        let normal_host = pty_host::PtyHost::new();
+        let normal = normal_host
+            .create(
+                "normal",
+                Some(&authorized),
+                pty_host::PtyOptions {
+                    cwd_handle: Some(normal_handle),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        normal
+            .write_input(b"pwd -P; printf '<%s>\\n' \"$PWD\"; exit 0\n")
+            .unwrap();
+        assert_eq!(normal.wait_exit(Duration::from_secs(10)), Some(Some(0)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !normal.output_closed() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let normal_output = match normal.read_since(0) {
+            pty_host::ReadOutcome::Suffix { text, .. }
+            | pty_host::ReadOutcome::Reset { text, .. } => text,
+        };
+        assert!(
+            normal_output.contains(&format!("<{}>", authorized.display())),
+            "{normal_output:?}"
+        );
+        normal_host.close("normal");
+        // A swap before opening the anchor is refused.
+        std::fs::rename(&parent, &moved).unwrap();
+        symlink(&chat, &parent).unwrap();
+        assert!(pin_cwd(&roots, &agent, &authorized).is_err());
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::rename(&moved, &parent).unwrap();
+        // A swap after pinning cannot retarget the child.
+        let handle = pin_cwd(&roots, &agent, &authorized).unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        symlink(&chat, &parent).unwrap();
+        let host = pty_host::PtyHost::new();
+        let pty = host
+            .create(
+                "pinned",
+                Some(&authorized),
+                pty_host::PtyOptions {
+                    cwd_handle: Some(handle),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        pty.write_input(
+            b"pwd -P; cat marker; for f in /proc/$$/fd/*; do readlink \"$f\"; done; exit 0\n",
+        )
+        .unwrap();
+        assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(Some(0)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !pty.output_closed() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = match pty.read_since(0) {
+            pty_host::ReadOutcome::Suffix { text, .. }
+            | pty_host::ReadOutcome::Reset { text, .. } => text,
+        };
+        assert!(output.contains("SAFE_PROJECT_MARKER"), "{output:?}");
+        assert!(!output.contains("CHAT_MARKER"), "{output:?}");
+        assert!(
+            output.contains(&moved.join("work").display().to_string()),
+            "{output:?}"
+        );
+        // Only pwd prints this directory: no inherited fd points back at it.
+        assert_eq!(
+            output
+                .matches(&moved.join("work").display().to_string())
+                .count(),
+            1,
+            "{output:?}"
+        );
+        host.close("pinned");
     }
 
     #[test]

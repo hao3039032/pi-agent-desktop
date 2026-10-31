@@ -113,6 +113,22 @@ impl AllowedRoots {
         false
     }
 
+    /// Open an already-authorized directory without following swapped path
+    /// components. The returned descriptor pins the directory across spawn.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_terminal_directory(&self, target: &Path) -> Option<(PathBuf, std::fs::File)> {
+        let (resolved, _) = self.resolved_write_parent_with_root(&target.join(".terminal-anchor"))?;
+        let mut directory = openat_directory_no_follow_by_path(Path::new("/")).ok()?;
+        for component in resolved.components() {
+            match component {
+                Component::RootDir => {},
+                Component::Normal(name) => directory = openat_directory_no_follow(&directory, name.to_str()?).ok()?,
+                _ => return None,
+            }
+        }
+        Some((resolved, directory))
+    }
+
     /// The canonical, resolved PARENT of a write target, authorized against
     /// the resolved roots. Returns None when the parent does not resolve or
     /// escapes the roots. This is the ONE authorization point for writes:

@@ -71,9 +71,13 @@ replays the bounded history. Explicit unsubscribe and missed ACKs reap the
 relay; a terminal without subscribers expires after 120 seconds. Terminal
 input is serialized with resize and is never retried after an ambiguous error.
 On Unix a close sends SIGHUP to the shell and escalates after two seconds;
-application exit force-terminates retained shells. Windows uses portable-pty's
-native process termination, not Unix signal names. Real Windows and macOS PTY
-lifecycle and native-WebView acceptance remain required.
+application exit force-terminates retained shells. Linux spawn pins an
+O_NOFOLLOW directory descriptor through spawn and rejects a changed or chat
+scope. Static terminal creation currently fails closed on Windows and macOS:
+secure handle-based cwd spawn is not yet implemented there. The PTY crate's
+Windows termination uses native process termination, not Unix signal names.
+Real Windows and macOS PTY lifecycle and native-WebView acceptance remain
+required before enabling them.
 
 ## Verification
 
