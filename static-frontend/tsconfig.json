@@ -82,6 +82,9 @@
       "@/lib/models-extras-service": [
         "./static-frontend/src/data/models-extras-service.ts"
       ],
+      "@/lib/session-actions-service": [
+        "./static-frontend/src/data/session-actions-service.ts"
+      ],
       "@/lib/font-service": [
         "./static-frontend/src/data/font-service.ts"
       ],
