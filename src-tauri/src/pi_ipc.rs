@@ -137,6 +137,30 @@ impl IpcHostState {
         self.scheduler_owner.store(false, Ordering::SeqCst);
     }
 
+    /// Host shutdown: stop new claims, reap linked child sessions, then let
+    /// their workers persist outcomes before management instances are closed.
+    pub fn shutdown_scheduler(&self) -> Result<(), String> {
+        self.stop_scheduler();
+        let repo = task_scheduler::task_repository::TaskRepository::new(self.agent_dir());
+        let deadline = std::time::Instant::now() + Duration::from_secs(35);
+        loop {
+            let active = self.scheduled_active.lock().unwrap().clone();
+            if active.is_empty() { return Ok(()); }
+            for task in repo.list()? {
+                let Some(task_id) = task["id"].as_str() else { continue };
+                for run in repo.runs(task_id)? {
+                    if run["runId"].as_str().is_some_and(|id| active.contains(id)) {
+                        if let Some(session_id) = run["sessionId"].as_str() {
+                            self.registry.remove(session_id, Duration::from_secs(5));
+                        }
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline { return Err("Scheduled runs did not stop during host shutdown".into()); }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Record a path the HOST derived (a session cwd or project root from
     /// the index scan). Such paths become grantable resources and, for
     /// directories, browsable file roots — the /api/files semantics where

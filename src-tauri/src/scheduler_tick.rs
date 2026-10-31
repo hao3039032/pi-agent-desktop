@@ -185,7 +185,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        state.stop_scheduler();
+        state.shutdown_scheduler().unwrap();
         assert!(!lock.exists());
     }
 

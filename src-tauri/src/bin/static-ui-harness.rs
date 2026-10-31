@@ -396,7 +396,7 @@ fn main() {
                     // child (stdin EOF + grace kill of the child's process
                     // group), so no pi process is orphaned by this exit.
                     let state = app.state::<Arc<IpcHostState>>();
-                    state.stop_scheduler();
+                    if let Err(error) = state.shutdown_scheduler() { eprintln!("[harness] scheduler shutdown: {error}"); }
                     for id in state.registry.ids() {
                         let _ = state.registry.remove(&id, std::time::Duration::from_secs(5));
                     }
