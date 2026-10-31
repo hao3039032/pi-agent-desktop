@@ -1075,6 +1075,16 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     sessions.push(info);
                 }
             }
+            let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
+                Ok(index) => index,
+                Err(error) => return protocol_error(&id, "io", &error.0),
+            };
+            for session in &mut sessions {
+                let relation = session.get("id").and_then(Value::as_str).and_then(|id| scheduled.relation(id));
+                if let Some((task_id, run_id)) = relation {
+                    session["relation"] = json!({ "kind": "scheduled", "taskId": task_id, "runId": run_id });
+                }
+            }
             sessions.sort_by(|a, b| {
                 let modified = |info: &Value| info.get("modified").and_then(Value::as_str).unwrap_or("").to_string();
                 modified(b).cmp(&modified(a))
