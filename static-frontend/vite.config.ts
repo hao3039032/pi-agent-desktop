@@ -174,6 +174,7 @@ export default defineConfig({
         find: /^@\/lib\/models-extras-service$/,
         replacement: resolve(import.meta.dirname, "src/data/models-extras-service.ts"),
       },
+      { find: /^@\/lib\/terminal-client$/, replacement: resolve(import.meta.dirname, "src/data/terminal-client.ts") },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

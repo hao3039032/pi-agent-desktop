@@ -99,6 +99,9 @@
       ],
       "@/lib/custom-css-service": [
         "./static-frontend/src/data/custom-css-service.ts"
+      ],
+      "@/lib/terminal-client": [
+        "./static-frontend/src/data/terminal-client.ts"
       ]
     }
   },

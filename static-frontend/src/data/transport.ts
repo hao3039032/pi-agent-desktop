@@ -179,14 +179,10 @@ class HostBridgeTransport implements IpcTransport {
               ? { onFrame: handle.channel }
               : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
         const ack = await invoke(command, payload);
-        if (closed) {
-          handle.stopLocalDelivery();
-          return;
-        }
         const parsed = parseSubscribeAck(ack);
         if ("error" in parsed) {
           handle.stopLocalDelivery();
-          onError(parsed.error);
+          if (!closed) onError(parsed.error);
           return;
         }
         const subscriptionId = parsed.subscriptionId;
@@ -199,14 +195,11 @@ class HostBridgeTransport implements IpcTransport {
             // The running-set stream unsubscribes the same way (its relay
             // keys the same registry by subscriptionId). A terminal stream
             // ends with its terminal (or page reload).
-            if (
-              subscriptionId !== null
-              && (command === "pi_ipc_subscribe_events" || command === "pi_ipc_subscribe_running")
-            ) {
+            if (subscriptionId !== null) {
               const request: IpcRequest = {
                 v: IPC_PROTOCOL_VERSION,
                 id: `unsubscribe-${subscriptionId}`,
-                op: "agent.unsubscribeEvents",
+                op: command === "pi_ipc_subscribe_terminal" ? "terminal.unsubscribe" : "agent.unsubscribeEvents",
                 args: { subscriptionId },
               };
               try {
@@ -218,6 +211,10 @@ class HostBridgeTransport implements IpcTransport {
             }
           },
         };
+        if (closed) {
+          void subscription.unsubscribe();
+          subscription = null;
+        }
       } catch (error) {
         if (!closed) {
           onError({

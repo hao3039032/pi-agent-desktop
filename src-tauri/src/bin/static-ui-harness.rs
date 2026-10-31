@@ -36,7 +36,6 @@
 //! Run by `scripts/migration/static-ui-acceptance.mjs`; never packaged
 //! (`required-features` keeps it out of normal builds).
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -50,7 +49,7 @@ use tauri::App;
 use tauri::Manager;
 
 use pi_agent_desktop_lib::pi_ipc::{
-    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, IpcHostState,
+    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, pi_ipc_subscribe_terminal, IpcHostState,
 };
 
 /// One call the host thread (which owns the `App` and therefore the
@@ -64,6 +63,7 @@ use pi_agent_desktop_lib::pi_ipc::{
 enum HostCall {
     SubscribeEvents { session: String, cb: u32 },
     SubscribeRunning { cb: u32 },
+    SubscribeTerminal { id: String, cursor: u64, cb: u32 },
     /// Orderly teardown of everything the host owns children-wise (sessions,
     /// management instances, PTYs). The connection thread exits the process
     /// once the reply is flushed.
@@ -75,7 +75,6 @@ enum HostCall {
 #[derive(Default)]
 struct Bridge {
     sse_senders: Mutex<Vec<(u64, std::sync::mpsc::Sender<String>)>>,
-    indexes: Mutex<HashMap<u32, u64>>,
     next_sse_id: std::sync::atomic::AtomicU64,
     /// The event-plugin stand-in: `(event id, event name, handler callback
     /// id)`. `plugin:event|listen` registers; `plugin:event|emit` delivers
@@ -88,6 +87,9 @@ impl Bridge {
     /// A Channel<Value> whose sends arrive in the browser at callback `cb`
     /// (the JS side registered `window._<cb>` via transformCallback).
     fn channel(self: &Arc<Self>, cb: u32) -> Channel<Value> {
+        // A reloaded page can reuse callback ids, but each Channel has its
+        // own index sequence.
+        let index = std::sync::atomic::AtomicU64::new(0);
         let bridge = Arc::clone(self);
         Channel::new(move |body: InvokeResponseBody| {
             let InvokeResponseBody::Json(text) = body else {
@@ -109,13 +111,7 @@ impl Bridge {
             // counter (tauri's JavaScriptChannelId starts an AtomicUsize at 0
             // and fetch_adds per send). Starting at 1 wedges every frame in
             // pendingMessages forever (no snapshot, no `connected`).
-            let index = {
-                let mut indexes = bridge.indexes.lock().unwrap();
-                let next = indexes.entry(cb).or_insert(0);
-                let index = *next;
-                *next += 1;
-                index
-            };
+            let index = index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let frame = json!({
                 "harness": "callback",
                 "cb": cb,
@@ -373,6 +369,9 @@ fn main() {
                 ),
                 HostCall::SubscribeRunning { cb } => {
                     pi_ipc_subscribe_running(app.state::<Arc<IpcHostState>>(), bridge_for_host.channel(cb))
+                }
+                HostCall::SubscribeTerminal { id, cursor, cb } => {
+                    pi_ipc_subscribe_terminal(app.state::<Arc<IpcHostState>>(), id, cursor, bridge_for_host.channel(cb))
                 }
                 HostCall::Shutdown => {
                     // Orderly teardown, the same paths the product uses per
@@ -640,6 +639,15 @@ fn handle_invoke(
                 return json!({ "harnessError": "pi_ipc_subscribe_events needs an onEvent channel" });
             };
             HostCall::SubscribeEvents { session: session.to_string(), cb }
+        }
+        "pi_ipc_subscribe_terminal" => {
+            let Some(id) = args.get("id").and_then(Value::as_str) else {
+                return json!({ "harnessError": "terminal id required" });
+            };
+            let Some(cb) = args.get("onOutput").and_then(channel_ref) else {
+                return json!({ "harnessError": "terminal output channel required" });
+            };
+            HostCall::SubscribeTerminal { id: id.to_string(), cursor: args.get("cursor").and_then(Value::as_u64).unwrap_or(0), cb }
         }
         "pi_ipc_subscribe_running" => {
             let Some(cb) = args.get("onFrame").and_then(channel_ref) else {

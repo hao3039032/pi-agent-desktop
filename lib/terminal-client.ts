@@ -8,6 +8,42 @@ export async function terminalRequest(path: string, options?: RequestInit): Prom
   return data;
 }
 
+export async function createTerminal(id: string, cwd: string, cols: number, rows: number): Promise<void> {
+  await terminalRequest("/api/terminal", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, cwd, cols, rows }) });
+}
+
+export async function checkTerminal(id: string): Promise<void> {
+  await terminalRequest(`/api/terminal/${encodeURIComponent(id)}`);
+}
+
+export async function closeTerminal(id: string): Promise<void> {
+  await terminalRequest(`/api/terminal/${encodeURIComponent(id)}`, { method: "DELETE", keepalive: true });
+}
+
+export function subscribeTerminal(id: string, offset: number | undefined, handlers: {
+  onOpen: () => void;
+  onEvent: (event: import("@/lib/terminal-manager").TerminalEvent, done: () => void) => void;
+  onError: (closed: boolean) => void;
+}): () => void {
+  const events = new EventSource(`/api/terminal/${encodeURIComponent(id)}/events${offset === undefined ? "" : `?after=${offset}`}`);
+  events.onmessage = (message) => handlers.onEvent(JSON.parse(message.data), () => {});
+  events.onopen = handlers.onOpen;
+  events.onerror = () => handlers.onError(events.readyState === EventSource.CLOSED);
+  return () => events.close();
+}
+
+export async function getTerminalSettings(signal?: AbortSignal): Promise<import("@/lib/api-types").TerminalSettingsResponse> {
+  const response = await fetch("/api/terminal/settings", { signal, cache: "no-store" });
+  if (!response.ok) throw new Error("Load failed");
+  return response.json();
+}
+
+export async function setTerminalSettings(shell: string): Promise<import("@/lib/api-types").TerminalSettingsResponse> {
+  const response = await fetch("/api/terminal/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shell }) });
+  if (!response.ok) throw new Error("Save failed");
+  return response.json();
+}
+
 export function createTerminalWriter(id: string, onError: (error: Error) => void) {
   let pending = Promise.resolve();
   let stopped = false;

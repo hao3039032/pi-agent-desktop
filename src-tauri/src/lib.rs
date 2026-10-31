@@ -36,6 +36,7 @@ pub mod settings_extras;
 mod session_search;
 mod session_actions;
 mod session_deletion;
+mod terminal_host;
 mod shell;
 mod update_install;
 
@@ -1530,6 +1531,9 @@ pub fn run() {
     app.run(|app_handle, event| match event {
         RunEvent::Exit => {
             desktop_log(app_handle, "exit");
+            if let Some(host) = app_handle.try_state::<std::sync::Arc<pi_ipc::IpcHostState>>() {
+                host.terminals.shutdown();
+            }
             #[cfg(target_os = "linux")]
             remove_instance_lock();
             if let Some(server) = app_handle.try_state::<DesktopServer>() {
