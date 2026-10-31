@@ -1479,6 +1479,55 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 }
             }
         }
+        // --- settings-extras -----------------------------------------------
+        "tools.settingsGet" => {
+            match crate::settings_extras::tools_settings_get(&state.agent_dir()) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "tools.settingsSet" => {
+            match crate::settings_extras::tools_settings_set(&state.agent_dir(), &args) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "artifacts.settingsGet" => {
+            match crate::settings_extras::artifacts_settings_get(&state.agent_dir()) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "artifacts.settingsSet" => {
+            match crate::settings_extras::artifacts_settings_set(&state.agent_dir(), &args) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "chats.settingsGet" => {
+            match crate::settings_extras::chats_settings_get(&state.agent_dir()) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "chats.settingsSet" => {
+            match crate::settings_extras::chats_settings_set(&state.agent_dir(), &args) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "appearance.customCssGet" => {
+            match crate::settings_extras::appearance_custom_css_get(&state.agent_dir()) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
+        "appearance.customCssSet" => {
+            match crate::settings_extras::appearance_custom_css_set(&state.agent_dir(), &args) {
+                Ok(v) => protocol_ok(&id, v),
+                Err(e) => e.to_protocol_value(&id),
+            }
+        }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
@@ -7646,5 +7695,65 @@ mod tests {
             response["data"]["decisionError"].is_string(),
             "the unparsable store is reported: {response}"
         );
+    }
+
+    #[test]
+    fn settings_extras_ipc_dispatch_roundtrip() {
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+
+        // 1. tools.settingsGet / tools.settingsSet
+        let res = send(&state, json!({ "v": 1, "id": "t1", "op": "tools.settingsGet" }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["codemode"], "automatic");
+
+        let res = send(&state, json!({
+            "v": 1,
+            "id": "t2",
+            "op": "tools.settingsSet",
+            "args": { "codemode": "always" }
+        }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["codemode"], "always");
+
+        // 2. artifacts.settingsGet / artifacts.settingsSet
+        let res = send(&state, json!({ "v": 1, "id": "a1", "op": "artifacts.settingsGet" }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["enabled"], true);
+
+        let res = send(&state, json!({
+            "v": 1,
+            "id": "a2",
+            "op": "artifacts.settingsSet",
+            "args": { "enabled": false }
+        }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["enabled"], false);
+
+        // 3. chats.settingsGet / chats.settingsSet
+        let res = send(&state, json!({ "v": 1, "id": "c1", "op": "chats.settingsGet" }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["instructions"], "");
+
+        let res = send(&state, json!({
+            "v": 1,
+            "id": "c2",
+            "op": "chats.settingsSet",
+            "args": { "instructions": "System prompt instructions" }
+        }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["instructions"], "System prompt instructions");
+
+        // 4. appearance.customCssGet / appearance.customCssSet
+        let res = send(&state, json!({ "v": 1, "id": "css1", "op": "appearance.customCssGet" }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["css"], "");
+
+        let res = send(&state, json!({ "v": 1, "id": "css2", "op": "appearance.customCssSet", "args": {} }));
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["data"]["created"], true);
     }
 }

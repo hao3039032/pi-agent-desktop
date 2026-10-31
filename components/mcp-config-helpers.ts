@@ -26,6 +26,11 @@ import type {
   ProjectTrustStatus,
 } from "@/lib/api-types";
 import type { McpImportFieldValue, McpImportNote } from "@/lib/mcp-import";
+import {
+  saveToolSettings,
+  ToolSettingsError,
+  type ToolSettingsChange,
+} from "@/lib/tool-settings-service";
 import { itemsToSwitch } from "./settings-ui-helpers";
 
 // Pure helpers for Settings › MCP (components/McpConfig.tsx): what each row
@@ -914,6 +919,8 @@ function isInlineBudgetSetting(value: unknown): value is CodemodeInlineBudgetSet
     && (setting.invalid === undefined || typeof setting.invalid === "string");
 }
 
+export const defaultToolSettingsFetchImpl: FetchLike = (input, init) => fetch(input, init);
+
 /**
  * One change through `PUT /api/tools/settings`, answered with the value the
  * route read back after writing (picked from its answer by `stored`), which
@@ -925,6 +932,20 @@ async function requestToolSettingsChange<T>(
   fetchImpl: FetchLike,
   signal: AbortSignal,
 ): Promise<{ ok: true; stored: T } | { ok: false; error: McpLoadFailure }> {
+  if (fetchImpl === defaultToolSettingsFetchImpl) {
+    try {
+      const data = await saveToolSettings(change as ToolSettingsChange);
+      const value = stored(data as unknown as Record<string, unknown>);
+      if (value !== undefined) return { ok: true, stored: value };
+      return { ok: false, error: { error: "Unexpected response format" } };
+    } catch (error) {
+      if (error instanceof ToolSettingsError) {
+        return { ok: false, error: { error: error.message, reason: error.reason } };
+      }
+      return { ok: false, error: { error: error instanceof Error ? error.message : String(error) } };
+    }
+  }
+
   let response: Awaited<ReturnType<FetchLike>>;
   try {
     response = await fetchImpl("/api/tools/settings", {
@@ -970,7 +991,7 @@ async function requestCodemodeSave(
  */
 export async function saveMcpCodemodePreference(
   preference: McpCodemodePreference,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = defaultToolSettingsFetchImpl,
   signal?: AbortSignal,
   timeoutMs: number = MCP_CODEMODE_SAVE_TIMEOUT_MS,
 ): Promise<McpCodemodeSaveResult> {
@@ -989,7 +1010,7 @@ export async function saveMcpCodemodePreference(
  */
 export async function saveMcpCodemodeMode(
   mode: CodemodeMode,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = defaultToolSettingsFetchImpl,
   signal?: AbortSignal,
   timeoutMs: number = MCP_CODEMODE_SAVE_TIMEOUT_MS,
 ): Promise<McpCodemodeModeSaveResult> {
@@ -1017,7 +1038,7 @@ export async function saveMcpCodemodeMode(
  */
 export async function saveMcpCodemodeInlineBudget(
   budget: number | null,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = defaultToolSettingsFetchImpl,
   signal?: AbortSignal,
   timeoutMs: number = MCP_CODEMODE_SAVE_TIMEOUT_MS,
 ): Promise<McpCodemodeInlineBudgetSaveResult> {

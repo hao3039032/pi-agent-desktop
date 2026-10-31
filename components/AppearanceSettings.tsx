@@ -5,6 +5,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { useTheme } from "@/hooks/useTheme";
 import { THEME_OPTIONS } from "@/lib/theme";
 import { isTauriDesktop, openPathNative } from "@/lib/desktop-native";
+import { ensureCustomCss } from "@/lib/custom-css-service";
 import { ConfigButton } from "./SettingsUi";
 import { ThemeIcon } from "./ThemeIcon";
 import { FontSettings } from "./FontSettings";
@@ -19,10 +20,7 @@ export function AppearanceSettings() {
     setCustomCssBusy(true);
     setCustomCssError(false);
     try {
-      const response = await fetch("/api/custom-css", { method: "POST" });
-      if (!response.ok) throw new Error("Could not open stylesheet");
-      const data = await response.json() as { path?: string };
-      if (!data.path) throw new Error("Missing stylesheet path");
+      const data = await ensureCustomCss();
       await openPathNative(data.path);
     } catch {
       setCustomCssError(true);

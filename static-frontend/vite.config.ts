@@ -139,6 +139,30 @@ export default defineConfig({
       },
       { find: /^@\/lib\/git-status-service$/, replacement: resolve(import.meta.dirname, "src/data/git-status-service.ts") },
       { find: /^@\/lib\/worktree-service$/, replacement: resolve(import.meta.dirname, "src/data/worktree-service.ts") },
+      {
+        // The tool-settings service swaps GET/PUT /api/tools/settings for
+        // tools.settingsGet / tools.settingsSet over IPC.
+        find: /^@\/lib\/tool-settings-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/tool-settings-service.ts"),
+      },
+      {
+        // The artifact-settings service swaps GET/PUT /api/artifacts/settings
+        // for artifacts.settingsGet / artifacts.settingsSet over IPC.
+        find: /^@\/lib\/artifact-settings-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/artifact-settings-service.ts"),
+      },
+      {
+        // The chat-settings service swaps GET/PUT /api/chat-settings for
+        // chats.settingsGet / chats.settingsSet over IPC.
+        find: /^@\/lib\/chat-settings-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/chat-settings-service.ts"),
+      },
+      {
+        // The custom-css service swaps GET/POST /api/custom-css for
+        // appearance.customCssGet / appearance.customCssSet over IPC.
+        find: /^@\/lib\/custom-css-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/custom-css-service.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],

@@ -17,6 +17,9 @@ import { AppShell } from "../../components/AppShell";
 import { I18nProvider } from "../../hooks/useI18n";
 import { DistroSetupGate } from "../../components/distro";
 import { bindAgentClient } from "./data/agent-client.ts";
+import { bindArtifactsSettingsService } from "./data/artifact-settings-service.ts";
+import { bindChatSettingsService } from "./data/chat-settings-service.ts";
+import { bindCustomCssService, applyCustomCssToDocument } from "./data/custom-css-service.ts";
 import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindEnabledModelsService } from "./data/enabled-models-service.ts";
 import { bindFileService } from "./data/file-service.ts";
@@ -29,6 +32,7 @@ import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
 import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
+import { bindToolSettingsService } from "./data/tool-settings-service.ts";
 import { bindWorkspaceService } from "./data/workspace-service.ts";
 import { bindWorktreeService } from "./data/worktree-service.ts";
 import { detectTransport } from "./data/transport.ts";
@@ -46,6 +50,10 @@ async function boot(): Promise<void> {
   bindEnabledModelsService(client);
   bindModelsConfigService(client);
   bindFontService(client);
+  bindToolSettingsService(client);
+  bindArtifactsSettingsService(client);
+  bindChatSettingsService(client);
+  bindCustomCssService(client);
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);
@@ -54,6 +62,7 @@ async function boot(): Promise<void> {
   bindScheduledTasksStore(client);
   bindProjectTrustClient(client);
   bindStateMirrorClient(client);
+  void applyCustomCssToDocument();
   // The transition mirror imports BEFORE React mounts (plan §七.4): the
   // exported snapshot lands in localStorage while the UI still holds no
   // state of its own. Never invented when absent; never rolled back.
