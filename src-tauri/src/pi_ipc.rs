@@ -4083,7 +4083,7 @@ mod tests {
         let mut types = Vec::new();
         while types.len() < 4 {
             let frame: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
-            types.push(frame["payload"]["type"].as_str().unwrap_or("").to_string());
+            if let Some(kind) = frame["payload"]["type"].as_str() { types.push(kind.to_string()); }
         }
         assert!(types.iter().any(|kind| kind == "run_started"));
         assert!(types.iter().any(|kind| kind == "run_finished"));

@@ -56,6 +56,7 @@ let loadId = 0;
 let streamRefs = 0;
 let stopStream: (() => void) | null = null;
 let streamError: string | null = null;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
 const eventHandlers = new Set<(event: ScheduledTaskEvent) => void>();
 /** Sessions known to be produced by a scheduled run (each task's latest run). */
 const scheduledSessionIds = new Set<string>();
@@ -86,13 +87,18 @@ export function onScheduledTaskEvent(handler: (event: ScheduledTaskEvent) => voi
   return () => { eventHandlers.delete(handler); };
 }
 
-export function retainScheduledTaskStream(): () => void {
-  streamRefs += 1;
-  if (streamRefs === 1) {
+function connectScheduledStream(): void {
     stopStream = clientForTasks().subscribe<ScheduledTaskEvent>("tasks.subscribeEvents", undefined, (frame) => {
       if (frame.kind === "reset") {
         streamError = "Scheduled task event stream overflowed; reload to reconnect";
         setState({ error: streamError, runningTaskIds: new Set() });
+        void refreshScheduledTasks();
+        scheduleStreamReconnect();
+        return;
+      }
+      if (frame.kind === "snapshot") {
+        streamError = null;
+        setState({ error: null });
         void refreshScheduledTasks();
         return;
       }
@@ -110,14 +116,34 @@ export function retainScheduledTaskStream(): () => void {
       setState({ runningTaskIds: running, ...(event.type === "scheduler_owner" ? { schedulerOwner: event.owner } : {}) });
       for (const handler of eventHandlers) handler(event);
       void refreshScheduledTasks();
-    }, (error) => { streamError = error.message; setState({ error: streamError }); });
-  }
+    }, (error) => { streamError = error.message; setState({ error: streamError }); scheduleStreamReconnect(); });
+}
+
+function scheduleStreamReconnect(): void {
+  if (streamRefs === 0 || retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    if (streamRefs === 0) return;
+    stopStream?.();
+    stopStream = null;
+    connectScheduledStream();
+    void refreshScheduledTasks();
+  }, 3000);
+}
+
+export function retainScheduledTaskStream(): () => void {
+  streamRefs += 1;
+  if (streamRefs === 1) connectScheduledStream();
   let released = false;
   return () => {
     if (released) return;
     released = true;
     streamRefs -= 1;
-    if (streamRefs === 0) { stopStream?.(); stopStream = null; streamError = null; }
+    if (streamRefs === 0) {
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      stopStream?.(); stopStream = null; streamError = null;
+    }
   };
 }
 

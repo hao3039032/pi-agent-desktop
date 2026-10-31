@@ -34,7 +34,11 @@ impl ScheduledEvents {
         let thread_id = id.clone();
         let subscribers = Arc::clone(&self.subscribers);
         if let Err(error) = std::thread::Builder::new().name(format!("scheduled-events-{id}")).spawn(move || {
-            let mut seq = 0u64;
+            let mut seq = 1u64;
+            if channel.send(json!({ "subscriptionId": thread_id, "epoch": 1, "seq": seq, "kind": "snapshot", "payload": {} })).is_err() {
+                subscribers.lock().unwrap().remove(&thread_id);
+                return;
+            }
             loop {
                 if overflowed.load(Ordering::SeqCst) {
                     seq += 1;
@@ -71,6 +75,8 @@ mod tests {
         });
         let id = events.subscribe(channel).unwrap();
         events.emit(json!({ "type": "task_changed", "taskId": "t" }));
+        let snapshot: Value = serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
         let text = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         let frame: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(frame["payload"]["taskId"], "t");
