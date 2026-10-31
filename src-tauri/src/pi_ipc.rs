@@ -71,6 +71,7 @@ pub struct IpcHostState {
     pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
+    pub(crate) native_drops: crate::native_drop::NativeDrops,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
     /// Authorized save destinations (bound via native dialog selections).
@@ -129,6 +130,7 @@ impl IpcHostState {
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
+            native_drops: crate::native_drop::NativeDrops::default(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
                 // The legacy default-cwd layouts stay browsable across
@@ -2293,8 +2295,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             { let _ = path; protocol_error(&id, "not_supported", "Secure directory reveal is not supported on this platform") }
         }
         "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
-        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(&id, &args),
-        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(&id, &args),
+        "files.importDropped" => crate::native_import::import_dropped(state, &id, &args),
+        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(state, &id, &args),
+        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(state, &id, &args),
         "desktop.saveFile" => crate::file_resources::handle_desktop_save_file(state, &id, &args),
         "chats.extractAttachmentText" => {
             crate::file_resources::handle_chats_extract_attachment_text(state, &id, &args)

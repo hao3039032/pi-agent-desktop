@@ -353,7 +353,7 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
 
 pub const MAX_PATHS: usize = 100;
 
-pub fn handle_desktop_describe_paths(id: &str, args: &Value) -> Value {
+pub fn handle_desktop_describe_paths(state: &IpcHostState, id: &str, args: &Value) -> Value {
     let Some(paths) = args.get("paths").and_then(Value::as_array) else {
         return protocol_error(id, "invalid_args", "paths must be an array of strings");
     };
@@ -376,20 +376,18 @@ pub fn handle_desktop_describe_paths(id: &str, args: &Value) -> Value {
             items.push(json!({ "path": raw, "kind": "other" }));
             continue;
         }
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            items.push(json!({ "path": raw, "kind": "missing" }));
+        let Some((directory, size, handle)) = state.native_drops.info(raw) else {
+            items.push(json!({ "path": raw, "kind": "other" }));
             continue;
         };
-        if meta.file_type().is_symlink() {
-            items.push(json!({ "path": raw, "kind": "other" }));
-        } else if meta.is_dir() {
+        if directory {
             items.push(json!({ "path": raw, "kind": "directory" }));
-        } else if meta.is_file() {
+        } else if handle.is_some() {
             let image_mime = get_image_mime(&p);
             let mut val = json!({
                 "path": raw,
                 "kind": "file",
-                "size": meta.len(),
+                "size": size,
             });
             if let Some(mime) = image_mime {
                 val["imageMime"] = json!(mime);
@@ -406,7 +404,7 @@ pub fn handle_desktop_describe_paths(id: &str, args: &Value) -> Value {
 // desktop.readImages
 // ---------------------------------------------------------------------------
 
-pub fn handle_desktop_read_images(id: &str, args: &Value) -> Value {
+pub fn handle_desktop_read_images(state: &IpcHostState, id: &str, args: &Value) -> Value {
     let Some(paths) = args.get("paths").and_then(Value::as_array) else {
         return protocol_error(id, "invalid_args", "paths must be an array of strings");
     };
@@ -439,13 +437,15 @@ pub fn handle_desktop_read_images(id: &str, args: &Value) -> Value {
             .unwrap_or(raw)
             .to_string();
 
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            return protocol_error(id, "not_found", &format!("File not found: {name}"));
+        let Some((false, _, Some(handle))) = state.native_drops.info(raw) else {
+            return protocol_error(id, "unauthorized_scope", "file was not supplied by a native drop");
         };
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return protocol_error(id, "invalid_args", &format!("Not a regular file: {name}"));
-        }
-        if meta.len() > MAX_ATTACHED_IMAGE_BYTES {
+        let response = state.resources.read(&handle, "", Some((0, MAX_ATTACHED_IMAGE_BYTES)));
+        let (bytes, size) = match response {
+            resource_protocol::ResourceResponse::Ok { bytes, total_len, .. } => (bytes, total_len),
+            _ => return protocol_error(id, "not_found", &format!("File no longer available: {name}")),
+        };
+        if size > MAX_ATTACHED_IMAGE_BYTES {
             return protocol_error(
                 id,
                 "payload_too_large",
@@ -455,7 +455,7 @@ pub fn handle_desktop_read_images(id: &str, args: &Value) -> Value {
                 ),
             );
         }
-        total_bytes += meta.len();
+        total_bytes += size;
         if total_bytes > MAX_ATTACHED_IMAGE_SELECTION_BYTES {
             return protocol_error(
                 id,
@@ -470,9 +470,6 @@ pub fn handle_desktop_read_images(id: &str, args: &Value) -> Value {
             return protocol_error(id, "invalid_args", &format!("Not an image: {name}"));
         };
 
-        let Ok(bytes) = std::fs::read(&path) else {
-            return protocol_error(id, "io", &format!("Failed to read file: {name}"));
-        };
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
         files.push(json!({
             "name": name,
@@ -828,6 +825,7 @@ mod tests {
         assert_eq!(matches_sub[0]["path"], "README.md");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_desktop_describe_paths() {
         let tmp = tempdir().unwrap();
@@ -851,7 +849,9 @@ mod tests {
             "relative/path".to_string(),
         ];
 
-        let res = handle_desktop_describe_paths("d1", &json!({ "paths": paths }));
+        let state = setup_state(tmp.path());
+        state.native_drops.register(&state, &[file.clone(), sub.clone(), missing.clone(), link.clone()]);
+        let res = handle_desktop_describe_paths(&state, "d1", &json!({ "paths": paths }));
         assert_eq!(res["ok"], true);
         let items = res["data"]["items"].as_array().unwrap();
         assert_eq!(items.len(), if cfg!(unix) { 5 } else { 4 });
@@ -864,8 +864,8 @@ mod tests {
         // Second item: directory
         assert_eq!(items[1]["kind"], "directory");
 
-        // Third item: missing
-        assert_eq!(items[2]["kind"], "missing");
+        // Unrecognized paths reveal no filesystem metadata.
+        assert_eq!(items[2]["kind"], "other");
 
         #[cfg(unix)]
         // Fourth item: symlink is reported as other
@@ -876,6 +876,7 @@ mod tests {
         assert_eq!(last["kind"], "other");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_desktop_read_images() {
         let tmp = tempdir().unwrap();
@@ -886,8 +887,12 @@ mod tests {
         let txt = tmp.path().join("text.txt");
         std::fs::write(&txt, b"hello").unwrap();
 
+        let state = setup_state(tmp.path());
+        let denied = handle_desktop_read_images(&state, "unauthorized", &json!({ "paths": [png.display().to_string()] }));
+        assert_eq!(denied["error"]["code"], "unauthorized_scope");
+        state.native_drops.register(&state, &[png.clone(), txt.clone(), tmp.path().to_path_buf()]);
         // 1. Valid image read
-        let res = handle_desktop_read_images("r1", &json!({ "paths": [png.display().to_string()] }));
+        let res = handle_desktop_read_images(&state, "r1", &json!({ "paths": [png.display().to_string()] }));
         assert_eq!(res["ok"], true);
         let files = res["data"]["files"].as_array().unwrap();
         assert_eq!(files.len(), 1);
@@ -898,18 +903,18 @@ mod tests {
         assert_eq!(decoded, png_bytes);
 
         // 2. Non-image rejected
-        let res_txt = handle_desktop_read_images("r2", &json!({ "paths": [txt.display().to_string()] }));
+        let res_txt = handle_desktop_read_images(&state, "r2", &json!({ "paths": [txt.display().to_string()] }));
         assert_eq!(res_txt["ok"], false);
         assert_eq!(res_txt["error"]["code"], "invalid_args");
         assert!(res_txt["error"]["message"].as_str().unwrap().contains("Not an image"));
 
         // 3. Directory rejected
-        let res_dir = handle_desktop_read_images("r3", &json!({ "paths": [tmp.path().display().to_string()] }));
+        let res_dir = handle_desktop_read_images(&state, "r3", &json!({ "paths": [tmp.path().display().to_string()] }));
         assert_eq!(res_dir["ok"], false);
-        assert_eq!(res_dir["error"]["code"], "invalid_args");
+        assert_eq!(res_dir["error"]["code"], "unauthorized_scope");
 
         // 4. Empty selection rejected
-        let res_empty = handle_desktop_read_images("r4", &json!({ "paths": [] }));
+        let res_empty = handle_desktop_read_images(&state, "r4", &json!({ "paths": [] }));
         assert_eq!(res_empty["ok"], false);
         assert_eq!(res_empty["error"]["code"], "invalid_args");
     }

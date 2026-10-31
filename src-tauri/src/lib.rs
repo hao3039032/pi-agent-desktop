@@ -24,6 +24,8 @@ mod worktrees;
 pub mod file_resources;
 mod logging;
 mod native_prefs;
+mod native_drop;
+mod native_import;
 mod resource_save;
 #[cfg(feature = "harness")]
 pub mod resource_handler;
@@ -1360,6 +1362,13 @@ pub fn run() {
     #[cfg(feature = "custom-protocol")]
     let server_instance_id = desktop_instance_id.clone();
     let app = tauri::Builder::default()
+        .on_webview_event(|webview, event| {
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                if let Some(state) = webview.app_handle().try_state::<Arc<pi_ipc::IpcHostState>>() {
+                    state.native_drops.register(&state, paths);
+                }
+            }
+        })
         .register_uri_scheme_protocol("pi-resource", |ctx, request| {
             let state = ctx.app_handle().state::<Arc<pi_ipc::IpcHostState>>();
             resource_handler::respond(&state.resources, request)

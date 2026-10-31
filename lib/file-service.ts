@@ -36,6 +36,8 @@ export interface FileNodeEntry {
   outsideLinkEncloses?: boolean;
 }
 
+export function usesStaticFileHost(): boolean { return false; }
+
 async function responseError(res: Response, fallback: string): Promise<Error> {
   const body = (await res.json().catch(() => null)) as { error?: string } | null;
   return new Error(body?.error ?? fallback);

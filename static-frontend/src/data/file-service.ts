@@ -13,6 +13,8 @@ import { getFileLanguage } from "../../../lib/file-language";
 import { TEXT_PREVIEW_MAX_BYTES } from "../../../lib/file-types";
 import { textPreviewChunk } from "../../../lib/text-preview-bytes";
 
+export function usesStaticFileHost(): boolean { return true; }
+
 let client: IpcClient | null = null;
 
 export function bindFileService(bound: IpcClient): void {
