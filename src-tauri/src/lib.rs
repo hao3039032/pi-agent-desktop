@@ -21,6 +21,7 @@ mod file_access;
 pub mod fonts;
 mod git_changes;
 mod worktrees;
+pub mod file_resources;
 mod logging;
 mod native_prefs;
 // `pi_ipc` is pub for the static-UI acceptance harness bin (same crate,
@@ -158,7 +159,7 @@ fn open_path_with_default_app(path: &Path) -> Result<(), String> {
     Err("Opening local paths is unsupported on this platform".into())
 }
 
-fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+pub(crate) fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("Path does not exist: {}", path.display()));
     }

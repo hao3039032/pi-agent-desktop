@@ -16,7 +16,17 @@ const jiti = createJiti(import.meta.url, {
   interopDefault: true,
 });
 
-const { fetchFileEntries, allowOutsideLink, bindFileService } = await jiti.import("./file-service.ts");
+const {
+  fetchFileEntries,
+  allowOutsideLink,
+  searchFileIndex,
+  fetchFileIndex,
+  readFileContent,
+  grantFileResource,
+  readFileResource,
+  revokeFileResource,
+  bindFileService,
+} = await jiti.import("./file-service.ts");
 const { IpcClient, MockTransport } = await jiti.import("../ipc/client.ts");
 
 function boundService(handler) {
@@ -90,4 +100,82 @@ test("allowOutsideLink sends the shown target and surfaces refusals", async () =
     allowOutsideLink("/proj/link", "/outside/other"),
     /changed/,
   );
+});
+
+test("searchFileIndex sends cwd and q to files.index and returns matches", async () => {
+  const mock = boundService(null);
+  const calls = [];
+  mock.on("files.index", (args) => {
+    calls.push(args);
+    return {
+      matches: [
+        { path: "src/Chat.tsx", isDir: false },
+        { path: "src", isDir: true },
+      ],
+    };
+  });
+  const results = await searchFileIndex("/proj", "chat");
+  assert.deepEqual(calls, [{ cwd: "/proj", q: "chat" }]);
+  assert.equal(results.length, 2);
+  assert.equal(results[0].path, "src/Chat.tsx");
+  assert.equal(results[0].isDir, false);
+});
+
+test("fetchFileIndex sends cwd to files.index and returns files with truncated flag", async () => {
+  const mock = boundService(null);
+  const calls = [];
+  mock.on("files.index", (args) => {
+    calls.push(args);
+    return {
+      files: ["a.ts", "b.ts"],
+      truncated: false,
+    };
+  });
+  const res = await fetchFileIndex("/proj");
+  assert.deepEqual(calls, [{ cwd: "/proj" }]);
+  assert.deepEqual(res, { files: ["a.ts", "b.ts"], truncated: false });
+});
+
+test("readFileContent sends path to files.read and returns mime and data", async () => {
+  const mock = boundService(null);
+  const calls = [];
+  mock.on("files.read", (args) => {
+    calls.push(args);
+    return {
+      mime: "text/plain",
+      data: "aGVsbG8=",
+    };
+  });
+  const res = await readFileContent("/proj/file.txt");
+  assert.deepEqual(calls, [{ path: "/proj/file.txt" }]);
+  assert.equal(res.mime, "text/plain");
+  assert.equal(res.data, "aGVsbG8=");
+});
+
+test("resource protocol functions roundtrip through resources.* ops", async () => {
+  const mock = boundService(null);
+  mock.on("resources.grantFile", (args) => {
+    assert.equal(args.path, "/proj/img.png");
+    return { handle: "handle-123" };
+  });
+  mock.on("resources.read", (args) => {
+    assert.equal(args.handle, "handle-123");
+    return {
+      mime: "image/png",
+      data: "iVBORw0KGgo=",
+      totalLen: 8,
+      rangeApplied: false,
+    };
+  });
+  mock.on("resources.revoke", (args) => {
+    assert.equal(args.handle, "handle-123");
+    return { revoked: true };
+  });
+
+  const handle = await grantFileResource("/proj/img.png");
+  assert.equal(handle, "handle-123");
+  const readRes = await readFileResource(handle);
+  assert.equal(readRes.mime, "image/png");
+  const revoked = await revokeFileResource(handle);
+  assert.equal(revoked, true);
 });

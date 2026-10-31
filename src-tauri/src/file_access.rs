@@ -530,7 +530,7 @@ const ALWAYS_HIDDEN_NAMES: [&str; 2] = [".git", ".DS_Store"];
 const HIDDEN_SUFFIXES: [&str; 1] = [".pyc"];
 
 /// The name-based rule for directories no Git work tree covers.
-fn is_hidden_outside_git(name: &str) -> bool {
+pub(crate) fn is_hidden_outside_git(name: &str) -> bool {
     HIDDEN_NAMES.contains(&name)
         || ALWAYS_HIDDEN_NAMES.contains(&name)
         || HIDDEN_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))

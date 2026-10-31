@@ -61,6 +61,10 @@ pub struct IpcHostState {
     pub resources: ResourceRegistry,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
+    /// Authorized save destinations (bound via native dialog selections).
+    pub authorized_save_destinations: Mutex<HashMap<String, std::time::Instant>>,
+    /// Per-cwd cache for files.index.
+    pub file_index_cache: Mutex<HashMap<String, crate::file_resources::CachedFileIndex>>,
     /// Paths the HOST itself proposed (session cwds, project roots from the
     /// session index, artifact locations). resource grants only ever accept
     /// members of this set — the frontend cannot mint its own.
@@ -109,11 +113,40 @@ impl IpcHostState {
                 }
                 Mutex::new(roots)
             },
+            authorized_save_destinations: Mutex::new(HashMap::new()),
+            file_index_cache: Mutex::new(HashMap::new()),
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
         }
+    }
+
+    /// Authorize a destination for desktop.saveFile (e.g. from dialog selection).
+    pub fn authorize_save_destination(&self, path: &Path, ttl: Duration) {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        self.authorized_save_destinations
+            .lock()
+            .unwrap()
+            .insert(normalized, std::time::Instant::now() + ttl);
+    }
+
+    /// Whether a destination is currently authorized.
+    pub fn is_authorized_save_destination(&self, path: &Path) -> bool {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let mut map = self.authorized_save_destinations.lock().unwrap();
+        let now = std::time::Instant::now();
+        map.retain(|_, expires_at| *expires_at > now);
+        map.contains_key(&normalized)
+    }
+
+    /// Consume (single-use) an authorized save destination.
+    pub fn consume_authorized_save_destination(&self, path: &Path) -> bool {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        let mut map = self.authorized_save_destinations.lock().unwrap();
+        let now = std::time::Instant::now();
+        map.retain(|_, expires_at| *expires_at > now);
+        map.remove(&normalized).is_some()
     }
 
     /// Record a path the HOST derived (a session cwd or project root from
@@ -858,7 +891,7 @@ impl Default for IpcHostState {
 }
 
 /// The response envelope for a protocol-level rejection.
-fn protocol_error(id: &str, code: &str, message: &str) -> Value {
+pub(crate) fn protocol_error(id: &str, code: &str, message: &str) -> Value {
     protocol_error_value(
         id,
         json!({ "code": code, "message": message, "retryable": false }),
@@ -877,7 +910,7 @@ fn protocol_error_value(id: &str, error: Value) -> Value {
 }
 
 /// The response envelope for a success.
-fn protocol_ok(id: &str, data: Value) -> Value {
+pub(crate) fn protocol_ok(id: &str, data: Value) -> Value {
     json!({ "v": IPC_PROTOCOL_VERSION, "id": id, "ok": true, "data": data })
 }
 
@@ -1843,6 +1876,15 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 }
             }
         }
+        "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
+        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(&id, &args),
+        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(&id, &args),
+        "desktop.saveFile" => crate::file_resources::handle_desktop_save_file(state, &id, &args),
+        "chats.extractAttachmentText" => {
+            crate::file_resources::handle_chats_extract_attachment_text(&id, &args)
+        }
+        "chats.revealFolder" => crate::file_resources::handle_chats_reveal_folder(state, &id, &args),
+        "chats.revealDownload" => crate::file_resources::handle_chats_reveal_download(&id, &args),
         other => protocol_error(&id, "unknown_op", &format!("unknown operation {other}")),
     }
 }
