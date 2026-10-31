@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-pi-ipc",
+  "description": "Allow ONLY the trusted app WebView (the static frontend Tauri serves) to call the typed IPC bridge. Deliberately has no `remote` entry: loopback HTTP origins (the legacy Next dev/prod server) must never reach pi_ipc — it can spawn pi children, grant file roots and drive terminals.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "allow-pi-ipc",
+    "allow-pi-ipc-subscribe-events",
+    "allow-pi-ipc-subscribe-terminal"
+  ]
+}

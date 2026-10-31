@@ -68,6 +68,20 @@ pub fn scan_sessions(agent_dir: &Path) -> SessionIndex {
     index
 }
 
+/// Find one session's file and header by id (the resolveSessionPath
+/// contract: a targeted look-up, then nothing — no negative caching).
+pub fn find_session_by_id(agent_dir: &Path, session_id: &str) -> Option<SessionSummary> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let index = scan_sessions(agent_dir);
+    index
+        .projects
+        .into_values()
+        .flatten()
+        .find(|summary| summary.id == session_id)
+}
+
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {

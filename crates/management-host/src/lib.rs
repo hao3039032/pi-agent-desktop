@@ -52,8 +52,10 @@ pub struct ManagementInstance {
     pub scope: String,
     client: Arc<PiRpcClient>,
     state: Mutex<InstanceState>,
-    /// The management protocol nonce this child was spawned with
-    /// (PI_WEB_MGMT_NONCE in the child env).
+    /// The management protocol nonce this child was spawned with. The HOST
+    /// generates it at spawn (never accepted from the caller): a caller-
+    /// supplied nonce — or worse, an empty one — would let a forged envelope
+    /// from anywhere in the child bind to the management protocol.
     nonce: String,
 }
 
@@ -200,6 +202,10 @@ impl ManagementInstance {
 /// The registry of management instances, partitioned by scope.
 pub struct ManagementHost {
     instances: Mutex<HashMap<String, Arc<ManagementInstance>>>,
+    /// One in-flight spawn per scope (the session registry's pattern):
+    /// without it, two concurrent `instance()` calls for one scope both
+    /// spawn a child and one becomes an orphan that is never recycled.
+    start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Default for ManagementHost {
@@ -210,31 +216,43 @@ impl Default for ManagementHost {
 
 impl ManagementHost {
     pub fn new() -> Self {
-        Self { instances: Mutex::new(HashMap::new()) }
+        Self {
+            instances: Mutex::new(HashMap::new()),
+            start_locks: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The instance for a scope (`"global"` or a project cwd), started on
-    /// demand. Concurrent acquisition is serialized per scope by the map
-    /// lock; the spawn happens outside it.
+    /// demand. Concurrent calls for the same scope share ONE spawn.
     pub fn instance(
         &self,
         scope: &str,
         config: &ManagementSpawnConfig,
     ) -> Result<Arc<ManagementInstance>, String> {
-        {
-            let instances = self.instances.lock().unwrap();
-            if let Some(existing) = instances.get(scope) {
-                if !existing.is_expired() {
-                    return Ok(Arc::clone(existing));
-                }
-            }
+        let scope = canonical_scope(scope);
+        if let Some(existing) = self.live_instance(&scope) {
+            return Ok(existing);
         }
-        let instance = spawn_management(scope, config)?;
+        let lock = {
+            let mut locks = self.start_locks.lock().unwrap();
+            Arc::clone(locks.entry(scope.clone()).or_insert_with(|| Arc::new(Mutex::new(()))))
+        };
+        let _guard = lock.lock().unwrap();
+        // Won the lock: another caller may have finished spawning meanwhile.
+        if let Some(existing) = self.live_instance(&scope) {
+            return Ok(existing);
+        }
+        let instance = spawn_management(&scope, config)?;
         self.instances
             .lock()
             .unwrap()
-            .insert(scope.to_string(), Arc::clone(&instance));
+            .insert(scope.clone(), Arc::clone(&instance));
         Ok(instance)
+    }
+
+    fn live_instance(&self, scope: &str) -> Option<Arc<ManagementInstance>> {
+        let instances = self.instances.lock().unwrap();
+        instances.get(scope).filter(|instance| !instance.is_expired()).cloned()
     }
 
     /// Recycle expired instances; returns the recycled scopes.
@@ -286,6 +304,19 @@ fn base64_url_no_pad(data: &str) -> String {
     out
 }
 
+/// Normalize a scope key: `global` stays; a project cwd is canonicalized
+/// (symlinks resolved) so `/a/b`, `/a/b/` and a symlinked spelling of the
+/// same project share ONE child.
+fn canonical_scope(scope: &str) -> String {
+    if scope == "global" {
+        return scope.to_string();
+    }
+    match std::fs::canonicalize(std::path::Path::new(scope)) {
+        Ok(resolved) => resolved.to_string_lossy().into_owned(),
+        Err(_) => scope.trim_end_matches('/').to_string(),
+    }
+}
+
 fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
@@ -304,6 +335,11 @@ fn spawn_management(
         args.push("--extension".into());
         args.push(extension.to_string_lossy().into_owned());
     }
+    // The HOST owns the nonce: generated per spawn, never read back from the
+    // caller's env (a caller-supplied or empty nonce would bind forged
+    // envelopes from anywhere in the child to the management protocol).
+    // Applied AFTER the caller's env so nothing can override it.
+    let nonce = format!("mgmt-{}", uuid::Uuid::new_v4());
     let mut env = EnvPolicy::inherit();
     if let Some(agent_dir) = &config.agent_dir {
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
@@ -311,17 +347,12 @@ fn spawn_management(
     for (key, value) in &config.env {
         env = env.set(key, value.clone());
     }
+    env = env.set("PI_WEB_MGMT_NONCE", nonce.clone());
     let client = PiRpcClient::spawn(
         &config.executable,
         SpawnOptions { args, cwd: None, env, ..SpawnOptions::default() },
     )
     .map_err(|error| format!("management instance failed to start: {error}"))?;
-    let nonce = config
-        .env
-        .iter()
-        .find(|(key, _)| key == "PI_WEB_MGMT_NONCE")
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default();
     Ok(Arc::new(ManagementInstance {
         scope: scope.to_string(),
         nonce,
@@ -388,10 +419,25 @@ impl task_scheduler::CronOracle for ManagementCronOracle<'_> {
         iso_to_ms(first)
     }
 
-    fn count_slots_between(&self, _expr: &str, _timezone: &str, _since_ms: i64, _until_ms: i64) -> u32 {
-        // Slot counting stays approximate until the extension exposes a
-        // dedicated op; the scheduler only uses it for the skipped count.
-        0
+    fn count_slots_between(&self, expr: &str, timezone: &str, since_ms: i64, until_ms: i64) -> u32 {
+        // The skipped-slot count needs the SAME croner the fire decision
+        // used — a local reimplementation would drift across DST/ranges.
+        // A failed count answers 0 (the scheduler only uses it for the
+        // skipped annotation, never for the fire/drop decision).
+        let args = serde_json::json!({
+            "expr": expr,
+            "timezone": timezone,
+            "sinceISO": iso_from_ms(since_ms),
+            "untilISO": iso_from_ms(until_ms),
+        });
+        match self.call("cron.countSlots", args) {
+            Ok(result) => result
+                .get("count")
+                .and_then(|count| count.as_u64())
+                .map(|count| count.min(u32::MAX as u64) as u32)
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
     }
 }
 
@@ -582,7 +628,8 @@ export default function managementFixture(pi) {
             ],
             env: vec![
                 ("PI_WEB_MANAGED_MODULES".to_string(), managed.to_string_lossy().into_owned()),
-                ("PI_WEB_MGMT_NONCE".to_string(), "rust-mgmt-nonce".to_string()),
+                // NOTE: no PI_WEB_MGMT_NONCE — the HOST generates it per
+                // spawn; a caller-supplied nonce must never bind.
             ],
         };
         let host = ManagementHost::new();
@@ -601,6 +648,15 @@ export default function managementFixture(pi) {
         let now_ms = 1_772_368_245_000;
         let previous = oracle.previous_run("17 5 * * *", "UTC", now_ms).expect("slot");
         assert_eq!(previous, 1_772_342_220_000, "2026-03-01T05:17:00Z");
+
+        // The skipped-slot count uses the SAME croner (every 10 minutes for
+        // one hour → 6 slots in (since, until]).
+        let since = 1_772_362_800_000; // 2026-03-01T11:00:00Z
+        let until = 1_772_366_400_000; // 2026-03-01T12:00:00Z
+        let count = oracle.count_slots_between("*/10 * * * *", "UTC", since, until);
+        assert_eq!(count, 6, "11:10, 11:20, 11:30, 11:40, 11:50, 12:00");
+        // An empty window counts nothing.
+        assert_eq!(oracle.count_slots_between("*/10 * * * *", "UTC", until, until), 0);
 
         // A failed op reports the extension's code.
         let error = instance

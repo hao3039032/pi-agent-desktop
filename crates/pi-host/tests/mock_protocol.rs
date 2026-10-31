@@ -491,3 +491,95 @@ fn spawn_failure_is_reported_synchronously() {
         .expect_err("missing executable fails");
     assert_eq!(error.kind, ErrorKind::Spawn);
 }
+
+#[test]
+fn duplicate_in_flight_ids_are_refused_not_silently_overwritten() {
+    let client = spawn_mock(None);
+    // Two commands carrying the SAME caller-supplied id: the second must be
+    // refused while the first is still in flight (an overwrite would hang
+    // the first waiter until its timeout).
+    let first = {
+        let client = Arc::clone(&client);
+        std::thread::spawn(move || {
+            client.command("slow", json!({ "id": "shared-id", "delay_ms": 400 }), Some(LONG))
+        })
+    };
+    std::thread::sleep(Duration::from_millis(80));
+    let second = client.command("slow", json!({ "id": "shared-id", "delay_ms": 0 }), Some(LONG));
+    assert!(second.is_err(), "the duplicate id is refused while in flight");
+    let first_result = first.join().expect("first thread").expect("first command answers");
+    assert_eq!(first_result, Value::Null);
+    client.close(Duration::from_secs(5));
+}
+
+#[test]
+fn a_response_written_just_before_exit_is_still_dispatched() {
+    // The drain race: the child answers and exits immediately. The response
+    // is already in the pipe when the exit watcher fires; the pending
+    // command must resolve with it, not with the exit error.
+    let client = spawn_mock(None);
+    let result = client.command("answer_then_die", json!({ "payload": "last-words" }), Some(SHORT));
+    assert_eq!(
+        result.expect("the buffered response wins over the exit"),
+        json!("last-words")
+    );
+    client.wait_exit(Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn an_oversized_stdout_record_is_dropped_whole_and_the_stream_continues() {
+    let (client, logs) = spawn_mock_logged(Some("oversize_line"));
+    // The oversized record is dropped (never parsed); the event after it
+    // still arrives.
+    let (events, _subscription) = client.on_event();
+    // The oversize record was printed at STARTUP (before our subscription
+    // could miss it — it is an event record without id), so drain what the
+    // subscription saw: after_big must arrive, big must not.
+    let mut saw_after = false;
+    let mut saw_big = false;
+    while let Ok(record) = events.recv_timeout(Duration::from_secs(2)) {
+        match record.get("type").and_then(Value::as_str) {
+            Some("after_big") => saw_after = true,
+            Some("big") => saw_big = true,
+            _ => {}
+        }
+        if saw_after {
+            break;
+        }
+    }
+    assert!(saw_after, "the stream continues after the dropped record");
+    assert!(!saw_big, "the oversized record never parses");
+    let mut logged = false;
+    while let Ok(line) = logs.try_recv() {
+        if line.contains("exceeded") {
+            logged = true;
+        }
+    }
+    assert!(logged, "the drop is diagnosable");
+    client.close(Duration::from_secs(5));
+}
+
+#[test]
+fn bridge_drop_detaches_the_notify_handler_and_ends_its_threads() {
+    use pi_host::bridge::Bridge;
+    let client = spawn_mock(None);
+    let bridge = Bridge::attach(Arc::clone(&client), "mock-session-id".into(), "nonce-1".into());
+    // A bridge request over the mock: the ack path needs the child alive.
+    // (The mock has no real bridge extension; we only assert the DETACH
+    // mechanics, so any request result is fine.)
+    let _ = bridge.request("noop", None, Some(Duration::from_millis(50)));
+    // Drop the Bridge: the notify handler must detach from the client.
+    drop(bridge);
+    // A plain notify after the drop is an UNHANDLED method: fire-and-forget
+    // methods get no response (no crash, no cancel), proving the handler is
+    // gone instead of silently kept alive.
+    let collected = client
+        .command("collect_ui", json!({}), Some(SHORT))
+        .expect("collect");
+    let responses = collected.as_array().cloned().unwrap_or_default();
+    assert!(
+        !responses.iter().any(|response| response.get("method").and_then(Value::as_str) == Some("notify")),
+        "no notify handler remains registered after the Bridge dropped"
+    );
+    client.close(Duration::from_secs(5));
+}

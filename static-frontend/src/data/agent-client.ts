@@ -6,42 +6,31 @@
  * static build through a vite alias; the Next app keeps the HTTP client
  * until M5.
  *
- * Error semantics preserved: failures surface as AgentCommandError with a
- * code (the protocol envelope's code — same names the HTTP layer used for
- * the shared paths), and `accepted` stays undefined (the prompt admission
- * protocol arrives with the full prompt flow).
+ * Error semantics preserved EXACTLY (the constructor argument order is the
+ * original's): failures surface as AgentCommandError with (message, status,
+ * code, accepted, instanceId); a prompt the host could not admit carries
+ * code "prompt_rejected" + accepted false (isPromptRejectedError matches).
  */
 
 import { IpcClient, IpcFailure, type IpcTransport } from "../ipc/client.ts";
 
 export class AgentCommandError extends Error {
-  public readonly code?: string;
-  public readonly accepted?: boolean;
-  public readonly status?: number;
-  public readonly instanceId?: string;
-
   constructor(
     message: string,
-    code?: string,
-    accepted?: boolean,
-    status?: number,
-    instanceId?: string,
+    public readonly status: number,
+    public readonly code?: string,
+    public readonly accepted?: boolean,
+    public readonly instanceId?: string,
   ) {
     super(message);
     this.name = "AgentCommandError";
-    this.code = code;
-    this.accepted = accepted;
-    this.status = status;
-    this.instanceId = instanceId;
   }
 }
 
 export function isPromptRejectedError(error: unknown): error is AgentCommandError {
-  return (
-    error instanceof AgentCommandError &&
-    error.code === "prompt_rejected" &&
-    error.accepted === false
-  );
+  return error instanceof AgentCommandError
+    && error.code === "prompt_rejected"
+    && error.accepted === false;
 }
 
 // The transport is injected (the app entry owns the single wiring point).
@@ -53,42 +42,72 @@ export function bindAgentClient(transport: IpcTransport): void {
 
 function ensureClient(): IpcClient {
   if (client === null) {
-    throw new AgentCommandError("the agent IPC bridge is not configured (bindAgentClient)");
+    throw new AgentCommandError("the agent IPC bridge is not configured (bindAgentClient)", 0);
   }
   return client;
+}
+
+/** Map an IPC failure envelope onto the HTTP-shaped error the UI knows. */
+function toAgentCommandError(failure: IpcFailure): AgentCommandError {
+  const details = failure.error.details ?? {};
+  const code = typeof details.code === "string" ? details.code : failure.error.code;
+  const accepted = typeof details.accepted === "boolean" ? details.accepted : undefined;
+  const instanceId = typeof details.instanceId === "string" ? details.instanceId : undefined;
+  // The HTTP surface used 404 for a missing session and 500 for the rest;
+  // the protocol codes carry the same distinction without HTTP numbers.
+  const status = failure.error.code === "not_found" ? 404 : 500;
+  // A prompt that was not admitted is the rejection the composer checks.
+  const promptRejected = failure.error.code === "agent_spawn_failed"
+    || failure.error.code === "agent_handshake_failed";
+  return new AgentCommandError(
+    failure.error.message,
+    status,
+    promptRejected ? "prompt_rejected" : code,
+    promptRejected ? false : accepted,
+    instanceId,
+  );
 }
 
 export async function sendAgentCommand<T = unknown>(
   sessionId: string,
   command: Record<string, unknown>,
-  _options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal },
 ): Promise<T> {
+  // An aborted caller stops WAITING; the command itself may already be in
+  // flight at the host (the protocol's rule: never resend blindly — the
+  // abort never triggers a retry).
+  if (options?.signal?.aborted) {
+    throw new AgentCommandError("the command was aborted before it was sent", 0);
+  }
+  let onAbort: (() => void) | null = null;
+  const abort = new Promise<never>((_, reject) => {
+    const signal = options?.signal;
+    if (!signal) return;
+    onAbort = () => reject(new AgentCommandError("the command was aborted", 0));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
   try {
-    // agent.command takes the closed command enum; the session id rides in
-    // args (the Rust side correlates both).
-    return await ensureClient().request<T>(
-      "agent.command",
-      { ...command, session: sessionId },
-      // Prompt-class commands legitimately run long: the child's run may
-      // outlive the admission; the admission itself answers fast.
-      { timeoutMs: 130_000 },
-    );
+    return await Promise.race([
+      // agent.command takes the closed command enum; the session id rides in
+      // args (the Rust side correlates both).
+      ensureClient().request<T>(
+        "agent.command",
+        { ...command, session: sessionId },
+        // Prompt-class commands legitimately run long: the child's run may
+        // outlive the admission; the admission itself answers fast.
+        { timeoutMs: 130_000 },
+      ),
+      abort,
+    ]);
   } catch (caught) {
-    const failure = caught instanceof IpcFailure ? caught : null;
-    if (failure) {
-      const instanceId =
-        typeof failure.error.details?.instanceId === "string"
-          ? (failure.error.details.instanceId as string)
-          : undefined;
-      throw new AgentCommandError(
-        failure.error.message,
-        failure.error.code,
-        undefined,
-        undefined,
-        instanceId,
-      );
-    }
+    if (caught instanceof AgentCommandError) throw caught;
+    if (caught instanceof IpcFailure) throw toAgentCommandError(caught);
     const message = caught instanceof Error ? caught.message : String(caught);
-    throw new AgentCommandError(message);
+    throw new AgentCommandError(message, 0);
+  } finally {
+    // The request settled: stop holding the abort listener.
+    if (onAbort !== null && options?.signal) {
+      options.signal.removeEventListener("abort", onAbort);
+    }
   }
 }

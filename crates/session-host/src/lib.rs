@@ -99,13 +99,21 @@ impl Session {
     }
 
     /// Subscribe to the child's session events. Dropping the receiver
-    /// detaches. Returns (receiver, detach guard... none needed: dropping
-    /// the Receiver detaches on next send).
-    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<Value> {
+    /// detaches; [`Session::unsubscribe`] detaches by id (the IPC layer's
+    /// explicit unsubscribe). Returns (subscriber id, receiver).
+    pub fn subscribe(&self) -> (u64, std::sync::mpsc::Receiver<Value>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut state = self.state.lock().unwrap();
-        state.subscribers.push((self.next_subscriber_id(), tx));
-        rx
+        let id = self.next_subscriber_id();
+        state.subscribers.push((id, tx));
+        (id, rx)
+    }
+
+    /// Detach the subscriber with this id (its relay thread's recv then
+    /// fails and the thread exits). Unknown ids are ignored.
+    pub fn unsubscribe(&self, subscriber_id: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.subscribers.retain(|(id, _)| *id != subscriber_id);
     }
 
     fn next_subscriber_id(&self) -> u64 {
@@ -561,14 +569,47 @@ fn spawn_session(
 
 /// Dispatch one typed operation (the `pi_ipc` Tauri command routes here).
 /// Unknown operations are refused without touching any child.
+///
+/// `config` (with the agent dir) enables the RESUME flow: an op on a
+/// session that is not running starts it from its on-disk file — the
+/// `POST /api/agent/[id]` contract (startRpcSession on demand). Without a
+/// config the answer is `not_found` (the host has no pi to spawn).
 pub fn dispatch_session_op(
     registry: &SessionRegistry,
     op: &str,
     args: &Value,
+    resume: Option<(&SessionSpawnConfig, &Path)>,
 ) -> Result<Value, DispatchError> {
     let session_id = args.get("session").and_then(Value::as_str).unwrap_or_default();
+    // The resume path: every session op may cold-start an on-disk session.
+    let resolve_or_start = |registry: &SessionRegistry,
+                            session_id: &str,
+                            registry_op: &str|
+     -> Result<std::sync::Arc<Session>, DispatchError> {
+        if let Some(session) = registry.get(session_id) {
+            return Ok(session);
+        }
+        let Some((config, agent_dir)) = resume else {
+            return Err(DispatchError::not_found(session_id));
+        };
+        let Some(summary) = crate::history::find_session_by_id(agent_dir, session_id) else {
+            return Err(DispatchError::not_found(session_id));
+        };
+        registry
+            .start(
+                session_id,
+                &summary.file,
+                &summary.id,
+                Path::new(&summary.cwd),
+                config,
+            )
+            .map_err(|error| DispatchError::Spawn(error, registry_op.to_string()))
+    };
     match op {
         // The history index (read-only scan of the agent dir's sessions).
+        // The agent dir comes from the CALLER of this library function; the
+        // IPC boundary (src-tauri) passes the host-resolved agent dir and
+        // never forwards a client-supplied one.
         "sessions.list" => {
             let agent_dir = args
                 .get("agentDir")
@@ -579,6 +620,8 @@ pub fn dispatch_session_op(
             Ok(crate::history::index_json(&index))
         }
         "sessions.runState" => {
+            // The /api/agent/running contract: a not-running session answers
+            // not-running (never an error, never a cold start).
             let Some(session) = registry.get(session_id) else {
                 return Ok(json!({ "running": false }));
             };
@@ -593,13 +636,13 @@ pub fn dispatch_session_op(
             }))
         }
         "agent.interrupt" => {
-            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            let session = resolve_or_start(registry, session_id, "agent.interrupt")?;
             session
                 .command("abort", json!({}), Some(Duration::from_secs(30)))
                 .map_err(DispatchError::Transport)
         }
         "agent.setSessionName" => {
-            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            let session = resolve_or_start(registry, session_id, "agent.setSessionName")?;
             let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
             let result = session
                 .command("set_session_name", json!({ "name": name }), Some(Duration::from_secs(30)))
@@ -610,27 +653,28 @@ pub fn dispatch_session_op(
             Ok(result)
         }
         // The typed agent command surface: a CLOSED command enum forwarded to
-        // the session's child. Unknown types and shapes are refused before
-        // anything reaches a child (plan: Rust 使用封闭操作枚举).
+        // the session's child. The forwarded payload is rebuilt from the
+        // validated fields ONLY (plan: Rust 使用封闭操作枚举) — the IPC
+        // envelope's `session` and any unknown field never reach a child.
         "agent.command" => {
-            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
             let Some(command_type) = args.get("type").and_then(Value::as_str) else {
                 return Err(DispatchError::invalid("the command has no type"));
             };
-            validate_agent_command(command_type, args)?;
+            let payload = build_agent_command(command_type, args)?;
+            let session = resolve_or_start(registry, session_id, "agent.command")?;
             session
-                .command(command_type, args.clone(), Some(Duration::from_secs(120)))
+                .command(command_type, payload, Some(Duration::from_secs(120)))
                 .map_err(DispatchError::Transport)
         }
         // The projected run state (the message-level machine's view).
         "agent.runState" => {
-            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            let session = resolve_or_start(registry, session_id, "agent.runState")?;
             Ok(run_state_json(&session.run_state()))
         }
         // A snapshot of the stream subscription (the Channel bridge in
         // src-tauri layers incremental events on top of this snapshot).
         "agent.eventsSnapshot" => {
-            let session = registry.get(session_id).ok_or(DispatchError::not_found(session_id))?;
+            let session = resolve_or_start(registry, session_id, "agent.eventsSnapshot")?;
             Ok(json!({
                 "epoch": session.epoch(),
                 "settledEpoch": session.machine_settled_epoch(),
@@ -651,33 +695,143 @@ fn default_agent_dir() -> PathBuf {
     PathBuf::from(home).join(".pi/agent")
 }
 
-/// The closed agent-command enum with per-type argument validation. A
-/// command outside this table never reaches a child.
-fn validate_agent_command(command_type: &str, args: &Value) -> Result<(), DispatchError> {
-    let requires_str = |field: &str| -> Result<(), DispatchError> {
-        if args.get(field).and_then(Value::as_str).is_some() {
-            Ok(())
-        } else {
-            Err(DispatchError::invalid(&format!("{command_type} requires a string {field}")))
-        }
+/// Build the exact child payload for one agent command from the IPC args.
+/// CLOSED on two axes: the command enum is the REAL pi child surface
+/// (lib/pi-rpc/session.ts — commands the wrapper answers host-side, like
+/// `fork`, `get_tools` enrichment or `navigate_tree`, are REFUSED here until
+/// the Rust host implements their host-side semantics), and each payload is
+/// rebuilt from the command's own fields — the envelope's `session`, `type`
+/// and every unknown field are dropped, so nothing else ever reaches a
+/// child.
+pub fn build_agent_command(command_type: &str, args: &Value) -> Result<Value, DispatchError> {
+    use serde_json::Map;
+    let invalid = |message: &str| DispatchError::invalid(message);
+    let str_field = |args: &Value, field: &str| -> Option<String> {
+        args.get(field).and_then(Value::as_str).map(str::to_string)
     };
+    let bool_field = |args: &Value, field: &str| -> Option<bool> {
+        args.get(field).and_then(Value::as_bool)
+    };
+    // The `images` array shape (prompt/steer/follow_up): each item is
+    // {type:"image", data, mimeType}; anything else is refused.
+    let images_field = |args: &Value| -> Result<Option<Value>, DispatchError> {
+        let Some(images) = args.get("images") else { return Ok(None) };
+        if images.is_null() {
+            return Ok(None);
+        }
+        let Value::Array(items) = images else {
+            return Err(invalid("images must be an array"));
+        };
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let mut clean = Vec::with_capacity(items.len());
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("image") {
+                return Err(invalid("images items must be type=image"));
+            }
+            let data = item.get("data").and_then(Value::as_str);
+            let mime = item.get("mimeType").and_then(Value::as_str);
+            let (Some(data), Some(mime)) = (data, mime) else {
+                return Err(invalid("images items need data and mimeType"));
+            };
+            clean.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+        }
+        Ok(Some(Value::Array(clean)))
+    };
+    let mut payload = Map::new();
     match command_type {
-        "get_state" | "get_commands" | "get_session_stats" | "get_last_assistant_text"
-        | "abort" | "clear_queue" | "compact" | "reload" | "get_tools" => Ok(()),
-        "prompt" | "steer" | "follow_up" => requires_str("message"),
-        "set_model" => requires_str("provider").and_then(|()| requires_str("modelId")),
-        "set_thinking_level" => requires_str("level"),
-        "set_session_name" => requires_str("name"),
-        "set_auto_compaction" => {
-            if args.get("enabled").and_then(Value::as_bool).is_some() {
-                Ok(())
-            } else {
-                Err(DispatchError::invalid("set_auto_compaction requires a boolean enabled"))
+        // No-argument commands.
+        "abort" | "abort_bash" | "abort_retry" | "clear_queue" | "get_state"
+        | "get_available_thinking_levels" | "get_last_assistant_text" | "get_tree"
+        | "get_entries" | "get_commands" | "get_session_stats" => {}
+        "prompt" => {
+            let Some(message) = str_field(args, "message") else {
+                return Err(invalid("prompt requires a string message"));
+            };
+            payload.insert("message".into(), json!(message));
+            if let Some(images) = images_field(args)? {
+                payload.insert("images".into(), images);
+            }
+            // The wrapper's admission channel: steer vs followUp when a run
+            // is active (lib/pi-rpc/session.ts prompt()).
+            if let Some(behavior) = str_field(args, "streamingBehavior") {
+                if behavior == "steer" || behavior == "followUp" {
+                    payload.insert("streamingBehavior".into(), json!(behavior));
+                }
             }
         }
-        "navigate_tree" => requires_str("targetId"),
-        other => Err(DispatchError::invalid(&format!("unknown agent command {other}"))),
+        "steer" | "follow_up" => {
+            let Some(message) = str_field(args, "message") else {
+                return Err(invalid(&format!("{command_type} requires a string message")));
+            };
+            payload.insert("message".into(), json!(message));
+            if let Some(images) = images_field(args)? {
+                payload.insert("images".into(), images);
+            }
+        }
+        "compact" => {
+            // Optional custom instructions (string, possibly empty).
+            if let Some(instructions) = str_field(args, "customInstructions") {
+                payload.insert("customInstructions".into(), json!(instructions));
+            }
+        }
+        "set_model" => {
+            let (Some(provider), Some(model_id)) =
+                (str_field(args, "provider"), str_field(args, "modelId"))
+            else {
+                return Err(invalid("set_model requires string provider and modelId"));
+            };
+            payload.insert("provider".into(), json!(provider));
+            payload.insert("modelId".into(), json!(model_id));
+        }
+        "set_thinking_level" => {
+            let Some(level) = str_field(args, "level") else {
+                return Err(invalid("set_thinking_level requires a string level"));
+            };
+            payload.insert("level".into(), json!(level));
+        }
+        "set_steering_mode" | "set_follow_up_mode" => {
+            let Some(mode) = str_field(args, "mode") else {
+                return Err(invalid(&format!("{command_type} requires a string mode")));
+            };
+            if mode != "all" && mode != "one-at-a-time" {
+                return Err(invalid(&format!("{command_type} mode must be all|one-at-a-time")));
+            }
+            payload.insert("mode".into(), json!(mode));
+        }
+        "set_session_name" => {
+            let Some(name) = str_field(args, "name") else {
+                return Err(invalid("set_session_name requires a string name"));
+            };
+            if name.trim().is_empty() {
+                return Err(invalid("Session name cannot be empty"));
+            }
+            payload.insert("name".into(), json!(name));
+        }
+        "set_auto_compaction" | "set_auto_retry" => {
+            let Some(enabled) = bool_field(args, "enabled") else {
+                return Err(invalid(&format!("{command_type} requires a boolean enabled")));
+            };
+            payload.insert("enabled".into(), json!(enabled));
+        }
+        // Host-level commands the wrapper answers with file/registry work
+        // (fork/fork_branch/clone write session files; get_tools filters and
+        // enriches; navigate_tree needs the SDK branch pointer; get_state's
+        // queued/context/prompt enrichment is host-side). They stay REFUSED
+        // here until the Rust host implements them — a blind forward would
+        // either fail opaquely in the child or answer a WRONG shape.
+        "fork" | "fork_branch" | "clone" | "get_tools" | "navigate_tree" | "extension_ui_response"
+        | "extension_ui_input" => {
+            return Err(DispatchError::Unsupported(format!(
+                "{command_type} needs host-side semantics the Rust host has not migrated yet"
+            )));
+        }
+        other => {
+            return Err(DispatchError::invalid(&format!("unknown agent command {other}")));
+        }
     }
+    Ok(Value::Object(payload))
 }
 
 /// Serialize the projected run state for IPC responses.
@@ -706,6 +860,10 @@ pub enum DispatchError {
     UnknownOp(String),
     NotFound(String),
     InvalidArgs(String),
+    /// A host-level command whose Rust host semantics are not migrated yet.
+    Unsupported(String),
+    /// Starting the session child failed.
+    Spawn(SessionHostError, String),
     Transport(pi_host::PiRpcError),
 }
 
@@ -728,10 +886,15 @@ impl DispatchError {
             DispatchError::UnknownOp(_) => "unknown_op",
             DispatchError::NotFound(_) => "not_found",
             DispatchError::InvalidArgs(_) => "invalid_args",
+            DispatchError::Unsupported(_) => "not_supported",
+            DispatchError::Spawn(error, _) => match error {
+                SessionHostError::Spawn(_) => "agent_spawn_failed",
+                SessionHostError::Handshake(_) => "agent_handshake_failed",
+            },
             DispatchError::Transport(error) => match error.kind {
                 pi_host::ErrorKind::Exit => "agent_child_exited",
                 pi_host::ErrorKind::Timeout => "agent_child_timeout",
-                pi_host::ErrorKind::Command => "bridge_op",
+                pi_host::ErrorKind::Command => "agent_child_error",
                 _ => "io",
             },
         }
@@ -742,9 +905,9 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DispatchError::UnknownOp(op) => write!(f, "unknown operation {op}"),
-            DispatchError::NotFound(message) | DispatchError::InvalidArgs(message) => {
-                write!(f, "{message}")
-            }
+            DispatchError::NotFound(message) | DispatchError::InvalidArgs(message)
+            | DispatchError::Unsupported(message) => write!(f, "{message}"),
+            DispatchError::Spawn(error, op) => write!(f, "{op}: {error}"),
             DispatchError::Transport(error) => write!(f, "{error}"),
         }
     }
@@ -803,14 +966,39 @@ mod dispatch_tests {
 
     #[test]
     fn the_agent_command_enum_is_closed_and_shape_checked() {
-        assert!(validate_agent_command("get_state", &json!({})).is_ok());
-        assert!(validate_agent_command("prompt", &json!({ "message": "hi" })).is_ok());
-        assert!(validate_agent_command("set_model", &json!({ "provider": "p", "modelId": "m" })).is_ok());
-        assert!(validate_agent_command("set_auto_compaction", &json!({ "enabled": true })).is_ok());
-        // Unknown commands never reach a child.
-        assert!(validate_agent_command("shell.exec", &json!({})).is_err());
-        assert!(validate_agent_command("prompt", &json!({})).is_err(), "message required");
-        assert!(validate_agent_command("set_model", &json!({ "provider": "p" })).is_err());
-        assert!(validate_agent_command("navigate_tree", &json!({})).is_err());
+        assert_eq!(build_agent_command("get_state", &json!({})).unwrap(), json!({}));
+        let prompt = build_agent_command(
+            "prompt",
+            &json!({ "message": "hi", "images": [{ "type": "image", "data": "abc", "mimeType": "image/png" }] }),
+        )
+        .unwrap();
+        assert_eq!(
+            prompt,
+            json!({ "message": "hi", "images": [{ "type": "image", "data": "abc", "mimeType": "image/png" }] })
+        );
+        // The envelope fields never leak into the child payload.
+        let cleaned = build_agent_command(
+            "prompt",
+            &json!({ "session": "s", "type": "prompt", "message": "hi", "evil": "x" }),
+        )
+        .unwrap();
+        assert_eq!(cleaned, json!({ "message": "hi" }));
+        assert!(build_agent_command("set_model", &json!({ "provider": "p", "modelId": "m" })).is_ok());
+        assert!(build_agent_command("set_auto_compaction", &json!({ "enabled": true })).is_ok());
+        assert!(build_agent_command("set_steering_mode", &json!({ "mode": "all" })).is_ok());
+        assert!(build_agent_command("compact", &json!({ "customInstructions": "tight" })).is_ok());
+        assert!(build_agent_command("compact", &json!({})).is_ok());
+        // Unknown commands and bad shapes never reach a child.
+        assert!(build_agent_command("shell.exec", &json!({})).is_err());
+        assert!(build_agent_command("prompt", &json!({})).is_err(), "message required");
+        assert!(build_agent_command("prompt", &json!({ "message": "x", "images": "not-array" })).is_err());
+        assert!(build_agent_command("set_model", &json!({ "provider": "p" })).is_err());
+        assert!(build_agent_command("set_session_name", &json!({ "name": "  " })).is_err());
+        // Host-level commands are refused (not blindly forwarded) until the
+        // Rust host implements their semantics.
+        for host_level in ["fork", "clone", "get_tools", "navigate_tree", "extension_ui_response"] {
+            let error = build_agent_command(host_level, &json!({})).unwrap_err();
+            assert_eq!(error.code(), "not_supported", "{host_level}: {error}");
+        }
     }
 }

@@ -1,65 +1,176 @@
 /**
- * The single IPC transport wiring point for the static app (the migration
- * plan: 唯一底层 Tauri 接线入口). Detects the Tauri host bridge; without a
- * host (browser dev) a mock transport keeps pure-frontend work possible.
+ * The single IPC transport wiring point for the static app. The plan (§四)
+ * keeps the LOW-LEVEL Tauri wiring in ONE place — `lib/desktop-native.ts` —
+ * so this module only decides between:
+ *
+ * - the real host bridge (Tauri runtime): `pi_ipc` requests over
+ *   `tauriHostInvoke`, event streams over `pi_ipc_subscribe_events` with the
+ *   official Channel, explicit host-side unsubscribe, cancellable timeouts;
+ * - NO bridge (a plain browser): an explicit, always-failing transport. The
+ *   app never pretends to work without its host — the boot page explains it.
+ *
+ * Mock transports exist only as an injectable test seam (`MockTransport` in
+ * ../ipc/client.ts); `detectTransport()` never silently installs one.
  */
-import { MockTransport, type IpcTransport } from "../ipc/client.ts";
+
+import { tauriHostChannel, tauriHostInvoke, hasTauriHostBridge } from "../../../lib/desktop-native";
+import { IpcTimeoutError, MockTransport, type IpcTransport } from "../ipc/client.ts";
+import { IPC_PROTOCOL_VERSION, type IpcError, type IpcRequest, type IpcStreamMessage } from "../ipc/protocol.ts";
+
+/** A transport without a host: every request fails with a diagnosable code. */
+export class MissingHostTransport implements IpcTransport {
+  public readonly reason = "no Tauri host bridge (this build runs inside the desktop app)";
+
+  send(request: IpcRequest): Promise<unknown> {
+    return Promise.reject(new Error(`ipc '${request.op}' unusable: ${this.reason}`));
+  }
+
+  subscribe(
+    op: string,
+    _args: Record<string, unknown> | undefined,
+    _onMessage: (message: IpcStreamMessage) => void,
+    onError: (error: IpcError) => void,
+  ): () => void {
+    onError({ code: "no_host", message: this.reason, retryable: false });
+    return () => {};
+  }
+}
+
+/** One open event-stream subscription over a host channel. */
+interface HostSubscription {
+  stopLocalDelivery(): void;
+  unsubscribe(): Promise<void>;
+}
 
 let cached: { transport: IpcTransport; label: string } | null = null;
 
 export function detectTransport(): { transport: IpcTransport; label: string } {
   if (cached) return cached;
-  const internals = (
-    window as unknown as { __TAURI_INTERNALS__?: { invoke?: unknown } }
-  ).__TAURI_INTERNALS__;
-  if (internals && typeof internals.invoke === "function") {
-    const invoke = internals.invoke as (cmd: string, payload: unknown) => Promise<unknown>;
-    const transport: IpcTransport = {
-      send: (request, timeoutMs) =>
-        Promise.race([
-          invoke("pi_ipc", { request }),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () =>
-                reject(
-                  new Error(
-                    `ipc '${request.op}' timed out; the operation may still have happened — never resend blindly`,
-                  ),
-                ),
-              timeoutMs,
-            ),
-          ),
-        ]),
-      subscribe: (op, args, onMessage) => {
-        if (op !== "agent.subscribeEvents") return () => {};
-        // The host exposes the stream as its own Channel command.
-        const ChannelCtor = (
-          window as unknown as {
-            __TAURI_INTERNALS__: { Channel: new () => { onmessage: unknown } };
-          }
-        ).__TAURI_INTERNALS__.Channel;
-        const channel = new ChannelCtor();
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (channel as any).onmessage = (message: unknown) => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          onMessage(message as any);
-        };
-        void invoke("pi_ipc_subscribe_events", {
-          session: args?.session,
-          onEvent: channel,
-        });
-        return () => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (channel as any).onmessage = () => {};
-        };
-      },
-    };
-    cached = { transport, label: "tauri" };
-    return cached;
-  }
-  cached = {
-    transport: new MockTransport(),
-    label: "mock (no Tauri host bridge)",
-  };
+  cached = hasTauriHostBridge()
+    ? { transport: new HostBridgeTransport(), label: "tauri" }
+    : { transport: new MissingHostTransport(), label: MissingHostTransport.name };
   return cached;
 }
+
+/** Test seam: force a transport (mock tests inject theirs; resets on undefined). */
+export function overrideTransportForTests(replacement: { transport: IpcTransport; label: string } | undefined): void {
+  cached = replacement ?? null;
+}
+
+/** The real host-bridge transport. */
+class HostBridgeTransport implements IpcTransport {
+  send(request: IpcRequest, timeoutMs: number): Promise<unknown> {
+    const invoke = tauriHostInvoke();
+    if (invoke === null) {
+      return Promise.reject(new Error(`ipc '${request.op}' unusable: no Tauri host bridge`));
+    }
+    // A cancellable timeout: the timer must not outlive the request (the
+    // old Promise.race leaked one timer per call), and a timeout NEVER
+    // auto-resends — the operation may still have happened.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new IpcTimeoutError(request.op, request.id)),
+        timeoutMs,
+      );
+    });
+    return Promise.race([
+      invoke("pi_ipc", { request }).finally(() => clearTimeout(timer)),
+      timeout,
+    ]);
+  }
+
+  subscribe(
+    op: string,
+    args: Record<string, unknown> | undefined,
+    onMessage: (message: IpcStreamMessage) => void,
+    onError: (error: IpcError) => void,
+  ): () => void {
+    const invoke = tauriHostInvoke();
+    if (invoke === null) {
+      onError({ code: "no_host", message: "no Tauri host bridge", retryable: false });
+      return () => {};
+    }
+    let subscription: HostSubscription | null = null;
+    let closed = false;
+    // The channel exists before the subscribe invoke fires (messages may
+    // race the invoke's own response); the disposer works even mid-open.
+    void (async () => {
+      try {
+        const handle = await tauriHostChannel((message) => {
+          if (closed) return;
+          onMessage(message as IpcStreamMessage);
+        });
+        if (closed) {
+          handle.stopLocalDelivery();
+          return;
+        }
+        // Which host command carries this stream is part of THIS layer's
+        // wiring (the plan: subscriptions are host commands, not generic).
+        const command =
+          op === "agent.subscribeEvents"
+            ? "pi_ipc_subscribe_events"
+            : op === "terminal.subscribeOutput"
+              ? "pi_ipc_subscribe_terminal"
+              : null;
+        if (command === null) {
+          handle.stopLocalDelivery();
+          onError({ code: "unknown_op", message: `no stream handler for '${op}'`, retryable: false });
+          return;
+        }
+        const payload: Record<string, unknown> =
+          command === "pi_ipc_subscribe_events"
+            ? { session: args?.session, onEvent: handle.channel }
+            : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
+        const ack = (await invoke(command, payload)) as {
+          subscriptionId?: string;
+        } | undefined;
+        if (closed) {
+          handle.stopLocalDelivery();
+          return;
+        }
+        const subscriptionId = typeof ack?.subscriptionId === "string" ? ack.subscriptionId : null;
+        subscription = {
+          stopLocalDelivery: () => handle.stopLocalDelivery(),
+          unsubscribe: async () => {
+            handle.stopLocalDelivery();
+            // The host-side relay ends here: `agent.unsubscribeEvents`
+            // detaches the session subscriber and reaps the relay thread.
+            // A terminal stream ends with its terminal (or page reload).
+            if (subscriptionId !== null && command === "pi_ipc_subscribe_events") {
+              const request: IpcRequest = {
+                v: IPC_PROTOCOL_VERSION,
+                id: `unsubscribe-${subscriptionId}`,
+                op: "agent.unsubscribeEvents",
+                args: { subscriptionId },
+              };
+              try {
+                await invoke("pi_ipc", { request });
+              } catch {
+                // The host may already be gone (window closing): local
+                // detach already happened, which is the guarantee we owe.
+              }
+            }
+          },
+        };
+      } catch (error) {
+        if (!closed) {
+          onError({
+            code: "no_host",
+            message: error instanceof Error ? error.message : String(error),
+            retryable: false,
+          });
+        }
+      }
+    })();
+    return () => {
+      closed = true;
+      subscription?.stopLocalDelivery();
+      void subscription?.unsubscribe();
+      subscription = null;
+    };
+  }
+}
+
+/** The mock stays importable for tests (never the default). */
+export { MockTransport };

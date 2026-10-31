@@ -55,6 +55,13 @@ pub const UI_ATTACH_MAX_ENTRIES: usize = 64;
 /// Cap on one stderr diagnostic line; longer lines are dropped whole.
 const STDERR_LINE_LIMIT: usize = 16_384;
 
+/// Cap on one stdout JSONL record. Real traffic stays far below (the
+/// largest records carry image payloads — the SSE layer documented a 24 MB
+/// command output); the cap exists so a buggy or hostile child cannot grow
+/// the reader's line buffer without bound (plan: 无界读缓冲 must be
+/// bounded). A line over the cap is dropped whole, like stderr.
+const STDOUT_LINE_LIMIT: usize = 64 * 1024 * 1024;
+
 type LogFn = Arc<dyn Fn(String) + Send + Sync>;
 type ExitFn = Arc<dyn Fn(Option<i32>) + Send + Sync>;
 type BypassFn = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
@@ -182,6 +189,12 @@ struct Shared {
     stdin: Mutex<Option<ChildStdin>>,
     /// Signaled when `exited` flips (close() waits on it).
     exit_cv: Condvar,
+    /// Count of reader threads still draining (stdout/stderr); the exit
+    /// watcher waits for them so a response already in the pipe is
+    /// dispatched instead of racing fail_all (plan: 退出与 stdout drain
+    /// 竞态).
+    readers_alive: Mutex<usize>,
+    readers_done: Condvar,
     /// Mirror of `Inner::exiting` for the stdin write paths (checked without
     /// nesting locks; set under `inner`, always alongside the flag there).
     exiting: AtomicBool,
@@ -266,24 +279,41 @@ impl PiRpcClient {
             }),
             stdin: Mutex::new(stdin),
             exit_cv: Condvar::new(),
+            readers_alive: Mutex::new(0),
+            readers_done: Condvar::new(),
             exiting: AtomicBool::new(false),
             log,
             on_exit: options.on_exit,
             pid,
         });
 
+        // Each reader registers itself so the exit watcher can wait for the
+        // pipes to drain before failing pending commands.
+        fn reader_guard(shared: &Arc<Shared>) -> ReaderDrained {
+            *shared.readers_alive.lock().unwrap() += 1;
+            ReaderDrained { shared: Arc::clone(shared) }
+        }
+
         if let Some(stdout) = stdout {
             let reader_shared = Arc::clone(&shared);
+            let _guard = reader_guard(&shared);
             std::thread::Builder::new()
                 .name("pi-rpc-stdout".into())
-                .spawn(move || reader_loop(stdout, reader_shared))
+                .spawn(move || {
+                    let _guard = _guard;
+                    reader_loop(stdout, reader_shared)
+                })
                 .map_err(|error| PiRpcError::spawn(format!("stdout reader thread failed: {error}")))?;
         }
         if let Some(stderr) = stderr {
             let stderr_shared = Arc::clone(&shared);
+            let _guard = reader_guard(&shared);
             std::thread::Builder::new()
                 .name("pi-rpc-stderr".into())
-                .spawn(move || stderr_loop(stderr, stderr_shared))
+                .spawn(move || {
+                    let _guard = _guard;
+                    stderr_loop(stderr, stderr_shared)
+                })
                 .map_err(|error| PiRpcError::spawn(format!("stderr reader thread failed: {error}")))?;
         }
 
@@ -434,6 +464,15 @@ impl PiRpcClient {
             if inner.exiting || inner.exited || inner.fatal.is_some() {
                 return Err(shutdown_error(&inner, "pi process is closing or has exited"));
             }
+            // A duplicate in-flight id would overwrite the first command's
+            // pending entry — its waiter would hang until timeout while the
+            // child's response settled the SECOND caller. Refuse instead.
+            if inner.pending.contains_key(&id) {
+                return Err(PiRpcError::invalid(format!(
+                    "command '{}' reuses an in-flight id ({id}); ids must be unique until answered",
+                    type_
+                )));
+            }
             inner.pending.insert(id.clone(), PendingEntry { tx, command: type_.to_string() });
         }
         data["type"] = json!(type_);
@@ -575,6 +614,26 @@ impl std::fmt::Debug for PiRpcClient {
     }
 }
 
+/// Decrements the reader count and signals when the last reader drained.
+struct ReaderDrained {
+    shared: Arc<Shared>,
+}
+
+impl Drop for ReaderDrained {
+    fn drop(&mut self) {
+        let mut alive = self.shared.readers_alive.lock().unwrap();
+        *alive = alive.saturating_sub(1);
+        if *alive == 0 {
+            self.shared.readers_done.notify_all();
+        }
+    }
+}
+
+/// How long the exit watcher waits for the pipes to drain after the child
+/// died before failing pending commands. A healthy pipe hits EOF in
+/// milliseconds; the bound only caps a wedged descriptor.
+const EXIT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Subscription that detaches an event listener on drop.
 pub struct EventSubscription {
     shared: Arc<Shared>,
@@ -647,8 +706,19 @@ fn reader_loop<R: Read>(stdout: R, shared: Arc<Shared>) {
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => break,
             Ok(_) => {
-                if buf.last() == Some(&b'\n') {
+                let had_newline = buf.last() == Some(&b'\n');
+                if had_newline {
                     buf.pop();
+                }
+                if buf.len() > STDOUT_LINE_LIMIT {
+                    // Oversized record: drop it whole (never parse a partial
+                    // line as protocol). The child stays alive; the request's
+                    // own timer rejects it.
+                    (shared.log)(format!(
+                        "stdout record exceeded {} bytes; dropped",
+                        buf.len()
+                    ));
+                    continue;
                 }
                 match frame_line(&buf) {
                     crate::framing::FramedLine::Blank => {}
@@ -898,6 +968,24 @@ fn exit_watcher(mut child: std::process::Child, shared: Arc<Shared>) {
         use std::os::unix::process::ExitStatusExt;
         status.as_ref().ok().and_then(|status| status.signal())
     };
+    // The pipes may still hold responses: wait (bounded) for the readers to
+    // hit EOF so a reply already written by the child is dispatched, and
+    // only then fail whatever is still pending (the drain race).
+    {
+        let deadline = Instant::now() + EXIT_DRAIN_GRACE;
+        let mut alive = shared.readers_alive.lock().unwrap();
+        while *alive > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (guard, _) = shared
+                .readers_done
+                .wait_timeout(alive, deadline - now)
+                .unwrap();
+            alive = guard;
+        }
+    }
     let (code, message) = {
         let mut inner = shared.inner.lock().unwrap();
         let was_exiting = inner.exiting;

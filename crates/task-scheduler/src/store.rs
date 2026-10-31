@@ -53,7 +53,7 @@ impl TaskStore {
     }
 
     fn runs_file(&self, task_id: &str) -> PathBuf {
-        self.runs_dir().join(format!("{task_id}.jsonl"))
+        self.runs_dir().join(format!("{}.jsonl", sanitize_task_id(task_id)))
     }
 
     /// Read all tasks (raw JSON kept for unknown fields; parsed into the
@@ -201,8 +201,32 @@ impl TaskStore {
     }
 }
 
-fn run_to_json(run: &RunRecord) -> Value {
-    let mut object = Map::new();
+/// Task ids become file names (`<id>.jsonl` under runs/): a store file —
+/// hand-edited or from a hostile source — must not be able to name
+/// `../evil` or `a/b` and escape the runs dir. Path separators, parent
+/// segments, Windows drive letters and NUL are replaced with `_`.
+fn sanitize_task_id(task_id: &str) -> String {
+    let clean: String = task_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // After mapping, `..`-only names ("..", "...") still traverse; a
+    // leading dot keeps the file hidden on Unix — strip leading dots.
+    let stripped = clean.trim_start_matches('.');
+    if stripped.is_empty() {
+        "task".to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+fn run_to_json(run: &RunRecord) -> Value {    let mut object = Map::new();
     object.insert("runId".into(), json!(run.run_id));
     object.insert("taskId".into(), json!(run.task_id));
     object.insert("trigger".into(), json!(run.trigger));
@@ -256,6 +280,15 @@ fn run_from_json(value: &Value) -> Option<RunRecord> {
 
 /// ISO-8601 (Zulu) → epoch ms; the shared minimal parser.
 pub(crate) fn iso_to_ms(value: &str) -> Option<i64> {
+    iso_to_ms_impl(value)
+}
+
+/// The crate-public alias task_from_json uses (same parser).
+pub(crate) fn iso_to_ms_pub(value: &str) -> Option<i64> {
+    iso_to_ms_impl(value)
+}
+
+fn iso_to_ms_impl(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;

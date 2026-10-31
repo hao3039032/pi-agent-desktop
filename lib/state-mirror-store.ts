@@ -11,8 +11,19 @@ import { dirname } from "node:path";
 import { userHome } from "./user-home";
 import { type StateMirrorPayload, verifyStateMirrorPayload } from "./state-mirror";
 
+/**
+ * The mirror file under the pi agent dir. `agentDir` IS the agent dir
+ * (`~/.pi/agent`): passing one appends the file name directly — the earlier
+ * `<agentDir>/.pi/agent/...` spelling nested a phantom directory.
+ */
 export function stateMirrorPath(agentDir?: string): string {
-  return `${agentDir ?? userHome()}/.pi/agent/desktop-state-mirror.json`;
+  const dir = agentDir ?? `${userHome()}/.pi/agent`;
+  return `${dir.replace(/[/\\]+$/, "")}/desktop-state-mirror.json`;
+}
+
+/** The pre-overwrite backup of the previous good payload (plan §七.2: 保留旧来源数据与备份). */
+export function stateMirrorBackupPath(agentDir?: string): string {
+  return `${stateMirrorPath(agentDir)}.bak`;
 }
 
 export interface ReadResult {
@@ -51,8 +62,18 @@ export function writeStateMirror(payload: unknown, agentDir?: string): WriteResu
     return { ok: false, reason: "stale" };
   }
   const file = stateMirrorPath(agentDir);
+  const backup = stateMirrorBackupPath(agentDir);
   try {
     mkdirSync(dirname(file), { recursive: true });
+    // Keep the previous good payload as a one-deep backup (a corrupted or
+    // regretted import can be rolled back to it; the importer never reads
+    // it automatically).
+    if (existing.ok) {
+      const previous = JSON.stringify(existing.payload, null, 2) + "\n";
+      const backupTmp = `${backup}.tmp-${process.pid}-${Date.now()}`;
+      writeFileSync(backupTmp, previous, { encoding: "utf8", mode: 0o600 });
+      renameSync(backupTmp, backup);
+    }
     const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
     const serialized = JSON.stringify(incoming, null, 2) + "\n";
     writeFileSync(tmp, serialized, { encoding: "utf8", mode: 0o600 });

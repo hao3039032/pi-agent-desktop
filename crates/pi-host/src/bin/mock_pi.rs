@@ -7,7 +7,12 @@
 //! - unset / `default`: normal loop; exits 0 on stdin EOF;
 //! - `no_exit_on_eof`:  keeps running after stdin EOF (grace-kill tests);
 //! - `split_hello`:     emits one record split mid-UTF-8 and one write
-//!   carrying two records before reading anything.
+//!   carrying two records before reading anything;
+//! - `answer_then_die`: `slow {delay}` answers, prints the response, then
+//!   exits 0 IMMEDIATELY without flushing order guarantees — the client's
+//!   exit watcher must still dispatch the buffered response (drain race);
+//! - `oversize_line`:   prints one record over the client's stdout cap,
+//!   then behaves normally (the cap drops the line, not the stream).
 //!
 //! Commands (the `type` field of each stdin record):
 //! - `get_state`, `echo` (echoes `data.payload`), `notify_send` (emits one
@@ -41,6 +46,19 @@ fn main() {
         }
         let _ = out.write_all(b"\n");
         let _ = out.write_all(b"{\"type\":\"event_one\"}\n{\"type\":\"event_two\"}\n");
+        let _ = out.flush();
+    }
+
+    if scenario == "oversize_line" {
+        // One record beyond the client's 64 MiB stdout cap: dropped whole;
+        // the stream continues afterwards.
+        let _ = out.write_all(b"{\"type\":\"big\",\"pad\":\"");
+        let chunk = "x".repeat(8192);
+        for _ in 0..(64 * 1024 / 8 + 2) {
+            let _ = out.write_all(chunk.as_bytes());
+        }
+        let _ = out.write_all(b"\"}\n");
+        let _ = out.write_all(b"{\"type\":\"after_big\"}\n");
         let _ = out.flush();
     }
 
@@ -96,6 +114,17 @@ fn handle<W: Write, R: Read>(
                 "isCompacting": false,
             }));
             true
+        }
+        "answer_then_die" => {
+            // Write the response, close stdout, and exit at once: the bytes
+            // are in the pipe while the process is already gone.
+            let payload = record.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            respond(out, &id, "answer_then_die", payload);
+            let _ = out.flush();
+            drop(out);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
         }
         "echo" => {
             let payload = record.get("payload").cloned().unwrap_or(serde_json::Value::Null);

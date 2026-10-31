@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::client::PiRpcClient;
+use crate::client::{PiRpcClient, UiSubscription};
 use crate::error::PiRpcError;
 
 /// The command the child's bridge extension registers for host state requests.
@@ -99,6 +99,9 @@ struct BridgeState {
 }
 
 /// The bridge channel over one live client. Create with [`Bridge::attach`].
+/// Dropping the Bridge detaches its UI subscription and ends its threads —
+/// a disposed session leaves no leak behind (the notify handler, the
+/// router and the exit watcher all terminate).
 pub struct Bridge {
     client: Arc<PiRpcClient>,
     session_id: String,
@@ -108,6 +111,11 @@ pub struct Bridge {
     /// Plain (non-bridge) notifies from the child, for the relay to show.
     plain_notify_rx: Mutex<Option<std::sync::mpsc::Receiver<Value>>>,
     request_counter: AtomicU64,
+    /// Detached on drop: removes the `notify` handler from the client so the
+    /// router thread's sender dies and the thread exits.
+    notify_subscription: Mutex<Option<UiSubscription>>,
+    /// Ends the exit-settle thread when the Bridge drops before the child.
+    exit_thread_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Bridge {
@@ -136,9 +144,9 @@ impl Bridge {
                 .and_then(Value::as_str)
                 .is_some_and(|message| message.starts_with(BRIDGE_RESULT_PREFIX))
         });
-        let _notify_subscription = client.on_ui("notify", notify_tx, Some(bypass));
-        // Hold the subscription for the Bridge's lifetime (detached on drop).
-        std::mem::forget(_notify_subscription);
+        let notify_subscription = client.on_ui("notify", notify_tx, Some(bypass));
+        // Held for the Bridge's lifetime; Drop detaches it (the handler's
+        // sender dies, the router thread's recv fails, the thread exits).
 
         let router_state = Arc::clone(&state);
         let router_session = session_id.clone();
@@ -168,21 +176,37 @@ impl Bridge {
             .expect("pi bridge router thread");
         let _ = router;
 
-        // Settle everything when the child exits.
+        // Settle everything when the child exits — and stop waiting when the
+        // BRIDGE goes away first (the thread must not outlive its owner
+        // holding the client's state alive forever).
         let exit_state = Arc::clone(&state);
+        let exit_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let exit_alive_for_thread = Arc::clone(&exit_alive);
         let exit_rx = client.on_process_exit();
         std::thread::Builder::new()
             .name("pi-bridge-exit".into())
             .spawn(move || {
-                let Ok(code) = exit_rx.recv() else { return };
-                let mut state = exit_state.lock().unwrap();
-                let error = PiRpcError::exit(format!(
-                    "pi process exited during a bridge request (code {})",
-                    code.map(|code| code.to_string()).unwrap_or_else(|| "?".to_string())
-                ));
-                state.transport_fatal = Some(error.clone());
-                for (_, pending) in state.pending.drain() {
-                    let _ = pending.tx.send(Err(BridgeError::Transport(error.clone())));
+                loop {
+                    match exit_rx.recv_timeout(Duration::from_millis(500)) {
+                        Ok(code) => {
+                            let mut state = exit_state.lock().unwrap();
+                            let error = PiRpcError::exit(format!(
+                                "pi process exited during a bridge request (code {})",
+                                code.map(|code| code.to_string()).unwrap_or_else(|| "?".to_string())
+                            ));
+                            state.transport_fatal = Some(error.clone());
+                            for (_, pending) in state.pending.drain() {
+                                let _ = pending.tx.send(Err(BridgeError::Transport(error.clone())));
+                            }
+                            return;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if !exit_alive_for_thread.load(Ordering::SeqCst) {
+                                return;
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
                 }
             })
             .expect("pi bridge exit thread");
@@ -195,6 +219,8 @@ impl Bridge {
             state,
             plain_notify_rx: Mutex::new(Some(relay_rx)),
             request_counter: AtomicU64::new(0),
+            notify_subscription: Mutex::new(Some(notify_subscription)),
+            exit_thread_alive: exit_alive,
         })
     }
 
@@ -343,13 +369,19 @@ impl Drop for Bridge {
     fn drop(&mut self) {
         // Pending requests must not wait for their timers: everything still
         // in flight gets an immediate, diagnosable reject.
-        let mut state = self.state.lock().unwrap();
-        for (_, pending) in state.pending.drain() {
-            let _ = pending.tx.send(Err(BridgeError::protocol(format!(
-                "pi-web bridge '{}' was cancelled: the session is being disposed",
-                pending.op
-            ))));
+        {
+            let mut state = self.state.lock().unwrap();
+            for (_, pending) in state.pending.drain() {
+                let _ = pending.tx.send(Err(BridgeError::protocol(format!(
+                    "pi-web bridge '{}' was cancelled: the session is being disposed",
+                    pending.op
+                ))));
+            }
         }
+        // Detach the notify handler (the router thread then exits when its
+        // sender dies) and stop the exit watcher.
+        drop(self.notify_subscription.lock().unwrap().take());
+        self.exit_thread_alive.store(false, Ordering::SeqCst);
     }
 }
 

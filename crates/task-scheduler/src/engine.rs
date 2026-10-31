@@ -36,6 +36,10 @@ pub struct Engine<'a> {
     pub oracle: &'a dyn CronOracle,
     pub run_book: crate::RunBook,
     pub leases: crate::LeaseTable,
+    /// The owner string leases are CLAIMED with (the spawner's identity);
+    /// `finish_run` releases with the same owner — a release under a wrong
+    /// owner silently never frees the lease.
+    owner: String,
     now_ms: i64,
 }
 
@@ -51,11 +55,19 @@ pub struct TickReport {
 
 impl<'a> Engine<'a> {
     pub fn new(store: TaskStore, oracle: &'a dyn CronOracle) -> Self {
+        Self::with_owner(store, oracle, format!("host-{}", std::process::id()))
+    }
+
+    /// The engine remembers the owner its leases are claimed under, so
+    /// `finish_run` releases with the SAME identity (a mismatched release
+    /// never frees the lease — exactly the bug this constructor prevents).
+    pub fn with_owner(store: TaskStore, oracle: &'a dyn CronOracle, owner: String) -> Self {
         Self {
             store,
             oracle,
             run_book: crate::RunBook::default(),
             leases: crate::LeaseTable::default(),
+            owner,
             now_ms: 0,
         }
     }
@@ -70,14 +82,14 @@ impl<'a> Engine<'a> {
 
         for (task, _raw) in tasks.iter_mut() {
             // A foreign fresh lease means another host is running this task.
-            if self.leases.held_by_other(&task.id, spawner.owner(), now_ms) {
+            if self.leases.held_by_other(&task.id, &self.owner, now_ms) {
                 continue;
             }
             match decide_slot(task, now_ms, self.oracle) {
                 SlotAction::None => {}
                 SlotAction::Fire { trigger, scheduled_for_ms, skipped_slots } => {
                     // Claim the lease, admit the run, advance the watermark.
-                    if !self.leases.claim(&task.id, spawner.owner(), now_ms) {
+                    if !self.leases.claim(&task.id, &self.owner, now_ms) {
                         continue;
                     }
                     match self.run_book.admit(&task.id, now_ms) {
@@ -131,7 +143,7 @@ impl<'a> Engine<'a> {
                         crate::Admission::ConcurrencyFull => {
                             // Try again next tick: release the lease, do not
                             // advance the watermark.
-                            self.leases.release(&task.id, spawner.owner());
+                            self.leases.release(&task.id, &self.owner);
                             report.concurrency_deferred.push(task.id.clone());
                         }
                     }
@@ -152,9 +164,11 @@ impl<'a> Engine<'a> {
 
     /// Record a finished run (the spawner calls this when its session
     /// settles); persists failure streaks and auto-pause through the store.
+    /// Releases the run lease under the ENGINE's owner identity (the same
+    /// identity the claim used).
     pub fn finish_run(&mut self, task_id: &str, failed: bool, error: Option<&str>) -> Result<Option<String>, String> {
         let paused = self.run_book.finish(task_id, failed, error);
-        self.leases.release(task_id, "engine");
+        self.leases.release(task_id, &self.owner.clone());
         if paused.is_some() {
             let mut tasks: Vec<(Task, Value)> = self.store.read_tasks()?.into_values().collect();
             for (task, _) in tasks.iter_mut() {
@@ -345,4 +359,59 @@ mod tests {
             "the consumed watermark means nothing to do"
         );
     }
+
+#[test]
+fn finish_run_releases_the_lease_under_the_claiming_owner() {
+    // The regression: finish_run used to release with owner "engine" while
+    // the claim used the spawner's identity — the release silently failed
+    // and the lease lingered until the 90 s staleness, so a second host
+    // would skip the task for that whole window.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = TaskStore::new(dir.path());
+    store.write_tasks(&[(crate::task_from_json(&task_json("t1")).unwrap(), task_json("t1"))]).unwrap();
+    let mut engine = Engine::with_owner(store, &GridCron, "host-a".to_string());
+    let mut spawner = Recorder { spawned: vec![], fail_all: false };
+    engine.tick(630_000, &mut spawner).unwrap();
+    assert!(engine.leases.held_by_other("t1", "host-b", 640_000), "claimed by host-a");
+    engine.finish_run("t1", false, None).unwrap();
+    assert!(
+        !engine.leases.held_by_other("t1", "host-b", 640_000),
+        "the lease is GONE after finish_run — not lingering until staleness"
+    );
+}
+
+#[test]
+fn run_file_names_never_escape_the_runs_dir() {
+    use crate::store::TaskStore;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = TaskStore::new(dir.path());
+    // A hostile/hand-edited task id must not traverse out of runs/.
+    for hostile in ["../evil", "a/b", "..", "win\\path"] {
+        let run = crate::store::RunRecord {
+            run_id: "r".into(),
+            task_id: hostile.into(),
+            trigger: "schedule".into(),
+            scheduled_for_ms: 1,
+            started_at_ms: 1,
+            ended_at_ms: None,
+            status: "skipped".into(),
+            error: None,
+            session_file: None,
+        };
+        store.append_run(&run).expect("append");
+        let runs_root = dir.path().join("scheduled-tasks").join("runs");
+        let escaped = [
+            dir.path().join("scheduled-tasks").join("evil.jsonl"),
+            dir.path().join("evil.jsonl"),
+            dir.path().join("scheduled-tasks").join("runs").join("a"),
+        ];
+        for path in escaped {
+            assert!(!path.exists(), "nothing escaped to {}", path.display());
+        }
+        // The record is still readable through the same sanitized name.
+        let read = store.read_runs(hostile);
+        assert_eq!(read.len(), 1, "{hostile}: {read:?}");
+    }
+}
+
 }

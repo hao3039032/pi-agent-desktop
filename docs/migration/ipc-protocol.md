@@ -34,6 +34,7 @@
 规则：
 
 - **未知操作直接拒绝**（`unknown_op`），不提供“任意 shell”“任意 URL”“任意 SDK 函数名”式通用执行接口。操作枚举在 Rust 侧是穷举 match，新增操作必须同时改清单。
+- **文件授权只由宿主侧事实派生**：会话扫描得到的 cwd/项目根、对话框选择、验证过的 cwd。**不存在前端可调用的 `files.allowRoot`**——WebView 不能自我扩权；`resources.grantFile` 只接受宿主自己提出过的路径。写入授权走解析后的父目录包含检查（symlink 逃逸拒绝，见 `src-tauri/src/file_access.rs`）。
 - requestId 由前端单调生成；宿主按 id 关联响应。**超时不意味着操作没发生**：prompt、安装、文件写入等不得自动重发；通过 requestId + 状态查询（`sessions.runState`、`tasks.runs` 等）确定结果。
 - 版本不匹配 → `version_mismatch` 错误，携带宿主支持的版本区间。桌面产品前后端同包发布，正常情况下版本恒等；该检查防御的是更新中断、旧 WebView 缓存等边角。
 - 参数在双端 schema 校验失败 → `invalid_args`，`details` 指出字段。前端不得发送未校验的用户输入。
@@ -46,12 +47,16 @@
 | `version_mismatch` | 协议版本不符 | false |
 | `invalid_args` | 参数校验失败 | false |
 | `unauthorized_scope` | 路径/资源超出授权范围（文件、终端、聊天文件夹） | false |
-| `not_found` | 会话/任务/条目不存在 | false |
+| `not_found` | 会话/任务/条目/订阅不存在 | false |
+| `no_host` | 前端无宿主桥（浏览器直开静态页） | false |
 | `busy` | 目标被独占（如安装进行中） | true |
 | `timeout` | 宿主等待下游（pi 子进程、git）超时；**副作用可能已发生** | 视操作 |
+| `not_supported` | 命令存在但宿主侧语义尚未迁移（如 `fork`、`get_tools` 的主机层逻辑） | false |
 | `agent_child_exited` | 会话子进程退出（对齐 `pi-host` 的 `ErrorKind::Exit`） | false |
 | `agent_child_timeout` | 子进程命令超时但子进程仍在（`ErrorKind::Timeout`） | false |
-| `bridge_op` | bridge 操作被子进程拒绝（携带 `details.code`） | false |
+| `agent_child_error` | 子进程拒绝命令（`ErrorKind::Command`） | false |
+| `agent_spawn_failed` | 会话子进程启动失败（冷启动恢复路径） | false |
+| `agent_handshake_failed` | 会话握手失败（身份不一致/bridge 未注册） | false |
 | `management_unavailable` | 管理实例不可用/正在回收 | true |
 | `io` | 文件系统/进程 IO 失败 | 视操作 |
 
@@ -74,7 +79,8 @@
 
 - **订阅建立时原子交付快照与后续事件**：`kind:"snapshot"` 先到，之后 `kind:"event"` 顺序追加。快照与事件之间不允许丢失或重排。
 - `kind:"reset"`：有界队列超限或纪元变化时发出；前端收到后必须丢弃本地状态、用新 requestId 重新取快照（不重放业务操作）。
-- 取消：前端 drop 订阅、页面刷新（WebView 重载）、窗口销毁均释放订阅；宿主侧以 `subscriptionId` 注销，无泄漏。
+- 取消：前端 drop 订阅、页面刷新（WebView 重载）、窗口销毁均释放订阅；宿主侧以 `subscriptionId` 注销（`agent.unsubscribeEvents`），无泄漏。
+- `agent.subscribeEvents` 的第一帧 `kind:"snapshot"` 的 payload 是宿主快照 `{epoch, settledEpoch, state}`，**不是 AgentEvent**；前端适配层把它翻译成连接层等待的 `connected` AgentEvent（`lib/agent-event-stream.ts` 的首个 data 事件语义），后续 `kind:"event"` 帧的 payload 才是真实事件记录。
 - 消费确认与有界队列：工具中间输出可合并（coalesce）；最终消息、错误、UI 确认（extension dialog 请求/回复）不可静默丢弃。隐藏窗口不订阅时，宿主只为仍在运行的对象保留状态，不为无人消费的流无限堆积。
 - 会话事件内容沿用 pi RPC 事件记录（`agent_start`、`message_*`、`agent_settled`、`extension_ui_request`…），包一层 envelope；扩展 UI 请求经 `agent.respondUi` 回传，语义与 `crates/pi-host` 的 UI 子协议一致（到达序重放、超时/溢出取消而非同意）。
 

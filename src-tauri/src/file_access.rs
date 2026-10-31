@@ -68,10 +68,35 @@ impl AllowedRoots {
     /// inside a root that ALSO resolves to the same spelling — a symlink or
     /// junction pointing outside the roots is refused.
     pub fn is_existing_path_allowed(&self, target: &Path) -> bool {
+        self.is_existing_path_allowed_at(target, true)
+    }
+
+    /// Authorization for a path that may not exist yet (a new file):
+    /// the RESOLVED PARENT must sit inside a resolved root and the final
+    /// component must be a plain name (never `..`, never empty) — the
+    /// /api/files rule (existingAuthorizationPath = dirname for new files).
+    /// A symlink final component therefore never authorizes: the write
+    /// would follow it outside the roots.
+    pub fn is_new_path_allowed(&self, target: &Path) -> bool {
+        self.is_existing_path_allowed_at(target, false)
+    }
+
+    fn is_existing_path_allowed_at(&self, target: &Path, target_itself: bool) -> bool {
+        if has_parent_segment(target) {
+            // `link/..` names a path beside the link's target, outside the
+            // roots (#748): refuse before any filesystem resolution.
+            return false;
+        }
         if !self.is_path_allowed(target) {
             return false;
         }
-        let Ok(resolved_target) = std::fs::canonicalize(target) else {
+        let authorize = if target_itself {
+            Some(target.to_path_buf())
+        } else {
+            target.parent().map(Path::to_path_buf)
+        };
+        let Some(authorize) = authorize else { return false };
+        let Ok(resolved_target) = std::fs::canonicalize(&authorize) else {
             return false;
         };
         for root in &self.roots {
@@ -85,6 +110,17 @@ impl AllowedRoots {
         }
         false
     }
+}
+
+/// Whether the path carries a `..` segment (Windows separators included —
+/// a backslash is a segment separator only in Windows paths, which is where
+/// it matters for authorization).
+fn has_parent_segment(path: &Path) -> bool {
+    path.components().any(|component| matches!(component, Component::ParentDir))
+        || path
+            .to_string_lossy()
+            .split(['/', '\\'])
+            .any(|segment| segment == "..")
 }
 
 fn normalize_root(root: &Path) -> Option<String> {
@@ -214,6 +250,15 @@ mod tests {
         assert!(!roots.is_existing_path_allowed(&project.join("leak/secret.txt")));
         // A real file inside passes both.
         assert!(roots.is_existing_path_allowed(&project.join("a.txt")));
+        // New-file authorization goes through the resolved PARENT: a plain
+        // new name inside the project passes, a symlink final component
+        // (the write would follow it outside) is refused, and a `..` in the
+        // spelling is refused before any resolution (#748).
+        assert!(roots.is_new_path_allowed(&project.join("brand-new.txt")));
+        std::os::unix::fs::symlink("/etc", project.join("leakdir")).expect("leakdir");
+        assert!(!roots.is_new_path_allowed(&project.join("leakdir/evil")));
+        assert!(!roots.is_existing_path_allowed(&project.join("leakdir")));
+        assert!(!roots.is_new_path_allowed(&project.join("../outside/evil")));
     }
 
     #[cfg(unix)]

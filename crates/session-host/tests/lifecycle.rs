@@ -63,15 +63,15 @@ fn session_file_creation_writes_the_pi_header() {
 #[test]
 fn dispatch_refuses_unknown_ops_without_touching_children() {
     let registry = SessionRegistry::new();
-    let error = dispatch_session_op(&registry, "shell.exec", &json!({ "session": "s" })).unwrap_err();
+    let error = dispatch_session_op(&registry, "shell.exec", &json!({ "session": "s" }), None).unwrap_err();
     assert_eq!(error.code(), "unknown_op");
 
     // runState for a non-running session is a clean "not running", and
     // per-session ops on missing sessions are not_found.
-    let state = dispatch_session_op(&registry, "sessions.runState", &json!({ "session": "ghost" }))
+    let state = dispatch_session_op(&registry, "sessions.runState", &json!({ "session": "ghost" }), None)
         .expect("clean answer");
     assert_eq!(state["running"], false);
-    let error = dispatch_session_op(&registry, "agent.interrupt", &json!({ "session": "ghost" })).unwrap_err();
+    let error = dispatch_session_op(&registry, "agent.interrupt", &json!({ "session": "ghost" }), None).unwrap_err();
     assert_eq!(error.code(), "not_found");
 }
 
@@ -120,7 +120,7 @@ fn real_pi_session_lifecycle() {
     assert_eq!(first["id"].as_str().expect("header id"), file_id);
 
     // Dispatch through the closed operation table.
-    let state = dispatch_session_op(&registry, "sessions.runState", &json!({ "session": "url-id-1" }))
+    let state = dispatch_session_op(&registry, "sessions.runState", &json!({ "session": "url-id-1" }), None)
         .expect("runState");
     assert_eq!(state["running"], false);
 
@@ -174,6 +174,7 @@ fn real_pi_machine_and_handled_prompt() {
         &registry,
         "agent.eventsSnapshot",
         &json!({ "session": "url-id-2" }),
+        None,
     )
     .expect("events snapshot");
     assert_eq!(snapshot["state"]["sessionId"], file_id);
@@ -185,6 +186,7 @@ fn real_pi_machine_and_handled_prompt() {
         &registry,
         "agent.setSessionName",
         &json!({ "session": "url-id-2", "name": "rust-mgmt-name" }),
+        None,
     )
     .expect("set name");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -193,6 +195,7 @@ fn real_pi_machine_and_handled_prompt() {
             &registry,
             "agent.eventsSnapshot",
             &json!({ "session": "url-id-2" }),
+            None,
         )
         .expect("snapshot");
         if snapshot["state"]["sessionName"] == "rust-mgmt-name" {

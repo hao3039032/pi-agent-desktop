@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test src/ipc/*.test.mjs"
+    "test": "node --experimental-strip-types --test \"src/ipc/*.test.mjs\" \"src/data/*.test.mjs\" \"src/*.test.mjs\""
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

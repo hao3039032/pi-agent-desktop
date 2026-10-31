@@ -17,7 +17,7 @@ export interface IpcRequest {
   args?: Record<string, unknown>;
 }
 
-/** Stable machine-readable error codes (initial set; see the protocol doc). */
+/** Stable machine-readable error codes (see the protocol doc). */
 export const IPC_ERROR_CODES = [
   "unknown_op",
   "version_mismatch",
@@ -26,9 +26,13 @@ export const IPC_ERROR_CODES = [
   "not_found",
   "busy",
   "timeout",
+  "no_host",
+  "not_supported",
   "agent_child_exited",
   "agent_child_timeout",
-  "bridge_op",
+  "agent_child_error",
+  "agent_spawn_failed",
+  "agent_handshake_failed",
   "management_unavailable",
   "io",
 ] as const;

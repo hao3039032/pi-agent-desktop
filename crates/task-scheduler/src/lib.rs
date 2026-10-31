@@ -319,10 +319,13 @@ pub fn task_from_json(value: &Value) -> Option<Task> {
     let schedule = match value.get("schedule").and_then(|s| s.get("kind")).and_then(Value::as_str) {
         Some("manual") => Schedule::Manual,
         Some("once") => Schedule::Once {
+            // The disk shape stores an ISO timestamp (`schedule.at`); an
+            // epoch-ms number is accepted from in-memory callers for
+            // convenience (store.rs owns the disk mapping).
             at_ms: value
                 .pointer("/schedule/at")
                 .and_then(Value::as_str)
-                .and_then(|at| at.parse::<i64>().ok())
+                .and_then(|at| at.parse::<i64>().ok().or_else(|| crate::store::iso_to_ms_pub(at)))
                 .or_else(|| value.pointer("/schedule/atMs").and_then(Value::as_i64))
                 .unwrap_or(0),
         },

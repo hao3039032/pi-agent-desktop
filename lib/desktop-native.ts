@@ -517,3 +517,50 @@ export async function readClipboardImageFileNative(): Promise<File | null> {
 }
 
 export { isTauriDesktop };
+
+// ---------------------------------------------------------------------------
+// The typed IPC bridge (the migration's single low-level Tauri wiring point)
+//
+// The migration plan (§四) fixes ONE place that talks to the Rust host's
+// `pi_ipc` commands: here. The static frontend's transport layer
+// (static-frontend/src/data/transport.ts) and any future domain clients go
+// through these helpers — nothing else touches the `pi_ipc*` command names.
+// ---------------------------------------------------------------------------
+
+/** Whether this runtime has a Tauri host bridge at all (a dev browser: no). */
+export function hasTauriHostBridge(): boolean {
+  return isTauriDesktop();
+}
+
+/** The host's invoke for the pi_ipc commands, or null without a bridge. */
+export function tauriHostInvoke(): ((cmd: string, payload?: Record<string, unknown>) => Promise<unknown>) | null {
+  if (!hasTauriHostBridge()) return null;
+  // Resolving through @tauri-apps/api keeps argument marshalling identical
+  // to every other command (and the plugin-version pairing for free). The
+  // module is cached after the first dynamic import.
+  return (cmd: string, payload?: Record<string, unknown>) =>
+    import("@tauri-apps/api/core").then(({ invoke }) => invoke(cmd, payload));
+}
+
+/** One host event-stream channel (the official Channel class: ordered delivery). */
+export interface TauriHostChannelHandle {
+  /** The channel object an invoke payload carries (serializes to its id). */
+  readonly channel: unknown;
+  /** Stop delivering messages client-side. The HOST unsubscribe is the real
+   * dispose (agent.unsubscribeEvents) — this only stops local handling. */
+  stopLocalDelivery(): void;
+}
+
+/** Create a host channel delivering each message to `onMessage`. */
+export async function tauriHostChannel(
+  onMessage: (message: unknown) => void,
+): Promise<TauriHostChannelHandle> {
+  const { Channel } = await import("@tauri-apps/api/core");
+  const channel = new Channel<unknown>((message) => onMessage(message));
+  return {
+    channel,
+    stopLocalDelivery() {
+      channel.onmessage = () => {};
+    },
+  };
+}

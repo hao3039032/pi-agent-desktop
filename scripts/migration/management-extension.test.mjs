@@ -185,6 +185,33 @@ test(
         const stillFine = await call("sys.capabilities", {});
         assert.equal(stillFine.ok, true, "usable after a failed op");
 
+        // 2d. The skipped-slot count (cron.countSlots): every 10 minutes
+        // over one hour → 6 slots in (since, until]; an empty window → 0.
+        const count = await call("cron.countSlots", {
+          expr: "*/10 * * * *",
+          timezone: "UTC",
+          sinceISO: "2026-03-01T11:00:00.000Z",
+          untilISO: "2026-03-01T12:00:00.000Z",
+        });
+        assert.equal(count.ok, true, JSON.stringify(count));
+        assert.equal(count.result.count, 6);
+        const empty = await call("cron.countSlots", {
+          expr: "*/10 * * * *",
+          timezone: "UTC",
+          sinceISO: "2026-03-01T12:00:00.000Z",
+          untilISO: "2026-03-01T12:00:00.000Z",
+        });
+        assert.equal(empty.result.count, 0);
+        // A window longer than a year refuses rather than spinning.
+        const huge = await call("cron.countSlots", {
+          expr: "* * * * *",
+          timezone: "UTC",
+          sinceISO: "2020-01-01T00:00:00.000Z",
+          untilISO: "2026-01-01T00:00:00.000Z",
+        });
+        assert.equal(huge.ok, false);
+        assert.equal(huge.code, "invalid_args");
+
         // 3. File-based session access on the VENDORED SDK.
         const headerReply = await call("session.readHeader", { file: sessionFile });
         assert.equal(headerReply.ok, true, JSON.stringify(headerReply));
