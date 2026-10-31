@@ -240,7 +240,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sessions/p"); std::fs::create_dir_all(&root).unwrap();
         let file = root.join("a.jsonl");
-        let header = "{\"type\":\"session\",\"id\":\"a\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n";
+        let header = "{\"type\":\"session\",\"id\":\"a\",\"cwd\":\"/tmp\",\"timestamp\":\"2026-01-01T00:00:00Z\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"needle\"}}\n";
         std::fs::write(&file, header).unwrap();
         let state = IpcHostState::new(); *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
         let saved = std::cell::RefCell::new(PathBuf::new());
@@ -251,7 +251,14 @@ mod tests {
             std::fs::rename(&file, root.join("old")).unwrap();
             std::fs::write(&file, "replacement").unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), header);
-            Ok(json!({"results":[{"session":session,"match":"needle"}],"truncated":false}))
+            let module = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/session-search.ts");
+            let script = "import {pathToFileURL} from 'node:url'; const m=await import(pathToFileURL(process.argv[1]).href); const a=JSON.parse(process.argv[2]); console.log(JSON.stringify(await m.searchSessionContents(a.sessions,a.query)));";
+            let output = std::process::Command::new("node").args(["--experimental-strip-types", "--input-type=module", "-e", script])
+                .arg(module).arg(request.to_string())
+                .env_remove("PI_PACKAGE_DIR").env_remove("PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT").env_remove("JITI_ALIAS")
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            Ok(serde_json::from_slice(&output.stdout).unwrap())
         }).unwrap();
         assert_eq!(result["results"][0]["session"]["path"], file.to_string_lossy().as_ref());
         assert!(!saved.borrow().exists());
