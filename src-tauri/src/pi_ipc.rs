@@ -74,6 +74,7 @@ pub struct IpcHostState {
     pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
+    pub(crate) native_drops: crate::native_drop::NativeDrops,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
     /// Authorized save destinations (bound via native dialog selections).
@@ -173,6 +174,7 @@ impl IpcHostState {
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
+            native_drops: crate::native_drop::NativeDrops::default(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
                 // The legacy default-cwd layouts stay browsable across
@@ -1339,7 +1341,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 None => protocol_error(&id, "not_found", "session not found"),
             }
         }
-        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
+        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" | "sessions.reference" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err((code, message)) => protocol_error(&id, &code, &message),
@@ -2206,24 +2208,70 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, &error.0, &error.1),
             }
         }
-        // Preview resources (crates/resource-protocol): grants are HOST-side
-        // decisions (a session-reported artifact location, a path the index
-        // scan proposed); the frontend can only confirm a path the host
-        // itself named — it can never mint a grant for an arbitrary path.
+        // A resource grant pins a regular file opened beneath a host-authorized
+        // root; a caller-supplied path alone never grants authority.
         "resources.grantFile" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             if path.is_empty() {
                 return protocol_error(&id, "invalid_args", "path is required");
             }
-            if !state.is_proposed(&path) {
-                return protocol_error(
-                    &id,
-                    "unauthorized_scope",
-                    "the host never proposed this path; resources are granted host-side only",
-                );
+            #[cfg(unix)]
+            let opened = {
+                let target_path = Path::new(path);
+                let scoped = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, target_path)
+                };
+                let scoped = if scoped.is_some() { scoped } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
+                    if target_path.is_absolute() && !target_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                        match session_file_referenced(state, session, path) {
+                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| (resolved, PathBuf::from("/"))),
+                            Ok(false) => None,
+                            Err((code, message)) => return protocol_error(&id, &code, &message),
+                        }
+                    } else { None }
+                } else { None };
+                scoped.map(|(target, root)| crate::file_access::open_file_beneath_root(&root, &target))
+            };
+            #[cfg(windows)]
+            let opened: Option<Result<std::fs::File, std::io::Error>> = None;
+            match opened {
+                Some(Ok(file)) => match state.resources.grant_open_file(file, Path::new(path), Duration::from_secs(600)) {
+                    Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
+                    Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+                },
+                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
-            match state.resources.grant_file(Path::new(path), Duration::from_secs(600)) {
-                Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
+        }
+        "resources.grantPreview" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            #[cfg(unix)]
+            {
+                let scoped = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, Path::new(path))
+                };
+                let Some((target, root)) = scoped else { return protocol_error(&id, "unauthorized_scope", "preview path is outside authorized roots"); };
+                let Some(parent) = target.parent() else { return protocol_error(&id, "invalid_args", "invalid preview path"); };
+                let Some(name) = target.file_name().and_then(|name| name.to_str()) else { return protocol_error(&id, "invalid_args", "invalid preview filename"); };
+                if crate::file_access::open_file_beneath_root(&root, &target).is_err() { return protocol_error(&id, "unauthorized_scope", "preview file cannot be opened safely"); }
+                let directory = match crate::file_access::open_directory_beneath_root(&root, parent) {
+                    Ok(directory) => directory,
+                    Err(error) => return protocol_error(&id, "unauthorized_scope", &error.to_string()),
+                };
+                match state.resources.grant_open_directory(directory, Duration::from_secs(600)) {
+                    Ok(handle) => protocol_ok(&id, json!({ "handle": handle, "name": name })),
+                    Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+                }
+            }
+            #[cfg(windows)]
+            { let _ = path; protocol_error(&id, "unauthorized_scope", "preview resources are unavailable on this platform") }
+        }
+        "resources.metadata" => {
+            let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
+            match state.resources.file_metadata(handle) {
+                Ok((size, revision)) => protocol_ok(&id, json!({ "size": size, "revision": revision })),
                 Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
             }
         }
@@ -2433,9 +2481,37 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 }
             }
         }
+        "files.revealSupport" => {
+            let platform = if cfg!(target_os = "macos") { "darwin" } else if cfg!(target_os = "windows") { "win32" } else { "linux" };
+            protocol_ok(&id, json!({ "supported": cfg!(unix), "reason": if cfg!(unix) { None } else { Some("unsupported-platform") }, "platform": platform }))
+        }
+        "files.reveal" => {
+            let path = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
+            #[cfg(unix)]
+            {
+                let resolved = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, path)
+                };
+                let Some((target, root)) = resolved else { return protocol_error(&id, "unauthorized_scope", "access-denied") };
+                if crate::file_access::open_directory_beneath_root(&root, &target).is_err() {
+                    return protocol_error(&id, "unauthorized_scope", "not-a-directory");
+                }
+                match crate::open_path_with_default_app(&target) {
+                    Ok(()) => protocol_ok(&id, json!({ "opened": true })),
+                    Err(error) => protocol_error(&id, "io", &error),
+                }
+            }
+            #[cfg(not(unix))]
+            { let _ = path; protocol_error(&id, "not_supported", "Secure directory reveal is not supported on this platform") }
+        }
         "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
-        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(&id, &args),
-        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(&id, &args),
+        "files.docxPreview" => crate::file_resources::handle_docx_preview(state, &id, &args),
+        "files.importDropped" => crate::native_import::import_dropped(state, &id, &args),
+        "files.uploadCheck" => crate::project_upload::check(state, &id, &args),
+        "files.uploadFile" => crate::project_upload::upload_one(state, &id, &args),
+        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(state, &id, &args),
+        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(state, &id, &args),
         "desktop.saveFile" => crate::file_resources::handle_desktop_save_file(state, &id, &args),
         "chats.extractAttachmentText" => {
             crate::file_resources::handle_chats_extract_attachment_text(state, &id, &args)
@@ -3039,6 +3115,29 @@ fn session_info_json(
     info
 }
 
+#[cfg(unix)]
+fn session_file_referenced(state: &IpcHostState, session_id: &str, path: &str) -> Result<bool, (String, String)> {
+    let live = state.registry.get(session_id);
+    let mut handoff = None;
+    let args = if let Some(session) = live {
+        session.lease();
+        let (entries, leaf, tree) = crate::session_view::live_child_snapshot(&session)
+            .map_err(|message| ("agent_child_error".to_string(), message))?;
+        let file = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree)
+            .map_err(|error| ("io".to_string(), error.to_string()))?;
+        let args = json!({ "snapshotFile": file, "path": path });
+        handoff = Some(file);
+        args
+    } else {
+        let summary = session_host::history::find_session_by_id(&state.agent_dir(), session_id)
+            .ok_or_else(|| ("not_found".to_string(), "Session not found".to_string()))?;
+        json!({ "file": summary.file, "path": path })
+    };
+    let result = management_call(state, "session.isFileReferenced", args);
+    if let Some(file) = handoff { let _ = std::fs::remove_file(file); }
+    Ok(result?.get("referenced").and_then(Value::as_bool) == Some(true))
+}
+
 /// sessions.get / sessions.context / sessions.state (the GET /api/sessions/[id]
 /// family). Returns (code, message) failures; the caller maps them onto the
 /// protocol envelope.
@@ -3197,6 +3296,25 @@ fn session_view_dispatch(
                 }));
             }
             Ok(json!({ "running": false }))
+        }
+
+        "sessions.reference" => {
+            let summary = session_host::history::find_session_by_id(&agent_dir, session_id)
+                .ok_or_else(|| ("not_found".to_string(), format!("Session not found: {session_id}")))?;
+            let mut args = json!({ "file": summary.file, "sessionId": session_id });
+            let mut handoff = None;
+            if let Some(session) = state.registry.get(session_id) {
+                session.lease();
+                let (entries, leaf, tree) = crate::session_view::live_child_snapshot(&session)
+                    .map_err(|message| ("agent_child_error".to_string(), message))?;
+                let file = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree)
+                    .map_err(|error| ("io".to_string(), error.to_string()))?;
+                args["snapshotFile"] = json!(file);
+                handoff = Some(file);
+            }
+            let result = management_call(state, "session.reference", args);
+            if let Some(file) = handoff { let _ = std::fs::remove_file(file); }
+            result
         }
 
         // The /api/sessions/[id]/context contract: branch paging over the
@@ -5450,6 +5568,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(call("tasks.list", json!({}))["data"]["tasks"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn preview_resources_grant_read_revoke_roundtrip() {
         let state = state();
@@ -5457,8 +5576,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let png = dir.path().join("shot.png");
         std::fs::write(&png, vec![1u8; 300]).expect("write");
 
-        // Grant by host-side path decision; the handle is opaque.
-        state.propose_path(&png);
+        // The host authorizes the directory; the handle is opaque.
+        state.file_roots.lock().unwrap().add(dir.path());
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5906,8 +6025,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(read["error"]["code"], "unauthorized_scope");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resource_grants_only_accept_host_proposed_paths() {
+    fn resource_grants_require_host_authorized_roots() {
         let state = state();
         let dir = tempfile::tempdir().expect("tempdir");
         let png = dir.path().join("shot.png");
@@ -5920,9 +6040,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
         assert_eq!(denied["error"]["code"], "unauthorized_scope", "{denied}");
 
-        // Once the HOST proposed the path (the session index shape), the
-        // grant is a pure confirmation.
-        state.propose_path(&png);
+        // A host-authorized root permits its files, but never a symlink escape.
+        state.file_roots.lock().unwrap().add(dir.path());
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5934,6 +6053,29 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             json!({ "v": 1, "id": "g2", "op": "resources.read", "args": { "handle": handle } }),
         );
         assert_eq!(read["data"]["totalLen"], 8);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let escaped = send(&state, json!({ "v": 1, "id": "g3", "op": "resources.grantFile", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
+        assert_eq!(escaped["error"]["code"], "unauthorized_scope");
+        let preview_escape = send(&state, json!({ "v": 1, "id": "g-preview", "op": "resources.grantPreview", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
+        assert_eq!(preview_escape["error"]["code"], "unauthorized_scope");
+        let preview = send(&state, json!({ "v": 1, "id": "g-preview-ok", "op": "resources.grantPreview", "args": { "path": png.display().to_string() } }));
+        assert_eq!(preview["data"]["name"], "shot.png", "{preview}");
+        std::fs::remove_file(&png).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), &png).unwrap();
+        let pinned = send(&state, json!({ "v": 1, "id": "g4", "op": "resources.read", "args": { "handle": handle } }));
+        assert_eq!(pinned["data"]["totalLen"], 8, "grant retains original inode");
+    }
+
+    #[test]
+    fn reveal_directory_rejects_an_unapproved_root() {
+        let state = state();
+        let outside = tempfile::tempdir().unwrap();
+        let support = send(&state, json!({ "v": 1, "id": "support", "op": "files.revealSupport", "args": {} }));
+        assert_eq!(support["data"]["supported"], cfg!(unix));
+        let denied = send(&state, json!({ "v": 1, "id": "reveal", "op": "files.reveal", "args": { "cwd": outside.path() } }));
+        assert_eq!(denied["ok"], false);
     }
 
     #[test]

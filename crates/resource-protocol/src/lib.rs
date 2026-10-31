@@ -26,9 +26,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// The deferred image route's 10 MiB cap and a registry-wide decoded-memory budget.
+pub const MAX_RESOURCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_RESOURCE_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RESOURCE_HANDLES: usize = 1024;
 
 /// A random 128-bit handle token (hex, 32 chars).
 pub type Handle = String;
@@ -73,13 +77,14 @@ struct Grant {
     /// a symlink/junction whose target moved is a different resource.
     original_target: PathBuf,
     expires_at: Instant,
+    pinned_file: Option<std::fs::File>,
+    pinned_directory: Option<std::fs::File>,
+    image_bytes: Option<(Vec<u8>, &'static str)>,
 }
 
 /// The registry of grants. `create` picks the handle; nothing else does.
 pub struct ResourceRegistry {
-    grants: Mutex<HashMap<Handle, Grant>>,
-    counter: AtomicU64,
-    entropy: Mutex<u64>,
+    grants: Arc<Mutex<HashMap<Handle, Grant>>>,
 }
 
 impl Default for ResourceRegistry {
@@ -90,33 +95,20 @@ impl Default for ResourceRegistry {
 
 impl ResourceRegistry {
     pub fn new() -> Self {
-        Self {
-            grants: Mutex::new(HashMap::new()),
-            counter: AtomicU64::new(0),
-            entropy: Mutex::new(0),
-        }
+        let grants: Arc<Mutex<HashMap<Handle, Grant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let weak = Arc::downgrade(&grants);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(grants) = weak.upgrade() else { break };
+            grants.lock().unwrap().retain(|_, grant| grant.expires_at > Instant::now());
+        });
+        Self { grants }
     }
 
-    fn random_handle(&self) -> Handle {
-        // 128 bits from the OS entropy pool (getrandom/OsRng equivalent via
-        // /dev/urandom on unix, RtlGenRandom on windows) — the crate keeps
-        // zero dependencies, so read the platform source directly.
+    fn random_handle(&self) -> Result<Handle, DenyReason> {
         let mut seed = [0u8; 16];
-        let filled = fill_entropy(&mut seed);
-        if !filled {
-            // Fall back to a time+counter token; still unguessable to a
-            // sandboxed iframe (which cannot read the clock source either).
-            let count = self.counter.fetch_add(1, Ordering::Relaxed);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos() as u64)
-                .unwrap_or(0);
-            let mut state = self.entropy.lock().unwrap();
-            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15).rotate_left(17) ^ now ^ count;
-            seed[..8].copy_from_slice(&state.to_le_bytes());
-            seed[8..].copy_from_slice(&count.to_le_bytes());
-        }
-        seed.iter().map(|byte| format!("{byte:02x}")).collect()
+        getrandom::fill(&mut seed).map_err(|_| DenyReason::IoError)?;
+        Ok(seed.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     /// Grant access to one file. `path` is host-picked (a dialog result, an
@@ -140,16 +132,100 @@ impl ResourceRegistry {
         if !matches_scope {
             return Err(DenyReason::InvalidPath);
         }
-        let handle = self.random_handle();
-        self.grants.lock().unwrap().insert(
+        let handle = self.random_handle()?;
+        let mut grants = self.grants.lock().unwrap();
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
+        if grants.len() >= MAX_RESOURCE_HANDLES { return Err(DenyReason::IoError); }
+        grants.insert(
             handle.clone(),
             Grant {
                 canonical: canonical.clone(),
                 scope,
                 original_target: canonical,
                 expires_at: Instant::now() + ttl,
+                pinned_file: None,
+                pinned_directory: None,
+                image_bytes: None,
             },
         );
+        Ok(handle)
+    }
+
+    /// Grant an already authorized and opened regular file, pinning its inode.
+    pub fn grant_open_file(&self, file: std::fs::File, name: &Path, ttl: Duration) -> Result<Handle, DenyReason> {
+        if !file.metadata().map_err(|_| DenyReason::IoError)?.is_file() {
+            return Err(DenyReason::InvalidPath);
+        }
+        let handle = self.random_handle()?;
+        let mut grants = self.grants.lock().unwrap();
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
+        if grants.len() >= MAX_RESOURCE_HANDLES { return Err(DenyReason::IoError); }
+        grants.insert(handle.clone(), Grant {
+            canonical: name.to_path_buf(), scope: Scope::File,
+            original_target: name.to_path_buf(), expires_at: Instant::now() + ttl,
+            pinned_file: Some(file), pinned_directory: None, image_bytes: None,
+        });
+        Ok(handle)
+    }
+
+    /// Host-only grant for one already-authorized deferred raster image.
+    /// There is deliberately no IPC operation accepting arbitrary bytes.
+    pub fn grant_image_bytes(&self, bytes: Vec<u8>, mime: &str, ttl: Duration) -> Result<Handle, DenyReason> {
+        let mime = match mime {
+            "image/png" => "image/png", "image/jpeg" => "image/jpeg",
+            "image/webp" => "image/webp", "image/gif" => "image/gif",
+            "image/bmp" => "image/bmp", "image/avif" => "image/avif",
+            _ => return Err(DenyReason::InvalidPath),
+        };
+        if bytes.is_empty() || bytes.len() > MAX_RESOURCE_IMAGE_BYTES { return Err(DenyReason::InvalidPath); }
+        let handle = self.random_handle()?;
+        let mut grants = self.grants.lock().unwrap();
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
+        let used: usize = grants.values().filter_map(|grant| grant.image_bytes.as_ref()).map(|(bytes, _)| bytes.len()).sum();
+        if grants.len() >= MAX_RESOURCE_HANDLES || used + bytes.len() > MAX_RESOURCE_IMAGE_TOTAL_BYTES { return Err(DenyReason::IoError); }
+        grants.insert(handle.clone(), Grant {
+            canonical: PathBuf::new(), original_target: PathBuf::new(), scope: Scope::File,
+            expires_at: Instant::now() + ttl, pinned_file: None, pinned_directory: None,
+            image_bytes: Some((bytes, mime)),
+        });
+        Ok(handle)
+    }
+
+    /// Metadata of a pinned file for explicit live-change polling.
+    pub fn file_metadata(&self, handle: &str) -> Result<(u64, String), DenyReason> {
+        let grants = self.grants.lock().unwrap();
+        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
+        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        let file = grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?;
+        let meta = file.metadata().map_err(|_| DenyReason::IoError)?;
+        let modified = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|time| time.as_nanos()).unwrap_or(0);
+        #[cfg(unix)]
+        let identity = { use std::os::unix::fs::MetadataExt; format!("{}:{}:{}:{}:{}", meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec(), modified) };
+        #[cfg(not(unix))]
+        let identity = modified.to_string();
+        Ok((meta.len(), format!("{identity}:{}", meta.len())))
+    }
+
+    /// Duplicate a live single-file descriptor for an authorized native save.
+    pub fn clone_open_file(&self, handle: &str) -> Result<std::fs::File, DenyReason> {
+        let grants = self.grants.lock().unwrap();
+        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
+        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?.try_clone().map_err(|_| DenyReason::IoError)
+    }
+
+    /// Grant a directory descriptor opened beneath an authorized root.
+    #[cfg(unix)]
+    pub fn grant_open_directory(&self, directory: std::fs::File, ttl: Duration) -> Result<Handle, DenyReason> {
+        if !directory.metadata().map_err(|_| DenyReason::IoError)?.is_dir() { return Err(DenyReason::InvalidPath); }
+        let handle = self.random_handle()?;
+        let mut grants = self.grants.lock().unwrap();
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
+        if grants.len() >= MAX_RESOURCE_HANDLES { return Err(DenyReason::IoError); }
+        grants.insert(handle.clone(), Grant {
+            canonical: PathBuf::new(), original_target: PathBuf::new(), scope: Scope::Directory,
+            expires_at: Instant::now() + ttl, pinned_file: None, pinned_directory: Some(directory), image_bytes: None,
+        });
         Ok(handle)
     }
 
@@ -175,12 +251,35 @@ impl ResourceRegistry {
         subpath: &str,
         range: Option<(u64, u64)>,
     ) -> ResourceResponse {
-        let grants = self.grants.lock().unwrap();
+        let mut grants = self.grants.lock().unwrap();
         let Some(grant) = grants.get(handle) else {
             return ResourceResponse::Denied(DenyReason::UnknownHandle);
         };
         if Instant::now() >= grant.expires_at {
+            grants.remove(handle);
             return ResourceResponse::Denied(DenyReason::Expired);
+        }
+        let grant = grants.get_mut(handle).unwrap();
+        if let Some((bytes, mime)) = &grant.image_bytes {
+            if !subpath.is_empty() { return ResourceResponse::Denied(DenyReason::InvalidPath); }
+            let total_len = bytes.len() as u64;
+            let (body, range_applied) = match range {
+                Some((start, end)) if start <= end && start < total_len => (bytes[start as usize..=end.min(total_len - 1) as usize].to_vec(), true),
+                Some((start, _)) if start >= total_len => (Vec::new(), true),
+                _ => (bytes.clone(), false),
+            };
+            return ResourceResponse::Ok { mime, bytes: body, total_len, range_applied };
+        }
+        if let Some(file) = grant.pinned_file.as_mut() {
+            if !subpath.is_empty() { return ResourceResponse::Denied(DenyReason::InvalidPath); }
+            return read_open_file(file, &grant.canonical, range);
+        }
+        #[cfg(unix)]
+        if let Some(directory) = grant.pinned_directory.as_ref() {
+            return match open_beneath_directory(directory, subpath) {
+                Ok(mut file) => read_open_file(&mut file, Path::new(subpath), range),
+                Err(_) => ResourceResponse::Denied(DenyReason::OutOfScope),
+            };
         }
         // Re-validate the anchor itself: the canonical location must still
         // resolve to the SAME target (a replaced symlink is a different
@@ -248,6 +347,39 @@ impl ResourceRegistry {
     }
 }
 
+fn read_open_file(file: &mut std::fs::File, name: &Path, range: Option<(u64, u64)>) -> ResourceResponse {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(total_len) = file.metadata().map(|m| m.len()) else { return ResourceResponse::Denied(DenyReason::IoError) };
+    let (start, length, applied) = match range {
+        Some((start, end)) if start <= end && start < total_len => (start, end.min(total_len - 1) - start + 1, true),
+        Some((start, _)) if start >= total_len => (0, 0, true),
+        _ => (0, total_len, false),
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
+    let mut bytes = Vec::new();
+    if file.take(length).read_to_end(&mut bytes).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
+    ResourceResponse::Ok { mime: mime_for(name), bytes, total_len, range_applied: applied }
+}
+
+#[cfg(unix)]
+fn open_beneath_directory(directory: &std::fs::File, path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let invalid = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "invalid resource path");
+    if path.is_empty() || path.contains('\\') || path.split('/').any(|p| p.is_empty() || p == "." || p == "..") { return Err(invalid()); }
+    let parts: Vec<_> = path.split('/').collect();
+    let mut current = directory.try_clone()?;
+    for (i, part) in parts.iter().enumerate() {
+        let name = std::ffi::CString::new(*part).map_err(|_| invalid())?;
+        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        if i + 1 < parts.len() { flags |= libc::O_DIRECTORY; }
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 { return Err(std::io::Error::last_os_error()); }
+        current = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    if !current.metadata()?.is_file() { return Err(invalid()); }
+    Ok(current)
+}
+
 /// MIME by extension — scriptless defaults; HTML is served as data for an
 /// opaque sandbox (the consuming iframe decides rendering, never execution).
 pub fn mime_for(path: &Path) -> &'static str {
@@ -273,31 +405,6 @@ pub fn mime_for(path: &Path) -> &'static str {
         "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
-}
-
-#[cfg(unix)]
-fn fill_entropy(buf: &mut [u8]) -> bool {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(buf))
-        .is_ok()
-}
-
-#[cfg(windows)]
-fn fill_entropy(buf: &mut [u8]) -> bool {
-    // RtlGenRandom via the BCryptGenRandom path without extra crates.
-    use std::os::windows::io::AsRawHandle;
-    let ok = unsafe {
-        windows_gen_random(buf.as_mut_ptr(), buf.len() as u32)
-    };
-    ok == 1
-}
-
-#[cfg(windows)]
-#[link(name = "bcrypt")]
-extern "system" {
-    #[link_name = "BCryptGenRandom"]
-    fn windows_gen_random(buffer: *mut u8, length: u32) -> i32;
 }
 
 // Shared test helper: an Arc<Registry> is not needed (no interior threads),
@@ -353,6 +460,58 @@ mod tests {
             registry.read(&handle, "other.png", None),
             ResourceResponse::Denied(DenyReason::InvalidPath)
         ));
+    }
+
+    #[test]
+    fn image_bytes_are_bounded_raster_only_and_revocable() {
+        let registry = ResourceRegistry::new();
+        for mime in ["image/svg+xml", "text/html", "image/svg", "application/octet-stream"] {
+            assert!(matches!(registry.grant_image_bytes(vec![1], mime, TTL), Err(DenyReason::InvalidPath)));
+        }
+        assert!(matches!(registry.grant_image_bytes(Vec::new(), "image/png", TTL), Err(DenyReason::InvalidPath)));
+        assert!(matches!(registry.grant_image_bytes(vec![0; MAX_RESOURCE_IMAGE_BYTES + 1], "image/png", TTL), Err(DenyReason::InvalidPath)));
+        for mime in ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "image/avif"] {
+            let handle = registry.grant_image_bytes(b"012345".to_vec(), mime, TTL).unwrap();
+            match registry.read(&handle, "", Some((1, 3))) {
+                ResourceResponse::Ok { mime: got, bytes, total_len, range_applied } => {
+                    assert_eq!(got, mime); assert_eq!(bytes, b"123"); assert_eq!(total_len, 6); assert!(range_applied);
+                }
+                _ => panic!("expected ranged image"),
+            }
+            assert!(matches!(registry.read(&handle, "other", None), ResourceResponse::Denied(DenyReason::InvalidPath)));
+            assert!(registry.revoke(&handle));
+            assert!(matches!(registry.read(&handle, "", None), ResourceResponse::Denied(DenyReason::UnknownHandle)));
+        }
+        let mut handles = Vec::new();
+        for _ in 0..6 { handles.push(registry.grant_image_bytes(vec![0; MAX_RESOURCE_IMAGE_BYTES], "image/png", TTL).unwrap()); }
+        assert!(matches!(registry.grant_image_bytes(vec![0; MAX_RESOURCE_IMAGE_BYTES], "image/png", TTL), Err(DenyReason::IoError)));
+        assert!(registry.revoke(&handles[0]));
+        assert!(registry.grant_image_bytes(vec![0; MAX_RESOURCE_IMAGE_BYTES], "image/png", TTL).is_ok());
+        let expired = registry.grant_image_bytes(vec![1], "image/png", Duration::ZERO).unwrap();
+        assert!(matches!(registry.read(&expired, "", None), ResourceResponse::Denied(DenyReason::Expired)));
+    }
+
+    #[test]
+    fn expired_image_memory_is_reclaimed_without_a_request() {
+        let registry = ResourceRegistry::new();
+        let handle = registry.grant_image_bytes(vec![1; 1024], "image/png", Duration::from_millis(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(1250));
+        assert!(!registry.grants.lock().unwrap().contains_key(&handle));
+    }
+
+    #[test]
+    fn each_grant_has_a_distinct_128_bit_hex_handle() {
+        let dir = setup_dir();
+        let file = dir.path().join("x.txt");
+        fs::write(&file, b"x").unwrap();
+        let registry = ResourceRegistry::new();
+        let mut handles = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let handle = registry.grant_file(&file, TTL).unwrap();
+            assert_eq!(handle.len(), 32);
+            assert!(handle.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(handles.insert(handle));
+        }
     }
 
     #[test]
@@ -419,7 +578,7 @@ mod tests {
             registry.read(&handle, "", None),
             ResourceResponse::Denied(DenyReason::Expired)
         ));
-        assert_eq!(registry.sweep_expired(), 1);
+        assert_eq!(registry.sweep_expired(), 0, "the expired read removed its grant");
 
         let handle = registry.grant_file(&file, TTL).expect("grant");
         assert!(registry.revoke(&handle));

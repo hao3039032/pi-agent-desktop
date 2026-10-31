@@ -7,6 +7,7 @@
   "permissions": [
     "allow-select-project-directory",
     "allow-pi-ipc",
+    "allow-save-resource-as",
     "allow-pi-ipc-subscribe-events",
     "allow-pi-ipc-subscribe-running",
     "allow-pi-ipc-subscribe-terminal",

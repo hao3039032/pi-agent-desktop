@@ -1,17 +1,11 @@
 import fs from "fs";
 import { TEXT_PREVIEW_MAX_BYTES } from "./file-types";
+import { textPreviewChunk } from "./text-preview-bytes";
 
 export interface TextPreviewChunk {
   content: string;
   nextOffset: number;
   truncated: boolean;
-}
-
-function utf8SequenceLength(byte: number): number {
-  if ((byte & 0xe0) === 0xc0) return 2;
-  if ((byte & 0xf0) === 0xe0) return 3;
-  if ((byte & 0xf8) === 0xf0) return 4;
-  return 1;
 }
 
 export function readTextPreviewChunk(
@@ -29,21 +23,5 @@ export function readTextPreviewChunk(
     fs.closeSync(descriptor);
   }
 
-  let end = Math.min(bytesRead, TEXT_PREVIEW_MAX_BYTES);
-  if (offset + end < fileSize) {
-    let sequenceStart = end;
-    while (sequenceStart > end - 3 && (buffer[sequenceStart] & 0xc0) === 0x80) {
-      sequenceStart--;
-    }
-    if (utf8SequenceLength(buffer[sequenceStart]) > end - sequenceStart) {
-      end = sequenceStart;
-    }
-  }
-  const nextOffset = offset + end;
-
-  return {
-    content: buffer.toString("utf8", 0, end),
-    nextOffset,
-    truncated: nextOffset < fileSize,
-  };
+  return textPreviewChunk(buffer.subarray(0, bytesRead), fileSize, offset);
 }

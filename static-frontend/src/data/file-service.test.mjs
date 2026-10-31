@@ -22,6 +22,10 @@ const {
   searchFileIndex,
   fetchFileIndex,
   readFileContent,
+  fetchTextFileChunk,
+  grantFilePreview,
+  fetchRevealSupport,
+  revealDirectory,
   grantFileResource,
   readFileResource,
   revokeFileResource,
@@ -152,10 +156,43 @@ test("readFileContent sends path to files.read and returns mime and data", async
   assert.equal(res.data, "aGVsbG8=");
 });
 
+test("text previews use bounded resource reads and revoke the handle", async () => {
+  const mock = boundService(null);
+  mock.on("resources.grantFile", ({ path }) => { assert.equal(path, "/proj/index.html"); return { handle: "token" }; });
+  mock.on("resources.read", (args) => {
+    assert.equal(args.handle, "token");
+    assert.equal(args.start, 0);
+    assert.equal(args.end, 256 * 1024);
+    return { data: Buffer.from("<html>fixture</html>").toString("base64"), totalLen: 20 };
+  });
+  let revoked = false;
+  mock.on("resources.revoke", ({ handle }) => { revoked = handle === "token"; return { revoked: true }; });
+  const result = await fetchTextFileChunk("/proj/index.html");
+  assert.equal(result.content, "<html>fixture</html>");
+  assert.equal(result.language, "html");
+  assert.equal(result.truncated, false);
+  assert.equal(revoked, true);
+});
+
+test("directory reveal uses host support and scoped operation", async () => {
+  const mock = boundService(null);
+  mock.on("files.revealSupport", () => ({ supported: true, reason: null, platform: "linux" }));
+  mock.on("files.reveal", (args) => { assert.deepEqual(args, { cwd: "/proj" }); return { opened: true }; });
+  assert.equal((await fetchRevealSupport()).supported, true);
+  await revealDirectory("/proj");
+});
+
+test("preview directory grant is scoped by the host", async () => {
+  const mock = boundService(null);
+  mock.on("resources.grantPreview", (args) => { assert.deepEqual(args, { path: "/proj/index.html" }); return { handle: "token", name: "index.html" }; });
+  assert.deepEqual(await grantFilePreview("/proj/index.html"), { handle: "token", name: "index.html" });
+});
+
 test("resource protocol functions roundtrip through resources.* ops", async () => {
   const mock = boundService(null);
   mock.on("resources.grantFile", (args) => {
     assert.equal(args.path, "/proj/img.png");
+    assert.equal(args.sessionId, "session-1");
     return { handle: "handle-123" };
   });
   mock.on("resources.read", (args) => {
@@ -172,7 +209,7 @@ test("resource protocol functions roundtrip through resources.* ops", async () =
     return { revoked: true };
   });
 
-  const handle = await grantFileResource("/proj/img.png");
+  const handle = await grantFileResource("/proj/img.png", "session-1");
   assert.equal(handle, "handle-123");
   const readRes = await readFileResource(handle);
   assert.equal(readRes.mime, "image/png");

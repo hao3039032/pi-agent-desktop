@@ -22,6 +22,7 @@ const {
   fetchSessionView,
   fetchThinkingContent,
   fetchBashOutput,
+  fetchSessionReference,
   fetchSessionContextPage,
   fetchAgentRunningState,
   renewSessionLease,
@@ -52,6 +53,14 @@ test("deferred thinking uses the typed session and entry IPC operation", async (
     return { thinking: "fixture trace" };
   }));
   assert.equal(await fetchThinkingContent("s1", "e1", 2), "fixture trace");
+});
+
+test("sessions.reference resolves through the bound host", async () => {
+  boundService((transport) => transport.on("sessions.reference", (args) => {
+    assert.deepEqual(args, { session: "s1" });
+    return { reference: "<referenced-session>fixture</referenced-session>" };
+  }));
+  assert.equal(await fetchSessionReference("s1"), "<referenced-session>fixture</referenced-session>");
 });
 
 test("sessions.get sends the view flags and maps the answer", async () => {

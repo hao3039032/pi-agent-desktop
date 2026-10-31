@@ -3,8 +3,7 @@
 import { useState } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { formatAttachmentSize } from "@/lib/chat-attachments";
-import { revealItemInDirNative } from "@/lib/desktop-native";
-import { isTauriDesktop } from "@/lib/desktop-updater";
+import { revealChatDownloadNative } from "@/lib/desktop-native";
 
 export interface SavedFileInfo {
   path: string;
@@ -26,18 +25,8 @@ export function SavedFileCard({ file }: { file: SavedFileInfo }) {
   const reveal = async () => {
     setError(null);
     try {
-      if (isTauriDesktop()) {
-        await revealItemInDirNative(file.path);
-        return;
-      }
-      const res = await fetch("/api/chat-downloads/reveal", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: file.path }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({})) as { error?: string };
-        throw new Error(data.error ?? `HTTP ${res.status}`);
+      if (!await revealChatDownloadNative(file.path)) {
+        throw new Error("Could not reveal the saved file");
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

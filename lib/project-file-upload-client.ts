@@ -19,6 +19,15 @@ export interface ProjectUploadResponse {
   error?: string;
 }
 
+export async function checkProjectUpload(targetDirectory: string, fileNames: string[]): Promise<ProjectUploadResponse> {
+  const response = await fetch(`/api/files/${encodeFilePathForApi(targetDirectory)}?type=upload-check`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fileNames }),
+  });
+  const data = await response.json().catch(() => ({})) as ProjectUploadResponse;
+  if (!response.ok) throw new Error(data.error ?? `Upload check failed (HTTP ${response.status})`);
+  return data;
+}
+
 /** Multipart upload into an allowed project directory (browser / WebView). */
 export function uploadProjectFiles(
   targetDirectory: string,

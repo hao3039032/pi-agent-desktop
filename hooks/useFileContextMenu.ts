@@ -16,7 +16,7 @@ import {
 } from "@/lib/desktop-native";
 import { getDesktopPlatform } from "@/lib/desktop-window";
 import { appListCacheKey, buildFileMenuEntries, revealLabelKey } from "@/lib/file-context-menu";
-import { encodeFilePathForApi } from "@/lib/file-paths";
+import { fileExists } from "@/lib/file-service";
 
 const APP_LIST_TTL_MS = 5 * 60_000;
 /** Past this the menu opens without the app list rather than keep the user waiting. */
@@ -42,15 +42,6 @@ async function loadAppsWithinDeadline(filePath: string): Promise<FileOpenApp[]> 
   }
 }
 
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/files/${encodeFilePathForApi(filePath)}?type=meta`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * The native popup while those are on, otherwise the in-app menu
  * (components/DomContextMenuHost.tsx), which draws the same entries.
@@ -69,6 +60,7 @@ export interface FileMenuTarget {
   filePath: string;
   /** PDF page fragment of a markdown link, handed back to `onOpenFile`. */
   page?: number;
+  sessionId?: string;
   /**
    * The path is only a guess (inline code): ask the server whether the file
    * exists, and when it does not, leave the right-click to the plain
@@ -87,7 +79,7 @@ export function useFileContextMenu(
 ): (event: MouseEvent, target: FileMenuTarget) => void {
   const { t } = useI18n();
 
-  return useCallback((event, { filePath, page, verify }) => {
+  return useCallback((event, { filePath, page, sessionId, verify }) => {
     if (!isTauriDesktop()) return;
     // Claim the right-click now: the checks below are async, and the document
     // fallback in useNativeContextMenu only respects a prevented event.
@@ -95,7 +87,7 @@ export function useFileContextMenu(
     const at = { x: event.clientX, y: event.clientY };
 
     void (async () => {
-      if (verify && !(await fileExists(filePath))) {
+      if (verify && !(await fileExists(filePath, sessionId))) {
         const selection = window.getSelection()?.toString() ?? "";
         if (selection !== "") {
           await showMenu(canUseNativeMenu()

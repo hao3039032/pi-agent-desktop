@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, useMemo, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import { useEffect, useState, useRef, useCallback, useMemo, type ComponentProps, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import {
   createElement as renderSyntaxNode,
   type SyntaxHighlighterProps,
@@ -16,7 +16,7 @@ import {
   isImagePath,
   isVideoPath,
 } from "@/lib/file-types";
-import { encodeFilePathForApi, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
+import { getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { parseFrontmatter } from "@/lib/frontmatter";
 import { markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
@@ -27,6 +27,9 @@ import type { GitFileDiffResponse } from "@/lib/git-types";
 import { fetchGitDiff as fetchGitDiffRequest } from "@/lib/git-status-service";
 import { getFileIcon } from "./FileIcons";
 import { useI18n } from "@/hooks/useI18n";
+import { useFileResourceUrl } from "@/hooks/useFileResourceUrl";
+import { downloadFile, fetchTextFileChunk } from "@/lib/file-service";
+import { fetchFileMetadata, loadDocxPreview, watchFile, type FileWatcher } from "@/lib/file-viewer-service";
 import {
   resolveInitialFileDisplayMode,
   type FileViewerDisplayMode as DisplayMode,
@@ -210,19 +213,10 @@ function SourceCodeRenderer({ rows, stylesheet, useInlineStyles, wrapLines }: So
   });
 }
 
-function getFileApiUrl(
-  filePath: string,
-  type: "read" | "download" | "meta" | "preview" | "serve" | "watch",
-  sourceSessionId?: string | null,
-  params: Record<string, string | number | undefined> = {},
-): string {
-  const encoded = encodeFilePathForApi(filePath);
-  const searchParams = new URLSearchParams({ type });
-  if (sourceSessionId) searchParams.set("sessionId", sourceSessionId);
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined) searchParams.set(key, String(value));
-  }
-  return `/api/files/${encoded}?${searchParams.toString()}`;
+function FileMarkdownImage({ path, sourceSessionId, fallback, ...props }: ComponentProps<"img"> & { path: string | null; sourceSessionId?: string | null; fallback?: string }) {
+  const local = useFileResourceUrl(path, sourceSessionId);
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img {...props} src={path ? local : fallback} loading="lazy" />;
 }
 
 function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceSessionId?: string | null }) {
@@ -239,12 +233,7 @@ function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceS
         void (async () => {
           setBusy(true);
           try {
-            const { saveLocalFileAs } = await import("@/lib/desktop-native");
-            await saveLocalFileAs(
-              filePath,
-              getFileName(filePath),
-              getFileApiUrl(filePath, "download", sourceSessionId),
-            );
+            await downloadFile(filePath, sourceSessionId);
           } catch (error) {
             console.error("Failed to save file:", error);
           } finally {
@@ -537,7 +526,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
   const [size, setSize] = useState<number | null>(null);
   const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<FileWatcher | null>(null);
   const syncRequestRef = useRef(0);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
@@ -563,8 +552,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     let active = true;
     const synchronize = () => {
       const requestId = ++syncRequestRef.current;
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((response) => response.json())
+      fetchFileMetadata(filePath, sourceSessionId)
         .then((next: { size?: number; error?: string }) => {
           if (!active || requestId !== syncRequestRef.current) return;
           if (next.error) {
@@ -581,7 +569,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
         });
     };
 
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
+    const es = watchFile(filePath, sourceSessionId);
     esRef.current = es;
 
     es.addEventListener("connected", () => {
@@ -611,7 +599,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     };
   }, [filePath, sourceSessionId, watchEnabled]);
 
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = useFileResourceUrl(filePath, sourceSessionId, bust);
 
   const formatSizeStr = size != null ? formatSize(size) : null;
   const metadata = [
@@ -671,7 +659,7 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
   const [size, setSize] = useState<number | null>(null);
   const [duration, setDuration] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<FileWatcher | null>(null);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
 
@@ -689,8 +677,7 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     }
 
     const synchronize = () => {
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((response) => response.json())
+      fetchFileMetadata(filePath, sourceSessionId)
         .then((next: { size?: number; error?: string }) => {
           if (next.error) {
             setError(next.error);
@@ -701,7 +688,7 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
         .catch((nextError) => setError(String(nextError)));
     };
 
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
+    const es = watchFile(filePath, sourceSessionId);
     esRef.current = es;
 
     es.addEventListener("connected", () => {
@@ -726,7 +713,7 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     };
   }, [filePath, sourceSessionId, watchEnabled]);
 
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = useFileResourceUrl(filePath, sourceSessionId, bust);
   const metadata = [
     ext || "audio",
     duration != null ? formatDuration(duration) : null,
@@ -773,7 +760,7 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
   const [size, setSize] = useState<number | null>(null);
   const [duration, setDuration] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<FileWatcher | null>(null);
   const syncRequestRef = useRef(0);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
@@ -799,8 +786,7 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     let active = true;
     const synchronize = () => {
       const requestId = ++syncRequestRef.current;
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((response) => response.json())
+      fetchFileMetadata(filePath, sourceSessionId)
         .then((next: { size?: number; error?: string }) => {
           if (!active || requestId !== syncRequestRef.current) return;
           if (next.error) {
@@ -817,7 +803,7 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
         });
     };
 
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
+    const es = watchFile(filePath, sourceSessionId);
     esRef.current = es;
 
     es.addEventListener("connected", () => {
@@ -847,7 +833,7 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     };
   }, [filePath, sourceSessionId, watchEnabled]);
 
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = useFileResourceUrl(filePath, sourceSessionId, bust);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -927,14 +913,25 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, initialPage, watchEnab
   const [bust, setBust] = useState(0);
   const [size, setSize] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
+  const [docxPreview, setDocxPreview] = useState<{ url?: string; srcDoc?: string }>();
+  const esRef = useRef<FileWatcher | null>(null);
 
   const ext = getFileExt(filePath);
   const isPdf = ext === "pdf";
   const pageFragment = isPdf && initialPage && initialPage > 0 ? `#page=${initialPage}` : "";
-  const previewUrl = isPdf
-    ? `${getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined)}${pageFragment}`
-    : getFileApiUrl(filePath, "preview", sourceSessionId, bust ? { v: bust } : undefined);
+  const pdfUrl = useFileResourceUrl(isPdf ? filePath : undefined, sourceSessionId, bust);
+  const previewUrl = isPdf ? (pdfUrl ? `${pdfUrl}${pageFragment}` : undefined) : docxPreview?.url;
+
+  useEffect(() => {
+    if (isPdf) return;
+    let cancelled = false;
+    setError(null);
+    setDocxPreview(undefined);
+    void loadDocxPreview(filePath, sourceSessionId, bust).then((preview) => {
+      if (!cancelled) setDocxPreview(preview);
+    }).catch((error) => { if (!cancelled) setError(String(error)); });
+    return () => { cancelled = true; };
+  }, [filePath, sourceSessionId, bust, isPdf]);
 
   useEffect(() => {
     if (!watchEnabled) return;
@@ -949,8 +946,7 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, initialPage, watchEnab
     }
 
     const synchronize = () => {
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((r) => r.json())
+      fetchFileMetadata(filePath, sourceSessionId)
         .then((d: { size?: number; error?: string }) => {
           if (d.error) setError(d.error);
           if (typeof d.size === "number") {
@@ -964,7 +960,7 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, initialPage, watchEnab
     };
     synchronize();
 
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
+    const es = watchFile(filePath, sourceSessionId);
     esRef.current = es;
 
     es.addEventListener("connected", () => {
@@ -1017,7 +1013,8 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, initialPage, watchEnab
           <iframe
             key={previewUrl}
             src={previewUrl}
-            sandbox={isPdf ? undefined : "allow-same-origin"}
+            srcDoc={isPdf ? undefined : docxPreview?.srcDoc}
+            sandbox={isPdf ? undefined : docxPreview?.srcDoc !== undefined ? "" : "allow-same-origin"}
             title={t("i18n.previewFile", { file: getFileName(filePath) })}
             style={{ width: "100%", height: "100%", border: "none", background: isPdf ? "var(--bg)" : "#eef1f5" }}
           />
@@ -1093,7 +1090,7 @@ function TextFileViewer({
   // isolated srcDoc sandbox instead, where scripts run but local files don't load.
   const [htmlScriptsEnabled, setHtmlScriptsEnabled] = useState(false);
   const [htmlPreviewRevision, setHtmlPreviewRevision] = useState(0);
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<FileWatcher | null>(null);
   const contentRequestRef = useRef(0);
   const gitDiffRequestRef = useRef(0);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -1151,8 +1148,7 @@ function TextFileViewer({
 
   const fetchContent = useCallback((filePath: string, offset = 0) => {
     const requestId = ++contentRequestRef.current;
-    return fetch(getFileApiUrl(filePath, "read", sourceSessionId, { offset: offset || undefined }))
-      .then((r) => r.json())
+    return fetchTextFileChunk(filePath, sourceSessionId, offset)
       .then((d: FileData & { error?: string }) => {
         if (requestId !== contentRequestRef.current) return null;
         if (d.error) {
@@ -1231,7 +1227,7 @@ function TextFileViewer({
       void fetchGitDiff(filePath);
     };
 
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
+    const es = watchFile(filePath, sourceSessionId);
     esRef.current = es;
 
     es.addEventListener("connected", () => {
@@ -1296,7 +1292,7 @@ function TextFileViewer({
   const isHtml = language === "html";
   const isMarkdown = language === "markdown";
   const htmlHasScripts = isHtml && /<script\b/i.test(viewerContent);
-  const htmlPreviewUrl = getFileApiUrl(filePath, "serve", sourceSessionId, { v: htmlPreviewRevision });
+  const htmlPreviewUrl = useFileResourceUrl(isHtml ? filePath : undefined, sourceSessionId, htmlPreviewRevision, true);
   const hasPreview = !data?.truncated && (isHtml || isMarkdown);
   // Only the first chunk of a large file is loaded, so preview is unavailable
   // until the rest arrives; a preview default falls back to source instead of
@@ -1723,12 +1719,7 @@ function TextFileViewer({
                   const imagePath = typeof src === "string"
                     ? resolveLocalFileHref(src, markdownDirectory, cwd ?? markdownDirectory)
                     : null;
-                  const imageSrc = imagePath
-                    ? getFileApiUrl(imagePath, "read", sourceSessionId)
-                    : src;
-                  // Dynamic local paths are served directly by the file API.
-                  // eslint-disable-next-line @next/next/no-img-element
-                  return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
+                  return <FileMarkdownImage path={imagePath} sourceSessionId={sourceSessionId} fallback={typeof src === "string" ? src : undefined} alt={alt ?? ""} {...props} />;
                 },
               }}
             >

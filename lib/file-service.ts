@@ -36,6 +36,8 @@ export interface FileNodeEntry {
   outsideLinkEncloses?: boolean;
 }
 
+export function usesStaticFileHost(): boolean { return false; }
+
 async function responseError(res: Response, fallback: string): Promise<Error> {
   const body = (await res.json().catch(() => null)) as { error?: string } | null;
   return new Error(body?.error ?? fallback);
@@ -112,8 +114,53 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   return { mime, data: btoa(binary) };
 }
 
+export async function fetchRevealSupport(): Promise<{ supported: boolean; reason: string | null; platform: string }> {
+  const { isTauriDesktop } = await import("@/lib/desktop-updater");
+  if (isTauriDesktop()) {
+    const { getDesktopPlatform } = await import("@/lib/desktop-window");
+    const platform = getDesktopPlatform();
+    return { supported: true, reason: null, platform: platform === "macos" ? "darwin" : platform === "windows" ? "win32" : "linux" };
+  }
+  const response = await fetch("/api/open-in-explorer");
+  if (!response.ok) throw await responseError(response, "File manager unavailable");
+  return response.json();
+}
+
+export async function revealDirectory(cwd: string): Promise<void> {
+  const { isTauriDesktop } = await import("@/lib/desktop-updater");
+  if (isTauriDesktop()) {
+    const { revealItemInDirNative } = await import("@/lib/desktop-native");
+    await revealItemInDirNative(cwd);
+    return;
+  }
+  const response = await fetch("/api/open-in-explorer", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd }) });
+  if (!response.ok) throw await responseError(response, `HTTP ${response.status}`);
+}
+
+export async function fileExists(filePath: string, sessionId?: string | null): Promise<boolean> {
+  const params = new URLSearchParams({ type: "meta" });
+  if (sessionId) params.set("sessionId", sessionId);
+  try { return (await fetch(`/api/files/${encodeFilePathForApi(filePath)}?${params}`)).ok; }
+  catch { return false; }
+}
+
+export async function downloadFile(filePath: string, sessionId?: string | null): Promise<void> {
+  const { saveLocalFileAs } = await import("@/lib/desktop-native");
+  const params = new URLSearchParams({ type: "download" });
+  if (sessionId) params.set("sessionId", sessionId);
+  await saveLocalFileAs(filePath, filePath.split(/[\\/]/).pop() ?? "download", `/api/files/${encodeFilePathForApi(filePath)}?${params}`);
+}
+
+export async function fetchTextFileChunk(filePath: string, sessionId?: string | null, offset = 0): Promise<{ content: string; language: string; size: number; nextOffset: number; truncated: boolean; error?: string }> {
+  const params = new URLSearchParams({ type: "read" });
+  if (sessionId) params.set("sessionId", sessionId);
+  if (offset) params.set("offset", String(offset));
+  const response = await fetch(`/api/files/${encodeFilePathForApi(filePath)}?${params}`);
+  return response.json();
+}
+
 /** Grant a preview resource handle for an allowed file. */
-export async function grantFileResource(filePath: string): Promise<string> {
+export async function grantFileResource(filePath: string, _sessionId?: string | null): Promise<string> {
   return filePath;
 }
 

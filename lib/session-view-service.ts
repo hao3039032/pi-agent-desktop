@@ -1,5 +1,12 @@
 "use client";
 
+export async function fetchSessionReference(session: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+  const response = await fetchImpl(`/api/sessions/${encodeURIComponent(session)}/reference`);
+  if (!response.ok) return "";
+  const data = await response.json() as { reference?: string };
+  return data.reference ?? "";
+}
+
 /**
  * The session-view service seam (migration M2): the data calls the session
  * loop makes — reading a session's view (GET /api/sessions/[id]), paging its

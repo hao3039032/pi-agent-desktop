@@ -84,6 +84,7 @@
       });
     },
     convertFileSrc(filePath, protocol = "asset") {
+      if (protocol === "pi-resource") return `/__harness__/resource/${filePath}`;
       return `${protocol}://localhost/${filePath}`;
     },
     metadata: {

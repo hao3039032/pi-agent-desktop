@@ -40,7 +40,7 @@ import {
 } from "@/lib/sidebar-draft-rows";
 import { getProjectDisplayName, getProjectDisplayNames } from "@/lib/project-display";
 import { notifyDesktop } from "@/lib/desktop-notify";
-import { revealItemInDirNative } from "@/lib/desktop-native";
+import { fetchRevealSupport, revealDirectory } from "@/lib/file-service";
 import { isTauriDesktop } from "@/lib/desktop-updater";
 import {
   canUseNativeMenu,
@@ -445,44 +445,25 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   // "Open in file manager" on a project row. Only the server can raise a
   // file-manager window, and only when the browser runs on that same machine,
   // so the browser asks once and the menu shows the entry only where it works;
-  // the desktop shell reveals natively through revealItemInDirNative instead.
+  // the desktop shell uses the native host service instead.
   const [fileManagerAvailability, setFileManagerAvailability] = useState<{ supported: boolean; reason: string | null; platform: string } | null>(null);
   const [projectRevealError, setProjectRevealError] = useState<string | null>(null);
   useEffect(() => {
-    if (isTauriDesktop()) return;
     let cancelled = false;
-    fetch("/api/open-in-explorer")
-      .then((res) => res.ok ? res.json() as Promise<{ supported: boolean; reason: string | null; platform: string }> : null)
-      .then((data) => { if (!cancelled && data) setFileManagerAvailability(data); })
+    fetchRevealSupport()
+      .then((data) => { if (!cancelled) setFileManagerAvailability(data); })
       .catch(() => {});
     return () => { cancelled = true; };
   }, []);
   const revealProjectInFileManager = useCallback(async (root: string) => {
     setProjectRevealError(null);
-    if (isTauriDesktop()) {
-      try {
-        await revealItemInDirNative(root);
-        setProjectMenu(null);
-      } catch (e) {
-        setProjectRevealError(e instanceof Error ? e.message : String(e));
-      }
-      return;
-    }
     try {
-      const res = await fetch("/api/open-in-explorer", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: root }),
-      });
-      if (res.ok) {
-        setProjectMenu(null);
-        return;
-      }
-      const data = await res.json().catch(() => ({})) as { error?: string };
-      const key = FILE_MANAGER_ERROR_KEYS[data.error ?? ""];
-      setProjectRevealError(key ? t(key) : (data.error ?? `HTTP ${res.status}`));
+      await revealDirectory(root);
+      setProjectMenu(null);
     } catch (e) {
-      setProjectRevealError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      const key = FILE_MANAGER_ERROR_KEYS[message];
+      setProjectRevealError(key ? t(key) : message);
     }
   }, [t]);
   const fileManagerPlatform = isTauriDesktop()
@@ -2155,7 +2136,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           worktreeError={worktreeActions.error}
           confirmRemove={worktreeActions.confirmRemove}
           newBranch={worktreeActions.newBranch}
-          canReveal={isTauriDesktop() || fileManagerAvailability?.supported === true}
+          canReveal={fileManagerAvailability?.supported === true}
           revealLabel={revealProjectLabel}
           projectRevealError={projectRevealError}
           t={t}
