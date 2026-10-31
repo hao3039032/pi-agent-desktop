@@ -69,6 +69,14 @@ export interface SessionViewResponse {
   error?: string;
 }
 
+export async function fetchThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/entries/${encodeURIComponent(entryId)}/thinking?blockIndex=${blockIndex}`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json() as { thinking?: unknown };
+  if (typeof data.thinking !== "string") throw new Error("Invalid thinking response");
+  return data.thinking;
+}
+
 function viewUrl(sid: string, params: SessionViewParams): string {
   const search = new URLSearchParams();
   if (params.deferThinking) search.set("deferThinking", "1");

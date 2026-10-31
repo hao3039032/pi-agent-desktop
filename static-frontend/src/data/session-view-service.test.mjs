@@ -20,6 +20,7 @@ const jiti = createJiti(import.meta.url, {
 
 const {
   fetchSessionView,
+  fetchThinkingContent,
   fetchSessionContextPage,
   fetchAgentRunningState,
   renewSessionLease,
@@ -35,6 +36,14 @@ function boundService(configure) {
   bindSessionViewService(client);
   return mock;
 }
+
+test("deferred thinking uses the typed session and entry IPC operation", async () => {
+  boundService((transport) => transport.on("sessions.thinking", (args) => {
+    assert.deepEqual(args, { session: "s1", entryId: "e1", blockIndex: 2 });
+    return { thinking: "fixture trace" };
+  }));
+  assert.equal(await fetchThinkingContent("s1", "e1", 2), "fixture trace");
+});
 
 test("sessions.get sends the view flags and maps the answer", async () => {
   const mock = boundService((transport) => {

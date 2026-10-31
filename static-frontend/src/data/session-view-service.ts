@@ -41,6 +41,12 @@ function failureStatus(failure: IpcFailure): number {
   return failure.error.code === "not_found" ? 404 : 500;
 }
 
+export async function fetchThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
+  const data = await ensureClient().request<{ thinking?: unknown }>("sessions.thinking", { session: sessionId, entryId, blockIndex }, { timeoutMs: 20_000 });
+  if (typeof data.thinking !== "string") throw new Error("Invalid thinking response");
+  return data.thinking;
+}
+
 function viewArgs(params: SessionViewParams): Record<string, unknown> {
   return {
     ...(params.summaryTree ? { summaryTree: true } : {}),

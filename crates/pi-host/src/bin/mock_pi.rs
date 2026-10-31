@@ -32,6 +32,11 @@ fn main() {
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
+    if scenario == "startup_ui" {
+        let _ = out.write_all(b"{\"type\":\"extension_ui_request\",\"id\":\"startup\",\"method\":\"confirm\",\"title\":\"Continue?\"}\n");
+        let _ = out.flush();
+    }
+
     if scenario == "split_hello" {
         // One record split mid-UTF-8 across writes (chunked delivery), then
         // two records in ONE write.

@@ -27,6 +27,7 @@
 pub mod composer_outbox;
 pub mod history;
 pub mod machine;
+mod session_ui;
 pub mod spawn_plan;
 pub use history::{list_session_files, scan_session_file_info, scan_sessions, SessionIndex, SessionSummary};
 pub use machine::{FollowUp, SessionMachine, SessionRunState, StreamingMessage};
@@ -237,6 +238,7 @@ struct SessionState {
     started_at: Instant,
     last_active: Instant,
     subscribers: Vec<(u64, std::sync::mpsc::Sender<Value>)>,
+    ui: session_ui::SessionUi,
 }
 
 impl Session {
@@ -253,6 +255,7 @@ impl Session {
         let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
+        if matches!(command, "abort" | "abort_bash") { self.cancel_ui(); }
         let result = self.client.command(command, data, timeout);
         self.touch();
         result
@@ -282,11 +285,70 @@ impl Session {
     /// detaches; [`Session::unsubscribe`] detaches by id (the IPC layer's
     /// explicit unsubscribe). Returns (subscriber id, receiver).
     pub fn subscribe(&self) -> (u64, std::sync::mpsc::Receiver<Value>) {
+        let (id, rx, _) = self.subscribe_with_ui();
+        (id, rx)
+    }
+
+    /// Atomically subscribe and snapshot the still-pending dialog records.
+    pub fn subscribe_with_ui(&self) -> (u64, std::sync::mpsc::Receiver<Value>, Vec<Value>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut state = self.state.lock().unwrap();
         let id = self.next_subscriber_id();
+        let pending = state.ui.records();
         state.subscribers.push((id, tx));
-        (id, rx)
+        (id, rx, pending)
+    }
+
+    pub fn pending_ui_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().ui.ids()
+    }
+
+    /// Extension status and string-array widget state observed from the child.
+    pub fn extension_ui_state(&self) -> (Vec<Value>, Vec<Value>) {
+        let state = self.state.lock().unwrap();
+        (state.ui.statuses(), state.ui.widgets())
+    }
+
+    /// Consume a current dialog once, with a response appropriate to its method.
+    pub fn respond_ui(&self, id: &str, response: &Value) -> Result<(), &'static str> {
+        let mut state = self.state.lock().unwrap();
+        let (child_id, payload) = state.ui.answer(id, response)?;
+        if !self.client.respond_ui(&child_id, payload) { return Err("session process is closed") }
+        let event = json!({"type":"extension_ui_closed", "id":id});
+        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        Ok(())
+    }
+
+    fn relay_ui(&self, record: Value) {
+        let mut state = self.state.lock().unwrap();
+        let (record, cancel) = state.ui.insert(record);
+        if let Some((child_id, id)) = cancel {
+            self.client.respond_ui(&child_id, json!({"cancelled": true}));
+            let closed = json!({"type":"extension_ui_closed", "id":id});
+            state.subscribers.retain(|(_, tx)| tx.send(closed.clone()).is_ok());
+        }
+        if let Some(record) = record {
+            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+        }
+    }
+
+    fn cancel_ui(&self) {
+        let mut state = self.state.lock().unwrap();
+        let ids = state.ui.ids();
+        for child_id in state.ui.drain() { self.client.respond_ui(&child_id, json!({"cancelled": true})); }
+        for id in ids {
+            let event = json!({"type":"extension_ui_closed", "id":id});
+            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        }
+    }
+
+    fn expire_ui(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (child_id, id) in state.ui.expire() {
+            self.client.respond_ui(&child_id, json!({"cancelled": true}));
+            let event = json!({"type":"extension_ui_closed", "id":id});
+            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        }
     }
 
     /// Detach the subscriber with this id (its relay thread's recv then
@@ -294,6 +356,9 @@ impl Session {
     pub fn unsubscribe(&self, subscriber_id: u64) {
         let mut state = self.state.lock().unwrap();
         state.subscribers.retain(|(id, _)| *id != subscriber_id);
+        if state.subscribers.is_empty() {
+            for id in state.ui.drain() { self.client.respond_ui(&id, json!({"cancelled": true})); }
+        }
     }
 
     fn next_subscriber_id(&self) -> u64 {
@@ -430,7 +495,9 @@ impl Session {
 
     /// The projected run state (a cheap copy for IPC responses).
     pub fn run_state(&self) -> crate::machine::SessionRunState {
-        self.machine.lock().unwrap().state.clone()
+        let mut result = self.machine.lock().unwrap().state.clone();
+        result.pending_ui_request_ids = self.pending_ui_ids();
+        result
     }
 
     /// Wait until the run of `min_epoch` (or later) settled, the child
@@ -530,6 +597,7 @@ impl Session {
         // A shutdown while a settle waiter sleeps must wake it at once (the
         // fan thread's exit wake covers a child-side exit; this covers the
         // host-ordered one — remove/evict during an in-flight delivery).
+        self.cancel_ui();
         let exit = self.client.close(grace);
         self.settle_cv.notify_all();
         exit
@@ -1100,7 +1168,7 @@ fn spawn_session(
 
     let client = PiRpcClient::spawn(
         &config.executable,
-        SpawnOptions { args, cwd: Some(cwd.to_path_buf()), env, ..SpawnOptions::default() },
+        SpawnOptions { args, cwd: Some(cwd.to_path_buf()), env, ui_attach_timeout: Some(Duration::from_secs(30)), ..SpawnOptions::default() },
     )
     .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
 
@@ -1116,18 +1184,20 @@ fn spawn_session(
     // resumed id inherits the queue an evicted child left behind — and the
     // generation its removal raised: the old child's drain is fenced).
     let composer_generation = composer_outbox.generation();
+    let (ui_tx, ui_rx) = std::sync::mpsc::sync_channel(64);
     let state = Arc::new(Session {
         id: id.to_string(),
         session_file_id: session_file_id.to_string(),
         session_file: session_file.to_path_buf(),
         cwd: cwd.to_path_buf(),
         client: Arc::clone(&client),
-        bridge: Bridge::attach(Arc::clone(&client), session_file_id.to_string(), nonce),
+        bridge: Bridge::attach_with_ui_forward(Arc::clone(&client), session_file_id.to_string(), nonce, ui_tx.clone()),
         state: Mutex::new(SessionState {
             lease_until: Instant::now() + IDLE_TIMEOUT,
             started_at: Instant::now(),
             last_active: Instant::now(),
             subscribers: Vec::new(),
+            ui: session_ui::SessionUi::default(),
         }),
         epoch: AtomicU64::new(1),
         machine: Mutex::new(crate::machine::SessionMachine::new(session_file_id)),
@@ -1139,6 +1209,25 @@ fn spawn_session(
         settle_cv: std::sync::Condvar::new(),
         running_signal,
     });
+    {
+        let guards: Vec<_> = ["select", "confirm", "input", "editor", "setStatus", "setWidget", "setTitle", "set_editor_text"]
+            .iter().map(|method| client.on_ui_bounded(method, ui_tx.clone())).collect();
+        drop(ui_tx);
+        client.end_ui_attach_window();
+        let weak = Arc::downgrade(&state);
+        std::thread::Builder::new().name(format!("session-ui-{id}")).spawn(move || {
+            let _guards = guards;
+            loop {
+                let Some(session) = weak.upgrade() else { break };
+                if session.client.has_exited() { session.cancel_ui(); break }
+                match ui_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(request) => session.relay_ui(request.record),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => session.expire_ui(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }).map_err(|error| SessionHostError::Spawn(error.to_string()))?;
+    }
     {
         let fan = Arc::clone(&state);
         std::thread::Builder::new()

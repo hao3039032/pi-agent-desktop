@@ -76,6 +76,7 @@ function toAgentCommandError(failure: IpcFailure): AgentCommandError {
  */
 const HOST_LEVEL_COMMAND_OPS: Record<string, string> = {
   get_tools: "agent.getTools",
+  extension_ui_response: "agent.respondUi",
 };
 
 export async function sendAgentCommand<T = unknown>(

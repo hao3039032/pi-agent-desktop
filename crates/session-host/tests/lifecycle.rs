@@ -225,6 +225,57 @@ fn real_pi_session_lifecycle() {
 }
 
 #[test]
+fn real_pi_extension_dialog_reply_and_timeout() {
+    let Some(executable) = pi_bin() else { eprintln!("skipping: PI_CLI_BIN not set"); return };
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let extension = dir.path().join("dialog.mjs");
+    let result = dir.path().join("result.json");
+    std::fs::write(&extension, format!(r#"
+import {{ writeFileSync }} from 'node:fs';
+export default function(pi) {{
+  pi.registerCommand('fixture-dialog', {{ handler: async (_args, ctx) => {{
+    const confirmed = await ctx.ui.confirm('Proceed?', 'fixture');
+    const input = await ctx.ui.input('Input', 'fixture', {{ timeout: 500 }});
+    writeFileSync({result:?}, JSON.stringify({{ confirmed, input: input ?? null }}));
+  }} }});
+}}
+"#, result = result.to_string_lossy())).unwrap();
+    let (file, file_id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let mut cfg = config(&executable, &agent_dir);
+    cfg.extra_args.extend(["--extension".into(), extension.to_string_lossy().into_owned()]);
+    let registry = SessionRegistry::new();
+    let session = registry.start("ui-test", &file, &file_id, &cwd, &cfg).unwrap();
+    let (_subscriber, events, _) = session.subscribe_with_ui();
+    let prompting = Arc::clone(&session);
+    let handle = std::thread::spawn(move || prompting.command("prompt", json!({"message":"/fixture-dialog"}), Some(Duration::from_secs(10))));
+    let confirm = loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).expect("confirm event");
+        if event["method"] == "confirm" { break event }
+    };
+    let id = confirm["id"].as_str().unwrap();
+    assert!(session.respond_ui(id, &json!({"confirmed": true})).is_ok());
+    assert!(session.respond_ui(id, &json!({"confirmed": true})).is_err());
+    let input = loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).expect("input event");
+        if event["method"] == "input" { break event }
+    };
+    let input_id = input["id"].as_str().unwrap().to_owned();
+    loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).expect("close event");
+        if event["type"] == "extension_ui_closed" && event["id"] == input_id { break }
+    }
+    assert!(session.respond_ui(&input_id, &json!({"value":"late"})).is_err());
+    handle.join().unwrap().unwrap();
+    let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result).unwrap()).unwrap();
+    assert_eq!(data, json!({"confirmed":true, "input":null}));
+    registry.remove("ui-test", Duration::from_secs(5));
+}
+
+#[test]
 fn real_pi_machine_and_handled_prompt() {
     let Some(executable) = pi_bin() else {
         eprintln!("skipping: PI_CLI_BIN not set");
