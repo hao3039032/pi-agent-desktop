@@ -31,7 +31,14 @@ import {
   ToolSettingsError,
   type ToolSettingsChange,
 } from "@/lib/tool-settings-service";
+import {
+  fetchMcpOverview as serviceFetchMcpOverview,
+  postMcpAction as servicePostMcpAction,
+  postMcpTest as servicePostMcpTest,
+} from "@/lib/mcp-service";
 import { itemsToSwitch } from "./settings-ui-helpers";
+
+const DEFAULT_FETCH: FetchLike = (input, init) => fetch(input, init);
 
 // Pure helpers for Settings › MCP (components/McpConfig.tsx): what each row
 // shows, how the groups are built, and how the overview is loaded. Client-safe:
@@ -835,6 +842,9 @@ export function mcpOverviewUrl(cwd: string | null): string {
 }
 
 async function requestMcpOverview(cwd: string | null, fetchImpl: FetchLike, signal?: AbortSignal): Promise<McpLoadResult> {
+  if (fetchImpl === DEFAULT_FETCH) {
+    return serviceFetchMcpOverview(cwd, signal);
+  }
   let response: Awaited<ReturnType<FetchLike>>;
   try {
     response = await fetchImpl(mcpOverviewUrl(cwd), { cache: "no-store", signal });
@@ -870,7 +880,7 @@ async function loadWithin(cwd: string | null, fetchImpl: FetchLike, signal: Abor
  */
 export async function loadMcpOverview(
   cwd: string | null,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_OVERVIEW_TIMEOUT_MS,
 ): Promise<McpLoadResult> {
@@ -1178,6 +1188,9 @@ export type McpActionResult = { ok: true; data: McpActionResponse } | { ok: fals
 export const MCP_ACTION_TIMEOUT_MS = 15_000;
 
 async function requestMcpAction(body: Record<string, unknown>, fetchImpl: FetchLike, signal: AbortSignal): Promise<McpActionResult> {
+  if (fetchImpl === DEFAULT_FETCH) {
+    return servicePostMcpAction(body as any, null, signal);
+  }
   let response: Awaited<ReturnType<FetchLike>>;
   try {
     response = await fetchImpl("/api/mcp", {
@@ -1210,7 +1223,7 @@ async function requestMcpAction(body: Record<string, unknown>, fetchImpl: FetchL
 export async function postMcpAction(
   request: McpActionRequest,
   cwd: string | null,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_ACTION_TIMEOUT_MS,
 ): Promise<McpActionResult> {
@@ -1450,6 +1463,7 @@ function isMcpTestResponse(value: unknown): value is McpTestResponse {
 }
 
 async function requestMcpTest(body: Record<string, unknown>, fetchImpl: FetchLike, signal: AbortSignal): Promise<McpTestRequestResult> {
+  if (fetchImpl === DEFAULT_FETCH) return servicePostMcpTest(body, signal);
   let response: Awaited<ReturnType<FetchLike>>;
   try {
     response = await fetchImpl("/api/mcp/test", {
@@ -1483,7 +1497,7 @@ async function requestMcpTest(body: Record<string, unknown>, fetchImpl: FetchLik
 export async function postMcpTest(
   server: McpServerRef,
   cwd: string | null,
-  fetchImpl: FetchLike = (input, init) => fetch(input, init),
+  fetchImpl: FetchLike = DEFAULT_FETCH,
   signal?: AbortSignal,
   timeoutMs: number = MCP_TEST_TIMEOUT_MS,
 ): Promise<McpTestRequestResult> {
