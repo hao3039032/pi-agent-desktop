@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use std::io::BufRead as _;
 
 /// One listed session.
 #[derive(Debug, Clone)]
@@ -85,6 +86,14 @@ pub fn find_session_by_id(agent_dir: &Path, session_id: &str) -> Option<SessionS
         .into_values()
         .flatten()
         .find(|summary| summary.id == session_id)
+}
+
+/// Every session file under `<agentDir>/sessions` (recursive; the catalogue
+/// and the ID lookup enumerate once and share the list).
+pub fn list_session_files(agent_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_jsonl(&agent_dir.join("sessions"), &mut files);
+    files
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -391,5 +400,426 @@ mod tests {
         let entry = &value["projects"][0]["sessions"][0];
         assert!(entry.get("modifiedMs").is_some());
         assert!(entry.get("firstMessage").is_some());
+    }
+}
+
+// ============================================================================
+// The full per-file scan (lib/session-list-scanner.ts scanSessionFileInfo)
+//
+// The CHEAP header scan above answers the session index (id/cwd/time from
+// line one). THIS scan is the catalogue's projection: it streams the whole
+// file line by line, tolerating unparsable lines (a crashed write's tail
+// never hides a session), and derives the fields the TS scanner derived —
+// the session_info rename, message/compaction counts, the attachment-aware
+// first-user-message title, and the modified time from message activity.
+// A differential test keeps the two implementations in step.
+// ============================================================================
+
+/// The per-file catalogue projection (ScannedSessionInfo's shape).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScannedSession {
+    pub path: PathBuf,
+    pub id: String,
+    pub cwd: String,
+    pub name: Option<String>,
+    pub parent_session_path: Option<String>,
+    /// Epoch ms of the header timestamp (a REAL ISO parse: milliseconds and
+    /// numeric offsets honored, invalid dates rejected to 0).
+    pub created_ms: i64,
+    /// Epoch ms: last message activity, else the header time, else mtime.
+    pub modified_ms: i64,
+    pub message_count: u64,
+    pub compaction_count: u64,
+    /// The attachment-aware first user message, else "(no messages)".
+    pub first_message: String,
+    pub size_bytes: u64,
+}
+
+/// Stream a session file and project the catalogue fields. A missing file,
+/// an empty file or a non-session first parsable line yields None (the TS
+/// scanner's null); every other parse error skips just that line.
+pub fn scan_session_file_info(path: &Path) -> Option<ScannedSession> {
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    let size_bytes = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let mut reader = std::io::BufReader::new(file);
+    let mut header: Option<Value> = None;
+    let mut name: Option<String> = None;
+    let mut message_count: u64 = 0;
+    let mut compaction_count: u64 = 0;
+    let mut first_message: Option<String> = None;
+    let mut last_activity_ms: Option<i64> = None;
+
+    let mut buffer = String::new();
+    loop {
+        buffer.clear();
+        match reader.read_line(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break, // a binary/undecodable middle never hides the session
+        }
+        let line = buffer.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(trimmed) else {
+            continue; // an unparsable line (a crashed write's tail) skips
+        };
+        if !entry.is_object() {
+            continue;
+        }
+        let Some(header_ref) = header.as_ref() else {
+            if entry.get("type").and_then(Value::as_str) != Some("session") {
+                return None; // the TS scanner: a foreign first line hides the file
+            }
+            header = Some(entry);
+            continue;
+        };
+        let _ = header_ref;
+        match entry.get("type").and_then(Value::as_str).unwrap_or("") {
+            "session_info" => {
+                // The LAST non-empty name wins (a rename overwrites).
+                if let Some(value) = entry.get("name").and_then(Value::as_str) {
+                    let trimmed_name = value.trim();
+                    name = if trimmed_name.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed_name.to_string())
+                    };
+                }
+            }
+            "compaction" => compaction_count += 1,
+            "message" => {
+                message_count += 1;
+                if let Some(activity) = activity_time_ms(&entry) {
+                    last_activity_ms = Some(last_activity_ms.unwrap_or(0).max(activity));
+                }
+                let message = entry.get("message");
+                let role = message
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str);
+                if !matches!(role, Some("user") | Some("assistant")) {
+                    continue;
+                }
+                let message = message.expect("role checked above");
+                if first_message.is_none() && role == Some("user") {
+                    if let Some(text) = extract_text_content(message.get("content")) {
+                        let title = attachment_aware_title(&text);
+                        if !title.is_empty() {
+                            first_message = Some(title);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let header = header?;
+    let id = header.get("id").and_then(Value::as_str)?.to_string();
+    let cwd = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let parent_session_path = header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let created_ms = header
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso_ms_full)
+        .unwrap_or(0);
+    let modified_ms = match last_activity_ms {
+        Some(activity) if activity > 0 => activity,
+        _ => {
+            if created_ms > 0 {
+                created_ms
+            } else {
+                mtime_ms
+            }
+        }
+    };
+    Some(ScannedSession {
+        path: path.to_path_buf(),
+        id,
+        cwd,
+        name,
+        parent_session_path,
+        created_ms,
+        modified_ms,
+        message_count,
+        compaction_count,
+        first_message: first_message.unwrap_or_else(|| "(no messages)".to_string()),
+        size_bytes,
+    })
+}
+
+/// The TS activityTimeOf: message.timestamp (a number, ms) else the entry's
+/// own ISO timestamp — only user/assistant messages count.
+fn activity_time_ms(entry: &Value) -> Option<i64> {
+    let message = entry.get("message")?;
+    let role = message.get("role").and_then(Value::as_str)?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    if !message.get("content").is_some() {
+        return None;
+    }
+    if let Some(stamp) = message.get("timestamp").and_then(Value::as_f64) {
+        return Some(stamp as i64);
+    }
+    match entry.get("timestamp") {
+        // An entry-level ms epoch (the JS Date accepts either shape).
+        Some(Value::Number(number)) => number.as_f64().map(|stamp| stamp as i64),
+        Some(Value::String(text)) => parse_iso_ms_full(text),
+        _ => None,
+    }
+}
+
+/// The TS extractTextContent: a plain string is itself; an array joins its
+/// text blocks with single spaces.
+fn extract_text_content(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let parts: Vec<String> = blocks
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        block.get("text").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" "))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The TS attachmentAwareTitle: the typed text, else the attached-file
+/// names joined with ", " (the attached_file block markup is stripped).
+fn attachment_aware_title(content: &str) -> String {
+    if !content.contains("<attached_file name=") {
+        return content.to_string();
+    }
+    let close = "\n</attached_file>";
+    let mut text = String::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = content;
+    loop {
+        let Some(open_at) = rest.find("<attached_file name=\"") else {
+            text.push_str(rest);
+            break;
+        };
+        let after_quote = open_at + "<attached_file name=\"".len();
+        let Some(name_end) = rest[after_quote..].find('"') else {
+            text.push_str(rest);
+            break;
+        };
+        let name = rest[after_quote..after_quote + name_end].to_string();
+        // The TS tag regex consumes `">\n`: the body starts after the
+        // closing angle bracket and its newline.
+        let after_name_quote = after_quote + name_end;
+        let Some(tag_tail) = rest[after_name_quote..].strip_prefix("\">\n") else {
+            text.push_str(rest);
+            break;
+        };
+        let body_start = rest.len() - tag_tail.len();
+        let Some(close_at) = rest[body_start..].find(close) else {
+            text.push_str(rest);
+            break;
+        };
+        text.push_str(&rest[..open_at]);
+        names.push(name);
+        rest = &rest[body_start + close_at + close.len()..];
+    }
+    let cleaned = collapse_triple_newlines(text.trim());
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    names.join(", ")
+}
+
+/// The TS text cleanup: three-or-more newlines collapse to two.
+fn collapse_triple_newlines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = 0;
+    for character in text.chars() {
+        if character == '\n' {
+            run += 1;
+            if run <= 2 {
+                out.push(character);
+            }
+        } else {
+            run = 0;
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// A REAL ISO-8601 parse (the TS new Date()): YYYY-MM-DD[T ]HH:MM[:SS[.fff]]
+/// with an optional Z or ±HH:MM offset, validated as a calendar date. None
+/// for anything malformed (the old parser dropped milliseconds, ignored
+/// offsets and accepted impossible dates).
+pub fn parse_iso_ms_full(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    let digit = |range: std::ops::Range<usize>| -> Option<i64> {
+        let slice = bytes.get(range)?;
+        if slice.iter().all(|byte| byte.is_ascii_digit()) {
+            Some(std::str::from_utf8(slice).ok()?.parse().ok()?)
+        } else {
+            None
+        }
+    };
+    if len < 19 {
+        return None;
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || !(bytes[10] == b'T' || bytes[10] == b' ') {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let year = digit(0..4)?;
+    let month = digit(5..7)?;
+    let day = digit(8..10)?;
+    let hour = digit(11..13)?;
+    let minute = digit(14..16)?;
+    let second = digit(17..19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Day validity against the month (leap years included).
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day > max_day {
+        return None;
+    }
+    let mut millis = 0i64;
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        let start = index + 1;
+        let mut end = start;
+        while end < len && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        let fraction = std::str::from_utf8(&bytes[start..end]).ok()?;
+        // .5 → 500ms, .25 → 250ms: scale the fraction to three digits.
+        millis = fraction.chars().take(3).collect::<String>().parse().ok()?;
+        for _ in fraction.len().min(3)..3 {
+            millis *= 10;
+        }
+        index = end;
+    }
+    // The offset: Z, ±HH:MM or ±HHMM; none means UTC (the files are Zulu).
+    let mut offset_ms: i64 = 0;
+    match bytes.get(index) {
+        Some(b'Z') | Some(b'z') => {
+            index += 1;
+        }
+        Some(b'+') | Some(b'-') => {
+            let sign = if bytes[index] == b'-' { -1 } else { 1 };
+            let oh = digit(index + 1..index + 3)?;
+            let om = if bytes.get(index + 3) == Some(&b':') {
+                digit(index + 4..index + 6)?
+            } else {
+                digit(index + 3..index + 5)?
+            };
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            offset_ms = sign * (oh * 3_600_000 + om * 60_000);
+            index += if bytes.get(index + 3) == Some(&b':') { 6 } else { 5 };
+        }
+        _ => {}
+    }
+    if index != len {
+        return None; // trailing garbage is a malformed stamp, not a date
+    }
+    let days = civil_days_from_iso(year, month, day);
+    let base = (days * 86_400_000) + (hour * 3_600_000) + (minute * 60_000) + (second * 1_000) + millis;
+    Some(base - offset_ms)
+}
+
+fn civil_days_from_iso(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod scan_report {
+    use super::*;
+
+    /// Differential-test bridge: read a file list from the --files argument
+    /// and print one RUST-SCAN <json> line per file (the TS scanner's
+    /// fixture test compares field for field). Ignored unless run
+    /// explicitly with --ignored --files <list>.
+    #[test]
+    #[ignore]
+    fn rust_scan_fixture_report() {
+        let list = std::env::var("RUST_SCAN_FILES").expect("RUST_SCAN_FILES lists the fixtures");
+        let content = std::fs::read_to_string(list).expect("the fixture list");
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            let path = std::path::PathBuf::from(line);
+            let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+            match scan_session_file_info(&path) {
+                Some(scan) => {
+                    let report = json!({
+                        "path": name,
+                        "id": scan.id,
+                        "cwd": scan.cwd,
+                        "name": scan.name,
+                        "parentSessionPath": scan.parent_session_path,
+                        "createdMs": scan.created_ms,
+                        "modifiedMs": scan.modified_ms,
+                        "messageCount": scan.message_count,
+                        "compactionCount": scan.compaction_count,
+                        "firstMessage": scan.first_message,
+                        "sizeBytes": scan.size_bytes,
+                    });
+                    println!("RUST-SCAN {report}");
+                }
+                None => println!("RUST-SCAN {{\"path\":\"{name}\",\"null\":true}}"),
+            }
+        }
     }
 }

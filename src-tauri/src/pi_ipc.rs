@@ -624,33 +624,42 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // messageCount/workspaceKind/relation/running fields are NOT
         // derivable from headers and stay pending (README's unfixed list) —
         // the static UI must not pretend they exist.
+        // The catalogue: the FULL per-file scan (the TS scanSessionFileInfo
+        // semantics, differential-tested) — the session_info rename, message
+        // and compaction counts, the attachment-aware first-user title, and
+        // the activity-based modified time. Field-for-field the GET
+        // /api/sessions projection except workspaceKind/relation/running
+        // (runtime state the disk cannot know — README's unfixed list).
         "sessions.catalogue" => {
             let agent_dir = state.agent_dir();
-            let index = session_host::scan_sessions(&agent_dir);
-            let mut sessions: Vec<Value> = index
-                .projects
-                .values()
-                .flatten()
-                .map(|summary| {
+            let files = session_host::list_session_files(&agent_dir);
+            let mut sessions: Vec<Value> = files
+                .iter()
+                .filter_map(|file| session_host::scan_session_file_info(file))
+                .map(|scan| {
                     json!({
-                        "id": summary.id,
-                        "path": summary.file.display().to_string(),
-                        "cwd": summary.cwd,
-                        "name": summary.name,
-                        "created": ms_to_iso(summary.timestamp_ms),
-                        "modified": ms_to_iso(summary.modified_ms),
-                        "parentSessionId": summary.parent_session,
-                        "firstMessage": summary.first_message,
-                        "sizeBytes": summary.size_bytes,
+                        "id": scan.id,
+                        "path": scan.path.display().to_string(),
+                        "cwd": scan.cwd,
+                        "name": scan.name,
+                        "created": ms_to_iso(scan.created_ms),
+                        "modified": ms_to_iso(scan.modified_ms),
+                        "messageCount": scan.message_count,
+                        "compactionCount": if scan.compaction_count > 0 { json!(scan.compaction_count) } else { Value::Null },
+                        "parentSessionId": scan.parent_session_path,
+                        "firstMessage": scan.first_message,
+                        "sizeBytes": scan.size_bytes,
                     })
                 })
                 .collect();
             sessions.sort_by(|a, b| {
                 b.get("modified").and_then(Value::as_str).cmp(&a.get("modified").and_then(Value::as_str))
             });
-            // Host-derived roots stay in step with the catalogue.
-            for (cwd, _) in index.projects.iter() {
-                state.propose_path(Path::new(cwd));
+            // Host-derived roots stay in step with the catalogue's cwds.
+            for value in sessions.iter() {
+                if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
+                    state.propose_path(Path::new(cwd));
+                }
             }
             protocol_ok(&id, json!({ "sessions": sessions }))
         }
@@ -1092,10 +1101,17 @@ mod tests {
         )
         .expect("older");
         // Give the newer file a later mtime (the catalogue sorts on it).
+        // A rename lives in a session_info entry (pi's real shape); the
+        // header never carries the display name.
         let newer = sessions.join("newer.jsonl");
         std::fs::write(
             &newer,
-            r#"{"type":"session","version":3,"id":"s-new","timestamp":"2026-02-01T00:00:00.000Z","cwd":"/proj","name":"Named"}"#,
+            concat!(
+                r#"{"type":"session","version":3,"id":"s-new","timestamp":"2026-02-01T00:00:00.000Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"session_info","id":"i1","parentId":null,"name":"Renamed"}"#,
+                "\n",
+            ),
         )
         .expect("newer");
         // Same instant: bump mtime deterministically via a copied temp file.
@@ -1115,9 +1131,11 @@ mod tests {
         assert_eq!(sessions.len(), 2, "{sessions:?}");
         // Newest (by mtime) first.
         assert_eq!(sessions[0]["id"], "s-new", "sorted newest first: {sessions:?}");
-        assert_eq!(sessions[0]["name"], "Named");
-        assert_eq!(sessions[1]["id"], "s-old");
+        assert_eq!(sessions[0]["name"], "Renamed", "the session_info rename, not a header name");
+        assert_eq!(sessions[0]["messageCount"], 0);
         assert_eq!(sessions[1]["firstMessage"], "older question");
+        assert_eq!(sessions[1]["messageCount"], 1);
+        assert_eq!(sessions[1]["id"], "s-old");
         // The catalogue carries created/modified as ISO strings and paths.
         assert!(sessions[0]["created"].as_str().unwrap_or_default().starts_with("2026-02-01T"));
         assert!(sessions[0]["modified"].as_str().unwrap_or_default().ends_with('Z'));

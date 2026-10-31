@@ -26,7 +26,7 @@
 
 pub mod history;
 pub mod machine;
-pub use history::{scan_sessions, SessionIndex, SessionSummary};
+pub use history::{list_session_files, scan_session_file_info, scan_sessions, SessionIndex, SessionSummary};
 pub use machine::{FollowUp, SessionMachine, SessionRunState, StreamingMessage};
 
 use std::collections::HashMap;
