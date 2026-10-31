@@ -29,6 +29,8 @@ import { bindGitStatusService } from "./data/git-status-service.ts";
 import { bindMcpService } from "./data/mcp-service.ts";
 import { bindMcpSignInClient } from "./data/mcp-sign-in-client.ts";
 import { bindModelsConfigService } from "./data/models-config-service.ts";
+import { bindDistroService } from "./data/distro-service.ts";
+import { bindUpdateService } from "./data/update-service.ts";
 import { bindModelsExtrasService } from "./data/models-extras-service.ts";
 import { bindModelsService } from "./data/models-service.ts";
 import { bindSkillsClient } from "./data/skills-client.ts";
@@ -63,6 +65,8 @@ async function boot(): Promise<void> {
   bindPluginsClient(client);
   bindEnabledModelsService(client);
   bindModelsConfigService(client);
+  bindDistroService(client);
+  bindUpdateService(client);
   bindFontService(client);
   bindToolSettingsService(client);
   bindArtifactsSettingsService(client);

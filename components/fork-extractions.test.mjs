@@ -102,7 +102,7 @@ const EXTRACTIONS = [
     // whose language and theme pickers duplicated General. They moved to
     // fork-owned files; regrouping them back into the settings panel is the
     // resurrection this guards against.
-    movedTo: ["components/AppUpdatesSection.tsx", "components/desktop/DesktopAppSection.tsx"],
+    movedTo: ["components/AppUpdatesSection.tsx", "components/desktop/DesktopAppSection.tsx", "lib/update-service.ts"],
     movedDefinitions: ["AppUpdatesSection", "DesktopAppSection"],
     absentFromOrigin: ["/api/updates", "installLatestDesktopRelease", "closeQuits", "quitAppNative"],
     requiredInOrigin: ["AppUpdatesSection", "DesktopAppSection"],
@@ -192,6 +192,7 @@ const EXTRACTIONS = [
     movedTo: [
       "hooks/useDesktopWorkspaceTabs.ts",
       "hooks/useWorkspaceAvailability.ts",
+      "lib/workspace-service.ts",
     ],
     movedDefinitions: ["workspaceStatusRef"],
     absentFromOrigin: [

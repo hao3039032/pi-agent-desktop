@@ -79,6 +79,11 @@ description = "Allows the UI to install the signed update the shell finds: it ch
 commands.allow = ["install_available_update"]
 
 [[permission]]
+identifier = "allow-select-project-directory"
+description = "Allows the trusted app window to choose a project directory through a host-owned native dialog."
+commands.allow = ["select_project_directory"]
+
+[[permission]]
 identifier = "allow-pi-ipc"
 description = "Allows the app WebView to call the typed IPC bridge (protocol v1): one closed operation table (docs/migration/ipc-protocol.md), no generic execution surface. Unknown operations are refused by the host."
 commands.allow = ["pi_ipc"]

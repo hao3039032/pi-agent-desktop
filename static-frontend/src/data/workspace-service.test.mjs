@@ -17,7 +17,7 @@ const jiti = createJiti(import.meta.url, {
   interopDefault: true,
 });
 
-const { fetchChatWorkspaceRoot, validateWorkspaceCwd, createDefaultWorkspaceCwd, bindWorkspaceService } =
+const { fetchChatWorkspaceRoot, validateWorkspaceCwd, createDefaultWorkspaceCwd, fetchWorkspaceStatus, bindWorkspaceService } =
   await jiti.import("./workspace-service.ts");
 const { IpcClient, MockTransport } = await jiti.import("../ipc/client.ts");
 
@@ -28,6 +28,15 @@ function bound(handler) {
   bindWorkspaceService(client);
   return mock;
 }
+
+test("workspace status uses the host and rejects invalid status", async () => {
+  const calls = [];
+  const mock = bound({ "cwd.status": args => { calls.push(args); return { availability: "missing" }; } });
+  assert.equal(await fetchWorkspaceStatus("/tmp/project"), "missing");
+  assert.deepEqual(calls, [{ cwd: "/tmp/project" }]);
+  mock.on("cwd.status", () => ({ availability: "bogus" }));
+  await assert.rejects(fetchWorkspaceStatus("/tmp/project"), /Invalid workspace status/);
+});
 
 test("the chat root rides chats.workspaceState", async () => {
   bound({ "chats.workspaceState": () => ({ cwd: "/tmp/agent/chats" }) });

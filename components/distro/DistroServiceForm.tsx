@@ -4,15 +4,10 @@ import { useEffect, useState, type CSSProperties } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { ConfigButton, ConfigField } from "@/components/SettingsUi";
 import { distroStrings } from "./strings";
+import { configureDistroService, fetchDistroStatus, type DistroServiceStatus } from "@/lib/distro-service";
 
-export interface DistroServiceStatus {
-  providerId: string;
-  providerName: string;
-  configured: boolean;
-  baseUrl: string;
-  hasApiKey: boolean;
-  npmMirror: boolean;
-}
+export { fetchDistroStatus };
+export type { DistroServiceStatus };
 
 const inputStyle: CSSProperties = {
   width: "100%",
@@ -26,21 +21,6 @@ const inputStyle: CSSProperties = {
   fontFamily: "var(--font-mono)",
   outline: "none",
 };
-
-export async function fetchDistroStatus(): Promise<DistroServiceStatus> {
-  const response = await fetch("/api/distro", { cache: "no-store" });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const data = (await response.json()) as Partial<DistroServiceStatus>;
-  // A 200 that is not the status shape (a partial failure, or a fixture that
-  // does not know this endpoint yet) must never reach the form: it reads
-  // `baseUrl` as a string and an undefined one throws during render, taking
-  // the whole Settings dialog down with it. Same guard the upstream terminal
-  // section applies to its own response.
-  if (typeof data?.baseUrl !== "string" || typeof data?.providerId !== "string") {
-    throw new Error("Invalid distro status");
-  }
-  return data as DistroServiceStatus;
-}
 
 export function DistroServiceForm({
   status,
@@ -68,13 +48,7 @@ export function DistroServiceForm({
     setBusy(true);
     setMessage(null);
     try {
-      const response = await fetch("/api/distro", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ baseUrl, apiKey, useNpmMirror }),
-      });
-      const data = (await response.json()) as DistroServiceStatus & { error?: string };
-      if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+      const data = await configureDistroService({ baseUrl, apiKey, useNpmMirror });
       setApiKey("");
       setMessage({ error: false, text: s.saved });
       onSaved(data);

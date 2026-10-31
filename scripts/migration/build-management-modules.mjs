@@ -74,6 +74,8 @@ export {
 } from "${ROOT}/lib/enabled-models-service.server.ts";
 export { getTerminalSettings, setTerminalShell, resolveTerminalShell } from "${ROOT}/lib/terminal-settings.ts";
 export { readRedactedModelsConfig } from "${ROOT}/lib/models-config-store.ts";
+export { readDistroServiceStatus, applyDistroServiceConfig } from "${ROOT}/lib/distro/service-config.ts";
+export { seedAgentDir } from "${ROOT}/lib/distro/seed.ts";
 export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-config-service.server.ts";
 export {
   composeProviderLists,

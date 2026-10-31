@@ -124,6 +124,13 @@ export async function selectDirectoryNative(defaultPath?: string): Promise<strin
   return typeof selection === "string" ? selection : null;
 }
 
+/** Host-owned project selection; only the dialog result grants a project root. */
+export async function selectProjectDirectoryHost(defaultPath?: string): Promise<string | null> {
+  if (!isTauriDesktop()) throw new Error("Native directory selection is only available in the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string | null>("select_project_directory", { defaultPath: defaultPath ?? null });
+}
+
 /** Native file-selection dialog. Resolves [] when cancelled. */
 export async function selectFilesNative(options: SelectFilesOptions = {}): Promise<string[]> {
   if (!isTauriDesktop()) {

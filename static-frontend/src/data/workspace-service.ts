@@ -9,6 +9,20 @@
 
 import { IpcClient, IpcFailure } from "../ipc/client.ts";
 import type { ValidatedCwd } from "../../../lib/workspace-service";
+import type { WorkspaceAvailability } from "../../../lib/workspace-availability";
+
+export async function fetchWorkspaceStatus(cwd: string, options: { signal?: AbortSignal } = {}): Promise<WorkspaceAvailability> {
+  if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  const result = await ensureClient().request<{ availability: WorkspaceAvailability }>("cwd.status", { cwd }, { timeoutMs: 15_000 });
+  if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  if (!["available", "missing", "not-directory", "unreadable"].includes(result.availability)) throw new Error("Invalid workspace status");
+  return result.availability;
+}
+
+export async function chooseProjectDirectory(defaultPath?: string): Promise<string | null> {
+  const { selectProjectDirectoryHost } = await import("@/lib/desktop-native");
+  return selectProjectDirectoryHost(defaultPath);
+}
 
 let client: IpcClient | null = null;
 

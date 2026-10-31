@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { AppUpdateInfo, AppUpdatesResponse } from "@/lib/app-update-types";
+import type { AppUpdateInfo } from "@/lib/app-update-types";
+import { checkAppUpdates } from "@/lib/update-service";
 import { PRODUCT_NAME } from "@/lib/branding";
 import { APP_PREF_KEYS, getPrefJson, setPrefJson } from "@/lib/app-prefs";
 import { handleExternalLinkClick } from "@/lib/desktop-native";
@@ -60,12 +61,7 @@ export function UpdateReminder({ onOpenSettings }: { onOpenSettings: () => void 
       controller?.abort();
       controller = new AbortController();
       try {
-        const response = await fetch("/api/updates", {
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json() as AppUpdatesResponse;
+        const data = await checkAppUpdates({ signal: controller.signal });
         if (cancelled) return;
         if (Array.isArray(data.updates) && data.updates.length > 0 && !isSnoozed(data.updates)) {
           setUpdates(data.updates);

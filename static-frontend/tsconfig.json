@@ -67,6 +67,12 @@
       "@/lib/mcp-sign-in-client": [
         "./static-frontend/src/data/mcp-sign-in-client.ts"
       ],
+      "@/lib/distro-service": [
+        "./static-frontend/src/data/distro-service.ts"
+      ],
+      "@/lib/update-service": [
+        "./static-frontend/src/data/update-service.ts"
+      ],
       "@/lib/mcp-service": [
         "./static-frontend/src/data/mcp-service.ts"
       ],

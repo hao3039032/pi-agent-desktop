@@ -15,6 +15,19 @@
  */
 
 import type { SessionWorkspaceKind } from "./types";
+import type { WorkspaceAvailability } from "./workspace-availability";
+
+export async function fetchWorkspaceStatus(cwd: string, options: { signal?: AbortSignal } = {}): Promise<WorkspaceAvailability> {
+  const response = await fetch(`/api/cwd/status?cwd=${encodeURIComponent(cwd)}`, { signal: options.signal });
+  const data = await response.json() as { availability?: WorkspaceAvailability };
+  if (!response.ok || !data.availability) throw new Error(`HTTP ${response.status}`);
+  return data.availability;
+}
+
+export async function chooseProjectDirectory(defaultPath?: string): Promise<string | null> {
+  const { selectDirectoryNative } = await import("@/lib/desktop-native");
+  return selectDirectoryNative(defaultPath);
+}
 
 export interface ValidatedCwd {
   success: true;
