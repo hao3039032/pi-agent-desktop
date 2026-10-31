@@ -137,6 +137,9 @@ mod linux {
         Ok(stat(parent, name)?.is_some_and(|value| matches_expected(&value, journal)))
     }
     fn finish(agent: &Path, root: &Path, token: &str, journal: &Journal) -> Result<(), Failure> {
+        finish_with_hook(agent, root, token, journal, |_| Ok(()))
+    }
+    fn finish_with_hook(agent: &Path, root: &Path, token: &str, journal: &Journal, hook: impl Fn(&str) -> Result<(), Failure>) -> Result<(), Failure> {
         verify_journal(journal, token)?;
         let journal_root = journal_dir(agent)?;
         let transaction = open_directory(&journal_root, token)?;
@@ -175,11 +178,13 @@ mod linux {
         } else if !committed && !original_is_expected(&parent, &original, journal)? {
             return Err(fail("busy", "Deletion recovery cannot verify the original session"));
         }
+        hook("applied")?;
         // A renamed completed tombstone makes cleanup itself restartable:
         // recovery never has to infer the outcome from partially removed files.
         let done = format!("{token}.done");
         rename_no_replace(&journal_root, token, &journal_root, &done)?;
         journal_root.sync_all().map_err(io)?;
+        hook("tombstoned")?;
         cleanup_done(&journal_root, &done)
     }
     fn cleanup_done(journal_root: &File, name: &str) -> Result<(), Failure> {
@@ -307,7 +312,7 @@ mod linux {
         create_file(&transaction, "commit", b"commit\n")?;
         transaction.sync_all().map_err(io)?;
         hook("committed")?;
-        finish(agent, root, &token, &journal)
+        finish_with_hook(agent, root, &token, &journal, hook)
     }
 
     #[cfg(test)]
@@ -340,7 +345,7 @@ mod linux {
                 });
                 panic!("fixture phase not reached");
             }
-            for phase in ["isolated", "committed"] {
+            for phase in ["isolated", "committed", "applied", "tombstoned"] {
                 let (dir, state, root, source) = fixture();
                 let status = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "session_deletion_journal::linux::tests::process_crash_requires_explicit_fixture_lock_recovery"])
@@ -356,17 +361,17 @@ mod linux {
                 std::fs::remove_dir(&gate).unwrap();
                 let _exclusive = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
                 recover(&state, &root).unwrap();
-                assert_eq!(source.exists(), phase != "committed");
+                assert_eq!(source.exists(), phase == "isolated");
             }
         }
         #[test]
         fn restart_recovers_each_durable_phase() {
-            for phase in ["prepared", "isolated", "committed"] {
+            for phase in ["prepared", "isolated", "committed", "applied", "tombstoned"] {
                 let (dir, state, root, source) = fixture();
                 let metadata = std::fs::metadata(&source).unwrap();
                 assert!(remove_with_hook(&root, dir.path(), "a", &source, &metadata, |at| if at == phase { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
                 recover(&state, &root).unwrap();
-                assert_eq!(source.exists(), phase != "committed", "{phase}");
+                assert_eq!(source.exists(), matches!(phase, "prepared" | "isolated"), "{phase}");
                 recover(&state, &root).unwrap();
             }
         }
