@@ -16,7 +16,7 @@ import {
 } from "@/lib/desktop-native";
 import { getDesktopPlatform } from "@/lib/desktop-window";
 import { appListCacheKey, buildFileMenuEntries, revealLabelKey } from "@/lib/file-context-menu";
-import { encodeFilePathForApi } from "@/lib/file-paths";
+import { fileExists } from "@/lib/file-service";
 
 const APP_LIST_TTL_MS = 5 * 60_000;
 /** Past this the menu opens without the app list rather than keep the user waiting. */
@@ -39,15 +39,6 @@ async function loadAppsWithinDeadline(filePath: string): Promise<FileOpenApp[]> 
     return await Promise.race([loadApps(filePath), slow]);
   } catch {
     return [];
-  }
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/files/${encodeFilePathForApi(filePath)}?type=meta`);
-    return res.ok;
-  } catch {
-    return false;
   }
 }
 

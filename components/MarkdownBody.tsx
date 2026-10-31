@@ -9,7 +9,7 @@ import { useFileResourceUrl } from "@/hooks/useFileResourceUrl";
 import { useI18n } from "@/hooks/useI18n";
 import { fenceFilePaths, inlineCodeFilePath } from "@/lib/file-context-menu";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
-import { encodeFilePathForApi } from "@/lib/file-paths";
+import { fileExists } from "@/lib/file-service";
 import { markdownRehypePlugins, markdownRemarkPlugins, markdownUrlTransform, markdownUserRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
 import { ImagePreview } from "./ImagePreview";
 import { MermaidBlock, CodeBlock } from "./MermaidBlock";
@@ -93,8 +93,8 @@ function CodeBlockOpenFile({ filePath, onOpenFile }: { filePath: string; onOpenF
   useEffect(() => {
     let cancelled = false;
     setExists(false);
-    fetch(`/api/files/${encodeFilePathForApi(filePath)}?type=meta`)
-      .then((res) => { if (!cancelled) setExists(res.ok); })
+    fileExists(filePath)
+      .then((exists) => { if (!cancelled) setExists(exists); })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [filePath]);

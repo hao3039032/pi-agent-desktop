@@ -2038,6 +2038,30 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
         }
+        "resources.grantPreview" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            #[cfg(unix)]
+            {
+                let scoped = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, Path::new(path))
+                };
+                let Some((target, root)) = scoped else { return protocol_error(&id, "unauthorized_scope", "preview path is outside authorized roots"); };
+                let Some(parent) = target.parent() else { return protocol_error(&id, "invalid_args", "invalid preview path"); };
+                let Some(name) = target.file_name().and_then(|name| name.to_str()) else { return protocol_error(&id, "invalid_args", "invalid preview filename"); };
+                if crate::file_access::open_file_beneath_root(&root, &target).is_err() { return protocol_error(&id, "unauthorized_scope", "preview file cannot be opened safely"); }
+                let directory = match crate::file_access::open_directory_beneath_root(&root, parent) {
+                    Ok(directory) => directory,
+                    Err(error) => return protocol_error(&id, "unauthorized_scope", &error.to_string()),
+                };
+                match state.resources.grant_open_directory(directory, Duration::from_secs(600)) {
+                    Ok(handle) => protocol_ok(&id, json!({ "handle": handle, "name": name })),
+                    Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+                }
+            }
+            #[cfg(windows)]
+            { let _ = path; protocol_error(&id, "unauthorized_scope", "preview resources are unavailable on this platform") }
+        }
         "resources.read" => {
             let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
             let subpath = args.get("subpath").and_then(Value::as_str).unwrap_or_default();
@@ -5478,6 +5502,10 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
         let escaped = send(&state, json!({ "v": 1, "id": "g3", "op": "resources.grantFile", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
         assert_eq!(escaped["error"]["code"], "unauthorized_scope");
+        let preview_escape = send(&state, json!({ "v": 1, "id": "g-preview", "op": "resources.grantPreview", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
+        assert_eq!(preview_escape["error"]["code"], "unauthorized_scope");
+        let preview = send(&state, json!({ "v": 1, "id": "g-preview-ok", "op": "resources.grantPreview", "args": { "path": png.display().to_string() } }));
+        assert_eq!(preview["data"]["name"], "shot.png", "{preview}");
         std::fs::remove_file(&png).unwrap();
         std::os::unix::fs::symlink(outside.path().join("secret"), &png).unwrap();
         let pinned = send(&state, json!({ "v": 1, "id": "g4", "op": "resources.read", "args": { "handle": handle } }));

@@ -22,6 +22,8 @@ const {
   searchFileIndex,
   fetchFileIndex,
   readFileContent,
+  fetchTextFileChunk,
+  grantFilePreview,
   grantFileResource,
   readFileResource,
   revokeFileResource,
@@ -150,6 +152,30 @@ test("readFileContent sends path to files.read and returns mime and data", async
   assert.deepEqual(calls, [{ path: "/proj/file.txt" }]);
   assert.equal(res.mime, "text/plain");
   assert.equal(res.data, "aGVsbG8=");
+});
+
+test("text previews use bounded resource reads and revoke the handle", async () => {
+  const mock = boundService(null);
+  mock.on("resources.grantFile", ({ path }) => { assert.equal(path, "/proj/index.html"); return { handle: "token" }; });
+  mock.on("resources.read", (args) => {
+    assert.equal(args.handle, "token");
+    assert.equal(args.start, 0);
+    assert.equal(args.end, 256 * 1024);
+    return { data: Buffer.from("<html>fixture</html>").toString("base64"), totalLen: 20 };
+  });
+  let revoked = false;
+  mock.on("resources.revoke", ({ handle }) => { revoked = handle === "token"; return { revoked: true }; });
+  const result = await fetchTextFileChunk("/proj/index.html");
+  assert.equal(result.content, "<html>fixture</html>");
+  assert.equal(result.language, "html");
+  assert.equal(result.truncated, false);
+  assert.equal(revoked, true);
+});
+
+test("preview directory grant is scoped by the host", async () => {
+  const mock = boundService(null);
+  mock.on("resources.grantPreview", (args) => { assert.deepEqual(args, { path: "/proj/index.html" }); return { handle: "token", name: "index.html" }; });
+  assert.deepEqual(await grantFilePreview("/proj/index.html"), { handle: "token", name: "index.html" });
 });
 
 test("resource protocol functions roundtrip through resources.* ops", async () => {

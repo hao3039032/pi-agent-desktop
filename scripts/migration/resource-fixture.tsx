@@ -1,0 +1,18 @@
+// Test-only: original UI with the real Rust IPC/resource bridge.
+import { createRoot } from "react-dom/client";
+import { I18nProvider } from "../../hooks/useI18n";
+import { FileViewer } from "../../components/FileViewer";
+import { MarkdownBody } from "../../components/MarkdownBody";
+import { bindFileService } from "../../static-frontend/src/data/file-service";
+import { detectTransport } from "../../static-frontend/src/data/transport";
+import { IpcClient } from "../../static-frontend/src/ipc/client";
+import "../../app/globals.css";
+import "../../app/settings.css";
+import "../../app/native-theme.css";
+
+bindFileService(new IpcClient(detectTransport().transport));
+const cwd = new URLSearchParams(location.search).get("cwd") ?? "";
+createRoot(document.getElementById("root")!).render(<I18nProvider>
+  <MarkdownBody cwd={cwd}>{"![fixture](image.png)"}</MarkdownBody>
+  <div style={{ height: 600 }}><FileViewer filePath={`${cwd}/index.html`} cwd={cwd} initialDisplayMode="preview" watchEnabled={false} /></div>
+</I18nProvider>);

@@ -28,6 +28,7 @@ import { fetchGitDiff as fetchGitDiffRequest } from "@/lib/git-status-service";
 import { getFileIcon } from "./FileIcons";
 import { useI18n } from "@/hooks/useI18n";
 import { useFileResourceUrl } from "@/hooks/useFileResourceUrl";
+import { downloadFile, fetchTextFileChunk } from "@/lib/file-service";
 import {
   resolveInitialFileDisplayMode,
   type FileViewerDisplayMode as DisplayMode,
@@ -240,12 +241,7 @@ function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceS
         void (async () => {
           setBusy(true);
           try {
-            const { saveLocalFileAs } = await import("@/lib/desktop-native");
-            await saveLocalFileAs(
-              filePath,
-              getFileName(filePath),
-              getFileApiUrl(filePath, "download", sourceSessionId),
-            );
+            await downloadFile(filePath, sourceSessionId);
           } catch (error) {
             console.error("Failed to save file:", error);
           } finally {
@@ -1152,8 +1148,7 @@ function TextFileViewer({
 
   const fetchContent = useCallback((filePath: string, offset = 0) => {
     const requestId = ++contentRequestRef.current;
-    return fetch(getFileApiUrl(filePath, "read", sourceSessionId, { offset: offset || undefined }))
-      .then((r) => r.json())
+    return fetchTextFileChunk(filePath, sourceSessionId, offset)
       .then((d: FileData & { error?: string }) => {
         if (requestId !== contentRequestRef.current) return null;
         if (d.error) {
@@ -1297,7 +1292,7 @@ function TextFileViewer({
   const isHtml = language === "html";
   const isMarkdown = language === "markdown";
   const htmlHasScripts = isHtml && /<script\b/i.test(viewerContent);
-  const htmlPreviewUrl = getFileApiUrl(filePath, "serve", sourceSessionId, { v: htmlPreviewRevision });
+  const htmlPreviewUrl = useFileResourceUrl(isHtml ? filePath : undefined, sourceSessionId, htmlPreviewRevision, true);
   const hasPreview = !data?.truncated && (isHtml || isMarkdown);
   // Only the first chunk of a large file is loaded, so preview is unavailable
   // until the rest arrives; a preview default falls back to source instead of

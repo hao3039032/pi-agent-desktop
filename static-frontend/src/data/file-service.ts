@@ -9,6 +9,9 @@ import { IpcClient, IpcFailure } from "../ipc/client.ts";
 import { joinFilePath } from "../../../lib/file-paths";
 import type { FileEntry, FileNodeEntry } from "../../../lib/file-service";
 import type { FileIndexEntry } from "../../../lib/file-fuzzy";
+import { getFileLanguage } from "../../../lib/file-language";
+import { TEXT_PREVIEW_MAX_BYTES } from "../../../lib/file-types";
+import { textPreviewChunk } from "../../../lib/text-preview-bytes";
 
 let client: IpcClient | null = null;
 
@@ -116,6 +119,39 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   }
 }
 
+export async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    const handle = await grantFileResource(filePath);
+    await revokeFileResource(handle);
+    return true;
+  } catch { return false; }
+}
+
+export async function downloadFile(filePath: string, sessionId?: string | null): Promise<void> {
+  const handle = await grantFileResource(filePath, sessionId);
+  try {
+    const { saveResourceAsNative } = await import("../../../lib/desktop-native");
+    await saveResourceAsNative(handle, filePath.split(/[\\/]/).pop() ?? "download");
+  } finally {
+    await revokeFileResource(handle).catch(() => {});
+  }
+}
+
+export async function fetchTextFileChunk(filePath: string, sessionId?: string | null, offset = 0): Promise<{ content: string; language: string; size: number; nextOffset: number; truncated: boolean }> {
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid text preview offset");
+  const handle = await grantFileResource(filePath, sessionId);
+  try {
+    const result = await readFileResource(handle, "", { start: offset, end: offset + TEXT_PREVIEW_MAX_BYTES });
+    const size = result.totalLen ?? 0;
+    if (offset > size) throw new Error("Invalid text preview offset");
+    const binary = atob(result.data);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return { ...textPreviewChunk(bytes, size, offset), language: getFileLanguage(filePath), size };
+  } finally {
+    await revokeFileResource(handle).catch(() => {});
+  }
+}
+
 /** Grant a preview resource handle for an allowed file. */
 export async function grantFileResource(filePath: string, sessionId?: string | null): Promise<string> {
   try {
@@ -127,6 +163,15 @@ export async function grantFileResource(filePath: string, sessionId?: string | n
     return data.handle;
   } catch (caught) {
     if (caught instanceof IpcFailure) throw toError(caught, "Failed to grant resource");
+    throw caught instanceof Error ? caught : new Error(String(caught));
+  }
+}
+
+export async function grantFilePreview(filePath: string): Promise<{ handle: string; name: string }> {
+  try {
+    return await ensureClient().request<{ handle: string; name: string }>("resources.grantPreview", { path: filePath }, { timeoutMs: 15_000 });
+  } catch (caught) {
+    if (caught instanceof IpcFailure) throw toError(caught, "Failed to grant preview");
     throw caught instanceof Error ? caught : new Error(String(caught));
   }
 }

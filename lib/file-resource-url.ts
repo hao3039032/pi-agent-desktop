@@ -9,3 +9,10 @@ export async function openFileResourceUrl(path: string, sessionId?: string | nul
   if (revision) params.set("v", String(revision));
   return { url: `/api/files/${encodeFilePathForApi(path)}?${params}`, release: () => {} };
 }
+
+export async function openFilePreviewUrl(path: string, sessionId?: string | null, revision?: number): Promise<{ url: string; release: () => void }> {
+  const params = new URLSearchParams({ type: "serve" });
+  if (sessionId) params.set("sessionId", sessionId);
+  if (revision) params.set("v", String(revision));
+  return { url: `/api/files/${encodeFilePathForApi(path)}?${params}`, release: () => {} };
+}

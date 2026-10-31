@@ -6,11 +6,28 @@ use tauri::http::{Request, Response, StatusCode};
 #[path = "resource_handler_tests.rs"]
 mod tests;
 
+fn decode_subpath(raw: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut bytes = raw.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            let text = std::str::from_utf8(&hex).ok()?;
+            let value = u8::from_str_radix(text, 16).ok()?;
+            if value == b'/' || value == b'\\' || value == 0 { return None; }
+            decoded.push(value);
+        } else { decoded.push(byte); }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 pub fn respond(registry: &ResourceRegistry, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     let empty = |status| Response::builder().status(status).header("Cache-Control", "no-store").body(Vec::new()).unwrap();
     if request.method() != tauri::http::Method::GET { return empty(StatusCode::METHOD_NOT_ALLOWED); }
-    let token = request.uri().path().strip_prefix('/').unwrap_or("");
-    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) || request.uri().query().is_some() {
+    let path = request.uri().path().strip_prefix('/').unwrap_or("");
+    let (token, raw_subpath) = path.split_once('/').unwrap_or((path, ""));
+    let Some(subpath) = decode_subpath(raw_subpath) else { return empty(StatusCode::NOT_FOUND) };
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         return empty(StatusCode::NOT_FOUND);
     }
     let range = match request.headers().get("range") {
@@ -23,7 +40,7 @@ pub fn respond(registry: &ResourceRegistry, request: Request<Vec<u8>>) -> Respon
             match parsed { Some(r) => Some(r), None => return empty(StatusCode::RANGE_NOT_SATISFIABLE) }
         }
     };
-    match registry.read(token, "", range) {
+    match registry.read(token, &subpath, range) {
         ResourceResponse::Denied(_) => empty(StatusCode::NOT_FOUND),
         ResourceResponse::Ok { mime, bytes, total_len, range_applied } => {
             if range_applied && bytes.is_empty() {
@@ -36,7 +53,7 @@ pub fn respond(registry: &ResourceRegistry, request: Request<Vec<u8>>) -> Respon
                 .header("Accept-Ranges", "bytes").header("Cache-Control", "no-store")
                 .header("X-Content-Type-Options", "nosniff")
                 .header("Referrer-Policy", "no-referrer")
-                .header("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
+                .header("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; sandbox allow-same-origin");
             if let Some((start, _)) = range.filter(|_| range_applied) {
                 response = response.header("Content-Range", format!("bytes {start}-{}/{total_len}", start + bytes.len() as u64 - 1));
             }

@@ -13,6 +13,7 @@ import {
 } from "@/lib/file-paths";
 import {
   allowOutsideLink as allowOutsideLinkViaService,
+  downloadFile,
   fetchFileEntries,
   searchFileIndex,
 } from "@/lib/file-service";
@@ -446,10 +447,9 @@ export function TreeNode({
           </button>
         )}
         {hovered && !node.isDir && (
-          <a
-            href={`/api/files/${encodeFilePathForApi(node.fullPath)}?type=download`}
-            download
-            onClick={(e) => e.stopPropagation()}
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); void downloadFile(node.fullPath).catch((error) => console.error("Failed to save file:", error)); }}
             title={t("files.download")}
             style={{
               position: "absolute",
@@ -478,7 +478,7 @@ export function TreeNode({
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-          </a>
+          </button>
         )}
       </div>
       {node.isDir && open && pendingLinkTarget && (

@@ -21,3 +21,31 @@ fn token_range_revoke_and_expiry() {
     let expired = registry.grant_open_file(std::fs::File::open(&path).unwrap(), &path, Duration::ZERO).unwrap();
     assert_eq!(respond(&registry, request(&expired).body(vec![]).unwrap()).status(), StatusCode::NOT_FOUND);
 }
+
+#[cfg(unix)]
+#[test]
+fn preview_directory_resolves_assets_but_not_symlinks_or_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let assets = dir.path().join("assets");
+    std::fs::create_dir(&assets).unwrap();
+    std::fs::write(assets.join("index.html"), b"<link rel=stylesheet href=style.css>").unwrap();
+    std::fs::write(assets.join("style.css"), b"body { color: red }").unwrap();
+    let outside = dir.path().join("secret.txt");
+    std::fs::write(&outside, b"secret").unwrap();
+    std::os::unix::fs::symlink(&outside, assets.join("leak")).unwrap();
+    let registry = ResourceRegistry::new();
+    let handle = registry.grant_open_directory(std::fs::File::open(&assets).unwrap(), Duration::from_secs(30)).unwrap();
+    let request = |path: &str| Request::builder().uri(format!("pi-resource://localhost/{handle}/{path}")).body(vec![]).unwrap();
+    let html = respond(&registry, request("index.html"));
+    assert_eq!(html.status(), StatusCode::OK);
+    assert!(html.headers()["content-security-policy"].to_str().unwrap().contains("sandbox allow-same-origin"));
+    assert!(!html.headers()["content-security-policy"].to_str().unwrap().contains("allow-scripts"));
+    let css = respond(&registry, request("style.css?v=1"));
+    assert_eq!(css.headers()["content-type"], "text/css; charset=utf-8");
+    assert_eq!(css.body(), b"body { color: red }");
+    assert_eq!(respond(&registry, request("leak")).status(), StatusCode::NOT_FOUND);
+    assert_eq!(respond(&registry, request("%2e%2e/secret.txt")).status(), StatusCode::NOT_FOUND);
+    assert_eq!(respond(&registry, request("%2fsecret.txt")).status(), StatusCode::NOT_FOUND);
+    assert!(registry.revoke(&handle));
+    assert_eq!(respond(&registry, request("style.css")).status(), StatusCode::NOT_FOUND);
+}

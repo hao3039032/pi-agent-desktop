@@ -24,6 +24,10 @@ mod worktrees;
 pub mod file_resources;
 mod logging;
 mod native_prefs;
+mod resource_save;
+#[cfg(feature = "harness")]
+pub mod resource_handler;
+#[cfg(not(feature = "harness"))]
 mod resource_handler;
 // The provider sign-in domain's host wiring (auth.* IPC arms + the OAuth
 // login stream relay). A standalone module so the auth domain's logic does
@@ -1416,6 +1420,7 @@ pub fn run() {
         .manage(DesktopApiToken(desktop_api_token))
         .invoke_handler(tauri::generate_handler![
             pi_ipc::pi_ipc,
+            resource_save::save_resource_as,
             pi_ipc::pi_ipc_subscribe_events,
             pi_ipc::pi_ipc_subscribe_scheduled,
             pi_ipc::pi_ipc_subscribe_running,

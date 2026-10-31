@@ -293,6 +293,11 @@ async function ipcInvoke<T>(op: string, args: Record<string, unknown>): Promise<
   return (raw.data ?? null) as T | null;
 }
 
+export async function saveResourceAsNative(handle: string, defaultFileName: string): Promise<boolean> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<boolean>("save_resource_as", { handle, defaultFileName });
+}
+
 /**
  * Desktop: save-dialog + server-side copy of an allowed local file.
  * Web: trigger download via the files API.

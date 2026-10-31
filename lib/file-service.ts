@@ -112,6 +112,26 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   return { mime, data: btoa(binary) };
 }
 
+export async function fileExists(filePath: string): Promise<boolean> {
+  try { return (await fetch(`/api/files/${encodeFilePathForApi(filePath)}?type=meta`)).ok; }
+  catch { return false; }
+}
+
+export async function downloadFile(filePath: string, sessionId?: string | null): Promise<void> {
+  const { saveLocalFileAs } = await import("@/lib/desktop-native");
+  const params = new URLSearchParams({ type: "download" });
+  if (sessionId) params.set("sessionId", sessionId);
+  await saveLocalFileAs(filePath, filePath.split(/[\\/]/).pop() ?? "download", `/api/files/${encodeFilePathForApi(filePath)}?${params}`);
+}
+
+export async function fetchTextFileChunk(filePath: string, sessionId?: string | null, offset = 0): Promise<{ content: string; language: string; size: number; nextOffset: number; truncated: boolean; error?: string }> {
+  const params = new URLSearchParams({ type: "read" });
+  if (sessionId) params.set("sessionId", sessionId);
+  if (offset) params.set("offset", String(offset));
+  const response = await fetch(`/api/files/${encodeFilePathForApi(filePath)}?${params}`);
+  return response.json();
+}
+
 /** Grant a preview resource handle for an allowed file. */
 export async function grantFileResource(filePath: string, _sessionId?: string | null): Promise<string> {
   return filePath;
