@@ -49,50 +49,123 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// One running session (its child, its bridge, its subscribers).
 /// The running-set change signal (the event-driven running stream).
 ///
-/// Every session in a registry shares ONE signal: a run-state TRANSITION
-/// (start, settle, child exit, removal) bumps the epoch and wakes every
-/// waiter, so the running-set relay derives on the change instead of
-/// sampling on a cadence — a run that starts AND settles inside one old
-/// cadence tick is still observed at its transitions.
+/// Every session in a registry shares ONE signal. Two kinds of change
+/// exist:
+///
+/// - a run-state TRANSITION (start, settle, child exit, removal) — recorded
+///   as a bounded ring of [`RunningTransition`] entries beside the epoch, so
+///   a relay that was blocked (a slow Channel send) while a run started AND
+///   settled can still REPLAY both transitions instead of seeing only the
+///   final set (a short run must not be swallowed — Terra P2-1);
+/// - a wake-only bump (a catalogue-version change, an unsubscribe): the
+///   epoch moves and waiters re-derive, but no transition is recorded.
+///
+/// The ring is bounded: a burst longer than it is answered with a `gap`, and
+/// the consumer falls back to one full re-derivation (a resync frame), never
+/// unbounded memory.
 pub struct RunningSignal {
-    epoch: std::sync::Mutex<u64>,
+    state: std::sync::Mutex<RunningSignalState>,
     cv: std::sync::Condvar,
 }
 
+/// One recorded run-state transition (the replay unit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningTransition {
+    pub epoch: u64,
+    pub session: String,
+    pub running: bool,
+}
+
+struct RunningSignalState {
+    epoch: u64,
+    ring: std::collections::VecDeque<RunningTransition>,
+}
+
+/// How many transitions the replay ring keeps (bounded memory; beyond it
+/// consumers get a gap and re-derive from a full snapshot).
+const RUNNING_TRANSITION_RING: usize = 512;
+
 impl Default for RunningSignal {
     fn default() -> Self {
-        Self { epoch: std::sync::Mutex::new(0), cv: std::sync::Condvar::new() }
+        Self {
+            state: std::sync::Mutex::new(RunningSignalState {
+                epoch: 0,
+                ring: std::collections::VecDeque::new(),
+            }),
+            cv: std::sync::Condvar::new(),
+        }
     }
 }
 
 impl RunningSignal {
-    /// Wake every waiter (call on anything that may change the running SET).
+    /// Wake every waiter WITHOUT recording a transition (a catalogue-version
+    /// change, an unsubscribe): waiters re-derive their view from scratch.
     pub fn notify(&self) {
-        let mut epoch = self.epoch.lock().unwrap();
-        *epoch += 1;
-        drop(epoch);
+        let mut state = self.state.lock().unwrap();
+        state.epoch += 1;
+        drop(state);
+        self.cv.notify_all();
+    }
+
+    /// Record one run-state TRANSITION and wake every waiter: `session`
+    /// entered (`running == true`) or left the running set.
+    pub fn notify_transition(&self, session: &str, running: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.epoch += 1;
+        let epoch = state.epoch;
+        state.ring.push_back(RunningTransition {
+            epoch,
+            session: session.to_string(),
+            running,
+        });
+        while state.ring.len() > RUNNING_TRANSITION_RING {
+            state.ring.pop_front();
+        }
+        drop(state);
         self.cv.notify_all();
     }
 
     /// The current epoch (a waiter's change-token).
     pub fn epoch(&self) -> u64 {
-        *self.epoch.lock().unwrap()
+        self.state.lock().unwrap().epoch
     }
 
     /// Block until the epoch moves past `seen` or the timeout passes;
     /// answers the epoch observed (unchanged on timeout).
     pub fn wait_for_change(&self, seen: u64, timeout: Duration) -> u64 {
         let deadline = Instant::now() + timeout;
-        let mut epoch = self.epoch.lock().unwrap();
-        while *epoch == seen {
+        let mut state = self.state.lock().unwrap();
+        while state.epoch == seen {
             let now = Instant::now();
             if now >= deadline {
-                return *epoch;
+                return state.epoch;
             }
-            let (guard, _) = self.cv.wait_timeout(epoch, deadline - now).unwrap();
-            epoch = guard;
+            let (guard, _) = self.cv.wait_timeout(state, deadline - now).unwrap();
+            state = guard;
         }
-        *epoch
+        state.epoch
+    }
+
+    /// The transitions recorded after `seen` (in epoch order), and whether
+    /// the ring overflowed in that span: on a gap the caller must fall back
+    /// to a full re-derivation (it cannot reconstruct the intermediate sets
+    /// it missed).
+    pub fn changes_since(&self, seen: u64) -> (Vec<RunningTransition>, bool) {
+        let state = self.state.lock().unwrap();
+        if state.ring.is_empty() {
+            return (Vec::new(), false);
+        }
+        let oldest = state.ring.front().expect("non-empty").epoch;
+        if oldest > seen + 1 {
+            return (Vec::new(), true);
+        }
+        let transitions = state
+            .ring
+            .iter()
+            .filter(|transition| transition.epoch > seen)
+            .cloned()
+            .collect();
+        (transitions, false)
     }
 }
 
@@ -242,7 +315,7 @@ impl Session {
             // stream derives on: signal the relay instead of letting it
             // sample for the change (the event-driven half of the stream).
             if machine.state.is_running() != was_running {
-                self.running_signal.notify();
+                self.running_signal.notify_transition(&self.id, machine.state.is_running());
             }
             follow_up
         };
@@ -295,8 +368,9 @@ impl Session {
         self.machine.lock().unwrap().apply_state_snapshot(&snapshot, captured_epoch);
         // A state merge can move the run flags too (the settle refresh, a
         // cold get_state): a transition wakes the running-set relay.
-        if self.machine.lock().unwrap().state.is_running() != was_running {
-            self.running_signal.notify();
+        let running_now = self.machine.lock().unwrap().state.is_running();
+        if running_now != was_running {
+            self.running_signal.notify_transition(&self.id, running_now);
         }
     }
 
@@ -609,9 +683,10 @@ impl SessionRegistry {
     pub fn remove(&self, id: &str, grace: Duration) -> Option<Option<i32>> {
         let session = self.sessions.lock().unwrap().remove(id)?;
         let exit = session.shutdown(grace);
-        // A running session's removal changes the running SET: wake the
-        // relay whatever the child's state was (it derives either way).
-        self.running_signal.notify();
+        // The session left the registry: it is out of the running set
+        // whatever the child's state was — record the transition so a
+        // blocked relay still replays the removal.
+        self.running_signal.notify_transition(id, false);
         Some(exit)
     }
 
@@ -869,9 +944,9 @@ fn spawn_session(
                     fan.fan_out(record);
                 }
                 // The child is gone: a running session left the running SET
-                // with no further record to carry the news — wake the relay
-                // (its derive filters the exited session out).
-                fan.running_signal.notify();
+                // with no further record to carry the news — record the
+                // exit so a blocked relay still replays it.
+                fan.running_signal.notify_transition(&fan.id, false);
             })
             .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
     }
