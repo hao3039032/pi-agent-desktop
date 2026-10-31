@@ -77,6 +77,11 @@ mod tests {
         std::fs::write(folder.join("fixture.jsonl"), format!("{header}\n")).unwrap();
         let response = crate::pi_ipc::dispatch_envelope(&state, serde_json::json!({"v":1,"id":"test","op":"cwd.validate","args":{"cwd":project}}));
         assert_eq!(response["ok"], true, "{response}");
+        std::fs::remove_dir(&project).unwrap();
+        let state = IpcHostState::new();
+        *state.task_agent_dir.lock().unwrap() = Some(agent);
+        let missing = crate::pi_ipc::dispatch_envelope(&state, serde_json::json!({"v":1,"id":"test","op":"cwd.status","args":{"cwd":project}}));
+        assert_eq!(missing["data"]["availability"], "missing", "{missing}");
     }
 
     #[cfg(unix)]

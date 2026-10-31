@@ -242,10 +242,19 @@ impl IpcHostState {
     /// Recover a persisted workspace from the host's session headers even if
     /// cwd validation races the first sidebar scan. Frontend paths alone grant nothing.
     fn discover_session_cwd(&self, cwd: &Path) {
-        if self.is_proposed(&cwd.to_string_lossy()) { return; }
+        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return; }
         let index = session_host::scan_sessions(&self.agent_dir());
         if index.projects.keys().any(|known| Path::new(known) == cwd) {
+            let agent_dir = self.agent_dir();
+            let is_chat = crate::session_view::is_chat_workspace_path(cwd, &agent_dir);
+            let in_chat = crate::worktrees::is_chat_area(cwd, &agent_dir);
+            if cwd.exists() && is_chat != in_chat { return; }
             self.propose_path(cwd);
+            if !cwd.exists() {
+                // A deleted session cwd is still a known lexical root for the
+                // read-only missing status; it cannot authorize existing files.
+                self.file_roots.lock().unwrap().add(cwd);
+            }
         }
     }
 
@@ -1245,6 +1254,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // gets proposed for browsing.
         "cwd.status" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else { return protocol_error(&id, "invalid_args", "An absolute cwd is required"); };
+            state.discover_session_cwd(Path::new(cwd));
             match crate::workspace_status::status(&state.file_roots.lock().unwrap(), cwd) {
                 Ok(result) => protocol_ok(&id, result),
                 Err((code, message)) => protocol_error(&id, code, message),
