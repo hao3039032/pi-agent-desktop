@@ -53,7 +53,7 @@ function detectTransport(): IpcTransport {
       subscribe: () => () => {},
     };
   }
-  return new MockTransport().on("sessions.list", () => ({
+  return new MockTransport().on("sessions.index", () => ({
     projects: [
       {
         cwd: "/demo/project",
@@ -86,7 +86,7 @@ export function useSessions(): SessionsState & { reload: () => void } {
     let cancelled = false;
     const client = new IpcClient(detectTransport());
     client
-      .request<{ projects?: ProjectGroup[] }>("sessions.list", undefined, { timeoutMs: 10_000 })
+      .request<{ projects?: ProjectGroup[] }>("sessions.index", undefined, { timeoutMs: 10_000 })
       .then((data) => {
         if (cancelled) return;
         setState({ status: "ready", projects: data.projects ?? [] });
@@ -126,7 +126,7 @@ export function SessionsView(): React.ReactElement {
         </p>
       )}
       {sessions.status === "ready" && (
-        <div className="sessions-list">
+        <div className="sessions.index">
           {sessions.projects.length === 0 && (
             <p className="sessions-note">没有项目会话。</p>
           )}

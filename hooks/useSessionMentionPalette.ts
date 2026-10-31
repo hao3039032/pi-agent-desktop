@@ -11,6 +11,7 @@ import {
 } from "@/lib/file-fuzzy";
 import type { SessionInfo } from "@/lib/types";
 
+import { fetchSessionList } from "@/lib/session-list-service";
 interface UseSessionMentionPaletteOptions {
   cwd?: string | null;
   value: string;
@@ -64,11 +65,8 @@ export function useSessionMentionPalette({ cwd, value, setValue, setAtQuery, tex
     if (sessionIndex && Date.now() - sessionIndex.fetchedAt < 10_000) return;
     if (sessionIndexFetchingRef.current) return;
     sessionIndexFetchingRef.current = true;
-    fetch("/api/sessions")
-      .then((res) => {
-        if (!res.ok) throw new Error(`session index failed: ${res.status}`);
-        return res.json() as Promise<{ sessions?: SessionInfo[] }>;
-      })
+    fetchSessionList()
+      .then((data) => ({ sessions: data.sessions as SessionInfo[] }))
       .then((data) => {
         const entries = (data.sessions ?? []).map((session): SessionMentionEntry => ({
           kind: "session",

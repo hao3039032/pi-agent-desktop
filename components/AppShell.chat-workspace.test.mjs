@@ -3,9 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const source = await readFile(new URL("./AppShell.tsx", import.meta.url), "utf8");
+// The chat-root fetch moved into the workspace service seam; the route call
+// and its no-store/signal policy are pinned against the service's source.
+const workspaceServiceSource = await readFile(new URL("../lib/workspace-service.ts", import.meta.url), "utf8");
 
 test("chat workspace classification comes from the server, never a derived path", async () => {
-  assert.match(source, /fetch\("\/api\/chat-workspace", \{ cache: "no-store", signal: controller\.signal \}\)/);
+  assert.match(source, /fetchChatWorkspaceRoot\(\{ signal: controller\.signal \}\)/);
+  assert.match(workspaceServiceSource, /fetch\("\/api\/chat-workspace", \{[\s\S]*?cache: "no-store",[\s\S]*?signal: options\.signal/);
   assert.match(source, /return selectedSession\.workspaceKind\s*\?\?\s*\(chatWorkspaceCwd && selectedSession\.cwd === chatWorkspaceCwd \? "chat" : "project"\)/);
   assert.match(source, /if \(cwd && chatWorkspaceCwd && cwd === chatWorkspaceCwd\) return "chat"/);
   assert.match(source, /if \(data\.workspaceKind === "chat"\) \{\s*setChatWorkspaceCwd\(data\.cwd\);/);

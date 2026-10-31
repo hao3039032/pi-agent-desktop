@@ -127,7 +127,7 @@ export async function createAgentSession(
   // answers unknown_op and the composer surfaces the honest error instead of
   // a half-created session.
   try {
-    const data = await ensureClient().request("sessions.create", body, { timeoutMs: 60_000 });
+    const data = await ensureClient().request("agent.create", body, { timeoutMs: 60_000 });
     return { ok: true, status: 200, data };
   } catch (caught) {
     if (caught instanceof IpcFailure) {

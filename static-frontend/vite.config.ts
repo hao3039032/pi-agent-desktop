@@ -64,9 +64,24 @@ export default defineConfig({
         // The session-view service (view read, context paging, state poll,
         // session create, lease renewal) swaps the /api/sessions and
         // /api/agent reads for sessions.get / sessions.context /
-        // sessions.state / sessions.create / sessions.lease over IPC.
+        // sessions.state / agent.create / sessions.lease over IPC.
         find: /^@\/lib\/session-view-service$/,
         replacement: resolve(import.meta.dirname, "src/data/session-view-service.ts"),
+      },
+      {
+        // The session-list service (catalogue load, running-set stream,
+        // home dir) swaps /api/sessions, /api/agent/running/events and
+        // /api/home for sessions.list / agent.subscribeRunning / cwd.home.
+        find: /^@\/lib\/session-list-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/session-list-service.ts"),
+      },
+      {
+        // The workspace service (chat root, cwd validation, default cwd)
+        // swaps /api/chat-workspace, /api/cwd/validate and
+        // /api/default-cwd for chats.workspaceState / cwd.validate /
+        // cwd.createDefault.
+        find: /^@\/lib\/workspace-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/workspace-service.ts"),
       },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },

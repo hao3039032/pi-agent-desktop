@@ -110,9 +110,11 @@ class HostBridgeTransport implements IpcTransport {
         const command =
           op === "agent.subscribeEvents"
             ? "pi_ipc_subscribe_events"
-            : op === "terminal.subscribeOutput"
-              ? "pi_ipc_subscribe_terminal"
-              : null;
+            : op === "agent.subscribeRunning"
+              ? "pi_ipc_subscribe_running"
+              : op === "terminal.subscribeOutput"
+                ? "pi_ipc_subscribe_terminal"
+                : null;
         if (command === null) {
           handle.stopLocalDelivery();
           onError({ code: "unknown_op", message: `no stream handler for '${op}'`, retryable: false });
@@ -121,7 +123,9 @@ class HostBridgeTransport implements IpcTransport {
         const payload: Record<string, unknown> =
           command === "pi_ipc_subscribe_events"
             ? { session: args?.session, onEvent: handle.channel }
-            : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
+            : command === "pi_ipc_subscribe_running"
+              ? { onFrame: handle.channel }
+              : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
         const ack = (await invoke(command, payload)) as {
           subscriptionId?: string;
         } | undefined;
@@ -136,8 +140,13 @@ class HostBridgeTransport implements IpcTransport {
             handle.stopLocalDelivery();
             // The host-side relay ends here: `agent.unsubscribeEvents`
             // detaches the session subscriber and reaps the relay thread.
-            // A terminal stream ends with its terminal (or page reload).
-            if (subscriptionId !== null && command === "pi_ipc_subscribe_events") {
+            // The running-set stream unsubscribes the same way (its relay
+            // keys the same registry by subscriptionId). A terminal stream
+            // ends with its terminal (or page reload).
+            if (
+              subscriptionId !== null
+              && (command === "pi_ipc_subscribe_events" || command === "pi_ipc_subscribe_running")
+            ) {
               const request: IpcRequest = {
                 v: IPC_PROTOCOL_VERSION,
                 id: `unsubscribe-${subscriptionId}`,

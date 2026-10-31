@@ -83,7 +83,11 @@ test("the initial ?cwd navigation consumes the parked draft into the active key"
   assert.notEqual(start, -1);
   assert.notEqual(end, -1);
   const effect = source.slice(start, end);
-  assert.match(effect, /if \(controller\.signal\.aborted\) return;\s*const data = await response\.json/);
+  // The validation rides the workspace service now; the abort guards around
+  // adoption are what the draft consumption needs (a superseded validation
+  // must never adopt its cwd).
+  assert.match(effect, /void validateWorkspaceCwd\(requestedCwd, \{ signal: controller\.signal \}\)/);
+  assert.match(effect, /if \(controller\.signal\.aborted\) return;[\s\S]*?if \(controller\.signal\.aborted\) return;/);
   const rekeyAt = effect.indexOf("rekeyDraft(parkedNewSessionDraftKey(data.cwd), draftKey)");
   const refsAt = effect.indexOf("activeNewSessionDraftKeyRef.current = draftKey;");
   assert.notEqual(rekeyAt, -1, "initial navigation must consume the parked draft");

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { AnimatedDropdown, PathLabel, displayCwd } from "./path-ui";
 import { isTauriDesktop } from "@/lib/desktop-updater";
+import { createDefaultWorkspaceCwd, validateWorkspaceCwd } from "@/lib/workspace-service";
 import { selectDirectoryNative } from "@/lib/desktop-window";
 import { isImeComposing } from "@/lib/ime";
 
@@ -61,15 +62,7 @@ export async function selectProjectDirectoryNative(selectedCwd: string | null, h
   const path = await selectDirectoryNative(selectedCwd ?? (homeDir || undefined));
   if (path === null) return null;
 
-  const res = await fetch("/api/cwd/validate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cwd: path }),
-  });
-  const data = await res.json().catch(() => ({})) as { cwd?: string; error?: string };
-  if (!res.ok || data.error) {
-    throw new Error(data.error ?? `HTTP ${res.status}`);
-  }
+  const data = await validateWorkspaceCwd(path);
   return data.cwd ?? path;
 }
 
@@ -107,16 +100,7 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
     setCustomPathValidating(true);
     setCustomPathError(null);
     try {
-      const res = await fetch("/api/cwd/validate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: path }),
-      });
-      const data = await res.json().catch(() => ({})) as { cwd?: string; error?: string };
-      if (!res.ok || data.error) {
-        setCustomPathError(data.error ?? `HTTP ${res.status}`);
-        return false;
-      }
+      const data = await validateWorkspaceCwd(path);
       onSelectCwd(data.cwd ?? path);
       closeDropdown();
       return true;
@@ -153,13 +137,13 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
 
   const handleDefaultCwd = useCallback(async () => {
     try {
-      const res = await fetch("/api/default-cwd", { method: "POST" });
-      const data = await res.json().catch(() => ({})) as { cwd?: string; error?: string };
+      const dir = await createDefaultWorkspaceCwd();
       // Select it like any other directory, so validation and the file
-      // allow-list go through /api/cwd/validate. It is not a path the user
-      // typed, so nothing is remembered as a recent pick.
-      if (data.cwd && await commitCustomPath(data.cwd)) return;
-      setCustomPathError(data.error ?? `HTTP ${res.status}`);
+      // allow-list go through validation. It is not a path the user
+      // typed, so nothing is remembered as a recent pick. Success closes
+      // the dropdown (commitCustomPath); a failed commit keeps it open
+      // with its own error state, exactly like the HTTP flow.
+      if (await commitCustomPath(dir)) return;
       if (!isTauriDesktop()) {
         setCustomPathOpen(true);
       }

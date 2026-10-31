@@ -1,4 +1,5 @@
 import type { AgentMessage, SessionInfo } from "./types";
+import { fetchSessionList } from "@/lib/session-list-service";
 
 // The visible token contains the session name, not its id. Quoted names keep
 // spaces intact, e.g. #"Design review".
@@ -83,6 +84,7 @@ export async function resolveSessionReferences(
   message: string,
   selectedTargets: ReadonlyMap<string, string>,
   fetchImpl: typeof fetch = fetch,
+  loadSessionIndex: () => Promise<{ sessions?: SessionInfo[] }> = () => fetchSessionList(),
 ): Promise<string> {
   const labels = extractSessionReferenceLabels(message);
   if (labels.length === 0) return message;
@@ -96,17 +98,17 @@ export async function resolveSessionReferences(
   const missingLabels = labels.filter((label) => !selectedTargets.has(label) && quotedLabels.has(label));
   if (missingLabels.length > 0) {
     try {
-      const response = await fetchImpl("/api/sessions");
-      if (response.ok) {
-        const data = await response.json() as { sessions?: SessionInfo[] };
-        for (const session of data.sessions ?? []) {
+      // The index load goes through the session-list service seam (HTTP in
+      // the Next app, the typed IPC catalogue in the static build); the
+      // per-id reference fetch stays on its own route until its IPC op.
+      const data = await loadSessionIndex();
+      for (const session of data.sessions ?? []) {
           const name = session.name?.trim();
           if (name && missingLabels.includes(name) && !fallbackTargets.has(name)) fallbackTargets.set(name, session.id);
           if (!name && missingLabels.includes(session.firstMessage.trim()) && !fallbackTargets.has(session.firstMessage.trim())) {
             fallbackTargets.set(session.firstMessage.trim(), session.id);
           }
         }
-      }
     } catch {
       // Keep unresolved tokens visible if the session list cannot be loaded.
     }

@@ -5,6 +5,10 @@ import vm from "node:vm";
 import { stripTypeScriptTypes } from "node:module";
 
 const source = (await readFile(new URL("./SessionSidebar.tsx", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
+// The running-set stream and the list-load URL modes moved into the
+// session-list service seam (SessionSidebar consumes it); their guards
+// assert against the service's source now.
+const listServiceSource = (await readFile(new URL("../lib/session-list-service.ts", import.meta.url), "utf8")).replace(/\r\n/g, "\n");
 const sessionItemSource = source.slice(source.indexOf("function SessionItem("));
 
 test("only Shift+click bypasses session deletion confirmation", () => {
@@ -40,10 +44,13 @@ test("the sidebar tree supports row-level keyboard navigation", () => {
 });
 
 test("streams running sessions and reconnects after visibility or network changes", () => {
-  assert.match(source, /new EventSource\("\/api\/agent\/running\/events"\)/);
-  assert.match(source, /document\.addEventListener\("visibilitychange", onVisible\)/);
-  assert.match(source, /window\.addEventListener\("online", connect\)/);
-  assert.match(source, /source\?\.close\(\)/);
+  // The sidebar subscribes through the service seam; the SSE transport, its
+  // reconnect and the visibility/online resubscribe live in the service.
+  assert.match(source, /subscribeRunningSessions\(/);
+  assert.match(listServiceSource, /new EventSource\("\/api\/agent\/running\/events"\)/);
+  assert.match(listServiceSource, /document\.addEventListener\("visibilitychange", onVisible\)/);
+  assert.match(listServiceSource, /window\.addEventListener\("online", connect\)/);
+  assert.match(listServiceSource, /source\?\.close\(\)/);
 });
 
 test("re-adding a removed project clears only its sidebar marker", () => {
@@ -65,7 +72,8 @@ test("exposes the loaded session catalog to the shell", () => {
 });
 
 test("subagent completion stays silent and never becomes unread", () => {
-  assert.match(source, /completionNotificationSuppressedSessionIds\?: string\[\]/);
+  // The payload type moved with the list fetch into the service seam.
+  assert.match(listServiceSource, /completionNotificationSuppressedSessionIds\?: string\[\]/);
   assert.match(
     source,
     /completedWithNotifications = completedInBackground\.filter\([\s\S]*?!previousSuppressedCompletionSessionIdsRef\.current\.has\(id\)[\s\S]*?!knownSubagentIds\.has\(id\)/,
@@ -111,14 +119,16 @@ test("offers the downstream context-menu hook only on a normal session row", () 
 });
 
 test("lifecycle refreshes bypass the cache while cross-window polling reuses it", () => {
-  assert.match(source, /function sessionListUrl\(summary: boolean, force: boolean\)/);
-  assert.match(source, /if \(summary\) return "\/api\/sessions\?summary=1"/);
-  assert.match(source, /if \(force\) return "\/api\/sessions\?force=1"/);
-  assert.match(source, /cache: "no-store"/);
+  // The URL modes and the no-store policy live in the service seam now; the
+  // summary-then-hydrate pacing stays in the sidebar.
+  assert.match(listServiceSource, /function sessionListUrl\(summary: boolean, force: boolean\)/);
+  assert.match(listServiceSource, /if \(summary\) return "\/api\/sessions\?summary=1"/);
+  assert.match(listServiceSource, /if \(force\) return "\/api\/sessions\?force=1"/);
+  assert.match(listServiceSource, /cache: "no-store"/);
   // First paint uses the cheap summary listing, then hydrates after a delay.
   assert.match(source, /loadSessions\(true, false, true\)/);
   assert.match(source, /setTimeout\(\(\) => \{[\s\S]*?void loadSessions\(false, true\)/);
-  assert.match(source, /data\.sessionListVersion !== sessionListVersionRef\.current[\s\S]*?await loadSessions\(\)/);
+  assert.match(source, /frame\.sessionListVersion !== sessionListVersionRef\.current[\s\S]*?void loadSessions\(\)/);
   assert.doesNotMatch(source, /sessionRefreshDone|sessionRefreshTimerRef|title=\{t\("sidebar\.refresh"\)\}/);
   assert.match(source, /loadSessions\(false, true\);[\s\S]*?onBackgroundTaskDone/);
 });

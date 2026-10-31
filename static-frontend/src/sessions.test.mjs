@@ -9,7 +9,7 @@ import test from "node:test";
 import { IpcClient, IpcFailure, MockTransport } from "./ipc/client.ts";
 
 test("sessions.list consumes the projects shape", async () => {
-  const mock = new MockTransport().on("sessions.list", () => ({
+  const mock = new MockTransport().on("sessions.index", () => ({
     projects: [
       {
         cwd: "/p/one",
@@ -21,7 +21,7 @@ test("sessions.list consumes the projects shape", async () => {
     ],
     skipped: [],
   }));
-  const data = await new IpcClient(mock).request("sessions.list");
+  const data = await new IpcClient(mock).request("sessions.index");
   assert.equal(data.projects.length, 1);
   assert.equal(data.projects[0].sessions.length, 2);
   assert.equal(data.projects[0].sessions[1].name, "Second");
@@ -30,14 +30,14 @@ test("sessions.list consumes the projects shape", async () => {
 test("sessions.list failures surface their protocol code", async () => {
   // No handler registered: unknown_op.
   const error = await new IpcClient(new MockTransport())
-    .request("sessions.list")
+    .request("sessions.index")
     .catch((error) => error);
   assert.ok(error instanceof IpcFailure);
   assert.equal(error.error.code, "unknown_op");
 });
 
 test("empty listings are a valid ready state", async () => {
-  const mock = new MockTransport().on("sessions.list", () => ({ projects: [], skipped: [] }));
-  const data = await new IpcClient(mock).request("sessions.list");
+  const mock = new MockTransport().on("sessions.index", () => ({ projects: [], skipped: [] }));
+  const data = await new IpcClient(mock).request("sessions.index");
   assert.deepEqual(data.projects, []);
 });

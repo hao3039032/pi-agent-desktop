@@ -832,10 +832,11 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
             protocol_ok(&id, json!({ "revision": revision }))
         }
-        // Session operations route through the closed table in session-host.
-        // `agentDir` is stripped here: the host resolves the agent dir, the
-        // frontend never chooses what directory gets scanned.
-        "sessions.list" => {
+        // The session FILE INDEX (a host-diagnostic shape the boot page
+        // lists projects from — NOT an HTTP method's projection): the
+        // per-cwd scan with skipped-file reasons. `sessions.list` below is
+        // the real GET /api/sessions (the inventory's name for it).
+        "sessions.index" => {
             let agent_dir = state.agent_dir();
             let index = session_host::scan_sessions(&agent_dir);
             // The /api/files semantics: session cwds (and the chat roots)
@@ -857,7 +858,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // payload's envelope fields (runningSessionIds,
         // completionNotificationSuppressedSessionIds, chatWorkspaceCwd,
         // sessionListVersion).
-        "sessions.catalogue" => {
+        "sessions.list" => {
             let agent_dir = state.agent_dir();
             let files = session_host::list_session_files(&agent_dir);
             // The parent-id map first (a fork's originSessionId resolves
@@ -965,13 +966,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // exists. All host-side (the home dir, the hidden chat root, the
         // scratch cwd, project validation) — the frontend never chooses what
         // gets proposed for browsing.
-        "desktop.home" => {
+        "cwd.home" => {
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .unwrap_or_else(|_| ".".to_string());
             protocol_ok(&id, json!({ "home": home }))
         }
-        "workspace.chatRoot" => {
+        "chats.workspaceState" => {
             let agent_dir = state.agent_dir();
             match crate::session_view::ensure_chat_workspace(&agent_dir) {
                 Ok(cwd) => {
@@ -981,7 +982,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
             }
         }
-        "workspace.defaultCwd" => {
+        "cwd.createDefault" => {
             // ~/pi-cwd/<local YYYYMMDD>, created on demand (defaultCwdPath).
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
@@ -998,7 +999,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
             }
         }
-        "workspace.validateCwd" => match validate_cwd(state, &args) {
+        "cwd.validate" => match validate_cwd(state, &args) {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
@@ -1006,7 +1007,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // route's contract — cwd validation, the chat folder factory, the
         // spawn plan, ensure_session vs the first command, and the honest
         // prompt_rejected error shape when a prompt-type create fails).
-        "sessions.create" => match create_session(state, &args) {
+        "agent.create" => match create_session(state, &args) {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message, details)) => {
                 let mut error = json!({ "code": code, "message": message, "retryable": false });
@@ -2552,7 +2553,7 @@ mod tests {
 
         let catalogue = send(
             &state,
-            json!({ "v": 1, "id": "cat1", "op": "sessions.catalogue" }),
+            json!({ "v": 1, "id": "cat1", "op": "sessions.list" }),
         );
         assert_eq!(catalogue["ok"], true, "{catalogue}");
         let sessions = catalogue["data"]["sessions"].as_array().expect("array");
@@ -2608,7 +2609,7 @@ mod tests {
         )
         .expect("fork");
 
-        let catalogue = send(&state, json!({ "v": 1, "id": "cat2", "op": "sessions.catalogue" }));
+        let catalogue = send(&state, json!({ "v": 1, "id": "cat2", "op": "sessions.list" }));
         assert_eq!(catalogue["ok"], true, "{catalogue}");
         let payload = &catalogue["data"];
         // The envelope fields (the sidebar's whole payload contract).
@@ -2643,7 +2644,7 @@ mod tests {
             ),
         )
         .expect("chat");
-        let catalogue = send(&state, json!({ "v": 1, "id": "cat3", "op": "sessions.catalogue" }));
+        let catalogue = send(&state, json!({ "v": 1, "id": "cat3", "op": "sessions.list" }));
         let rows = catalogue["data"]["sessions"].as_array().expect("rows");
         let chat_row = rows.iter().find(|row| row["id"] == "c1").expect("the chat row");
         assert_eq!(chat_row["workspaceKind"], "chat");
@@ -2672,7 +2673,7 @@ mod tests {
         )
         .expect("subagent");
 
-        let catalogue = send(&state, json!({ "v": 1, "id": "cat4", "op": "sessions.catalogue" }));
+        let catalogue = send(&state, json!({ "v": 1, "id": "cat4", "op": "sessions.list" }));
         let rows = catalogue["data"]["sessions"].as_array().expect("rows");
         let row = rows.iter().find(|row| row["id"] == "s1").expect("the subagent row");
         // The subagent relation (the parent id from the marker, not the
@@ -3753,7 +3754,7 @@ mod tests {
         // 1. ensure_session for a PROJECT with a pinned tool selection.
         let created = send(
             &state,
-            json!({ "v": 1, "id": "new1", "op": "sessions.create", "args": {
+            json!({ "v": 1, "id": "new1", "op": "agent.create", "args": {
                 "cwd": cwd.display().to_string(),
                 "type": "ensure_session",
                 "toolNames": ["read", "bash"],
@@ -3809,7 +3810,7 @@ mod tests {
         let chat_root = crate::session_view::chat_workspace_dir(&agent_dir);
         let chat_created = send(
             &state,
-            json!({ "v": 1, "id": "new2", "op": "sessions.create", "args": {
+            json!({ "v": 1, "id": "new2", "op": "agent.create", "args": {
                 "cwd": chat_root.display().to_string(),
                 "type": "ensure_session",
                 // A chat ignores a stale client tool selection (the policy decides).
@@ -3846,7 +3847,7 @@ mod tests {
         // 3. The honest rejection: a cwd that does not exist.
         let missing = send(
             &state,
-            json!({ "v": 1, "id": "new3", "op": "sessions.create", "args": {
+            json!({ "v": 1, "id": "new3", "op": "agent.create", "args": {
                 "cwd": dir.path().join("nope").display().to_string(),
                 "type": "ensure_session",
             }}),
@@ -3862,7 +3863,7 @@ mod tests {
         // rejection contract (no blind retry).
         let rejected = send(
             &state,
-            json!({ "v": 1, "id": "new4", "op": "sessions.create", "args": {
+            json!({ "v": 1, "id": "new4", "op": "agent.create", "args": {
                 "cwd": dir.path().join("nope").display().to_string(),
                 "type": "prompt",
                 "message": "hello",
@@ -3923,7 +3924,7 @@ mod tests {
         // A session to host the outbox.
         let created = send(
             &state,
-            json!({ "v": 1, "id": "cq0", "op": "sessions.create", "args": {
+            json!({ "v": 1, "id": "cq0", "op": "agent.create", "args": {
                 "cwd": cwd.display().to_string(), "type": "ensure_session",
             }}),
         );
@@ -4064,7 +4065,7 @@ mod tests {
         for n in 0..2 {
             let created = send(
                 &state,
-                json!({ "v": 1, "id": format!("rs-c{n}"), "op": "sessions.create", "args": {
+                json!({ "v": 1, "id": format!("rs-c{n}"), "op": "agent.create", "args": {
                     "cwd": cwd.display().to_string(), "type": "prompt",
                     "message": format!("hold {n}"),
                 }}),

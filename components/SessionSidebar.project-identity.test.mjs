@@ -6,8 +6,14 @@ import test from "node:test";
 // (the extraction boundary guarded by fork-extractions.test.mjs). The
 // validated-identity assertions therefore target the extraction, not this file.
 test("custom cwd selection validates the path through ProjectPicker", async () => {
+  // The pick flows through the workspace service seam — never a client-side
+  // decision — and the seam's Next implementation POSTs the server route
+  // (the static build's alias target carries the same contract).
   const picker = await readFile(new URL("./ProjectPicker.tsx", import.meta.url), "utf8");
-  assert.match(picker, /\/api\/cwd\/validate/);
+  assert.match(picker, /validateWorkspaceCwd/);
+  const service = await readFile(new URL("../lib/workspace-service.ts", import.meta.url), "utf8");
+  assert.match(service, /"\/api\/cwd\/validate"/);
+  assert.match(service, /method: "POST"/);
 });
 
 test("default cwd is selected through the same validation as a custom path", async () => {
@@ -18,7 +24,7 @@ test("default cwd is selected through the same validation as a custom path", asy
   assert.notEqual(defaultStart, -1);
   // The created folder is not a path the user typed, so it flows through the
   // same validation as a custom pick without being remembered as one.
-  assert.match(defaultSource, /await commitCustomPath\(data\.cwd\)/);
+  assert.match(defaultSource, /await commitCustomPath\(dir\)/);
 });
 
 // A repo subfolder opened as a project gets the parent repo in its worktree

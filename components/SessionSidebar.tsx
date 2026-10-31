@@ -6,6 +6,7 @@ import { listSessionFamilies } from "@/lib/session-family";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
+import { fetchHomeDirectory, fetchSessionList, subscribeRunningSessions } from "@/lib/session-list-service";
 import { useI18n } from "@/hooks/useI18n";
 import { formatCompactRelativeTime, formatRelativeTime } from "@/lib/i18n/format";
 import { createPortal } from "react-dom";
@@ -60,11 +61,6 @@ import { appNotify } from "@/lib/notification-store";
 import { useMenuPlacement } from "@/hooks/useMenuPlacement";
 import type { MenuAnchor } from "@/lib/menu-placement";
 
-function sessionListUrl(summary: boolean, force: boolean): string {
-  if (summary) return "/api/sessions?summary=1";
-  if (force) return "/api/sessions?force=1";
-  return "/api/sessions";
-}
 interface Props {
   selectedSessionId: string | null;
   onSelectSession: (session: SessionInfo, isRestore?: boolean, entryId?: string, blockIndex?: number) => void;
@@ -545,17 +541,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     const loadId = ++sessionLoadIdRef.current;
     try {
       if (showLoading) setLoading(true);
-      const res = await fetch(sessionListUrl(summary, force), {
-        cache: "no-store",
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json() as {
-        sessions: SessionInfo[];
-        sessionListVersion: number;
-        runningSessionIds?: string[];
-        completionNotificationSuppressedSessionIds?: string[];
-        chatWorkspaceCwd?: string | null;
-      };
+      // Through the session-list service seam: HTTP in the Next app, the
+      // typed IPC catalogue (sessions.list) in the static build.
+      const data = await fetchSessionList({ summary, force });
       if (loadId !== sessionLoadIdRef.current) return;
       sessionListVersionRef.current = data.sessionListVersion;
       setSessionsLoaded(true);
@@ -664,57 +652,20 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   }, [projectSessionPages]);
 
   useEffect(() => {
-    // Live running status via SSE — no polling. The server pushes the current
-    // set of running session ids whenever any session starts/stops working.
-    let source: EventSource | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let closed = false;
-
-    const connect = () => {
-      if (closed) return;
-      source?.close();
-      source = new EventSource("/api/agent/running/events");
-      source.onmessage = async (e) => {
-        try {
-          const data = JSON.parse(e.data) as { type?: string; runningSessionIds?: string[]; sessionListVersion?: number };
-          if (data.type === "running") {
-            sseAuthoritativeRef.current = true;
-            setRunningSessionIds(new Set(data.runningSessionIds ?? []));
-          }
-          if (typeof data.sessionListVersion === "number"
-            && data.sessionListVersion !== sessionListVersionRef.current) {
-            // Another window/process changed the list; reuse the invalidated
-            // server cache instead of forcing a fresh scan.
-            await loadSessions();
-          }
-        } catch {
-          // ignore malformed frames
-        }
-      };
-      source.onerror = () => {
-        // Force a fresh connection after prolonged failures; EventSource alone
-        // can stall after local server restarts in the desktop shell.
-        if (source?.readyState === EventSource.CLOSED) {
-          if (reconnectTimer) clearTimeout(reconnectTimer);
-          reconnectTimer = setTimeout(connect, 1_500);
-        }
-      };
-    };
-
-    connect();
-    const onVisible = () => {
-      if (document.visibilityState === "visible") connect();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("online", connect);
-
-    return () => {
-      closed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("online", connect);
-      source?.close();
-    };
+    // Live running status — no polling. The stream pushes the current set of
+    // running session ids whenever any session starts/stops working; the
+    // transport (SSE / the IPC running channel) and its reconnect lifecycle
+    // live behind the session-list service seam.
+    const dispose = subscribeRunningSessions((frame) => {
+      sseAuthoritativeRef.current = true;
+      setRunningSessionIds(new Set(frame.runningSessionIds));
+      if (frame.sessionListVersion !== sessionListVersionRef.current) {
+        // Another window/process changed the list; reuse the invalidated
+        // server cache instead of forcing a fresh scan.
+        void loadSessions();
+      }
+    });
+    return () => dispose();
   }, [loadSessions]);
 
   useEffect(() => {
@@ -876,9 +827,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   }, [selectedSessionId]);
 
   useEffect(() => {
-    fetch("/api/home").then((r) => r.json()).then((d: { home?: string }) => {
-      if (d.home) setHomeDir(d.home);
-    }).catch(() => {});
+    void fetchHomeDirectory().then((home) => {
+      if (home) setHomeDir(home);
+    });
   }, []);
 
   const restoredRef = useRef(false);

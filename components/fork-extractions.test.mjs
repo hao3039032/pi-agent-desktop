@@ -61,7 +61,11 @@ const EXTRACTIONS = [
     // Roughly 500 lines were moved out of SessionSidebar into these files,
     // neither of which exists upstream. This is the highest-risk divergence in
     // the fork; see the manifest entry for components/SessionSidebar.tsx.
-    movedTo: ["components/ProjectPicker.tsx", "components/path-ui.tsx"],
+    // lib/workspace-service.ts joined as an extraction target with the
+    // de-Next migration: the server-validated path calls the picker makes
+    // moved behind the workspace service seam (same routes in the Next app,
+    // typed IPC ops in the static build), still never inlined client-side.
+    movedTo: ["components/ProjectPicker.tsx", "components/path-ui.tsx", "lib/workspace-service.ts"],
     movedDefinitions: ["getRecentProjects", "displayCwd", "PathLabel", "AnimatedDropdown"],
     // Project-picker internals that must live only in ProjectPicker now.
     absentFromOrigin: [

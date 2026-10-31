@@ -127,6 +127,13 @@ test("New restores the draft after session navigation and workspace auto-restore
           context[state] = typeof value === "function" ? value(context[state]) : value;
         };
       }
+      vm.runInContext(stripTypeScriptTypes(`
+        // restoreWorkspaceContext loads the catalogue through the
+        // session-list service seam; against the sandbox it rides the same
+        // stubbed fetch the adopt path always used (defined INSIDE the
+        // context: an outer closure would capture Node's real fetch).
+        fetchSessionList = async () => (await fetch("/api/sessions")).json();
+      `), context);
       vm.runInContext(stripTypeScriptTypes(`${callbacks}
         globalThis.navigate = { handleCwdChange, handleSelectSession, handleNewSession };
       `), context);

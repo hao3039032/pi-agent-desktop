@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { fetchChatWorkspaceRoot } from "@/lib/workspace-service";
 import { useI18n } from "@/hooks/useI18n";
 import { AppSelect } from "./AppSelect";
 import { ConfigSwitch } from "./SettingsUi";
@@ -44,9 +45,8 @@ export function ChatsSettingsSection() {
       })
       .catch(() => { if (!cancelled) setFailed(true); });
     // The model list is scoped by the same enabled-models setting a chat starts from.
-    fetch("/api/chat-workspace", { cache: "no-store" })
-      .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
-      .then((data: { cwd?: string }) => fetch(`/api/models?cwd=${encodeURIComponent(data.cwd ?? "")}`, { cache: "no-store" }))
+    fetchChatWorkspaceRoot()
+      .then((cwd) => fetch(`/api/models?cwd=${encodeURIComponent(cwd ?? "")}`, { cache: "no-store" }))
       .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
       .then((data: { modelList?: ModelOption[] }) => { if (!cancelled) setModels(data.modelList ?? []); })
       .catch(() => { /* the picker then offers only the global default */ });

@@ -165,7 +165,7 @@ test("sessions.lease renews and reports the host's relay count", async () => {
 
 test("createAgentSession surfaces the host's refusal without inventing success", async () => {
   boundService((transport) => {
-    transport.fail("sessions.create", { code: "unknown_op", message: "unknown operation sessions.create" });
+    transport.fail("agent.create", { code: "unknown_op", message: "unknown operation sessions.create" });
   });
   const refused = await createAgentSession({ cwd: "/w", type: "ensure_session" });
   assert.equal(refused.ok, false);

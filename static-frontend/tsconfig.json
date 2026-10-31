@@ -45,6 +45,15 @@
       ],
       "@/lib/file-service": [
         "./static-frontend/src/data/file-service.ts"
+      ],
+      "@/lib/session-view-service": [
+        "./static-frontend/src/data/session-view-service.ts"
+      ],
+      "@/lib/session-list-service": [
+        "./static-frontend/src/data/session-list-service.ts"
+      ],
+      "@/lib/workspace-service": [
+        "./static-frontend/src/data/workspace-service.ts"
       ]
     }
   },

@@ -57,6 +57,28 @@ test("the missing-host transport reports the stream error through onError", () =
   dispose();
 });
 
+// The host-command mapping for stream ops is wiring THIS file's transport
+// owns; a typo would only surface inside the packaged app. Pin it from the
+// source (the Rust side pins its own end of the contract in pi_ipc tests).
+test("every stream op maps onto its host subscribe command", async () => {
+  const source = await import("node:fs").then((fs) => fs.readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), "transport.ts"), "utf8",
+  ));
+  const mappings = [
+    ["agent.subscribeEvents", "pi_ipc_subscribe_events"],
+    ["agent.subscribeRunning", "pi_ipc_subscribe_running"],
+    ["terminal.subscribeOutput", "pi_ipc_subscribe_terminal"],
+  ];
+  for (const [op, command] of mappings) {
+    assert.ok(source.includes(`"${op}"`), `${op} wired in the transport`);
+    assert.ok(source.includes(`"${command}"`), `${command} wired in the transport`);
+  }
+  // The running stream's payload key is the command's own (onFrame), and it
+  // unsubscribes through the shared agent.unsubscribeEvents op.
+  assert.ok(source.includes("{ onFrame: handle.channel }"), "the running stream sends onFrame");
+  assert.ok(/command === "pi_ipc_subscribe_running"/.test(source), "the running stream reuses the unsubscribe path");
+});
+
 test("the detection result is cached (one transport per page)", () => {
   overrideTransportForTests(undefined);
   const first = detectTransport();

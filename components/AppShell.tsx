@@ -30,6 +30,8 @@ import { openFileTab, saveFileViewerState } from "./file-tab-state";
 import { SettingsPanel } from "./SettingsPanel";
 import { keepDocumentTitle } from "@/lib/document-title";
 import { fetchSessionView } from "@/lib/session-view-service";
+import { fetchSessionList } from "@/lib/session-list-service";
+import { fetchChatWorkspaceRoot, validateWorkspaceCwd } from "@/lib/workspace-service";
 import { ProjectTrustDialog, type ProjectTrustFailure } from "./ProjectTrustDialog";
 import { BranchNavigator, hasSessionBranches } from "./BranchNavigator";
 import { UpdateReminder } from "./UpdateReminder";
@@ -180,10 +182,10 @@ export function AppShell() {
   // a chat URL or restored blank composer is classified on the first render.
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/api/chat-workspace", { cache: "no-store", signal: controller.signal })
-      .then((response) => response.ok ? response.json() as Promise<{ cwd?: string }> : null)
-      .then((data) => {
-        if (data?.cwd) setChatWorkspaceCwd(data.cwd);
+    void fetchChatWorkspaceRoot({ signal: controller.signal })
+      .then((cwd) => {
+        if (controller.signal.aborted) return;
+        setChatWorkspaceCwd(cwd);
       })
       .catch((error) => {
         if (error instanceof DOMException && error.name === "AbortError") return;
@@ -898,28 +900,15 @@ export function AppShell() {
     setInitialCwdStatus("validating");
     setInitialCwdError(null);
 
-    void fetch("/api/cwd/validate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: requestedCwd }),
-      signal: controller.signal,
-    })
-      .then(async (response) => {
+    void validateWorkspaceCwd(requestedCwd, { signal: controller.signal })
+      .then(async (data) => {
         // A StrictMode remount aborts the first request; a late resolution
         // must not adopt a cwd the user has already navigated away from.
         if (controller.signal.aborted) return;
-        const data = await response.json().catch(() => ({})) as {
-          cwd?: string;
-          error?: string;
-          workspaceKind?: SessionWorkspaceKind;
-        };
         // The body read can straddle a StrictMode cleanup: the signal flips
         // before the cleanup returns, and an already-buffered body would still
         // resolve. Re-check before adopting the cwd.
         if (controller.signal.aborted) return;
-        if (!response.ok || !data.cwd) {
-          throw new Error(data.error ?? `HTTP ${response.status}`);
-        }
 
         // The sidebar will notify us when it adopts this cwd. Avoid remounting
         // the just-created empty chat during that initial synchronization.
@@ -1003,8 +992,8 @@ export function AppShell() {
       adopt({ sessions: sessionCatalog });
       return;
     }
-    void fetch("/api/sessions")
-      .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
+    void fetchSessionList()
+      .then((data) => ({ sessions: data.sessions }))
       .then(adopt)
       .catch(() => {
         // Network hiccup: keep the remembered session for a later retry.
@@ -1358,8 +1347,8 @@ export function AppShell() {
   // handleCwdChange relies on. Hydrate it from the session list so switching
   // worktrees right after creating a session doesn't close the chat.
   const hydrateSelectedSession = useCallback((sessionId: string) => {
-    void fetch("/api/sessions", { cache: "no-store" })
-      .then((r) => (r.ok ? (r.json() as Promise<{ sessions: SessionInfo[] }>) : null))
+    void fetchSessionList({ force: true })
+      .then((d) => ({ sessions: d.sessions }))
       .then((d) => {
         const full = d?.sessions.find((s) => s.id === sessionId);
         if (!full) return;
