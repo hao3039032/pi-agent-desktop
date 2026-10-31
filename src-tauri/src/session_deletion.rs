@@ -39,11 +39,20 @@ pub(crate) trait ScheduledReferences {
     fn is_referenced(&self, session_id: &str) -> bool;
 }
 
-pub(crate) fn delete(_state: &IpcHostState, _args: &Value) -> Result<Value, (String, String)> {
-    Err(error("not_supported", "Deletion is unavailable until the scheduled-session reference index is connected."))
+impl ScheduledReferences for crate::scheduled_session_index::ScheduledSessionIndex {
+    fn is_referenced(&self, id: &str) -> bool { self.is_referenced(id) }
 }
 
-#[allow(dead_code)]
+pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let agent = state.agent_dir();
+    let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
+        .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
+    let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
+        .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
+    delete_with_index(state, args, &index)
+}
+
+
 pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences) -> Result<Value, (String, String)> {
     let id = args.get("session").and_then(Value::as_str).filter(|v| !v.is_empty())
         .ok_or_else(|| error("invalid_args", "session is required"))?;
@@ -53,20 +62,26 @@ pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &
     if args.get("trashChatFolder").and_then(Value::as_bool) == Some(true) {
         return Err(error("not_supported", "Deleting a chat folder requires recoverable multi-file deletion, which is not available yet."));
     }
-    let lock = state.registry.start_lock_for(id);
-    let _guard = lock.lock().unwrap();
+    state.registry.with_idle_session_writer(id, |_| delete_locked(state, id, scheduled))
+        .map_err(|error| match error {
+            session_host::SessionWriterError::Busy(message) => self::error("busy", message),
+            session_host::SessionWriterError::Operation(error) => error,
+        })
+}
+
+fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences) -> Result<Value, (String, String)> {
     if scheduled.is_referenced(id) {
         return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
     }
     // Never stop a writer on the user's behalf; removal waits for a truly
     // inactive child, and prevents a stale queued message from disappearing.
-    if state.registry.get(id).is_some() || state.registry.composer_outbox_for(id).has_items() {
+    if state.registry.get(id).is_some() {
         return Err(error("busy", "Close the session and wait for queued messages before deleting it."));
     }
     let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
     let mut files = Vec::new();
     files_in(&root, &mut files)?;
-    let mut target: Option<PathBuf> = None;
+    let mut target: Option<(PathBuf, std::fs::Metadata)> = None;
     let mut references = Vec::new();
     for file in files {
         let handle = std::fs::File::open(&file).map_err(|e| error("io", e))?;
@@ -97,11 +112,11 @@ pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
             if subagent_parent.is_some() { return Err(error("not_supported", "Subagent deletion requires the full cascade operation.")); }
-            target = Some(file.clone());
+            target = Some((file.clone(), reader.get_ref().metadata().map_err(|e| error("io", e))?));
         }
         references.push((child_id.to_string(), parent, subagent_parent));
     }
-    let target = target.ok_or_else(|| error("not_found", "Session not found"))?;
+    let (target, target_metadata) = target.ok_or_else(|| error("not_found", "Session not found"))?;
     let canonical_target = target.canonicalize().map_err(|e| error("io", e))?;
     if !canonical_target.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
     for (child_id, parent, subagent_parent) in references {
@@ -116,8 +131,44 @@ pub(crate) fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &
             }
         }
     }
-    std::fs::remove_file(&canonical_target).map_err(|e| error("io", e))?;
+    remove_verified_file(&root, &canonical_target, &target_metadata)?;
     Ok(json!({"ok": true, "folderTrashed": false}))
+}
+
+#[cfg(unix)]
+fn remove_verified_file(root: &Path, target: &Path, expected: &std::fs::Metadata) -> Result<(), (String, String)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let relative = target.strip_prefix(root).map_err(|e| error("access_denied", e))?;
+    let mut directory = std::fs::File::open(root).map_err(|e| error("io", e))?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else { return Err(error("access_denied", "Invalid session path")); };
+        if components.peek().is_some() {
+            directory = crate::file_access::openat_directory_no_follow(&directory, name.to_str().ok_or_else(|| error("io", "Invalid session path encoding"))?)
+                .map_err(|e| error("io", e))?;
+        } else {
+            let name = std::ffi::CString::new(name.as_encoded_bytes()).map_err(|e| error("io", e))?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstatat(directory.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+                return Err(error("io", std::io::Error::last_os_error()));
+            }
+            let stat = unsafe { stat.assume_init() };
+            if stat.st_dev as u64 != expected.dev() || stat.st_ino as u64 != expected.ino() || stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err(error("busy", "Session file changed during deletion"));
+            }
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(error("io", std::io::Error::last_os_error()));
+            }
+            return Ok(());
+        }
+    }
+    Err(error("io", "Invalid session path"))
+}
+
+#[cfg(not(unix))]
+fn remove_verified_file(_root: &Path, _target: &Path, _expected: &std::fs::Metadata) -> Result<(), (String, String)> {
+    Err(error("not_supported", "Safe session deletion is unavailable on this platform."))
 }
 
 #[cfg(test)]
@@ -151,8 +202,50 @@ mod tests {
         let (_dir, state, root) = fixture();
         let target = session(&root, "target", None);
         let args = json!({"session":"target"});
-        assert_eq!(super::delete(&state, &args).unwrap_err().0, "not_supported");
         assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["target".into()])).unwrap_err().0, "not_supported");
+        assert!(target.exists());
+    }
+    #[test]
+    fn production_delete_checks_the_strict_scheduled_index() {
+        let (dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let runs = dir.path().join("scheduled-tasks/runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let run = runs.join(format!("{id}.archive.jsonl"));
+        std::fs::write(&run, format!("{}\n", json!({"runId":"run","sessionId":"target"}))).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(target.exists());
+        std::fs::write(&run, "{broken\n").unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "io");
+        assert!(target.exists());
+        std::fs::remove_file(run).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
+        assert!(!target.exists());
+    }
+    #[test]
+    fn production_ipc_deletes_an_unreferenced_offline_session() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"delete","op":"sessions.delete","args":{"session":"target","trashChatFolder":false}}));
+        assert_eq!(response["ok"], true, "{response}");
+        assert!(!target.exists());
+    }
+    #[test]
+    fn scheduler_gate_covers_index_load_and_removal() {
+        let (dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let guard = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| super::delete(&state, &json!({"session":"target"})));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(target.exists());
+            let runs = dir.path().join("scheduled-tasks/runs");
+            std::fs::create_dir_all(&runs).unwrap();
+            std::fs::write(runs.join("12345678-1234-1234-1234-123456789abc.archive.jsonl"), format!("{}\n", json!({"runId":"r","sessionId":"target"}))).unwrap();
+            drop(guard);
+            assert_eq!(worker.join().unwrap().unwrap_err().0, "not_supported");
+        });
         assert!(target.exists());
     }
     #[test]

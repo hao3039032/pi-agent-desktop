@@ -88,11 +88,27 @@ impl OutboxState {
 #[derive(Default)]
 pub struct ComposerOutbox {
     state: std::sync::Mutex<OutboxState>,
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+struct DeliveryGuard<'a>(&'a ComposerOutbox);
+impl Drop for DeliveryGuard<'_> {
+    fn drop(&mut self) { self.0.in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
 }
 
 impl ComposerOutbox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn delivery_guard(&self) -> DeliveryGuard<'_> {
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DeliveryGuard(self)
+    }
+
+    /// Includes claimed messages whose outcome has not yet returned to the outbox.
+    pub fn has_pending_or_in_flight(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst) != 0 || self.has_items()
     }
 
     /// `queue_composer`: enqueue one message (empty refused, 100 max).
@@ -255,6 +271,7 @@ impl Session {
     /// `queue_composer` (a host-level command): enqueue, notify, wake.
     pub fn composer_enqueue(self: &Arc<Self>, message: &str, images: Option<Value>) -> Result<Value, String> {
         let _admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
+        if self.client.has_exited() { return Err("session process has exited".to_string()); }
         let item = self.composer_outbox.enqueue(message, images)?;
         self.emit_composer_update();
         self.composer_wake();
@@ -283,6 +300,7 @@ impl Session {
     /// silently re-delivered.
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
         let admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
+        let _delivery = self.composer_outbox.delivery_guard();
         let Some(item) = self.composer_outbox.take(id) else {
             // Missing is a normal no-op (another window won the claim).
             return Ok(self.composer_answer(None));
@@ -438,6 +456,8 @@ impl Session {
                 // a drain parked between its alive-check and its claim must
                 // not take the replacement's queue (Terra round-4).
                 let admission = self.activity_gate.read().unwrap();
+                if self.client.has_exited() { break; }
+                let _delivery = self.composer_outbox.delivery_guard();
                 let Some(item) = self
                     .composer_outbox
                     .claim_front_for_delivery(self.composer_generation)
@@ -539,6 +559,21 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_observes_claimed_delivery_until_outcome_is_recorded() {
+        let outbox = ComposerOutbox::new();
+        let item = outbox.enqueue("queued", None).unwrap();
+        let delivery = outbox.delivery_guard();
+        outbox.take(&item.id).unwrap();
+        assert!(outbox.has_pending_or_in_flight());
+        outbox.park_unknown(item);
+        drop(delivery);
+        assert!(outbox.has_pending_or_in_flight());
+        let id = outbox.snapshot().0[0]["id"].as_str().unwrap().to_string();
+        outbox.take(&id);
+        assert!(!outbox.has_pending_or_in_flight());
+    }
 
     #[test]
     fn every_queue_change_bumps_the_version_under_the_same_lock() {

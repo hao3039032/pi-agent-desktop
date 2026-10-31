@@ -630,6 +630,13 @@ pub fn create_session_file(session_dir: &Path, cwd: &Path) -> std::io::Result<(P
     Ok((file, id))
 }
 
+/// Failure to acquire an idle session writer, or an error from its operation.
+#[derive(Debug)]
+pub enum SessionWriterError<E> {
+    Busy(&'static str),
+    Operation(E),
+}
+
 /// The registry: one child per active session id, shared concurrent starts.
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -679,6 +686,30 @@ impl SessionRegistry {
     pub fn start_lock_for(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.start_locks.lock().unwrap();
         Arc::clone(locks.entry(id.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))))
+    }
+
+    /// Serialize a host writer against spawn/removal and live prompt admission.
+    /// The closure runs with both guards held and must not call start/remove or
+    /// acquire this session's activity gate again. It may issue a bridge request
+    /// that does not itself acquire that gate. Do not wait on network while also
+    /// holding a scheduler transaction.
+    pub fn with_idle_session_writer<T, E>(
+        &self, id: &str, operation: impl FnOnce(Option<&Arc<Session>>) -> Result<T, E>,
+    ) -> Result<T, SessionWriterError<E>> {
+        let lock = self.start_lock_for(id);
+        let _start = lock.lock().unwrap();
+        // Include exited entries: their in-flight delivery can still restore an
+        // unknown message to the persistent outbox after the process exits.
+        let session = self.sessions.lock().unwrap().get(id).cloned();
+        let _activity = match &session {
+            Some(session) => Some(session.try_branch_activity().map_err(SessionWriterError::Busy)?),
+            None => None,
+        };
+        let outbox = self.composer_outbox_for(id);
+        if outbox.has_pending_or_in_flight() || session.as_ref().is_some_and(|session| session.run_state().is_running()) {
+            return Err(SessionWriterError::Busy("session is running or has pending messages"));
+        }
+        operation(session.as_ref()).map_err(SessionWriterError::Operation)
     }
 
     /// Start (or return the running) session for an id. Concurrent starts

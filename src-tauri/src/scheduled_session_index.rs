@@ -25,6 +25,16 @@ fn valid_id(id: &str) -> bool {
 
 impl ScheduledSessionIndex {
     pub fn load(agent_dir: &Path) -> Result<Self, IndexError> {
+        Self::load_inner(agent_dir, false)
+    }
+
+    /// Deletion needs proof of absence; unlike the catalogue it cannot skip
+    /// torn or unrecognizable records. Call with the scheduler transaction held.
+    pub fn load_for_deletion(agent_dir: &Path) -> Result<Self, IndexError> {
+        Self::load_inner(agent_dir, true)
+    }
+
+    fn load_inner(agent_dir: &Path, strict: bool) -> Result<Self, IndexError> {
         let task_file = agent_dir.join("scheduled-tasks.json");
         let existing: HashSet<String> = match std::fs::read_to_string(task_file) {
             Ok(content) => {
@@ -54,10 +64,27 @@ impl ScheduledSessionIndex {
             let (id, archive) = if let Some(id) = name.strip_suffix(".archive.jsonl") { (id, true) }
                 else if let Some(id) = name.strip_suffix(".jsonl") { (id, false) }
                 else { continue };
-            if !valid_id(id) { continue; }
+            if !valid_id(id) {
+                if strict { return Err(IndexError("Invalid scheduled run filename".into())); }
+                continue;
+            }
+            if strict && !entry.file_type().map_err(|e| IndexError(e.to_string()))?.is_file() {
+                return Err(IndexError("Scheduled run is not a regular file".into()));
+            }
             let content = std::fs::read_to_string(entry.path()).map_err(|e| IndexError(e.to_string()))?;
             for line in content.lines() {
-                let Ok(run) = serde_json::from_str::<Value>(line) else { continue };
+                let run = match serde_json::from_str::<Value>(line) {
+                    Ok(run) => run,
+                    Err(e) if strict => return Err(IndexError(format!("Malformed scheduled run: {e}"))),
+                    Err(_) => continue,
+                };
+                if strict && (!run.is_object() || run["runId"].as_str().is_none_or(str::is_empty)
+                    || (!archive && run["taskId"].as_str() != Some(id))
+                    || (run.get("sessionId").is_some_and(|value| !value.is_null() && value.as_str().is_none_or(str::is_empty)))
+                    || (archive && run["sessionId"].as_str().is_none_or(str::is_empty))
+                    || (!archive && run["status"].as_str() == Some("running") && run["sessionId"].as_str().is_none_or(str::is_empty))) {
+                    return Err(IndexError("Invalid scheduled run record".into()));
+                }
                 let (Some(run_id), Some(session_id)) = (run["runId"].as_str(), run["sessionId"].as_str()) else { continue };
                 if !archive && run["taskId"].as_str() != Some(id) { continue; }
                 result.referenced.insert(session_id.to_string());
@@ -81,6 +108,27 @@ impl ScheduledSessionIndex {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn deletion_index_fails_closed_on_corrupt_runs_and_keeps_missing_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ScheduledSessionIndex::load_for_deletion(dir.path()).unwrap().is_referenced("target"));
+        let runs = dir.path().join("scheduled-tasks/runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let file = runs.join(format!("{id}.jsonl"));
+        std::fs::write(&file, format!("{}\n", json!({"taskId":id,"runId":"r","sessionId":"target"}))).unwrap();
+        assert!(ScheduledSessionIndex::load_for_deletion(dir.path()).unwrap().is_referenced("target"));
+        for bad in ["{broken", "{}", "{\"runId\":\"r\",\"sessionId\":7}", &format!("{}", json!({"taskId":id,"runId":"r","status":"running"}))] {
+            std::fs::write(&file, bad).unwrap();
+            assert!(ScheduledSessionIndex::load_for_deletion(dir.path()).is_err());
+        }
+        std::fs::remove_file(&file).unwrap();
+        let archive = runs.join(format!("{id}.archive.jsonl"));
+        std::fs::write(&archive, format!("{}\n", json!({"runId":"r","sessionId":"target"}))).unwrap();
+        assert!(ScheduledSessionIndex::load_for_deletion(dir.path()).unwrap().is_referenced("target"));
+        std::fs::write(&archive, "{}\n").unwrap();
+        assert!(ScheduledSessionIndex::load_for_deletion(dir.path()).is_err());
+    }
     #[test]
     fn running_history_archive_deleted_tasks_and_torn_lines() {
         let dir = tempfile::tempdir().unwrap();
