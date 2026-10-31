@@ -239,6 +239,16 @@ impl IpcHostState {
         self.proposed_paths.lock().unwrap().contains(path)
     }
 
+    /// Recover a persisted workspace from the host's session headers even if
+    /// cwd validation races the first sidebar scan. Frontend paths alone grant nothing.
+    fn discover_session_cwd(&self, cwd: &Path) {
+        if self.is_proposed(&cwd.to_string_lossy()) { return; }
+        let index = session_host::scan_sessions(&self.agent_dir());
+        if index.projects.keys().any(|known| Path::new(known) == cwd) {
+            self.propose_path(cwd);
+        }
+    }
+
     /// The agent dir this host runs against (sessions.list, the task store).
     pub fn agent_dir(&self) -> PathBuf {
         self.task_agent_dir
@@ -3186,6 +3196,7 @@ pub(crate) fn create_session(
     )
     .map_err(|message| invalid(&message, command_type.as_deref()))?;
 
+    state.discover_session_cwd(&requested_cwd);
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
     if chat_workspace && !chat_root && (!state.is_proposed(&requested_cwd.to_string_lossy())
@@ -3653,6 +3664,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
     let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
+    state.discover_session_cwd(&cwd);
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
         if !crate::session_view::is_chat_root_path(&cwd, &agent_dir)
@@ -4292,22 +4304,13 @@ mod tests {
             "the answered cwd is the validated directory itself"
         );
 
-        // A `~/…` path under a home that does not exist must fail as a
-        // MISSING directory (not a protocol error): the message shape the
-        // ProjectPicker surfaces is the route's.
+        // An arbitrary unapproved path is refused before probing whether it exists.
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv2", "op": "cwd.validate", "args": { "cwd": "~/definitely-not-here-918273" } }),
         );
         assert_eq!(response["ok"], false, "{response}");
-        assert_eq!(response["error"]["code"], "invalid_args");
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("does not exist")),
-            "the honest missing-directory message: {}",
-            response["error"]["message"]
-        );
+        assert_eq!(response["error"]["code"], "unauthorized_scope");
     }
 
     #[test]

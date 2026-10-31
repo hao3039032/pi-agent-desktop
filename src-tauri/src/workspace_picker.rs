@@ -65,6 +65,20 @@ mod tests {
         assert_eq!(call("cwd.validate", &project)["ok"], true);
     }
 
+    #[test]
+    fn persisted_session_cwd_is_discovered_before_sidebar_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = IpcHostState::new();
+        let agent = tmp.path().join("agent");
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        let project = tmp.path().join("existing"); std::fs::create_dir(&project).unwrap();
+        let folder = agent.join("sessions").join("fixture"); std::fs::create_dir_all(&folder).unwrap();
+        let header = serde_json::json!({"type":"session","version":3,"id":"fixture", "timestamp":"2026-01-01T00:00:00.000Z", "cwd":project});
+        std::fs::write(folder.join("fixture.jsonl"), format!("{header}\n")).unwrap();
+        let response = crate::pi_ipc::dispatch_envelope(&state, serde_json::json!({"v":1,"id":"test","op":"cwd.validate","args":{"cwd":project}}));
+        assert_eq!(response["ok"], true, "{response}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn selected_root_replaced_by_symlink_is_not_authorized() {
