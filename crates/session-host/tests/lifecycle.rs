@@ -80,6 +80,78 @@ fn dispatch_refuses_unknown_ops_without_touching_children() {
     assert_eq!(error.code(), "not_found");
 }
 
+/// A chat MUST NOT start without its policy asset: the asset carries the
+/// before_agent_start / tool_call enforcement that confines the chat's file
+/// tools to its folder. Missing or unreadable → the spawn fails BEFORE any
+/// child exists (the Next factory threw the same way). Deterministic: the
+/// check precedes PiRpcClient::spawn, so no pi binary is needed.
+#[test]
+fn a_chat_without_its_policy_asset_fails_closed_before_spawning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).expect("create");
+    let prompt_file = dir.path().join("chat-prompt.txt");
+    std::fs::write(&prompt_file, "chat preamble").expect("prompt");
+
+    let chat_shape = |chat_asset: Option<PathBuf>| session_host::SessionSpawnConfig {
+        executable: "/nonexistent/pi".to_string(),
+        agent_dir: Some(agent_dir.clone()),
+        session_dir: None,
+        bridge_asset: bridge_asset(),
+        artifacts_asset: None,
+        chat_asset,
+        shape: session_host::SessionSpawnShape::Chat {
+            prompt_file: prompt_file.clone(),
+            folder: true,
+            unlocked: false,
+            files_enabled: true,
+        },
+        initial_model: None,
+        thinking_level: None,
+        extra_args: Vec::new(),
+    };
+
+    let registry = SessionRegistry::new();
+    // 1. No asset at all.
+    let error = match registry.start(&id, &file, &id, &cwd, &chat_shape(None)) { Err(e) => e, Ok(_) => panic!("a chat without its policy asset must not start") };
+    match error {
+        SessionHostError::Spawn(message) => assert!(
+            message.contains("chat policy asset") && message.contains("missing"),
+            "the honest missing-asset message: {message}"
+        ),
+        other => panic!("a Spawn error, not {other:?}"),
+    }
+    assert!(registry.ids().is_empty(), "no child was ever spawned");
+
+    // 2. An asset path that does not resolve to a readable file.
+    let ghost = dir.path().join("pi-web-chat.mjs");
+    let error = match registry.start(&id, &file, &id, &cwd, &chat_shape(Some(ghost))) { Err(e) => e, Ok(_) => panic!("a chat with an unreadable policy asset must not start") };
+    match error {
+        SessionHostError::Spawn(message) => assert!(
+            message.contains("not readable"),
+            "the honest unreadable-asset message: {message}"
+        ),
+        other => panic!("a Spawn error, not {other:?}"),
+    }
+    assert!(registry.ids().is_empty());
+
+    // 3. A readable asset passes the gate (the spawn then fails on the
+    //    deliberately missing executable — a DIFFERENT error, proving the
+    //    gate itself let a real asset through).
+    let real_asset = dir.path().join("pi-web-chat.mjs");
+    std::fs::write(&real_asset, "// policy").expect("asset");
+    let error = match registry.start(&id, &file, &id, &cwd, &chat_shape(Some(real_asset))) { Err(e) => e, Ok(_) => panic!("expected the missing-executable failure after the gate") };
+    match error {
+        SessionHostError::Spawn(message) => assert!(
+            !message.contains("chat policy asset"),
+            "a real asset passes the policy gate (the failure is the missing executable): {message}"
+        ),
+        other => panic!("a Spawn error, not {other:?}"),
+    }
+}
+
 #[test]
 fn real_pi_session_lifecycle() {
     let Some(executable) = pi_bin() else {

@@ -63,7 +63,11 @@ pub struct Session {
     machine: Mutex<crate::machine::SessionMachine>,
     /// The composer outbox (`lib/composer-queue.ts`'s host half): messages
     /// queued while a run was active, delivered once the session is idle.
-    pub composer_outbox: composer_outbox::ComposerOutbox,
+    /// Arc-shared with the REGISTRY's session-id-keyed store — the queue
+    /// must outlive this Session (idle eviction or a remove-then-resume
+    /// must not drop queued messages; the Next registry survived wrapper
+    /// eviction the same way).
+    pub composer_outbox: Arc<composer_outbox::ComposerOutbox>,
     /// One drain at a time (the wrapper's `delivering` flag).
     composer_delivering: Mutex<bool>,
     /// Notified when a run settles (prompt waits) or the child exits.
@@ -430,6 +434,10 @@ pub struct SessionRegistry {
     /// from the session map — a failed spawn is retried by the next caller,
     /// never cached as a poison state.
     start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The composer outboxes BY SESSION ID, decoupled from the live
+    /// Session objects (the Next `__piComposerQueues` registry: a queued
+    /// message survives idle eviction and a remove-then-resume).
+    composer_outboxes: Mutex<HashMap<String, Arc<composer_outbox::ComposerOutbox>>>,
 }
 
 impl Default for SessionRegistry {
@@ -440,7 +448,18 @@ impl Default for SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()), start_locks: Mutex::new(HashMap::new()) }
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            start_locks: Mutex::new(HashMap::new()),
+            composer_outboxes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The session-id-keyed composer outbox (created on first use, kept
+    /// across Session lifetimes — the queue outlives the child).
+    pub fn composer_outbox_for(&self, id: &str) -> Arc<composer_outbox::ComposerOutbox> {
+        let mut outboxes = self.composer_outboxes.lock().unwrap();
+        Arc::clone(outboxes.entry(id.to_string()).or_insert_with(|| Arc::new(composer_outbox::ComposerOutbox::new())))
     }
 
     fn start_lock_for(&self, id: &str) -> Arc<Mutex<()>> {
@@ -471,7 +490,10 @@ impl SessionRegistry {
                 return Ok(existing);
             }
         }
-        let session = spawn_session(id, session_file, session_file_id, cwd, config)?;
+        // The composer outbox comes from the session-id store: a resumed
+        // session inherits the queue an evicted child left behind.
+        let composer_outbox = self.composer_outbox_for(id);
+        let session = spawn_session(id, session_file, session_file_id, cwd, config, composer_outbox)?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
         Ok(session)
     }
@@ -552,6 +574,7 @@ fn spawn_session(
     session_file_id: &str,
     cwd: &Path,
     config: &SessionSpawnConfig,
+    composer_outbox: Arc<composer_outbox::ComposerOutbox>,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -593,13 +616,28 @@ fn spawn_session(
             ]);
         }
         SessionSpawnShape::Chat { prompt_file, folder, unlocked, files_enabled } => {
+            // Fail closed: a chat without its policy asset must never start.
+            // The asset carries the before_agent_start / tool_call
+            // enforcement that confines the chat's file tools to its folder
+            // and withholds un-allowed extension tools — losing it while
+            // keeping --tools would hand the model file tools with no path
+            // limits (the Next factory threw when the asset was missing).
+            let chat_asset = config.chat_asset.as_ref().ok_or_else(|| {
+                SessionHostError::Spawn(
+                    "the chat policy asset (pi-web-chat.mjs) is missing; a chat cannot start without it".to_string(),
+                )
+            })?;
+            if !chat_asset.is_file() {
+                return Err(SessionHostError::Spawn(format!(
+                    "the chat policy asset is not readable: {}; a chat cannot start without it",
+                    chat_asset.display()
+                )));
+            }
             args.push("--no-context-files".into());
             args.push("--system-prompt".into());
             args.push(prompt_file.to_string_lossy().into_owned());
-            if let Some(chat_asset) = &config.chat_asset {
-                args.push("--extension".into());
-                args.push(chat_asset.to_string_lossy().into_owned());
-            }
+            args.push("--extension".into());
+            args.push(chat_asset.to_string_lossy().into_owned());
             if !unlocked {
                 // Delegation tools hand work to agents that carry their own
                 // tools — a chat's limits would not reach them.
@@ -681,7 +719,7 @@ fn spawn_session(
         }),
         epoch: AtomicU64::new(1),
         machine: Mutex::new(crate::machine::SessionMachine::new(session_file_id)),
-        composer_outbox: composer_outbox::ComposerOutbox::new(),
+        composer_outbox,
         composer_delivering: Mutex::new(false),
         settle_cv: std::sync::Condvar::new(),
     });

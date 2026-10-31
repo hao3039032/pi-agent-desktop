@@ -307,10 +307,30 @@ test(
           );
         }
 
-        // The chat-only pin: the cwd's context files joined in order.
-        const chatOnly = await call("session.chatOnlyPrompt", { cwd });
+        // The chat-only pin: the cwd's context files joined in order. The
+        // explicit agentDir (what the Rust host passes) must be used AS IS:
+        // PI_CODING_AGENT_DIR is already the complete agent dir, and a
+        // nested `.../<agentDir>/.pi/agent` read would miss the global
+        // context file placed below.
+        await writeFile(join(agentDir, "AGENTS.md"), "global-from-agent-dir", "utf8");
+        const chatOnly = await call("session.chatOnlyPrompt", { cwd, agentDir });
         assert.equal(chatOnly.ok, true, JSON.stringify(chatOnly));
-        assert.equal(chatOnly.result.prompt, "context-file body", "the AGENTS.md body joined");
+        assert.match(chatOnly.result.prompt, /context-file body/, "the cwd AGENTS.md body joined");
+        assert.match(
+          chatOnly.result.prompt,
+          /global-from-agent-dir/,
+          "the agentDir's own global context file joined — the agentDir was not re-nested",
+        );
+        // And WITHOUT the explicit arg: PI_CODING_AGENT_DIR (set above to
+        // the same directory) must be honoured as the COMPLETE agent dir —
+        // the old default appended /.pi/agent to it and missed the file.
+        const chatOnlyEnv = await call("session.chatOnlyPrompt", { cwd });
+        assert.equal(chatOnlyEnv.ok, true, JSON.stringify(chatOnlyEnv));
+        assert.match(
+          chatOnlyEnv.result.prompt,
+          /global-from-agent-dir/,
+          "PI_CODING_AGENT_DIR is the complete agent dir, never re-nested",
+        );
       } finally {
         await client.close(5_000);
         client = null;

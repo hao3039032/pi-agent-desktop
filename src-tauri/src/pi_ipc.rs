@@ -471,6 +471,14 @@ fn derive_running_snapshot(registry: &SessionRegistry, version: &AtomicU64) -> R
 /// registry) and its channel probe (how often a quiet stream is re-sent so
 /// a dead Channel — a page reload that never unsubscribed — is detected
 /// and the relay reaped instead of leaking forever).
+///
+/// KNOWN LIMIT (deliberate, until the event-driven rework): the stream is
+/// sampled, not event-fed — a run that starts AND settles inside one
+/// cadence tick can pass unobserved (the sidebar then shows the session as
+/// not-running until the next list load). Runs shorter than the cadence are
+/// rare in practice (a model round-trip), and the client's own state poll
+/// covers the gap; the honest trade was cadence cost vs a per-machine
+/// broadcast hook. Revisit when run-state transitions emit host events.
 const RUNNING_DERIVE_CADENCE: Duration = Duration::from_millis(1_000);
 const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(30);
 
@@ -1821,8 +1829,14 @@ fn build_spawn_plan(
     let config = if chat_workspace {
         // A chat: the unlock marker decides the loadout; a chat has no tool
         // preset of its own (the request's toolNames is ignored — the
-        // workspace policy decides, server-side).
-        let unlocked = session_host::spawn_plan::read_chat_unlocked(session_file);
+        // workspace policy decides, server-side). Unlocking lets a chat use
+        // the computer, so a persisted marker is honoured ONLY for a folder
+        // chat (the Next factory's gate: a legacy shared-workspace session
+        // file that carries the marker keeps the locked loadout; the desktop
+        // host is local-only, so the network-exposure half of the old gate
+        // is structural here).
+        let unlocked = chat_folder
+            && session_host::spawn_plan::read_chat_unlocked(session_file);
         // Chats read Settings › Chats while they are still empty.
         let (chat_model, chat_thinking) = if file_has_messages(session_file) {
             (None, None)
@@ -1943,7 +1957,14 @@ fn chat_only_prompt(state: &IpcHostState, cwd: &Path) -> Result<String, String> 
     let result = management_call(
         state,
         "session.chatOnlyPrompt",
-        json!({ "cwd": cwd.display().to_string() }),
+        json!({
+            "cwd": cwd.display().to_string(),
+            // The host's agent dir, explicitly: PI_CODING_AGENT_DIR already
+            // IS the complete agent dir (the SDK's convention), and without
+            // this the extension would append /.pi/agent to it and read a
+            // nested directory that does not exist.
+            "agentDir": state.agent_dir().display().to_string(),
+        }),
     )
     .map_err(|(code, message)| format!("the chat-only prompt could not be built ({code}): {message}"))?;
     result
@@ -2114,12 +2135,18 @@ fn create_session(
     let data = session
         .command(&command_type, payload, Some(std::time::Duration::from_secs(120)))
         .map_err(|error| {
-            let rejected = command_type == "prompt";
-            (
-                "op_failed".to_string(),
-                error.to_string(),
-                rejected.then(|| json!({ "code": "prompt_rejected", "accepted": false })),
-            )
+            // The admission trichotomy (the plan's no-blind-retry rule):
+            // only a child that ANSWERED its refusal is `prompt_rejected`
+            // with `accepted:false` — the one signal the composer treats as
+            // "definitely not executed, safe to restore the draft". A
+            // timeout, a broken transport or an exited child leaves the
+            // result UNKNOWN: the prompt may already be running, so the
+            // error must not invite a resend. It carries the session
+            // identity instead, for a state query.
+            if command_type != "prompt" {
+                return ("op_failed".to_string(), error.to_string(), None);
+            }
+            classify_first_prompt_error(&error, &session_id)
         })?;
     Ok(json!({
         "success": true,
@@ -2128,6 +2155,42 @@ fn create_session(
         "model": model.unwrap_or(Value::Null),
         "thinkingLevel": thinking_level,
     }))
+}
+
+/// The first prompt's error trichotomy (the plan's no-blind-retry rule):
+/// - the child ANSWERED its refusal → `prompt_rejected` + `accepted:false`,
+///   the only signal the composer treats as "definitely not executed";
+/// - the child never came up → nothing was sent (also safe to restore);
+/// - anything else (timeout, broken transport, exit) → the outcome is
+///   UNKNOWN: the prompt may already be running. The error then carries the
+///   session identity and NEVER `accepted:false`, so no caller resends.
+fn classify_first_prompt_error(
+    error: &pi_host::PiRpcError,
+    session_id: &str,
+) -> (String, String, Option<Value>) {
+    match error.kind {
+        pi_host::ErrorKind::Command => (
+            "op_failed".to_string(),
+            error.to_string(),
+            Some(json!({ "code": "prompt_rejected", "accepted": false })),
+        ),
+        pi_host::ErrorKind::Spawn => (
+            "agent_spawn_failed".to_string(),
+            error.to_string(),
+            Some(json!({ "code": "prompt_rejected", "accepted": false })),
+        ),
+        _ => (
+            "prompt_unknown".to_string(),
+            format!(
+                "the prompt's outcome is unknown ({error}); the session may still be running it — query its state before resending"
+            ),
+            Some(json!({
+                "code": "prompt_unknown",
+                "accepted": null,
+                "sessionId": session_id,
+            })),
+        ),
+    }
 }
 
 /// The command type the create body carries (the route's `command.type`).
@@ -2412,8 +2475,15 @@ fn dispatch_with_resume(
         )
     };
     let resume = session_host::ResumeContext { agent_dir: agent_dir.as_path(), plan: &plan };
-    session_host::dispatch_session_op(&state.registry, op, args, Some(&resume))
-        .map_err(|error| (error.code().to_string(), error.to_string()))
+    let result = session_host::dispatch_session_op(&state.registry, op, args, Some(&resume))
+        .map_err(|error| (error.code().to_string(), error.to_string()))?;
+    // A rename changes the list every catalogue holder displays: bump the
+    // version so other windows' staleness check refetches (the SSE stream
+    // carried the same bump through getSessionListVersion).
+    if op == "agent.setSessionName" {
+        bump_session_list_version(state);
+    }
+    Ok(result)
 }
 
 
@@ -3421,6 +3491,116 @@ mod tests {
         assert_eq!(malformed["error"]["code"], "invalid_args");
     }
 
+    #[test]
+    fn the_first_prompt_error_trichotomy_never_marks_an_unknown_outcome_rejected() {
+        // Only a child that ANSWERED its refusal (or never spawned) is
+        // `prompt_rejected accepted:false` — the composer's restore-draft
+        // signal. A timeout, a lost transport or an exit leaves the outcome
+        // UNKNOWN: no accepted:false, and the session identity rides along.
+        let refused = classify_first_prompt_error(
+            &pi_host::PiRpcError::command("message is empty"),
+            "s-1",
+        );
+        assert_eq!(refused.0, "op_failed");
+        assert_eq!(refused.2.as_ref().unwrap()["code"], "prompt_rejected");
+        assert_eq!(refused.2.as_ref().unwrap()["accepted"], false);
+
+        let never_spawned = classify_first_prompt_error(
+            &pi_host::PiRpcError::spawn("ENOENT"),
+            "s-1",
+        );
+        assert_eq!(never_spawned.0, "agent_spawn_failed");
+        assert_eq!(never_spawned.2.as_ref().unwrap()["accepted"], false);
+
+        for unknown in [
+            pi_host::PiRpcError::timeout("timed out after 120000 ms"),
+            pi_host::PiRpcError::exit("pi process exited"),
+            pi_host::PiRpcError::closing("shutdown began"),
+        ] {
+            let (code, message, details) = classify_first_prompt_error(&unknown, "s-42");
+            assert_eq!(code, "prompt_unknown", "an unknown outcome is never a rejection");
+            assert!(message.contains("unknown"), "the message states the ambiguity: {message}");
+            let details = details.expect("the unknown case carries details");
+            assert_eq!(details["code"], "prompt_unknown");
+            assert_ne!(details["accepted"], false, "accepted:false would invite a resend");
+            assert_eq!(details["sessionId"], "s-42", "the session identity for a state query");
+        }
+    }
+
+    #[test]
+    fn a_persisted_unlock_marker_is_honoured_only_for_a_folder_chat() {
+        // The Next factory's gate (rpc-manager): chatFolder && marker. A
+        // LEGACY shared-workspace session file that carries the marker keeps
+        // the locked loadout — a persisted input must not widen its rights.
+        // Gated like the other plan tests: the chat prompt rides the
+        // management instance (a real pi child on the staged managed tree).
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let state = state();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = stage_managed_tree(dir.path());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![(
+                "PI_WEB_MANAGED_MODULES".to_string(),
+                managed.display().to_string(),
+            )],
+        });
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("bridge asset");
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+
+        // The unlock marker in pi's custom-entry shape (both files below).
+        let marker = format!(
+            "{}\n{}\n",
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+            r#"{"type":"custom","customType":"pi-web:chat-unlock","id":"u1","parentId":null,"data":{"version":1,"unlocked":true}}"#,
+        );
+
+        let request = SpawnRequest::default();
+        let base = state.spawn_base.lock().unwrap().clone().expect("base");
+
+        // 1. A FOLDER chat (a child of <agent_dir>/chats) with the marker: unlocked.
+        let folder_cwd = agent_dir.join("chats").join("20260101_120000_abcd");
+        std::fs::create_dir_all(&folder_cwd).expect("folder");
+        let folder_file = dir.path().join("folder.jsonl");
+        std::fs::write(&folder_file, &marker).expect("write");
+        let plan = build_spawn_plan(&state, &base, &folder_cwd, &folder_file, &request, false)
+            .expect("the folder chat plan");
+        match plan.shape {
+            session_host::SessionSpawnShape::Chat { unlocked, .. } => {
+                assert!(unlocked, "a folder chat's persisted unlock is honoured");
+            }
+            _ => panic!("a chat shape, not another kind"),
+        }
+
+        // 2. The LEGACY shared workspace with the same marker: still locked.
+        let legacy_cwd = agent_dir.join("chat-workspace");
+        std::fs::create_dir_all(&legacy_cwd).expect("legacy cwd");
+        let legacy_file = dir.path().join("legacy.jsonl");
+        std::fs::write(&legacy_file, &marker).expect("write");
+        let plan = build_spawn_plan(&state, &base, &legacy_cwd, &legacy_file, &request, false)
+            .expect("the legacy chat plan");
+        match plan.shape {
+            session_host::SessionSpawnShape::Chat { unlocked, folder, .. } => {
+                assert!(!folder, "the legacy cwd is not a folder chat");
+                assert!(!unlocked, "a legacy chat's persisted unlock marker is IGNORED (the locked loadout stays)");
+            }
+            _ => panic!("a chat shape, not another kind"),
+        }
+    }
     /// A Channel that records every frame it is sent (the relay's own
     /// serialization path: InvokeResponseBody::Json).
     fn recording_channel() -> (Channel<Value>, Arc<Mutex<Vec<Value>>>) {
@@ -3873,6 +4053,53 @@ mod tests {
         assert_eq!(rejected["error"]["details"]["accepted"], false);
     }
 
+    /// A rename changes the catalogue every holder displays: the list
+    /// version must bump so other windows' staleness check refetches (the
+    /// SSE stream carried the same bump through getSessionListVersion).
+    #[test]
+    fn real_pi_set_session_name_bumps_the_list_version() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+
+        let created = send(
+            &state,
+            json!({ "v": 1, "id": "rn0", "op": "agent.create", "args": {
+                "cwd": cwd.display().to_string(), "type": "ensure_session",
+            }}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let sid = created["data"]["sessionId"].as_str().expect("id").to_string();
+        // create itself bumped once; capture the version AFTER that.
+        let before = state.session_list_version();
+
+        let renamed = send(
+            &state,
+            json!({ "v": 1, "id": "rn1", "op": "agent.setSessionName", "args": { "session": sid, "name": "Renamed for the version test" } }),
+        );
+        assert_eq!(renamed["ok"], true, "{renamed}");
+        assert!(
+            state.session_list_version() > before,
+            "a rename bumps the catalogue version (before {before}, after {})",
+            state.session_list_version()
+        );
+
+        state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
     /// The composer outbox (queue_composer / take / send) and the state
     /// poll's queued/context fields, against the REAL pi (PI_CLI_BIN,
     /// sandboxed): an idle session with queued items delivers them as
@@ -3997,6 +4224,112 @@ mod tests {
             poll["data"]["state"]["contextUsage"]
         );
         assert!(poll["data"]["state"].get("systemPrompt").is_some(), "the system-prompt field exists");
+        state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    /// The drain's settle coordination against the REAL pi (PI_CLI_BIN,
+    /// sandboxed): two items queued while the session is idle; the FIRST
+    /// delivery's run is held open by a fixture extension (deterministic —
+    /// a slow command, no model). While that run is in flight, the second
+    /// item MUST still be in the editable outbox: admission alone must not
+    /// pop it (the agent_start event projects the run only after the
+    /// admission response — the exact window the old drain raced).
+    #[test]
+    fn real_pi_composer_drain_keeps_the_next_item_editable_until_the_run_settles() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("cwd");
+        std::fs::create_dir_all(agent_dir.join("extensions")).expect("extensions");
+        // The stalled-model shape keeps the run open deterministically.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                std::mem::forget(stream);
+            }
+        });
+        let models = json!({
+            "providers": {
+                "stall": {
+                    "baseUrl": format!("http://{endpoint}"),
+                    "apiKey": "stall-not-a-credential",
+                    "api": "openai-completions",
+                    "models": [{
+                        "id": "stuck", "name": "Stuck", "reasoning": false,
+                        "input": ["text"], "contextWindow": 200000, "maxTokens": 4096,
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+                    }]
+                }
+            }
+        });
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(agent_dir.join("models.json"), models.to_string()).expect("models");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProvider":"stall","defaultModel":"stuck"}"#,
+        )
+        .expect("settings");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+
+        // Create the session and hold ONE run open (the prompt stalls on the
+        // model endpoint — is_running stays true until the 120s timeout).
+        let created = send(
+            &state,
+            json!({ "v": 1, "id": "dr0", "op": "agent.create", "args": {
+                "cwd": cwd.display().to_string(), "type": "prompt", "message": "hold the run open",
+            }}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let sid = created["data"]["sessionId"].as_str().expect("id").to_string();
+
+        // The run is in flight: queue TWO more while it runs.
+        let run_state = send(
+            &state,
+            json!({ "v": 1, "id": "dr1", "op": "sessions.runState", "args": { "session": sid } }),
+        );
+        assert_eq!(run_state["data"]["running"], true, "the first run is in flight: {run_state}");
+        let first = send(
+            &state,
+            json!({ "v": 1, "id": "dr2", "op": "agent.command", "args": { "session": sid, "type": "queue_composer", "message": "first follow-up" } }),
+        );
+        assert_eq!(first["ok"], true, "{first}");
+        let second = send(
+            &state,
+            json!({ "v": 1, "id": "dr3", "op": "agent.command", "args": { "session": sid, "type": "queue_composer", "message": "second follow-up" } }),
+        );
+        assert_eq!(second["ok"], true, "{second}");
+        let second_id = second["data"]["id"].as_str().expect("the second item id").to_string();
+
+        // While the run is in flight, the SECOND item is still editable —
+        // the drain must not have popped it (canDeliver is false).
+        let taken = send(
+            &state,
+            json!({ "v": 1, "id": "dr4", "op": "agent.command", "args": { "session": sid, "type": "take_composer_message", "id": second_id } }),
+        );
+        assert_eq!(taken["ok"], true, "{taken}");
+        assert_eq!(taken["data"]["item"]["message"], "second follow-up", "the second item was still in the editable outbox");
+        assert_eq!(
+            taken["data"]["pendingVersion"], 3,
+            "the version moved with every change (enqueue, enqueue, take): {taken}"
+        );
+        assert_eq!(
+            taken["data"]["pending"].as_array().map(Vec::len),
+            Some(1),
+            "only the first follow-up is still queued: {taken}"
+        );
+
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
     }
 

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::Session;
+use crate::{Session, SettleOutcome};
 
 /// One queued message (`PendingComposerMessage`).
 #[derive(Debug, Clone)]
@@ -45,8 +45,25 @@ impl PendingComposerMessage {
 #[derive(Default)]
 struct OutboxState {
     items: Vec<PendingComposerMessage>,
+    /// Strictly increasing on every actual queue change (enqueue, take,
+    /// send-claim, restore, drain-claim) — the client's staleness check
+    /// drops any snapshot whose version is not newer than one it already
+    /// held (`lib/composer-queue-types.ts`'s contract). Read under the SAME
+    /// lock as the items, so a snapshot's version always belongs to exactly
+    /// the items beside it.
     version: u64,
     paused: bool,
+    /// The front item's last delivery ended UNKNOWN (may have executed):
+    /// shown in the state answer so the UI asks before any resend.
+    unknown_front: bool,
+}
+
+impl OutboxState {
+    /// Record an actual change: bump the version ONCE per mutation, under
+    /// the state lock the caller already holds.
+    fn changed(&mut self) {
+        self.version = self.version.saturating_add(1);
+    }
 }
 
 /// The per-session outbox.
@@ -78,6 +95,7 @@ impl ComposerOutbox {
         };
         state.items.push(item.clone());
         state.paused = false;
+        state.changed();
         Ok(item)
     }
 
@@ -86,7 +104,9 @@ impl ComposerOutbox {
     pub fn take(&self, id: &str) -> Option<PendingComposerMessage> {
         let mut state = self.state.lock().unwrap();
         let index = state.items.iter().position(|item| item.id == id)?;
-        Some(state.items.remove(index))
+        let item = state.items.remove(index);
+        state.changed();
+        Some(item)
     }
 
     /// The snapshot + version every answer and event carries.
@@ -95,12 +115,33 @@ impl ComposerOutbox {
         (state.items.iter().map(PendingComposerMessage::to_json).collect(), state.version)
     }
 
-    /// A delivery failed: the item goes back to the front and the queue
-    /// pauses until the user acts (never a silent retry).
+    /// A delivery whose outcome is KNOWN-not-delivered (the child refused
+    /// it): the item goes back to the front and the queue pauses until the
+    /// user acts (never a silent retry).
     pub fn restore_front(&self, item: PendingComposerMessage) {
         let mut state = self.state.lock().unwrap();
         state.items.insert(0, item);
         state.paused = true;
+        state.changed();
+    }
+
+    /// A delivery whose outcome is UNKNOWN (timeout, transport loss, child
+    /// exit after the prompt may have reached it): the item is parked back
+    /// — visible, editable — with an `unknown` marker, and the queue stays
+    /// paused. It is NEVER re-delivered automatically; resending is the
+    /// user's explicit choice after checking the session.
+    pub fn park_unknown(&self, item: PendingComposerMessage) {
+        let mut state = self.state.lock().unwrap();
+        state.items.insert(0, item);
+        state.paused = true;
+        state.unknown_front = true;
+        state.changed();
+    }
+
+    /// Whether the front item is parked as outcome-unknown (the state
+    /// answer tells the UI which confirmation to show).
+    pub fn front_is_unknown(&self) -> bool {
+        self.state.lock().unwrap().unknown_front
     }
 
     pub fn is_paused(&self) -> bool {
@@ -116,7 +157,10 @@ impl ComposerOutbox {
         if state.items.is_empty() {
             return None;
         }
-        Some(state.items.remove(0))
+        let item = state.items.remove(0);
+        state.unknown_front = false;
+        state.changed();
+        Some(item)
     }
 }
 
@@ -137,8 +181,11 @@ impl Session {
         self.composer_answer(item.as_ref().map(|item| item.to_json()))
     }
 
-    /// `send_composer_message`: send one item NOW (as a steer). A delivery
-    /// failure puts it back, pauses the queue and emits prompt_error.
+    /// `send_composer_message`: send one item NOW (as a steer). The
+    /// delivery-error trichotomy decides the restore semantics: a certain
+    /// non-delivery goes back as retryable; an UNKNOWN outcome (the prompt
+    /// may already be running) is parked with the unknown marker — never
+    /// silently re-delivered.
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
         let Some(item) = self.composer_outbox.take(id) else {
             // Missing is a normal no-op (another window won the claim).
@@ -148,38 +195,93 @@ impl Session {
         match self.deliver_composer(&item, "steer") {
             Ok(()) => Ok(self.composer_answer(None)),
             Err(error) => {
-                self.composer_outbox.restore_front(item);
+                match error.kind {
+                    // The child answered a refusal: definitely not executed.
+                    pi_host::ErrorKind::Command | pi_host::ErrorKind::Spawn
+                    | pi_host::ErrorKind::Invalid | pi_host::ErrorKind::Closing => {
+                        self.composer_outbox.restore_front(item);
+                    }
+                    // Timeout / exit / transport loss: the outcome is unknown.
+                    _ => self.composer_outbox.park_unknown(item),
+                }
                 self.emit_composer_update();
-                self.emit_prompt_error(&error);
-                Err(error)
+                self.emit_prompt_error(&error.to_string());
+                Err(error.to_string())
             }
         }
     }
 
     fn composer_answer(&self, item: Option<Value>) -> Value {
         let (pending, pending_version) = self.composer_outbox.snapshot();
-        json!({ "item": item, "pending": pending, "pendingVersion": pending_version })
+        let front_unknown = self.composer_outbox.front_is_unknown();
+        json!({
+            "item": item,
+            "pending": pending,
+            "pendingVersion": pending_version,
+            // The UI's confirmation choice: an unknown outcome must not look
+            // like a plain retryable failure.
+            "frontDeliveryUnknown": front_unknown,
+        })
     }
 
     /// One prompt delivery (the wrapper's `deliver`): the ordinary prompt
-    /// command with the streaming behavior the queue chose.
-    fn deliver_composer(&self, item: &PendingComposerMessage, behavior: &str) -> Result<(), String> {
+    /// command with the streaming behavior the queue chose, followed by the
+    /// SDK settle wait — a `started` run waits for the NEXT epoch to settle,
+    /// a `queued` one for the current. Waiting for ADMISSION alone is not
+    /// enough: between the prompt response and the `agent_start` event the
+    /// run is not yet projected, and a drain that continues there would
+    /// pop the next item early, stealing its editability mid-run.
+    fn deliver_composer(
+        &self,
+        item: &PendingComposerMessage,
+        behavior: &str,
+    ) -> Result<(), pi_host::PiRpcError> {
         let mut payload = json!({ "message": item.message, "streamingBehavior": behavior });
         if let Some(images) = item.images.as_ref().and_then(Value::as_array).filter(|items| !items.is_empty()) {
             payload["images"] = json!(images);
         }
-        self.command("prompt", payload, Some(std::time::Duration::from_secs(120)))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let epoch_at_send = self.machine.lock().unwrap().epoch();
+        let response = self.command("prompt", payload, Some(std::time::Duration::from_secs(120)))?;
+        let disposition = match response.get("disposition").and_then(Value::as_str) {
+            Some("queued") => "queued",
+            Some("handled") => "handled",
+            _ => "started",
+        };
+        match disposition {
+            "started" => match self.wait_for_settle(epoch_at_send + 1, std::time::Duration::from_secs(600)) {
+                SettleOutcome::Settled => Ok(()),
+                // The run was cut short: the outcome of the DELIVERED prompt
+                // is unknown — surface as an error so the caller parks it.
+                SettleOutcome::ChildExited => Err(pi_host::PiRpcError::exit(
+                    "pi process exited during the run",
+                )),
+                SettleOutcome::Timeout => Err(pi_host::PiRpcError::timeout(
+                    "the run did not settle in time",
+                )),
+            },
+            "queued" => match self.wait_for_settle(epoch_at_send, std::time::Duration::from_secs(600)) {
+                SettleOutcome::Settled => Ok(()),
+                SettleOutcome::ChildExited => Err(pi_host::PiRpcError::exit(
+                    "pi process exited with the item queued",
+                )),
+                SettleOutcome::Timeout => Err(pi_host::PiRpcError::timeout(
+                    "the queued run did not settle in time",
+                )),
+            },
+            _ => Ok(()),
+        }
     }
 
-    /// The composer_queue_update event every subscriber consumes.
+    /// The composer_queue_update event every subscriber consumes. The
+    /// version and the items come from ONE snapshot call (one lock), so an
+    /// event's version always belongs to exactly the items beside it.
     pub fn emit_composer_update(&self) {
         let (items, pending_version) = self.composer_outbox.snapshot();
         self.emit_host_event(json!({
             "type": "composer_queue_update",
             "items": items,
             "pendingVersion": pending_version,
+            "frontDeliveryUnknown": self.composer_outbox.front_is_unknown(),
         }));
     }
 
@@ -222,12 +324,101 @@ impl Session {
             let Some(item) = self.composer_outbox.pop_front() else { break };
             self.emit_composer_update();
             if let Err(error) = self.deliver_composer(&item, "followUp") {
-                self.composer_outbox.restore_front(item);
+                match error.kind {
+                    pi_host::ErrorKind::Command | pi_host::ErrorKind::Spawn
+                    | pi_host::ErrorKind::Invalid | pi_host::ErrorKind::Closing => {
+                        self.composer_outbox.restore_front(item);
+                    }
+                    _ => self.composer_outbox.park_unknown(item),
+                }
                 self.emit_composer_update();
-                self.emit_prompt_error(&error);
+                self.emit_prompt_error(&error.to_string());
                 break;
             }
         }
         *self.composer_delivering.lock().unwrap() = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_queue_change_bumps_the_version_under_the_same_lock() {
+        let outbox = ComposerOutbox::new();
+        let (_, v0) = outbox.snapshot();
+        assert_eq!(v0, 0, "a fresh queue starts at version 0");
+
+        // enqueue bumps.
+        let item = outbox.enqueue("one", None).expect("enqueue");
+        let (_, v1) = outbox.snapshot();
+        assert_eq!(v1, 1, "enqueue bumps the version");
+
+        // take bumps (the item leaves the editable queue).
+        outbox.take(&item.id).expect("take");
+        let (_, v2) = outbox.snapshot();
+        assert_eq!(v2, 2, "take bumps the version");
+
+        // restore (a known-not-delivered send) bumps.
+        outbox.restore_front(item.clone());
+        let (_, v3) = outbox.snapshot();
+        assert_eq!(v3, 3, "restore bumps the version");
+
+        // park_unknown bumps and flags (the take back out bumped first).
+        outbox.take(&item.id).expect("take again");
+        outbox.park_unknown(item);
+        let (items, v4) = outbox.snapshot();
+        assert_eq!(v4, 5, "park_unknown bumps the version");
+        assert_eq!(items.len(), 1);
+        assert!(outbox.front_is_unknown(), "the parked front is marked unknown");
+        assert!(outbox.is_paused(), "an unknown delivery pauses the queue");
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_resurrect_a_deleted_item() {
+        // The client contract (lib/composer-queue-types.ts): a snapshot is
+        // applied only when its version is NEWER than the one held. The
+        // pairing under one lock is what makes that check sound: a snapshot
+        // taken before a take must carry an older version than the take's.
+        let outbox = ComposerOutbox::new();
+        let a = outbox.enqueue("a", None).expect("a");
+        let _b = outbox.enqueue("b", None).expect("b");
+        // A client holds this snapshot…
+        let (stale_items, stale_version) = outbox.snapshot();
+        assert_eq!(stale_version, 2);
+        // …then the user deletes `a` (a NEWER version).
+        outbox.take(&a.id).expect("delete a");
+        let (current_items, current_version) = outbox.snapshot();
+        assert_eq!(current_version, 3);
+        assert_eq!(current_items.len(), 1);
+        // The stale snapshot's version cannot pass the client's check, so
+        // the deleted item cannot come back through it.
+        assert!(stale_version < current_version);
+        assert_eq!(stale_items.len(), 2, "the stale snapshot still holds both (proving the versions differ)");
+    }
+
+    #[test]
+    fn the_queue_survives_the_session_object() {
+        // The P1 fix: the outbox lives in the registry keyed by session id,
+        // so a Session being dropped (idle eviction, remove-then-resume)
+        // must not take the queued messages with it. The same Arc answers.
+        let registry = crate::SessionRegistry::new();
+        let outbox = registry.composer_outbox_for("s-1");
+        outbox.enqueue("still queued", None).expect("enqueue");
+
+        // A second fetch answers the SAME store (not a fresh empty queue).
+        let again = registry.composer_outbox_for("s-1");
+        let (items, version) = again.snapshot();
+        assert_eq!(version, 1, "the shared store kept the change");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["message"], "still queued");
+
+        // Dropping every handle and re-fetching still keeps the state (the
+        // registry owns it, not the Session).
+        drop(outbox);
+        drop(again);
+        let (items, _) = registry.composer_outbox_for("s-1").snapshot();
+        assert_eq!(items.len(), 1, "the queue outlives its Session handles");
     }
 }
