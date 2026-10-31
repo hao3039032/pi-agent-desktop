@@ -1153,10 +1153,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         path: data.path ?? "",
         cwd: data.cwd ?? cwd,
         workspaceKind: "project",
+        chatFolder: false,
         projectRoot: projectRootFor(cwd) ?? cwd,
         created: now,
         modified: now,
         parentSessionId: chat.id,
+        relation: { kind: "fork", originSessionId: chat.id },
       });
       void loadSessions(false, true);
     } catch (e) {
