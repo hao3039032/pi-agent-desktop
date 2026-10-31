@@ -31,6 +31,8 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
     const external = join(externalDir, "extra.md");
     await writeFile(external, "---\nname: extra\ndescription: external fixture\n---\nbody\n");
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ skills: [external] }));
+    await mkdir(join(root, ".agents"), { recursive: true });
+    await writeFile(join(root, ".agents", ".skill-lock.json"), JSON.stringify({ skills: { fixture: { source: "local/fixture", sourceType: "local", skillPath: "SKILL.md" } } }));
     await buildProjectionInto(managed);
     const nonce = "skills-test-nonce";
     client = new PiRpcClient(executable, {
@@ -60,6 +62,9 @@ test("real management instance lists, toggles, and reloads isolated skills", { s
     assert.equal(search.ok, true, JSON.stringify(search));
     assert.equal(search.result.results[0].package, "fixture/repo@demo");
     assert.equal(search.result.results[0].installs, "1.2K installs");
+    const check = await call("skills.check", { cwd });
+    assert.equal(check.ok, true, JSON.stringify(check));
+    assert.equal(check.result.updates[0].state, "unsupported");
     const first = await call("skills.list", { cwd });
     assert.equal(first.ok, true, JSON.stringify(first));
     assert.ok(first.result.skills.some((entry) => entry.filePath === skill));

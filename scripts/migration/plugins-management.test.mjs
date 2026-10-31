@@ -32,9 +32,9 @@ test("real management instance lists isolated local packages and refreshes", { s
       if (typeof record.message === "string" && record.message.startsWith("PI_WEB_MGMT_V1 ")) replies.push(JSON.parse(record.message.slice(15)));
     });
     let index = 0;
-    const list = async () => {
+    const call = async (op, args = { cwd }) => {
       const rid = `plugins-${++index}`;
-      const token = Buffer.from(JSON.stringify({ op: "plugins.list", args: { cwd }, nonce })).toString("base64url");
+      const token = Buffer.from(JSON.stringify({ op, args, nonce })).toString("base64url");
       const ack = await client.command("prompt", { message: `/pi-web:mgmt ${rid} ${token}` }, 60_000);
       assert.equal(ack.disposition, "handled");
       for (let i = 0; i < 600; i++) {
@@ -44,12 +44,14 @@ test("real management instance lists isolated local packages and refreshes", { s
       }
       throw new Error("no plugins.list reply");
     };
-    const first = await list();
+    const first = await call("plugins.list");
+    const check = await call("plugins.check");
+    assert.equal(check.updates[0].state, "unsupported");
     assert.equal(first.packages[0].source, pkg);
     assert.equal(first.packages[0].packageName, "plugin-fixture");
     assert.equal(first.packages[0].disabled, false);
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [{ source: pkg, extensions: [], skills: [], prompts: [], themes: [] }] }));
-    const second = await list();
+    const second = await call("plugins.list");
     assert.equal(second.packages[0].disabled, true);
   } finally {
     if (client) await client.close(5_000);

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
-import { listPlugins } from "@/lib/plugins-client";
+import { checkPlugins, listPlugins } from "@/lib/plugins-client";
 import type {
   PluginPackageInfo,
   PluginStandaloneExtensionInfo,
@@ -669,23 +669,10 @@ export function PluginsConfig({
     setCheckingUpdates((current) => new Set([...current, ...keys]));
     if (!pkg) setCheckingAll(true);
     try {
-      const res = await fetch("/api/plugins/check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cwd,
-          source: pkg?.source,
-          scope: pkg?.scope,
-        }),
-      });
-      const data = (await res.json()) as {
-        updates?: PluginUpdateResult[];
-        error?: string;
-      };
-      if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const updates = await checkPlugins(cwd, pkg?.source, pkg?.scope);
       setUpdateStatuses((current) => {
         const next = { ...current };
-        for (const update of data.updates ?? []) {
+        for (const update of updates) {
           next[packageKey(update)] = update;
         }
         return next;
