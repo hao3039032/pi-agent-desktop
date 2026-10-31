@@ -12,7 +12,7 @@ test("plugin install polls task progress then returns the real result", async ()
   const result = { packages: [], totals: {}, diagnostics: [] };
   const transport = new MockTransport()
     .on("plugins.install.start", () => ({ handle: "task-fixture" }))
-    .on("plugins.install.status", ({ handle }) => {
+    .on("plugins.mutation.status", ({ handle }) => {
       assert.equal(handle, "task-fixture");
       return ++polls === 1 ? { status: "running", progress: { phase: "running" } } : { status: "succeeded", result };
     });
@@ -26,11 +26,11 @@ test("plugin install cancellation targets its handle and reports unknown", async
   let cancelled = false;
   const transport = new MockTransport()
     .on("plugins.install.start", () => ({ handle: "task-cancel" }))
-    .on("plugins.install.status", ({ handle }) => {
+    .on("plugins.mutation.status", ({ handle }) => {
       assert.equal(handle, "task-cancel");
       return cancelled ? { status: "unknown", error: "operation cancelled; outcome unknown" } : { status: "running", progress: { phase: "running" } };
     })
-    .on("plugins.install.cancel", ({ handle }) => { assert.equal(handle, "task-cancel"); cancelled = true; return { requested: true }; });
+    .on("plugins.mutation.cancel", ({ handle }) => { assert.equal(handle, "task-cancel"); cancelled = true; return { requested: true }; });
   bindPluginsClient(new IpcClient(transport));
   await assert.rejects(installPluginPackage("/cwd", "fixture", "global", controller.signal, () => controller.abort()), /outcome unknown/);
   assert.equal(cancelled, true);

@@ -14,10 +14,13 @@ export async function setPluginsEnabled(cwd: string, action: "enable" | "disable
   return data;
 }
 
-export async function installPluginPackage(cwd: string, source: string, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
+export function installPluginPackage(cwd: string, source: string, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
+  return mutatePluginPackage(cwd, "install", source, scope, signal, onProgress);
+}
+export async function mutatePluginPackage(cwd: string, action: "install" | "remove" | "update", source: string | undefined, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
   try {
     onProgress("running");
-    const response = await fetch("/api/plugins", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, source, scope, action: "install" }), signal });
+    const response = await fetch("/api/plugins", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, source, scope, action }), signal });
     const data = await response.json() as PluginsResponse & { error?: string };
     if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
     return data;

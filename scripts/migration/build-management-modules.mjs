@@ -78,6 +78,7 @@ export { loadSkillsWithInstallInfo } from "${ROOT}/lib/skills-service.ts";
 export { setVisibleSkillsDisabled } from "${ROOT}/lib/skills-management.server.ts";
 export { readPlugins, managePlugins } from "${ROOT}/lib/plugins-service.server.ts";
 export { runPluginMutationTask } from "${ROOT}/lib/plugins-mutation-task.server.ts";
+export { runSkillMutationTask } from "${ROOT}/lib/skills-mutation-task.server.ts";
 export { searchSkills } from "${ROOT}/lib/skills-search.server.ts";
 export { checkManagedPluginUpdates, checkManagedSkillUpdates } from "${ROOT}/lib/updates-management.server.ts";
 `;

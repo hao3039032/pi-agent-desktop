@@ -14,8 +14,7 @@ export async function runPluginMutationTask(
   try {
     result = await managePlugins(input);
   } catch (error) {
-    if (context.signal.aborted) throw Object.assign(new Error("Plugin operation outcome unknown"), { code: "outcome_unknown" });
-    throw error;
+    throw Object.assign(new Error("Plugin operation outcome unknown"), { code: "outcome_unknown", cause: error });
   }
   if (context.signal.aborted) throw Object.assign(new Error("Plugin operation outcome unknown"), { code: "outcome_unknown" });
   context.progress({ phase: "complete" });

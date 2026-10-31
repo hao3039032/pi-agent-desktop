@@ -12,18 +12,21 @@ export function setPluginsEnabled(cwd: string, action: "enable" | "disable", pac
   if (!client) throw new Error("plugins IPC bridge is not configured");
   return client.request("plugins.setEnabled", { cwd, action, packages, single }, { timeoutMs: 60_000 });
 }
-export async function installPluginPackage(cwd: string, source: string, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
+export function installPluginPackage(cwd: string, source: string, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
+  return mutatePluginPackage(cwd, "install", source, scope, signal, onProgress);
+}
+export async function mutatePluginPackage(cwd: string, action: "install" | "remove" | "update", source: string | undefined, scope: PluginScope, signal: AbortSignal, onProgress: (phase: string) => void): Promise<PluginsResponse> {
   if (!client) throw new Error("plugins IPC bridge is not configured");
   const bound = client;
   if (signal.aborted) throw new Error("Installation cancelled before it started");
-  const { handle } = await bound.request<{ handle: string }>("plugins.install.start", { cwd, source, scope });
+  const { handle } = await bound.request<{ handle: string }>(`plugins.${action}.start`, { cwd, source, scope });
   let cancellationSent = false;
   for (;;) {
     if (signal.aborted && !cancellationSent) {
       cancellationSent = true;
-      await bound.request("plugins.install.cancel", { handle });
+      await bound.request("plugins.mutation.cancel", { handle });
     }
-    const task = await bound.request<{ status: string; progress?: { phase?: string }; result?: PluginsResponse; error?: string }>("plugins.install.status", { handle });
+    const task = await bound.request<{ status: string; progress?: { phase?: string }; result?: PluginsResponse; error?: string }>("plugins.mutation.status", { handle });
     if (task.progress?.phase) onProgress(task.progress.phase);
     if (task.status === "succeeded" && task.result) return task.result;
     if (task.status !== "running") throw new Error(task.error || `Installation ${task.status}; outcome may be unknown`);

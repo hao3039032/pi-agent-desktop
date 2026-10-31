@@ -11,7 +11,7 @@ import type {
   ProjectTrustStatus,
 } from "@/lib/api-types";
 import { displayPathWithin, shortenPath } from "@/lib/display-path";
-import { checkSkills, listSkills, searchSkills, setSkillsDisabled } from "@/lib/skills-client";
+import { checkSkills, listSkills, mutateSkill, searchSkills, setSkillsDisabled } from "@/lib/skills-client";
 import {
   getLastSettingsSelection,
   setLastSettingsSelection,
@@ -111,9 +111,11 @@ function SkillDetail({
   updateStatus,
   checkingUpdate,
   updating,
+  updateProgress,
   updateError,
   onCheckUpdate,
   onUpdate,
+  onCancelUpdate,
 }: {
   skill: Skill;
   cwd: string;
@@ -123,9 +125,11 @@ function SkillDetail({
   updateStatus?: SkillUpdateResult;
   checkingUpdate: boolean;
   updating: boolean;
+  updateProgress: string | null;
   updateError: string | null;
   onCheckUpdate: () => void;
   onUpdate: () => void;
+  onCancelUpdate: () => void;
 }) {
   const { t } = useI18n();
   const label = sourceLabel(skill);
@@ -221,6 +225,8 @@ function SkillDetail({
                          : updateStatus?.message || t("i18n.checkFailed")}
               </span>
             )}
+            {updating && updateProgress && <span role="status">{t("i18n.updating")}</span>}
+            {updating && <ConfigButton size="small" onClick={onCancelUpdate}>{t("i18n.cancel")}</ConfigButton>}
             {updateStatus?.state === "update-available" && (
               <ConfigButton
                 variant="primary"
@@ -271,6 +277,8 @@ function AddSkillPanel({
   const [searchError, setSearchError] = useState<string | null>(null);
   const [installing, setInstalling] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
+  const installController = useRef<AbortController | null>(null);
+  const [installProgress, setInstallProgress] = useState<string | null>(null);
   const [newlyInstalledPkgs, setNewlyInstalledPkgs] = useState<Set<string>>(
     new Set(),
   );
@@ -301,17 +309,11 @@ function AddSkillPanel({
     async (pkg: string) => {
       setInstalling(pkg);
       setInstallError(null);
+      const controller = new AbortController();
+      installController.current = controller;
+      setInstallProgress(null);
       try {
-        const res = await fetch("/api/skills/install", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ package: pkg, scope, cwd }),
-        });
-        const d = (await res.json()) as { success?: boolean; error?: string };
-        if (!res.ok || d.error) {
-          setInstallError(d.error ?? `HTTP ${res.status}`);
-          return;
-        }
+        await mutateSkill(cwd, "install", pkg, scope, controller.signal, setInstallProgress);
         setNewlyInstalledPkgs((prev) =>
           new Set(prev).add(`${scope}:${pkg}`),
         );
@@ -319,6 +321,7 @@ function AddSkillPanel({
       } catch (e) {
         setInstallError(String(e));
       } finally {
+        if (installController.current === controller) installController.current = null;
         setInstalling(null);
       }
     },
@@ -389,6 +392,7 @@ function AddSkillPanel({
           </ConfigButton>
         </div>
 
+        {installing && <div>{installProgress && <span role="status">{t("i18n.installing")}</span>} <ConfigButton size="small" onClick={() => installController.current?.abort()}>{t("i18n.cancel")}</ConfigButton></div>}
         {/* Errors */}
         {searchError && (
           <div style={{ fontSize: 12, color: "#f87171" }}>{searchError}</div>
@@ -538,6 +542,8 @@ export function SkillsConfig({
   const [checkingUpdates, setCheckingUpdates] = useState<Set<string>>(new Set());
   const [checkingAll, setCheckingAll] = useState(false);
   const [updatingSkill, setUpdatingSkill] = useState<string | null>(null);
+  const updateController = useRef<AbortController | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<string | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [projectResourcesLoaded, setProjectResourcesLoaded] = useState(true);
 
@@ -623,24 +629,11 @@ export function SkillsConfig({
     const key = updateKey(skill)!;
     setUpdatingSkill(key);
     setUpdateError(null);
+    const controller = new AbortController();
+    updateController.current = controller;
+    setUpdateProgress(null);
     try {
-      const res = await fetch("/api/skills/update", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cwd,
-          package: skill.install.package,
-          scope: skill.install.scope,
-        }),
-      });
-      const data = (await res.json()) as {
-        success?: boolean;
-        skill?: Skill;
-        error?: string;
-      };
-      if (!res.ok || data.error || !data.success) {
-        throw new Error(data.error ?? `HTTP ${res.status}`);
-      }
+      const data = await mutateSkill(cwd, "update", skill.install.package, skill.install.scope, controller.signal, setUpdateProgress);
       await loadSkills();
       const versionHash = data.skill?.install?.versionHash;
       setUpdateStatuses((current) => ({
@@ -656,6 +649,7 @@ export function SkillsConfig({
     } catch (e) {
       setUpdateError(e instanceof Error ? e.message : String(e));
     } finally {
+      if (updateController.current === controller) updateController.current = null;
       setUpdatingSkill(null);
     }
   }, [cwd, loadSkills]);
@@ -905,9 +899,11 @@ export function SkillsConfig({
                     : false
                 }
                 updating={updatingSkill === updateKey(selectedSkill)}
+                updateProgress={updateProgress}
                 updateError={updateError}
                 onCheckUpdate={() => void checkForUpdates(selectedSkill)}
                 onUpdate={() => void updateInstalledSkill(selectedSkill)}
+                onCancelUpdate={() => updateController.current?.abort()}
               />
               ) : (
                 <ConfigEmptyState>{t("i18n.selectSkill")}</ConfigEmptyState>
