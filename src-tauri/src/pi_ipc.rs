@@ -988,6 +988,36 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
             protocol_ok(&id, json!({ "revision": revision }))
         }
+        // The font preferences read (GET /api/appearance/fonts contract):
+        // reads stored fonts from <agent_dir>/pi-web/settings.json.
+        "appearance.fontsGet" => {
+            let agent_dir = state.agent_dir();
+            match crate::fonts::read_font_preferences(&agent_dir) {
+                Ok(fonts) => protocol_ok(&id, json!({ "fonts": fonts })),
+                Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
+        // The font preferences write (PUT /api/appearance/fonts contract):
+        // validates fonts schema, atomic private write preserving unknown fields.
+        "appearance.fontsSet" => {
+            let agent_dir = state.agent_dir();
+            let Some(fonts_val) = args.get("fonts") else {
+                return protocol_error(&id, "invalid_args", "missing fonts payload");
+            };
+            match crate::fonts::write_font_preferences(&agent_dir, fonts_val) {
+                Ok(fonts) => protocol_ok(&id, json!({ "fonts": fonts })),
+                Err(crate::fonts::FontError::InvalidArgs(msg)) => {
+                    protocol_error(&id, "invalid_args", &msg)
+                }
+                Err(crate::fonts::FontError::Io(msg)) => protocol_error(&id, "io", &msg),
+            }
+        }
+        // The native installed system fonts enumeration (GET /api/desktop/fonts contract):
+        // enumerates OS trusted fonts without permanent node/server.
+        "desktop.fonts" => match crate::fonts::list_system_fonts() {
+            Ok(fonts) => protocol_ok(&id, json!({ "fonts": fonts })),
+            Err(error) => protocol_error(&id, "io", &error),
+        },
         // The session FILE INDEX (a host-diagnostic shape the boot page
         // lists projects from — NOT an HTTP method's projection): the
         // per-cwd scan with skipped-file reasons. `sessions.list` below is
@@ -5228,6 +5258,67 @@ mod tests {
             json!({ "v": 1, "id": "sm6", "op": "desktop.writeStateMirror", "args": { "payload": { "revision": 9 } } }),
         );
         assert_eq!(malformed["error"]["code"], "invalid_args");
+    }
+
+    #[test]
+    fn test_font_ops_ipc() {
+        let state = IpcHostState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+
+        // 1. Initial read when settings file doesn't exist returns null
+        let read1 = send(
+            &state,
+            json!({ "v": 1, "id": "f1", "op": "appearance.fontsGet" }),
+        );
+        assert_eq!(read1["ok"], true);
+        assert_eq!(read1["data"]["fonts"], Value::Null);
+
+        // 2. Setting invalid fonts fails with invalid_args
+        let bad = send(
+            &state,
+            json!({ "v": 1, "id": "f2", "op": "appearance.fontsSet", "args": { "fonts": { "ui": "bad; color:red", "mono": "Consolas" } } }),
+        );
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["error"]["code"], "invalid_args");
+
+        // 3. Setting missing fonts payload fails with invalid_args
+        let missing = send(
+            &state,
+            json!({ "v": 1, "id": "f3", "op": "appearance.fontsSet", "args": {} }),
+        );
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["error"]["code"], "invalid_args");
+
+        // 4. Setting valid fonts succeeds and echoes
+        let set = send(
+            &state,
+            json!({ "v": 1, "id": "f4", "op": "appearance.fontsSet", "args": { "fonts": { "ui": "Microsoft YaHei", "mono": "Consolas" } } }),
+        );
+        assert_eq!(set["ok"], true);
+        assert_eq!(set["data"]["fonts"]["ui"], "Microsoft YaHei");
+        assert_eq!(set["data"]["fonts"]["mono"], "Consolas");
+
+        // 5. Subsequent read returns the saved fonts
+        let read2 = send(
+            &state,
+            json!({ "v": 1, "id": "f5", "op": "appearance.fontsGet" }),
+        );
+        assert_eq!(read2["ok"], true);
+        assert_eq!(read2["data"]["fonts"]["ui"], "Microsoft YaHei");
+        assert_eq!(read2["data"]["fonts"]["mono"], "Consolas");
+
+        // 6. desktop.fonts returns array of fonts on supported platform
+        #[cfg(target_os = "linux")]
+        {
+            let fonts = send(
+                &state,
+                json!({ "v": 1, "id": "f6", "op": "desktop.fonts" }),
+            );
+            if fonts["ok"] == true {
+                assert!(fonts["data"]["fonts"].as_array().is_some());
+            }
+        }
     }
 
     #[test]
