@@ -57,6 +57,8 @@ pub struct ManagementInstance {
     /// supplied nonce — or worse, an empty one — would let a forged envelope
     /// from anywhere in the child bind to the management protocol.
     nonce: String,
+    pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>>,
+    _notify_subscription: pi_host::client::UiSubscription,
 }
 
 struct InstanceState {
@@ -81,32 +83,8 @@ impl ManagementInstance {
         let payload = json!({ "op": op, "args": args, "nonce": nonce });
         let token = base64_url_no_pad(&payload.to_string());
 
-        // pi-host's on_ui delivers through a channel: a per-call consumer
-        // thread correlates the envelope by rid (drops everything else).
-        let (notify_tx, notify_rx) = mpsc::channel::<pi_host::client::UiRequest>();
-        let subscription = self.client.on_ui("notify", notify_tx, None);
         let (envelope_tx, envelope_rx) = mpsc::channel::<Value>();
-        let rid_for_router = request_id.clone();
-        let router = std::thread::Builder::new()
-            .name("mgmt-envelope-wait".into())
-            .spawn(move || {
-                while let Ok(request) = notify_rx.recv() {
-                    let Some(message) = request.record.get("message").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let Some(body) = message.strip_prefix("PI_WEB_MGMT_V1 ") else {
-                        continue;
-                    };
-                    let Ok(envelope) = serde_json::from_str::<Value>(body) else {
-                        continue;
-                    };
-                    if envelope.get("rid").and_then(Value::as_str) == Some(rid_for_router.as_str()) {
-                        let _ = envelope_tx.send(envelope);
-                        return;
-                    }
-                }
-            })
-            .map_err(|error| format!("envelope router failed: {error}"))?;
+        self.pending.lock().unwrap().insert(request_id.clone(), envelope_tx);
 
         let result = (|| -> Result<Value, String> {
             let ack = self
@@ -132,10 +110,7 @@ impl ManagementInstance {
                 Err(_) => Err(format!("management op {op} timed out")),
             }
         })();
-        drop(subscription);
-        // Dropping the notify sender ends the router thread on its next
-        // recv (or it already returned with the envelope).
-        let _ = router.join();
+        self.pending.lock().unwrap().remove(&request_id);
         self.touch();
         result
     }
@@ -298,6 +273,19 @@ impl ManagementHost {
     }
 }
 
+fn route_envelope(
+    pending: &Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
+    record: &Value,
+) {
+    let Some(body) = record.get("message").and_then(Value::as_str)
+        .and_then(|message| message.strip_prefix("PI_WEB_MGMT_V1 ")) else { return };
+    let Ok(envelope) = serde_json::from_str::<Value>(body) else { return };
+    let Some(rid) = envelope.get("rid").and_then(Value::as_str) else { return };
+    if let Some(sender) = pending.lock().unwrap().get(rid) {
+        let _ = sender.send(envelope.clone());
+    }
+}
+
 /// base64url without padding (RFC 4648 §5).
 fn base64_url_no_pad(data: &str) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -366,10 +354,24 @@ fn spawn_management(
         SpawnOptions { args, cwd: None, env, ..SpawnOptions::default() },
     )
     .map_err(|error| format!("management instance failed to start: {error}"))?;
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let (notify_tx, notify_rx) = std::sync::mpsc::channel::<pi_host::client::UiRequest>();
+    let notify_subscription = client.on_ui("notify", notify_tx, None);
+    let router_pending = Arc::clone(&pending);
+    std::thread::Builder::new()
+        .name("mgmt-notify-router".into())
+        .spawn(move || {
+            while let Ok(request) = notify_rx.recv() {
+                route_envelope(&router_pending, &request.record);
+            }
+        })
+        .map_err(|error| format!("envelope router failed: {error}"))?;
     Ok(Arc::new(ManagementInstance {
         scope: scope.to_string(),
         nonce,
         client,
+        pending,
+        _notify_subscription: notify_subscription,
         state: Mutex::new(InstanceState {
             lease_until: Instant::now() + IDLE_RECYCLE,
             last_used: Instant::now(),
@@ -507,6 +509,22 @@ fn civil_days_from(y: i64, m: i64, d: i64) -> i64 {
 mod tests {
     use super::*;
     use task_scheduler::CronOracle as _;
+
+    #[test]
+    fn notify_router_correlates_concurrent_replies() {
+        let pending = Mutex::new(HashMap::new());
+        let (a_tx, a_rx) = std::sync::mpsc::channel();
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        pending.lock().unwrap().insert("a".to_string(), a_tx);
+        pending.lock().unwrap().insert("b".to_string(), b_tx);
+        route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"b\",\"nonce\":\"bad\"}"}));
+        route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"a\",\"nonce\":\"good\"}"}));
+        assert_eq!(a_rx.try_recv().unwrap()["nonce"], "good");
+        assert_eq!(b_rx.try_recv().unwrap()["nonce"], "bad");
+        pending.lock().unwrap().remove("a");
+        route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"a\"}"}));
+        assert!(a_rx.try_recv().is_err());
+    }
 
     fn pi_bin() -> Option<String> {
         match std::env::var("PI_CLI_BIN") {
