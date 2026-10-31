@@ -1,7 +1,6 @@
-import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import { existsSync, statSync } from "fs";
 import { resolve } from "path";
 import { NextResponse } from "next/server";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { isChatFolderPath, isChatWorkspacePath } from "@/lib/chat-workspace";
 import { allowFileRoot } from "@/lib/file-access";
 import { getRpcSession } from "@/lib/rpc-manager";
@@ -10,7 +9,7 @@ import {
   readSessionHeader,
   resolveSessionPath,
 } from "@/lib/session-reader";
-import { appendClearedSessionToolSelection } from "@/lib/session-tool-selection";
+import { copyChatToProject } from "@/lib/chat-continue";
 
 export const runtime = "nodejs";
 
@@ -47,26 +46,12 @@ export async function POST(
       return NextResponse.json({ error: "Wait for the chat to finish first" }, { status: 409 });
     }
 
-    const manager = SessionManager.forkFrom(filePath, cwd);
-    // An older chat's transcript pins an empty tool list; the project session follows its own settings.
-    appendClearedSessionToolSelection(manager);
-    // pi restores the tool loadout the transcript declares, which for a chat is `read` and
-    // `codemode` only, so the chat's system messages stay behind.
-    const copiedFile = manager.getSessionFile();
-    if (copiedFile) {
-      try {
-        forgetChatSystemPrompt(copiedFile);
-      } catch (error) {
-        // A copy that still carries the chat's prompt and tool limits would be a broken project session.
-        rmSync(copiedFile, { force: true });
-        throw error;
-      }
-    }
+    const copy = copyChatToProject(filePath, cwd);
     allowFileRoot(cwd);
     invalidateSessionListCache();
     return NextResponse.json({
-      sessionId: manager.getSessionId(),
-      path: manager.getSessionFile() ?? null,
+      sessionId: copy.sessionId,
+      path: copy.path,
       cwd,
       // Files the chat made stay in its folder; the project session starts without them.
       chatFolder: isChatFolderPath(header.cwd) ? header.cwd : null,
@@ -77,40 +62,4 @@ export async function POST(
       { status: 500 },
     );
   }
-}
-
-/**
- * Remove the system messages from a copied transcript, joining the entries around them.
- * They hold the chat's prompt and tool declarations; without them pi builds the project
- * session's own prompt and default tools on its next run, as it does for a new session.
- */
-function forgetChatSystemPrompt(file: string): void {
-  const entries = readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => {
-    try {
-      return JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      return null;
-    }
-  });
-  if (entries.some((entry) => entry === null)) {
-    throw new Error("This chat's transcript is damaged and cannot be continued in a project");
-  }
-  const parents = new Map<string, string | null>();
-  const kept = (entries as Record<string, unknown>[]).filter((entry) => {
-    const message = entry.message as { role?: string } | undefined;
-    if (entry.type === "message" && message?.role === "system" && typeof entry.id === "string") {
-      parents.set(entry.id, (entry.parentId as string | null | undefined) ?? null);
-      return false;
-    }
-    return true;
-  });
-  const survivor = (id: string | null | undefined): string | null => {
-    let current = id ?? null;
-    while (current !== null && parents.has(current)) current = parents.get(current) ?? null;
-    return current;
-  };
-  const rewritten = kept.map((entry) => (
-    "parentId" in entry ? { ...entry, parentId: survivor(entry.parentId as string | null | undefined) } : entry
-  ));
-  writeFileSync(file, `${rewritten.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 }

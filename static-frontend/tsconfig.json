@@ -64,6 +64,18 @@
       "@/lib/scheduled-tasks/client": [
         "./static-frontend/src/data/scheduled-tasks-client.ts"
       ],
+      "@/lib/mcp-sign-in-client": [
+        "./static-frontend/src/data/mcp-sign-in-client.ts"
+      ],
+      "@/lib/distro-service": [
+        "./static-frontend/src/data/distro-service.ts"
+      ],
+      "@/lib/update-service": [
+        "./static-frontend/src/data/update-service.ts"
+      ],
+      "@/lib/mcp-service": [
+        "./static-frontend/src/data/mcp-service.ts"
+      ],
       "@/lib/project-trust-client": [
         "./static-frontend/src/data/project-trust-client.ts"
       ],
@@ -87,6 +99,9 @@
       ],
       "@/lib/session-actions-service": [
         "./static-frontend/src/data/session-actions-service.ts"
+      ],
+      "@/lib/chat-session-service": [
+        "./static-frontend/src/data/chat-session-service.ts"
       ],
       "@/lib/font-service": [
         "./static-frontend/src/data/font-service.ts"

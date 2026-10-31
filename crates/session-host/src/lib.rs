@@ -27,6 +27,7 @@
 pub mod composer_outbox;
 pub mod history;
 pub mod machine;
+mod session_ui;
 pub mod spawn_plan;
 pub use history::{list_session_files, scan_session_file_info, scan_sessions, SessionIndex, SessionSummary};
 pub use machine::{FollowUp, SessionMachine, SessionRunState, StreamingMessage};
@@ -192,7 +193,10 @@ impl RunningSignal {
     }
 }
 
+pub type SessionFenceChecker = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 pub struct Session {
+    fence_checker: SessionFenceChecker,
     /// The registry key (the URL-facing session id).
     pub id: String,
     /// The session file's own header id (the child's sessionId).
@@ -224,6 +228,8 @@ pub struct Session {
     composer_delivering: Mutex<bool>,
     /// Serializes host branch changes against prompt admission and outbox delivery.
     activity_gate: std::sync::RwLock<()>,
+    /// Host-wide policy changes exclude prompt admission and queued delivery.
+    policy_gate: Arc<std::sync::RwLock<()>>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
     /// The registry-wide running-set signal (shared with the relay).
@@ -235,6 +241,7 @@ struct SessionState {
     started_at: Instant,
     last_active: Instant,
     subscribers: Vec<(u64, std::sync::mpsc::Sender<Value>)>,
+    ui: session_ui::SessionUi,
 }
 
 impl Session {
@@ -245,9 +252,16 @@ impl Session {
         data: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
+        let _policy = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
+            Some(self.policy_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session policy change is in progress"))?)
+        } else { None };
         let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
+        if matches!(command, "abort" | "abort_bash") { self.cancel_ui(); }
+        if _admission.is_some() {
+            (self.fence_checker)(&self.id).map_err(pi_host::PiRpcError::invalid)?;
+        }
         let result = self.client.command(command, data, timeout);
         self.touch();
         result
@@ -255,7 +269,9 @@ impl Session {
 
     /// Hold across branch validation and mutation so admissions cannot race it.
     pub fn try_branch_activity(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, &'static str> {
-        self.activity_gate.try_write().map_err(|_| "session is busy")
+        let guard = self.activity_gate.try_write().map_err(|_| "session is busy")?;
+        (self.fence_checker)(&self.id).map_err(|_| "session has an unresolved writer outcome")?;
+        Ok(guard)
     }
 
     /// One bridge request (nonce/session-verified by pi-host).
@@ -277,11 +293,70 @@ impl Session {
     /// detaches; [`Session::unsubscribe`] detaches by id (the IPC layer's
     /// explicit unsubscribe). Returns (subscriber id, receiver).
     pub fn subscribe(&self) -> (u64, std::sync::mpsc::Receiver<Value>) {
+        let (id, rx, _) = self.subscribe_with_ui();
+        (id, rx)
+    }
+
+    /// Atomically subscribe and snapshot the still-pending dialog records.
+    pub fn subscribe_with_ui(&self) -> (u64, std::sync::mpsc::Receiver<Value>, Vec<Value>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut state = self.state.lock().unwrap();
         let id = self.next_subscriber_id();
+        let pending = state.ui.records();
         state.subscribers.push((id, tx));
-        (id, rx)
+        (id, rx, pending)
+    }
+
+    pub fn pending_ui_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().ui.ids()
+    }
+
+    /// Extension status and string-array widget state observed from the child.
+    pub fn extension_ui_state(&self) -> (Vec<Value>, Vec<Value>) {
+        let state = self.state.lock().unwrap();
+        (state.ui.statuses(), state.ui.widgets())
+    }
+
+    /// Consume a current dialog once, with a response appropriate to its method.
+    pub fn respond_ui(&self, id: &str, response: &Value) -> Result<(), &'static str> {
+        let mut state = self.state.lock().unwrap();
+        let (child_id, payload) = state.ui.answer(id, response)?;
+        if !self.client.respond_ui(&child_id, payload) { return Err("session process is closed") }
+        let event = json!({"type":"extension_ui_closed", "id":id});
+        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        Ok(())
+    }
+
+    fn relay_ui(&self, record: Value) {
+        let mut state = self.state.lock().unwrap();
+        let (record, cancel) = state.ui.insert(record);
+        if let Some((child_id, id)) = cancel {
+            self.client.respond_ui(&child_id, json!({"cancelled": true}));
+            let closed = json!({"type":"extension_ui_closed", "id":id});
+            state.subscribers.retain(|(_, tx)| tx.send(closed.clone()).is_ok());
+        }
+        if let Some(record) = record {
+            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+        }
+    }
+
+    fn cancel_ui(&self) {
+        let mut state = self.state.lock().unwrap();
+        let ids = state.ui.ids();
+        for child_id in state.ui.drain() { self.client.respond_ui(&child_id, json!({"cancelled": true})); }
+        for id in ids {
+            let event = json!({"type":"extension_ui_closed", "id":id});
+            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        }
+    }
+
+    fn expire_ui(&self) {
+        let mut state = self.state.lock().unwrap();
+        for (child_id, id) in state.ui.expire() {
+            self.client.respond_ui(&child_id, json!({"cancelled": true}));
+            let event = json!({"type":"extension_ui_closed", "id":id});
+            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        }
     }
 
     /// Detach the subscriber with this id (its relay thread's recv then
@@ -289,6 +364,9 @@ impl Session {
     pub fn unsubscribe(&self, subscriber_id: u64) {
         let mut state = self.state.lock().unwrap();
         state.subscribers.retain(|(id, _)| *id != subscriber_id);
+        if state.subscribers.is_empty() {
+            for id in state.ui.drain() { self.client.respond_ui(&id, json!({"cancelled": true})); }
+        }
     }
 
     fn next_subscriber_id(&self) -> u64 {
@@ -425,7 +503,9 @@ impl Session {
 
     /// The projected run state (a cheap copy for IPC responses).
     pub fn run_state(&self) -> crate::machine::SessionRunState {
-        self.machine.lock().unwrap().state.clone()
+        let mut result = self.machine.lock().unwrap().state.clone();
+        result.pending_ui_request_ids = self.pending_ui_ids();
+        result
     }
 
     /// Wait until the run of `min_epoch` (or later) settled, the child
@@ -525,6 +605,7 @@ impl Session {
         // A shutdown while a settle waiter sleeps must wake it at once (the
         // fan thread's exit wake covers a child-side exit; this covers the
         // host-ordered one — remove/evict during an in-flight delivery).
+        self.cancel_ui();
         let exit = self.client.close(grace);
         self.settle_cv.notify_all();
         exit
@@ -639,6 +720,7 @@ pub enum SessionWriterError<E> {
 
 /// The registry: one child per active session id, shared concurrent starts.
 pub struct SessionRegistry {
+    fence_checker: SessionFenceChecker,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// One in-flight spawn per id (rpc-manager's `__piStartLocks`): the
     /// first caller spawns, the rest wait on the mutex and read the result
@@ -651,6 +733,7 @@ pub struct SessionRegistry {
     composer_outboxes: Mutex<HashMap<String, Arc<composer_outbox::ComposerOutbox>>>,
     /// The running-set change signal the running stream derives on.
     running_signal: Arc<RunningSignal>,
+    policy_gate: Arc<std::sync::RwLock<()>>,
 }
 
 impl Default for SessionRegistry {
@@ -661,11 +744,23 @@ impl Default for SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
+        Self::with_fence_checker(Arc::new(|_| Err("session fence checker is not configured".into())))
+    }
+
+    pub fn with_fence_checker(fence_checker: SessionFenceChecker) -> Self {
+        Self::with_policy_gate_and_fence_checker(Arc::new(std::sync::RwLock::new(())), fence_checker)
+    }
+
+    pub fn with_policy_gate_and_fence_checker(
+        policy_gate: Arc<std::sync::RwLock<()>>, fence_checker: SessionFenceChecker,
+    ) -> Self {
         Self {
+            fence_checker,
             sessions: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
             composer_outboxes: Mutex::new(HashMap::new()),
             running_signal: Arc::new(RunningSignal::default()),
+            policy_gate,
         }
     }
 
@@ -698,6 +793,7 @@ impl SessionRegistry {
     ) -> Result<T, SessionWriterError<E>> {
         let lock = self.start_lock_for(id);
         let _start = lock.lock().unwrap();
+        (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         // Include exited entries: their in-flight delivery can still restore an
         // unknown message to the persistent outbox after the process exits.
         let session = self.sessions.lock().unwrap().get(id).cloned();
@@ -735,6 +831,7 @@ impl SessionRegistry {
             });
         }
         for (id, session) in ids.iter().zip(&sessions) {
+            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
             if self.composer_outbox_for(id).has_pending_or_in_flight()
                 || session.as_ref().is_some_and(|session| session.run_state().is_running()) {
                 return Err(SessionWriterError::Busy("session is running or has pending messages"));
@@ -792,13 +889,10 @@ impl SessionRegistry {
         &self, id: &str, session_file: &Path, session_file_id: &str, cwd: &Path,
         plan: impl FnOnce() -> Result<SessionSpawnConfig, String>,
     ) -> Result<Arc<Session>, SessionHostError> {
-        if let Some(existing) = self.get(id) {
-            if !existing.is_idle_expired() {
-                return Ok(existing);
-            }
-        }
+        let _policy = self.policy_gate.try_read().map_err(|_| SessionHostError::Spawn("session policy change is in progress".to_string()))?;
         let lock = self.start_lock_for(id);
         let _guard = lock.lock().unwrap();
+        (self.fence_checker)(id).map_err(SessionHostError::Spawn)?;
         // Won the lock: re-check (another caller may have finished spawning).
         if let Some(existing) = self.get(id) {
             if existing.is_idle_expired() {
@@ -833,6 +927,8 @@ impl SessionRegistry {
             &config,
             composer_outbox,
             Arc::clone(&self.running_signal),
+            Arc::clone(&self.policy_gate),
+            Arc::clone(&self.fence_checker),
         )?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
         Ok(session)
@@ -940,6 +1036,8 @@ fn spawn_session(
     config: &SessionSpawnConfig,
     composer_outbox: Arc<composer_outbox::ComposerOutbox>,
     running_signal: Arc<RunningSignal>,
+    policy_gate: Arc<std::sync::RwLock<()>>,
+    fence_checker: SessionFenceChecker,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -1086,7 +1184,7 @@ fn spawn_session(
 
     let client = PiRpcClient::spawn(
         &config.executable,
-        SpawnOptions { args, cwd: Some(cwd.to_path_buf()), env, ..SpawnOptions::default() },
+        SpawnOptions { args, cwd: Some(cwd.to_path_buf()), env, ui_attach_timeout: Some(Duration::from_secs(30)), ..SpawnOptions::default() },
     )
     .map_err(|error| SessionHostError::Spawn(error.to_string()))?;
 
@@ -1102,18 +1200,20 @@ fn spawn_session(
     // resumed id inherits the queue an evicted child left behind — and the
     // generation its removal raised: the old child's drain is fenced).
     let composer_generation = composer_outbox.generation();
+    let (ui_tx, ui_rx) = std::sync::mpsc::sync_channel(64);
     let state = Arc::new(Session {
         id: id.to_string(),
         session_file_id: session_file_id.to_string(),
         session_file: session_file.to_path_buf(),
         cwd: cwd.to_path_buf(),
         client: Arc::clone(&client),
-        bridge: Bridge::attach(Arc::clone(&client), session_file_id.to_string(), nonce),
+        bridge: Bridge::attach_with_ui_forward(Arc::clone(&client), session_file_id.to_string(), nonce, ui_tx.clone()),
         state: Mutex::new(SessionState {
             lease_until: Instant::now() + IDLE_TIMEOUT,
             started_at: Instant::now(),
             last_active: Instant::now(),
             subscribers: Vec::new(),
+            ui: session_ui::SessionUi::default(),
         }),
         epoch: AtomicU64::new(1),
         machine: Mutex::new(crate::machine::SessionMachine::new(session_file_id)),
@@ -1121,9 +1221,30 @@ fn spawn_session(
         composer_generation,
         composer_delivering: Mutex::new(false),
         activity_gate: std::sync::RwLock::new(()),
+        policy_gate,
+        fence_checker,
         settle_cv: std::sync::Condvar::new(),
         running_signal,
     });
+    {
+        let guards: Vec<_> = ["select", "confirm", "input", "editor", "setStatus", "setWidget", "setTitle", "set_editor_text"]
+            .iter().map(|method| client.on_ui_bounded(method, ui_tx.clone())).collect();
+        drop(ui_tx);
+        client.end_ui_attach_window();
+        let weak = Arc::downgrade(&state);
+        std::thread::Builder::new().name(format!("session-ui-{id}")).spawn(move || {
+            let _guards = guards;
+            loop {
+                let Some(session) = weak.upgrade() else { break };
+                if session.client.has_exited() { session.cancel_ui(); break }
+                match ui_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(request) => session.relay_ui(request.record),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => session.expire_ui(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }).map_err(|error| SessionHostError::Spawn(error.to_string()))?;
+    }
     {
         let fan = Arc::clone(&state);
         std::thread::Builder::new()
@@ -1840,6 +1961,26 @@ mod running_signal_tests {
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;
+
+    struct SessionRegistry;
+    impl SessionRegistry {
+        fn new() -> super::SessionRegistry {
+            super::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+        }
+    }
+
+    #[test]
+    fn session_fence_refuses_offline_writers_and_starts() {
+        let checker: SessionFenceChecker = Arc::new(|id| {
+            if id == "blocked" { Err("unknown writer outcome".into()) } else { Ok(()) }
+        });
+        let registry = super::SessionRegistry::with_fence_checker(checker);
+        let result = registry.with_offline_session_writer("blocked", Duration::from_millis(1), || Ok::<_, ()>(()));
+        assert!(matches!(result, Err(SessionWriterError::Busy(_))));
+        let result = registry.start_with_plan("blocked", Path::new("/missing"), "blocked", Path::new("/"), || unreachable!());
+        assert!(matches!(result, Err(SessionHostError::Spawn(message)) if message.contains("unknown writer outcome")));
+        assert!(registry.with_idle_session_writer("other", |_| Ok::<_, ()>(())).is_ok());
+    }
 
     #[test]
     fn idle_writer_rejects_unknown_queue_and_serializes_stale_start() {

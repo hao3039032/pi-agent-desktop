@@ -3,15 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { revealItemInDirNative } from "@/lib/desktop-native";
 import { isTauriDesktop } from "@/lib/desktop-updater";
-
-export interface ChatAccessState {
-  chat: boolean;
-  /** The chat's own folder (null for a legacy chat). */
-  folder: string | null;
-  unlocked: boolean;
-  /** The chat has a folder and the server is local, so it can be unlocked. */
-  available: boolean;
-}
+import { getChatAccess, setChatAccess, type ChatAccessState } from "@/lib/chat-session-service";
 
 export interface ChatAccessControls {
   state: ChatAccessState;
@@ -41,8 +33,7 @@ export function useChatAccess(
     setError(null);
     if (!enabled || !sessionId) return;
     let active = true;
-    fetch(`/api/sessions/${encodeURIComponent(sessionId)}/chat-access`, { cache: "no-store" })
-      .then(async (res) => (res.ok ? await res.json() as ChatAccessState : null))
+    getChatAccess(sessionId)
       .then((next) => { if (active && next?.chat) setState(next); })
       .catch(() => undefined);
     return () => { active = false; };
@@ -75,13 +66,7 @@ export function useChatAccess(
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/chat-access`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ unlocked }),
-      });
-      const data = await res.json().catch(() => ({})) as { error?: string };
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      await setChatAccess(sessionId, unlocked);
       setState((current) => (current ? { ...current, unlocked } : current));
       await onRebuilt?.();
       return true;

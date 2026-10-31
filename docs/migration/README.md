@@ -2,7 +2,11 @@
 
 总计划见 `plans/2026-10-31-去-next-js-静态前端-tauri-rust-应用宿主完整迁移计划.md`。本目录存放迁移的落地工件；按里程碑（M0–M5）推进，每个阶段的验证门槛以计划 §八–§九 为准。
 
-## 当前状态（M0 完成主体；见下方「当前状态（M0–M2 进行中）」最新进展）
+## 最新状态
+
+当前集成情况、在实施领域及 M5 阻塞项见 **[status.md](status.md)**。下文保留早期 PoC/测试工件的历史记录，不代表最新完成度；其中旧的「未迁移」列表、测试计数及打包描述不能用作本轮验收结论。正式产品尚未切离 Next。
+
+## 历史状态（M0 主体）
 
 | 项 | 状态 | 工件 |
 |---|---|---|
@@ -19,7 +23,7 @@
 
 ## 如何跑真实 pi 测试
 
-真实 pi 测试（Rust `crates/pi-host/tests/real_pi.rs`、JS `lib/pi-rpc/*.smoke.test.mjs`、`scripts/migration/management-deps-loading.test.mjs`）都以 `PI_CLI_BIN` 门控，未设置时跳过。开发机上直接指向本地托管安装即可（它就是桌面随包的 release 目录布局）：
+真实 pi 测试（Rust `crates/pi-host/tests/real_pi.rs`、JS `lib/pi-rpc/*.smoke.test.mjs`、`scripts/migration/management-deps-loading.test.mjs`）以 `PI_CLI_BIN` 门控，未设置时跳过。开发机可以指向本地托管安装验证行为；它不证明 genuine standalone 发布包的模块布局，后者必须另测：
 
 ```bash
 PI_CLI_BIN=$HOME/.pi/agent/bin/pi npm test          # 全量套件含真实 pi 冒烟（3629 个，0 跳过）
@@ -28,7 +32,7 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 
 所有真实 pi 测试都跑在隔离沙箱（临时 `PI_CODING_AGENT_DIR`、临时 cwd），不碰真实 `~/.pi/agent` 数据。
 
-## 当前状态（M0–M2 进行中；两轮审计修复已落地）
+## 历史状态（早期 M0–M2；两轮审计修复记录）
 
 > **准确边界**：下表只对**已实现且有测试证据**的项打勾。整体迁移远未完成：
 > 数据域大部分仍走 HTTP、主机层命令未实现、调度器未接产、打包未验收。

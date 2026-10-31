@@ -25,6 +25,9 @@ task-scheduler = { path = "../crates/task-scheduler" }
 resource-protocol = { path = "../crates/resource-protocol" }
 session-host = { path = "../crates/session-host" }
 base64 = "0.22"
+chrono = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "system-proxy"] }
+semver = "1"
 dunce = "1"
 getrandom = "0.3"
 libc = "0.2"

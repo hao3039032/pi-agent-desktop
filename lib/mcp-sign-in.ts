@@ -274,6 +274,7 @@ interface Flow {
   /** Answers the SDK's prompt, while it waits. */
   prompt?: (value: string | undefined) => void;
   sawPage: boolean;
+  completion?: Promise<void>;
   alreadySignedIn?: true;
   refreshed?: true;
   result?: McpTestResult;
@@ -587,8 +588,13 @@ export function startMcpSignIn(
   active.set(key, flow.id);
   prune(flows);
   armExpiry(flow, ttlMs);
-  void runFlow(flow, deps);
+  flow.completion = runFlow(flow, deps);
   return { flow: describeFlow(flow), joined: false };
+}
+
+/** Wait for the flow's connection and SDK cleanup, including after cancellation. */
+export function mcpSignInCompletion(flowId: string): Promise<void> | undefined {
+  return registry().flows.get(flowId)?.completion;
 }
 
 /** A flow as the browser polls it; undefined once it is forgotten (`MCP_SIGN_IN_KEEP_MS` after it ended) or unknown. */

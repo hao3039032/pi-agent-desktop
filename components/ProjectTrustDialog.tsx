@@ -22,6 +22,7 @@ import {
   revealHiddenCharacters,
 } from "@/lib/mcp-server-display";
 import { openStackedDialog } from "@/lib/stacked-dialog";
+import { fetchProjectTrustOverview } from "@/lib/project-trust-client";
 
 /** How long the dialog waits for the listing before it stops holding Trust back. */
 export const MCP_LISTING_TIMEOUT_MS = 10_000;
@@ -137,11 +138,10 @@ export function ProjectTrustDialog({
       timedOut = true;
       controller.abort();
     }, MCP_LISTING_TIMEOUT_MS);
-    fetch(`/api/project-trust?cwd=${encodeURIComponent(cwd)}`, { signal: controller.signal, cache: "no-store" })
-      .then(async (response) => {
-        const data = await response.json() as Partial<ProjectTrustResponse & McpErrorResponse>;
+    fetchProjectTrustOverview(cwd, controller.signal)
+      .then((response) => {
         if (!active) return;
-        const next = projectTrustListingFrom(response.ok, response.status, data);
+        const next = projectTrustListingFrom(response.ok, response.status, response.data);
         setListing(next);
         if (next.state === "loaded" && next.status) onStatusRef.current?.(next.status);
       })

@@ -202,6 +202,14 @@ test("close detaches the subscription (no further delivery)", () => {
 
 // --- agent-client error mapping ---------------------------------------------
 
+test("extension UI replies use the dedicated session-bound IPC operation", async () => {
+  let received;
+  const mock = new MockTransport().on("agent.respondUi", (args) => { received = args; return { ok: true }; });
+  bindAgentClient(mock);
+  await sendAgentCommand("session-a", { type: "extension_ui_response", id: "ui-1", confirmed: false });
+  assert.deepEqual(received, { session: "session-a", type: "extension_ui_response", id: "ui-1", confirmed: false });
+});
+
 test("agent-client failures keep the HTTP-shaped error contract", async () => {
   const mock = new MockTransport();
   // The mock answers an error envelope (unknown op) — the client maps it.

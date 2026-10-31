@@ -10,9 +10,17 @@ use std::time::Duration;
 use serde_json::json;
 
 use session_host::{
-    create_session_file, dispatch_session_op, SessionHostError, SessionRegistry,
+    create_session_file, dispatch_session_op, SessionHostError,
     SessionSpawnConfig, IDLE_TIMEOUT,
 };
+
+// Every lifecycle fixture opts into an isolated, unrestricted checker.
+struct SessionRegistry;
+impl SessionRegistry {
+    fn new() -> session_host::SessionRegistry {
+        session_host::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+    }
+}
 
 fn pi_bin() -> Option<String> {
     match std::env::var("PI_CLI_BIN") {
@@ -222,6 +230,57 @@ fn real_pi_session_lifecycle() {
     // Explicit remove of a missing id is None.
     assert!(registry.remove("url-id-1", Duration::from_secs(5)).is_none());
     let _ = IDLE_TIMEOUT;
+}
+
+#[test]
+fn real_pi_extension_dialog_reply_and_timeout() {
+    let Some(executable) = pi_bin() else { eprintln!("skipping: PI_CLI_BIN not set"); return };
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let extension = dir.path().join("dialog.mjs");
+    let result = dir.path().join("result.json");
+    std::fs::write(&extension, format!(r#"
+import {{ writeFileSync }} from 'node:fs';
+export default function(pi) {{
+  pi.registerCommand('fixture-dialog', {{ handler: async (_args, ctx) => {{
+    const confirmed = await ctx.ui.confirm('Proceed?', 'fixture');
+    const input = await ctx.ui.input('Input', 'fixture', {{ timeout: 500 }});
+    writeFileSync({result:?}, JSON.stringify({{ confirmed, input: input ?? null }}));
+  }} }});
+}}
+"#, result = result.to_string_lossy())).unwrap();
+    let (file, file_id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let mut cfg = config(&executable, &agent_dir);
+    cfg.extra_args.extend(["--extension".into(), extension.to_string_lossy().into_owned()]);
+    let registry = SessionRegistry::new();
+    let session = registry.start("ui-test", &file, &file_id, &cwd, &cfg).unwrap();
+    let (_subscriber, events, _) = session.subscribe_with_ui();
+    let prompting = Arc::clone(&session);
+    let handle = std::thread::spawn(move || prompting.command("prompt", json!({"message":"/fixture-dialog"}), Some(Duration::from_secs(10))));
+    let confirm = loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).expect("confirm event");
+        if event["method"] == "confirm" { break event }
+    };
+    let id = confirm["id"].as_str().unwrap();
+    assert!(session.respond_ui(id, &json!({"confirmed": true})).is_ok());
+    assert!(session.respond_ui(id, &json!({"confirmed": true})).is_err());
+    let input = loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).expect("input event");
+        if event["method"] == "input" { break event }
+    };
+    let input_id = input["id"].as_str().unwrap().to_owned();
+    loop {
+        let event = events.recv_timeout(Duration::from_secs(10)).expect("close event");
+        if event["type"] == "extension_ui_closed" && event["id"] == input_id { break }
+    }
+    assert!(session.respond_ui(&input_id, &json!({"value":"late"})).is_err());
+    handle.join().unwrap().unwrap();
+    let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(result).unwrap()).unwrap();
+    assert_eq!(data, json!({"confirmed":true, "input":null}));
+    registry.remove("ui-test", Duration::from_secs(5));
 }
 
 #[test]
@@ -1187,6 +1246,38 @@ fn a_replaced_sessions_inflight_drain_only_parks_its_own_item() {
     assert_eq!(log_lines(&log_old), vec!["A".to_string()], "the old child saw A exactly once");
     assert_eq!(log_lines(&log_new), vec!["A".to_string()], "the new child saw A exactly once");
     registry.remove(&id, Duration::from_secs(5));
+}
+
+#[test]
+fn session_writer_fence_blocks_live_admissions_and_drain() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, _) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let id = "fenced-live";
+    let log = dir.path().join("prompts.log");
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&dir.path().join("agent"), &[
+        "--mock-session-id", id, "--mock-commands", &commands,
+        "--mock-prompt-log", log.to_str().unwrap(),
+    ]);
+    let fenced = Arc::new(AtomicBool::new(false));
+    let checker_flag = Arc::clone(&fenced);
+    let registry = session_host::SessionRegistry::with_fence_checker(Arc::new(move |_| {
+        if checker_flag.load(Ordering::SeqCst) { Err("unknown writer outcome".into()) } else { Ok(()) }
+    }));
+    let session = registry.start(id, &file, id, &cwd, &config).unwrap();
+    fenced.store(true, Ordering::SeqCst);
+    assert!(registry.start(id, &file, id, &cwd, &config).is_err());
+    assert!(session.command("prompt", json!({"message":"blocked"}), Some(Duration::from_secs(2))).is_err());
+    assert!(session.composer_enqueue("blocked", None).is_err());
+    session.composer_outbox.enqueue("queued", None).unwrap();
+    session.composer_wake();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(session.composer_outbox.has_items());
+    assert!(log_lines(&log).is_empty());
+    registry.remove(id, Duration::from_secs(5));
 }
 
 /// Terra round-4 (the reviewer's exact window): an old drain parked between

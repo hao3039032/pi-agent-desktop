@@ -32,6 +32,8 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// outlive the request that opened them.
 pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
+    /// Global policy transaction gate shared with session admission and drains.
+    pub(crate) policy_gate: Arc<std::sync::RwLock<()>>,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -62,8 +64,9 @@ pub struct IpcHostState {
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
+    mcp_signin_tasks: Mutex<BTreeSet<String>>,
     /// The scheduled-task store root (the agent dir the host runs against).
-    pub task_agent_dir: Mutex<Option<PathBuf>>,
+    pub task_agent_dir: Arc<Mutex<Option<PathBuf>>>,
     pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
@@ -91,10 +94,21 @@ pub struct IpcHostState {
     /// changes the list a client holds (a create, a rename). Clients compare
     /// and refetch — the cross-window staleness contract.
     session_list_version: Arc<AtomicU64>,
+    /// Set only by a future packaged static-app startup path, never by IPC.
+    chat_unlock_policy: ChatUnlockPolicy,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
     dispatch_gate: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatUnlockPolicy {
+    Denied,
+    // Reserved for the packaged WebviewUrl::App startup, not the current
+    // external Next window or the HTTP test harness.
+    #[allow(dead_code)]
+    StaticPackaged,
 }
 
 /// Handle that ends one event-stream relay thread on unsubscribe.
@@ -106,10 +120,37 @@ struct EventRelayHandle {
 }
 
 impl IpcHostState {
+    pub(crate) fn chat_unlock_permitted(&self) -> bool {
+        self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allow_chat_unlock_for_test(&mut self) {
+        self.chat_unlock_policy = ChatUnlockPolicy::StaticPackaged;
+    }
+
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
+        let policy_gate = Arc::new(std::sync::RwLock::new(()));
+        let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
+        let fence_agent_dir = Arc::clone(&task_agent_dir);
+        let admitted_agent_dir = Mutex::new(None::<PathBuf>);
+        let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
+            let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
+                .clone().ok_or_else(|| "Agent directory unavailable".to_string())?;
+            let mut admitted = admitted_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?;
+            if admitted.as_ref().is_some_and(|previous| previous != &agent) {
+                return Err("Agent directory changed after session admission".into());
+            }
+            *admitted = Some(agent.clone());
+            if crate::trust_policy_fence::is_pending(&agent) {
+                return Err("Trust policy outcome is unresolved; session admission is blocked".into());
+            }
+            crate::session_writer_fence::assert_session_writable(&agent, id)
+        });
         Self {
-            registry: Arc::new(SessionRegistry::new()),
+            registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
+            policy_gate,
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -122,7 +163,8 @@ impl IpcHostState {
             terminal_test_shell: Mutex::new(None),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
-            task_agent_dir: Mutex::new(None),
+            mcp_signin_tasks: Mutex::new(BTreeSet::new()),
+            task_agent_dir,
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),
@@ -145,6 +187,7 @@ impl IpcHostState {
             session_exports: Mutex::new(std::collections::VecDeque::new()),
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
+            chat_unlock_policy: ChatUnlockPolicy::Denied,
         }
     }
 
@@ -235,8 +278,27 @@ impl IpcHostState {
     }
 
     /// Whether the host itself proposed this exact path.
-    fn is_proposed(&self, path: &str) -> bool {
+    pub(crate) fn is_proposed(&self, path: &str) -> bool {
         self.proposed_paths.lock().unwrap().contains(path)
+    }
+
+    /// Recover a persisted workspace from the host's session headers even if
+    /// cwd validation races the first sidebar scan. Frontend paths alone grant nothing.
+    fn discover_session_cwd(&self, cwd: &Path) {
+        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return; }
+        let index = session_host::scan_sessions(&self.agent_dir());
+        if index.projects.keys().any(|known| Path::new(known) == cwd) {
+            let agent_dir = self.agent_dir();
+            let is_chat = crate::session_view::is_chat_workspace_path(cwd, &agent_dir);
+            let in_chat = crate::worktrees::is_chat_area(cwd, &agent_dir);
+            if cwd.exists() && is_chat != in_chat { return; }
+            self.propose_path(cwd);
+            if !cwd.exists() {
+                // A deleted session cwd is still a known lexical root for the
+                // read-only missing status; it cannot authorize existing files.
+                self.file_roots.lock().unwrap().add(cwd);
+            }
+        }
     }
 
     /// The agent dir this host runs against (sessions.list, the task store).
@@ -527,7 +589,7 @@ pub fn pi_ipc_subscribe_events(
     );
     let subscription_id_for_relay = subscription_id.clone();
     let epoch = session_handle.epoch();
-    let (subscriber_id, events) = session_handle.subscribe();
+    let (subscriber_id, events, pending_ui) = session_handle.subscribe_with_ui();
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -561,12 +623,19 @@ pub fn pi_ipc_subscribe_events(
                 "state": session_run_state_json(&session_handle),
                 // The SSE `connected` contract: the client reconciles its
                 // dialog queue against what the session still holds.
-                "pendingExtensionUiIds": session_handle.run_state().pending_ui_request_ids,
+                "pendingExtensionUiIds": pending_ui.iter().filter_map(|record| record.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
             });
             seq += 1;
             if on_event.send(stream_frame(&subscription_id, epoch, seq, "snapshot", snapshot)).is_err() {
                 detach(subscriber_id);
                 return;
+            }
+            for record in pending_ui {
+                seq += 1;
+                if on_event.send(stream_frame(&subscription_id, epoch, seq, "event", record)).is_err() {
+                    detach(subscriber_id);
+                    return;
+                }
             }
             loop {
                 if stop_for_relay.load(Ordering::SeqCst) {
@@ -1237,10 +1306,31 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "sessions.chatAccessGet" => match crate::chat_sessions::get_access(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "sessions.search" => match crate::session_search::search(state, &args) {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "sessions.thinking" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
+            let index = args.get("blockIndex").and_then(Value::as_u64);
+            if sid.is_empty() || entry.is_empty() || entry.len() > 256 || index.is_none() || index.is_some_and(|n| n > 9_007_199_254_740_991) {
+                return protocol_error(&id, "invalid_args", "session, entryId and a valid blockIndex are required");
+            }
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            match file {
+                Some(file) => match management_call(state, "session.readThinking", json!({"file":file.display().to_string(),"entryId":entry,"blockIndex":index})) {
+                    Ok(data) => protocol_ok(&id, data),
+                    Err((code, message)) => protocol_error(&id, &code, &message),
+                },
+                None => protocol_error(&id, "not_found", "session not found"),
+            }
+        }
         "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
@@ -1253,6 +1343,14 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // exists. All host-side (the home dir, the hidden chat root, the
         // scratch cwd, project validation) — the frontend never chooses what
         // gets proposed for browsing.
+        "cwd.status" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str) else { return protocol_error(&id, "invalid_args", "An absolute cwd is required"); };
+            state.discover_session_cwd(Path::new(cwd));
+            match crate::workspace_status::status(&state.file_roots.lock().unwrap(), cwd) {
+                Ok(result) => protocol_ok(&id, result),
+                Err((code, message)) => protocol_error(&id, code, message),
+            }
+        }
         "cwd.home" => {
             let home = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
@@ -1290,17 +1388,64 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
-        // GET /api/project-trust's status half: the trust banner's mount
-        // probe (requiresTrust/trusted/decision/…). The MCP listing and the
-        // POST (trusting a folder) stay on the HTTP domain until their M3
-        // migration; this op covers exactly the read the UI performs on
-        // every workspace switch.
+        // GET /api/project-trust: the trust banner's mount probe and the
+        // project trust dialog.
         "trust.status" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
                 return protocol_error(&id, "invalid_params", "trust.status needs a cwd");
             };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
             let agent_dir = state.agent_dir();
-            protocol_ok(&id, crate::session_view::project_trust_status(&agent_dir, Path::new(cwd)))
+            let mut status = crate::session_view::project_trust_status(&agent_dir, Path::new(cwd));
+            {
+                let call_args = json!({ "cwd": cwd, "agentDir": agent_dir.to_string_lossy(), "allowedRoots": state.file_roots.lock().unwrap().snapshot() });
+                if let Ok(listing) = management_call(state, "trust.projectListing", call_args) {
+                    if let Some(mcp_file) = listing.get("mcpFile") {
+                        status["mcpFile"] = mcp_file.clone();
+                    }
+                    if let Some(mcp_servers) = listing.get("mcpServers") {
+                        status["mcpServers"] = mcp_servers.clone();
+                    }
+                    if let Some(mcp_error) = listing.get("mcpError") {
+                        status["mcpError"] = mcp_error.clone();
+                    }
+                } else {
+                    status["mcpServers"] = json!([]);
+                    status["mcpError"] = json!("Could not read the project's MCP listing");
+                }
+            }
+            protocol_ok(&id, status)
+        }
+        "trust.set" => {
+            let _policy = match state.policy_gate.try_write() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session admission is in progress"),
+            };
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
+                return protocol_error(&id, "invalid_params", "trust.set needs a cwd");
+            };
+            if let Err(error) = validate_scoped_cwd(state, cwd) {
+                return protocol_error(&id, error.0.as_str(), &error.1);
+            }
+            let agent_dir = state.agent_dir();
+            let current = crate::session_view::project_trust_status(&agent_dir, Path::new(cwd));
+            if current.get("requiresTrust").and_then(Value::as_bool) != Some(true) {
+                return protocol_error(&id, "trust-not-required", "This project has no resources that require trust");
+            }
+            for sid in state.registry.ids() {
+                if let Some(session) = state.registry.get(&sid) {
+                    if session.run_state().is_running() {
+                        return protocol_error(&id, "session-busy", "Wait for the active session to finish before trusting this project");
+                    }
+                }
+            }
+            let call_args = json!({ "cwd": cwd, "agentDir": agent_dir.to_string_lossy() });
+            match management_call(state, "trust.set", call_args) {
+                Ok(new_status) => mcp_management_response(&id, new_status),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
         }
         // POST /api/agent/new: a brand-new session (the factory + the
         // route's contract — cwd validation, the chat folder factory, the
@@ -1325,6 +1470,17 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     protocol_ok(&id, data)
                 }
                 Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        }
+        "agent.respondUi" => {
+            let session_id = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let request_id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            match state.registry.get(session_id) {
+                Some(session) => match session.respond_ui(request_id, &args) {
+                    Ok(()) => protocol_ok(&id, json!({ "ok": true })),
+                    Err(message) => protocol_error(&id, "invalid_params", message),
+                },
+                None => protocol_error(&id, "not_found", "session is not running"),
             }
         }
         "sessions.runState" | "agent.interrupt" | "agent.setSessionName" | "agent.runState"
@@ -1711,6 +1867,28 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // (readRedactedModelsConfig), so a stored literal apiKey can never
         // reach the frontend. No cwd scope — models.json is a global file
         // read, like the route's bare GET.
+        "updates.check" => {
+            let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+            match crate::update_check::check(&state.agent_dir(), refresh) {
+                Ok(result) => protocol_ok(&id, result),
+                Err(message) => protocol_error(&id, "io", &message),
+            }
+        },
+        "distro.status" => match management_call(state, "distro.status", json!({})) {
+            Ok(status) => protocol_ok(&id, status),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "distro.configure" => {
+            if !args["baseUrl"].is_string() || !args["apiKey"].is_string() || !args["useNpmMirror"].is_boolean() {
+                return protocol_error(&id, "invalid_args", "Invalid distro configuration");
+            }
+            match management_call(state, "distro.configure", json!({
+                "baseUrl": args["baseUrl"], "apiKey": args["apiKey"], "useNpmMirror": args["useNpmMirror"]
+            })) {
+                Ok(status) => protocol_ok(&id, status),
+                Err((code, message)) => protocol_error(&id, &code, &message),
+            }
+        },
         "modelsConfig.get" => match management_call(state, "modelsConfig.get", json!({})) {
             Ok(config) => protocol_ok(&id, config),
             Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
@@ -1875,6 +2053,81 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             match crate::provider_auth::dispatch(state, op, &id, &args) {
                 Some(answer) => answer,
                 None => protocol_error(&id, "unknown_op", &format!("unknown operation: {op}")),
+            }
+        }
+        // --- MCP management (M3) ---
+        "mcp.signInStart" | "mcp.signInStatus" | "mcp.signInSubmit" | "mcp.signInCancel" => {
+            mcp_signin_dispatch(state, op, &id, &args)
+        }
+        "mcp.test" => {
+            let Some(body) = args.as_object() else { return protocol_error(&id, "invalid_args", "Expected an MCP test object"); };
+            if body.keys().any(|key| !["scope", "name", "cwd"].contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
+                return protocol_error(&id, "invalid_args", "Invalid MCP test fields");
+            }
+            if let Some(cwd) = args.get("cwd").and_then(Value::as_str) {
+                if let Err(error) = validate_scoped_cwd(state, cwd) { return mcp_cwd_error(&id, &error); }
+            }
+            let mut payload = args.clone();
+            payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
+            payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+            match management_call(state, "mcp.test", payload) {
+                Ok(result) => mcp_management_response(&id, result),
+                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+            }
+        }
+        "mcp.configGet" => {
+            let cwd = args.get("cwd").and_then(Value::as_str);
+            let agent_dir = state.agent_dir();
+            let mut payload = json!({ "agentDir": agent_dir.to_string_lossy(), "allowedRoots": state.file_roots.lock().unwrap().snapshot() });
+            if let Some(cwd) = cwd {
+                if let Err(error) = validate_scoped_cwd(state, cwd) {
+                    return mcp_cwd_error(&id, &error);
+                }
+                payload["cwd"] = json!(cwd);
+                match management_call(state, "mcp.configGet", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            } else {
+                match management_call(state, "mcp.configGet", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            }
+        }
+        "mcp.configAction" => {
+            let Some(body) = args.as_object() else {
+                return protocol_error(&id, "invalid_args", "Expected an MCP action object");
+            };
+            let allowed: &[&str] = match body.get("action").and_then(Value::as_str) {
+                Some("enable" | "disable" | "remove" | "sign-out") => &["action", "cwd", "scope", "name"],
+                Some("set-exposure") => &["action", "cwd", "scope", "name", "exposure"],
+                Some("set-enabled") => &["action", "cwd", "enabled", "servers"],
+                Some("undo") => &["action", "cwd", "token"],
+                Some("add") => &["action", "cwd", "scope", "text", "values", "secretReferences", "server", "name", "rawPi", "trustFolder", "confirmHostEnv"],
+                _ => return protocol_error(&id, "invalid_args", "Unknown MCP action"),
+            };
+            if body.keys().any(|key| !allowed.contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
+                return protocol_error(&id, "invalid_args", "Invalid MCP action fields");
+            }
+            let cwd = args.get("cwd").and_then(Value::as_str);
+            let agent_dir = state.agent_dir();
+            let mut payload = args.clone();
+            payload["agentDir"] = json!(agent_dir.to_string_lossy());
+            payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+            if let Some(cwd) = cwd {
+                if let Err(error) = validate_scoped_cwd(state, cwd) {
+                    return mcp_cwd_error(&id, &error);
+                }
+                match management_call(state, "mcp.configAction", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
+            } else {
+                match management_call(state, "mcp.configAction", payload) {
+                    Ok(result) => mcp_management_response(&id, result),
+                    Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                }
             }
         }
         // Scheduled tasks (crates/task-scheduler): list/preview read the
@@ -2255,8 +2508,131 @@ pub(crate) fn management_call(
         .management
         .instance("global", &config)
         .map_err(|error| ("management_unavailable".to_string(), error))?;
-    if op == "modelsConfig.put" { return management_serial_call(state, op, args); }
+    if matches!(op, "modelsConfig.put" | "distro.configure" | "distro.seed") { return management_serial_call(state, op, args); }
     instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
+}
+
+fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Value {
+    let Some(config) = state.management_config.lock().unwrap().clone() else {
+        return protocol_error(id, "management_unavailable", "Management instance is not configured");
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => return protocol_error(id, "management_unavailable", &error),
+    };
+    if op == "mcp.signInStart" {
+        let Some(body) = args.as_object() else { return protocol_error(id, "invalid_args", "Expected a sign-in object"); };
+        if body.keys().any(|key| !["scope", "name", "cwd"].contains(&key.as_str())) || body.get("cwd").is_some_and(|v| !v.is_string()) {
+            return protocol_error(id, "invalid_args", "Invalid sign-in fields");
+        }
+        if let Some(cwd) = args.get("cwd").and_then(Value::as_str) {
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return mcp_cwd_error(id, &error); }
+        }
+        let Some(scope) = args.get("scope").and_then(Value::as_str).filter(|v| *v == "global" || *v == "project") else { return protocol_error(id, "invalid_args", "Invalid MCP scope"); };
+        let Some(name) = args.get("name").and_then(Value::as_str).filter(|v| !v.is_empty() && v.len() <= 1024) else { return protocol_error(id, "invalid_args", "Invalid MCP server name"); };
+        let mut payload = args.clone();
+        payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
+        payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+        let handle = match instance.start_task("mcp.signInStart", payload, Duration::from_secs(600), management_host::TaskKind::Mutation) {
+            Ok(handle) => handle,
+            Err(error) => return protocol_error(id, "io", &error),
+        };
+        {
+            let mut handles = state.mcp_signin_tasks.lock().unwrap();
+            handles.retain(|handle| instance.task_snapshot(handle).is_ok());
+            handles.insert(handle.clone());
+        }
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match instance.task_snapshot(&handle) {
+                Ok(snapshot) => {
+                    if snapshot.status == management_host::TaskStatus::Unknown {
+                        return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown"));
+                    }
+                    if let Some(flow) = snapshot.result.or(snapshot.progress) { return mcp_signin_flow_response(id, &handle, flow); }
+                    if matches!(snapshot.status, management_host::TaskStatus::Failed | management_host::TaskStatus::Cancelled) {
+                        return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown"));
+                    }
+                }
+                Err(error) => return protocol_error(id, "io", &error),
+            }
+            if std::time::Instant::now() >= until {
+                return protocol_ok(id, json!({"flowId":handle, "phase":"starting", "scope":scope, "name":name, "expiresInMs":300000}));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let Some(body) = args.as_object() else { return protocol_error(id, "invalid_args", "Expected sign-in control fields"); };
+    let allowed: &[&str] = if op == "mcp.signInSubmit" { &["flowId", "redirectUrl"] } else { &["flowId"] };
+    if body.keys().any(|key| !allowed.contains(&key.as_str())) { return protocol_error(id, "invalid_args", "Invalid sign-in control fields"); }
+    let Some(handle) = args.get("flowId").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 100) else {
+        return protocol_error(id, "invalid_args", "A sign-in flowId is required");
+    };
+    if !state.mcp_signin_tasks.lock().unwrap().contains(handle) {
+        return protocol_error_value(id, json!({"code":"not_found", "message":"No sign-in has that id", "reason":"sign-in-unknown", "retryable":false}));
+    }
+    if op == "mcp.signInStatus" {
+        return match instance.task_snapshot(handle) {
+            Ok(snapshot) => {
+                if snapshot.status == management_host::TaskStatus::Unknown {
+                    return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown; retry status"));
+                }
+                match snapshot.result.or(snapshot.progress) {
+                    Some(flow) => mcp_signin_flow_response(id, handle, flow),
+                    None => protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in status unavailable")),
+                }
+            },
+            Err(_) => protocol_error_value(id, json!({"code":"not_found", "message":"No sign-in has that id", "reason":"sign-in-unknown", "retryable":false})),
+        };
+    }
+    let input = if op == "mcp.signInSubmit" {
+        let Some(redirect) = args.get("redirectUrl").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 3500) else {
+            return protocol_error(id, "invalid_args", "Invalid redirect address");
+        };
+        json!({"action":"submit", "redirectUrl":redirect})
+    } else { json!({"action":"cancel"}) };
+    match instance.submit_task_input(handle, input) {
+        Ok(flow) => mcp_signin_flow_response(id, handle, flow),
+        Err(error) => {
+            if op == "mcp.signInCancel" {
+                if let Ok(snapshot) = instance.task_snapshot(handle) {
+                    if snapshot.status == management_host::TaskStatus::Succeeded {
+                        if let Some(flow) = snapshot.result { return mcp_signin_flow_response(id, handle, flow); }
+                    }
+                }
+            }
+            protocol_error(id, "io", &error)
+        }
+    }
+}
+
+fn mcp_signin_flow_response(id: &str, handle: &str, mut flow: Value) -> Value {
+    if flow.get("mcpRefusal").is_some() { return mcp_management_response(id, flow); }
+    if !flow.is_object() || flow.get("phase").and_then(Value::as_str).is_none() {
+        return protocol_error(id, "io", "Invalid MCP sign-in response");
+    }
+    flow["flowId"] = json!(handle);
+    protocol_ok(id, flow)
+}
+
+fn mcp_cwd_error(id: &str, error: &(String, String)) -> Value {
+    let reason = if error.0 == "access_denied" { "cwd-denied" } else { "cwd-invalid" };
+    protocol_error_value(id, json!({ "code": "invalid_args", "message": error.1, "reason": reason, "retryable": false }))
+}
+
+/// Map MCP's bounded service refusal to the ordinary IPC error envelope.
+fn mcp_management_response(id: &str, result: Value) -> Value {
+    let Some(refusal) = result.get("mcpRefusal").and_then(Value::as_object) else {
+        return protocol_ok(id, result);
+    };
+    let Some(reason) = refusal.get("reason").and_then(Value::as_str) else {
+        return protocol_error(id, "io", "Invalid MCP refusal");
+    };
+    let Some(message) = refusal.get("message").and_then(Value::as_str) else {
+        return protocol_error(id, "io", "Invalid MCP refusal");
+    };
+    let details = refusal.get("details").cloned().unwrap_or_else(|| json!({}));
+    protocol_error_value(id, json!({ "code": "io", "message": message, "reason": reason, "details": details, "retryable": false }))
 }
 
 /// The cwd gate every models op shares — the Next routes' 400/403 half:
@@ -2266,6 +2642,9 @@ fn validate_scoped_cwd(
     state: &IpcHostState,
     cwd: &str,
 ) -> Result<(), (String, String)> {
+    if Path::new(cwd).components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+        return Err(("access_denied".to_string(), "Access denied".to_string()));
+    }
     let folded = lexical_fold(cwd, cfg!(windows));
     let path = Path::new(&folded);
     if !path.is_dir() {
@@ -2657,6 +3036,24 @@ fn session_view_dispatch(
                         "tokens": usage.get("tokens").cloned().unwrap_or(Value::Null),
                     }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
+                let (extension_statuses, extension_widgets) = session.extension_ui_state();
+                // Only the child's active entries/leaf can identify a recorded prompt.
+                // A failed read or absence of a record is unknown (a spawn-time
+                // custom prompt may still exist); never invent a composed prompt.
+                let recorded_prompt = session.command("get_entries", json!({}), Some(Duration::from_secs(10))).ok().and_then(|snapshot| {
+                    let entries = snapshot.get("entries")?.as_array()?;
+                    let leaf = match snapshot.get("leafId")? {
+                        Value::Null => None,
+                        Value::String(id) if entries.iter().any(|entry| entry.get("id").and_then(Value::as_str) == Some(id)) => Some(id.as_str()),
+                        _ => return None,
+                    };
+                    let handoff = crate::session_view::write_snapshot_handoff(entries, leaf, &[]).ok()?;
+                    let result = management_call(state, "session.recordedSystemPrompt", json!({"snapshotFile":handoff.display().to_string()})).ok();
+                    let _ = std::fs::remove_file(handoff);
+                    result
+                });
+                let prompt_recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool) == Some(true);
+                let prompt = recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str).unwrap_or("");
                 let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
@@ -2695,14 +3092,10 @@ fn session_view_dispatch(
                     // The context meter (null when the child cannot calculate
                     // usage — unknown is not zero).
                     "contextUsage": context_usage.unwrap_or(Value::Null),
-                    // The system panel's prompt: replaying the transcript's
-                    // system messages needs the SDK's own projection — served
-                    // with the readView family, not yet this poll (README's
-                    // unfixed list keeps it honest).
-                    "systemPrompt": "",
-                    "systemPromptStatus": "none",
-                    "extensionStatuses": [],
-                    "extensionWidgets": [],
+                    "systemPrompt": prompt,
+                    "systemPromptStatus": if prompt_recorded { "recorded" } else { "unknown" },
+                    "extensionStatuses": extension_statuses,
+                    "extensionWidgets": extension_widgets,
                 });
                 return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
             }
@@ -2980,10 +3373,10 @@ fn build_spawn_plan(
         // workspace policy decides, server-side). Unlocking lets a chat use
         // the computer, so a persisted marker is honoured ONLY for a folder
         // chat (the Next factory's gate: a legacy shared-workspace session
-        // file that carries the marker keeps the locked loadout; the desktop
-        // host is local-only, so the network-exposure half of the old gate
-        // is structural here).
-        let unlocked = chat_folder
+        // file that carries the marker keeps the locked loadout). Legacy
+        // windows and the test harness cannot honour a stored unlock.
+        let unlocked = state.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
+            && chat_folder
             && session_host::spawn_plan::read_chat_unlocked(session_file);
         // Chats read Settings › Chats while they are still empty.
         let (chat_model, chat_thinking) = if file_has_messages(session_file) {
@@ -3145,6 +3538,14 @@ pub(crate) fn create_session(
     state: &IpcHostState,
     args: &Value,
 ) -> Result<Value, (String, String, Option<Value>)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| (
+        "busy".to_string(), "Session policy change is in progress".to_string(),
+        (command_type(args).as_deref() == Some("prompt")).then(|| json!({ "code": "prompt_rejected", "accepted": false })),
+    ))?;
+    if crate::trust_policy_fence::is_pending(&state.agent_dir()) {
+        return Err(("busy".into(), "Trust policy outcome is unresolved; session admission is blocked".into(),
+            (command_type(args).as_deref() == Some("prompt")).then(|| json!({"code":"prompt_rejected", "accepted":false}))));
+    }
     let invalid = |message: &str, command_type: Option<&str>| -> (String, String, Option<Value>) {
         let rejected = command_type == Some("prompt");
         (
@@ -3184,8 +3585,18 @@ pub(crate) fn create_session(
     )
     .map_err(|message| invalid(&message, command_type.as_deref()))?;
 
+    state.discover_session_cwd(&requested_cwd);
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
+    if chat_workspace && !chat_root && (!state.is_proposed(&requested_cwd.to_string_lossy())
+        || !crate::worktrees::is_chat_area(&requested_cwd, &agent_dir)
+        || !state.file_roots.lock().unwrap().is_existing_path_allowed(&requested_cwd)) {
+        return Err(("unauthorized_scope".into(), "Chat folder is not a host-known workspace".into(), None));
+    }
+    if !chat_workspace && (crate::worktrees::is_chat_area(&requested_cwd, &agent_dir)
+        || !state.file_roots.lock().unwrap().is_existing_path_allowed(&requested_cwd)) {
+        return Err(("unauthorized_scope".into(), "Choose this folder using the native project picker first".into(), None));
+    }
     if chat_workspace {
         // ensureChatWorkspace runs before the folder factory (both private).
         crate::session_view::ensure_chat_workspace(&agent_dir)
@@ -3642,8 +4053,15 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
     let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
+    state.discover_session_cwd(&cwd);
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
+        if !crate::session_view::is_chat_root_path(&cwd, &agent_dir)
+            && (!state.is_proposed(&cwd.to_string_lossy())
+                || !crate::worktrees::is_chat_area(&cwd, &agent_dir)
+                || !state.file_roots.lock().unwrap().is_existing_path_allowed(&cwd)) {
+            return Err(("unauthorized_scope".into(), "Chat folder is not a host-known workspace".into()));
+        }
         // A chat's own folder (or the legacy shared cwd) stays what it is;
         // only the root maps onto the hidden chat cwd.
         let chat_cwd = if crate::session_view::is_chat_root_path(&cwd, &agent_dir) {
@@ -3654,7 +4072,6 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
                 .map_err(|error| ("io".to_string(), error.to_string()))?;
             cwd.clone()
         };
-        state.propose_path(&chat_cwd);
         return Ok(json!({
             "success": true,
             "cwd": chat_cwd.display().to_string(),
@@ -3664,6 +4081,9 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         }));
     }
 
+    if crate::worktrees::is_chat_area(&cwd, &agent_dir) || !state.file_roots.lock().unwrap().is_existing_path_allowed(&cwd) {
+        return Err(("unauthorized_scope".into(), "Choose this folder using the native project picker first".into()));
+    }
     // A real directory (stat first: missing and not-a-directory answer
     // differently; a permission error at selection time, not later).
     let meta = std::fs::metadata(&cwd).map_err(|error| {
@@ -3683,7 +4103,6 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
             format!("Directory cannot be read: {cwd_text}"),
         ));
     }
-    state.propose_path(&cwd);
     let project = state.projects.resolve(&cwd);
     Ok(json!({
         "success": true,
@@ -3884,6 +4303,15 @@ pub(crate) fn dispatch_with_resume(
     op: &str,
     args: &Value,
 ) -> Result<Value, (String, String)> {
+    // Stop remains available during a policy change, but never cold-starts a child.
+    if op == "agent.interrupt" || (op == "agent.command" && matches!(args.get("type").and_then(Value::as_str), Some("abort" | "abort_bash" | "abort_retry"))) {
+        return session_host::dispatch_session_op(&state.registry, op, args, None)
+            .map_err(|error| (error.code().to_string(), error.to_string()));
+    }
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".to_string(), "Session policy change is in progress".to_string()))?;
+    if crate::trust_policy_fence::is_pending(&state.agent_dir()) {
+        return Err(("busy".into(), "Trust policy outcome is unresolved; session admission is blocked".into()));
+    }
     let base = state.spawn_base.lock().unwrap().clone();
     let agent_dir = state.agent_dir();
     let Some(base) = base else {
@@ -3976,6 +4404,111 @@ mod tests {
 
     fn send(state: &IpcHostState, request: Value) -> Value {
         dispatch_envelope(state, request)
+    }
+
+    #[test]
+    fn real_pi_extension_ui_response_ipc_is_session_bound() {
+        let Ok(executable) = std::env::var("PI_CLI_BIN") else { eprintln!("skipping: PI_CLI_BIN not set"); return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let ext = dir.path().join("confirm.mjs");
+        let output = dir.path().join("answer");
+        std::fs::write(&ext, format!(r#"import {{ writeFileSync }} from 'node:fs';
+export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_, ctx) => {{
+  ctx.ui.setStatus('fixture', 'ready');
+  ctx.ui.setWidget('fixture-widget', ['fixture line'], {{ placement: 'belowEditor' }});
+  const answer = await ctx.ui.confirm('Allow?', 'fixture');
+  writeFileSync({:?}, JSON.stringify(answer));
+}} }});"#, output.to_string_lossy())).unwrap();
+        let (file, id) = session_host::create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+        let bridge = Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        let config = session_host::SessionSpawnConfig {
+            executable, agent_dir: Some(agent), session_dir: None, bridge_asset: bridge,
+            artifacts_asset: None, chat_asset: None, chat_asset_sha256: None,
+            shape: session_host::SessionSpawnShape::Project { tool_args: None },
+            initial_model: None, thinking_level: None,
+            extra_args: vec!["--extension".into(), ext.to_string_lossy().into_owned()],
+        };
+        let state = state();
+        let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
+        let (_sub, events, _) = session.subscribe_with_ui();
+        let prompt = Arc::clone(&session);
+        let handle = std::thread::spawn(move || prompt.command("prompt", json!({"message":"/fixture-confirm"}), Some(Duration::from_secs(10))));
+        let event = loop {
+            let event = events.recv_timeout(Duration::from_secs(10)).unwrap();
+            if event["method"] == "confirm" { break event }
+        };
+        let request_id = event["id"].as_str().unwrap();
+        let view = send(&state, json!({"v":1,"id":"view","op":"sessions.state","args":{"session":id}}));
+        assert_eq!(view["data"]["state"]["extensionStatuses"], json!([{"key":"fixture","text":"ready"}]));
+        assert_eq!(view["data"]["state"]["extensionWidgets"], json!([{"key":"fixture-widget","lines":["fixture line"],"placement":"belowEditor"}]));
+        let reply = send(&state, json!({"v":1,"id":"reply","op":"agent.respondUi","args":{
+            "session":id,"type":"extension_ui_response","id":request_id,"confirmed":false
+        }}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        let replay = send(&state, json!({"v":1,"id":"replay","op":"agent.respondUi","args":{
+            "session":id,"type":"extension_ui_response","id":request_id,"confirmed":true
+        }}));
+        assert_eq!(replay["ok"], false, "{replay}");
+        handle.join().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "false");
+        state.registry.remove(&id, Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_pi_active_prompt_and_deferred_thinking() {
+        use std::io::Write;
+        let Ok(executable) = std::env::var("PI_CLI_BIN") else { eprintln!("skipping: PI_CLI_BIN not set"); return };
+        // Under the checkout solely so the generated bundle resolves the shared,
+        // read-only jiti dependency without copying a node_modules tree.
+        let root = tempfile::tempdir_in("..").unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let agent = root_path.join("agent");
+        let cwd = root_path.join("work");
+        let managed = root_path.join("managed");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
+        std::fs::create_dir_all(managed.join("@earendil-works")).unwrap();
+        std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works/pi-coding-agent").canonicalize().unwrap(), managed.join("@earendil-works/pi-coding-agent")).unwrap();
+        let (file, id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        for (entry, parent, text) in [("root", Value::Null, "ROOT"), ("a", json!("root"), "BRANCH A"), ("b", json!("root"), "BRANCH B")] {
+            writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
+        }
+        writeln!(writer, "{}", json!({"type":"message","id":"think","parentId":"b","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"fixture hidden reasoning"}]}})).unwrap();
+        drop(writer);
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(), agent_dir: Some(agent.clone()),
+            extensions: vec![Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), root_path.display().to_string())],
+        });
+        let config = session_host::SessionSpawnConfig {
+            executable, agent_dir: Some(agent), session_dir: None,
+            bridge_asset: Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap(),
+            artifacts_asset: None, chat_asset: None, chat_asset_sha256: None,
+            shape: session_host::SessionSpawnShape::Project { tool_args: None },
+            initial_model: None, thinking_level: None, extra_args: Vec::new(),
+        };
+        let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
+        let read = || send(&state, json!({"v":1,"id":"state","op":"sessions.state","args":{"session":id}}));
+        let before = read();
+        assert_eq!(before["data"]["state"]["systemPromptStatus"], "recorded", "{before}");
+        assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
+        let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
+        assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
+        let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
+        assert_eq!(missing["ok"], false, "{missing}");
+        session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
+        let after = read();
+        assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
+        state.registry.remove(&id, Duration::from_secs(5));
     }
 
     #[test]
@@ -4235,6 +4768,7 @@ mod tests {
         std::fs::create_dir_all(&folder).expect("folder");
         std::fs::create_dir_all(dir.path().join("elsewhere")).expect("elsewhere");
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        state.propose_path(&folder);
 
         let dotted = format!(
             "{}/../chats/20260101-120000-abcd",
@@ -4259,6 +4793,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("project");
         std::fs::create_dir_all(&target).expect("target");
+        state.propose_path(&target);
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv1", "op": "cwd.validate", "args": { "cwd": target.to_string_lossy() } }),
@@ -4272,22 +4807,13 @@ mod tests {
             "the answered cwd is the validated directory itself"
         );
 
-        // A `~/…` path under a home that does not exist must fail as a
-        // MISSING directory (not a protocol error): the message shape the
-        // ProjectPicker surfaces is the route's.
+        // An arbitrary unapproved path is refused before probing whether it exists.
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv2", "op": "cwd.validate", "args": { "cwd": "~/definitely-not-here-918273" } }),
         );
         assert_eq!(response["ok"], false, "{response}");
-        assert_eq!(response["error"]["code"], "invalid_args");
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("does not exist")),
-            "the honest missing-directory message: {}",
-            response["error"]["message"]
-        );
+        assert_eq!(response["error"]["code"], "unauthorized_scope");
     }
 
     #[test]
@@ -5757,6 +6283,135 @@ mod tests {
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn real_pi_mcp_config_through_host() {
+        use std::os::unix::fs::symlink;
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
+        let build = std::process::Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap();
+        assert!(build.success());
+        let fixture = std::path::Path::new("../lib/__fixtures__/mcp-env-server.mjs").canonicalize().unwrap();
+        std::fs::write(project.join(".pi/mcp.json"), json!({"mcpServers": {"local": {"command": "node", "args": [fixture]}}}).to_string()).unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        state.propose_path(&project);
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
+        });
+        let cwd = project.to_string_lossy();
+        let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let listed = call("trust.status", json!({"cwd":cwd}));
+        assert_eq!(listed["data"]["mcpServers"][0]["name"], "local", "{listed}");
+        let trusted = call("trust.set", json!({"cwd":cwd}));
+        assert_eq!(trusted["data"]["trusted"], true, "{trusted}");
+        let action = json!({"cwd":cwd,"action":"add","scope":"global","text":"node fixture.js","name":"fixture"});
+        let added = call("mcp.configAction", action.clone());
+        assert_eq!(added["data"]["added"]["name"], "fixture", "{added}");
+        let refused = call("mcp.configAction", action);
+        assert_eq!(refused["error"]["reason"], "name-taken", "{refused}");
+        assert_eq!(refused["error"]["details"]["name"], "fixture", "{refused}");
+        assert!(refused["error"]["details"]["suggestedName"].is_string(), "{refused}");
+        let removed = call("mcp.configAction", json!({"cwd":cwd,"action":"remove","scope":"global","name":"fixture"}));
+        let restored = call("mcp.configAction", json!({"cwd":cwd,"action":"undo","token":removed["data"]["undo"]["token"]}));
+        assert_eq!(restored["data"]["restored"]["name"], "fixture", "{restored}");
+        let probe = call("mcp.test", json!({"cwd":cwd,"scope":"project","name":"local"}));
+        assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
+        assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
+        assert_eq!(state.management.scopes(), vec!["global".to_string()]);
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_pi_mcp_oauth_through_ipc() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::symlink;
+        use std::process::{Command, Stdio};
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let mut fixture = Fixture(Command::new("node").arg("../scripts/migration/mcp-oauth-fixture.mjs").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut url = String::new();
+        BufReader::new(fixture.0.stdout.take().unwrap()).read_line(&mut url).unwrap();
+        let url = url.trim();
+        assert!(url.starts_with("http://127.0.0.1:"));
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
+        assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"cancel":{"url":url},"signout":{"url":url}}}).to_string()).unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable, agent_dir: Some(agent.clone()),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
+        });
+        let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let start = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
+        assert_eq!(start["ok"], true, "{start}");
+        let handle = start["data"]["flowId"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let waiting = loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            assert_eq!(status["ok"], true, "{status}");
+            if status["data"]["phase"] == "authorize" { break status; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let page = waiting["data"]["authorizationUrl"].as_str().unwrap();
+        let result = Command::new("node").arg("-e").arg("fetch(process.argv[1],{redirect:'manual'}).then(r=>console.log(r.headers.get('location'))) ").arg(page).output().unwrap();
+        assert!(result.status.success());
+        let redirect = String::from_utf8(result.stdout).unwrap();
+        let invalid = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":"http://localhost/?code=x&state=wrong"}));
+        assert_eq!(invalid["error"]["reason"], "redirect-state-mismatch", "{invalid}");
+        let submitted = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":redirect.trim()}));
+        assert_eq!(submitted["ok"], true, "{submitted}");
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            assert_eq!(status["ok"], true, "{status}");
+            if status["data"]["phase"] == "done" { assert_eq!(status["data"]["result"]["state"], "connected", "{status}"); break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"fixture"}));
+        assert_eq!(out["data"]["signedOut"]["removed"], true, "{out}");
+        let start = call("mcp.signInStart", json!({"scope":"global","name":"cancel"}));
+        let cancelled = call("mcp.signInCancel", json!({"flowId":start["data"]["flowId"]}));
+        assert_eq!(cancelled["data"]["phase"], "cancelled", "{cancelled}");
+        let start = call("mcp.signInStart", json!({"scope":"global","name":"signout"}));
+        assert_eq!(start["ok"], true, "{start}");
+        let handle = start["data"]["flowId"].as_str().unwrap();
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            if status["data"]["phase"] == "authorize" { break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let signout = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"signout"}));
+        assert_eq!(signout["ok"], true, "{signout}");
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":handle}));
+            if status["data"]["phase"] == "cancelled" { break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        state.management.shutdown_all(Duration::from_secs(5));
+    }
+
     /// The models domain over the REAL pi management instance (PI_CLI_BIN,
     /// sandboxed agent dir + a staged managed tree): models.list answers the
     /// full /api/models contract through the host's cwd gate and the
@@ -6552,7 +7207,7 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_unlock_marker_is_honoured_only_for_a_folder_chat() {
+    fn a_persisted_unlock_marker_requires_static_host_and_folder_chat() {
         // The Next factory's gate (rpc-manager): chatFolder && marker. A
         // LEGACY shared-workspace session file that carries the marker keeps
         // the locked loadout — a persisted input must not widen its rights.
@@ -6562,7 +7217,7 @@ mod tests {
             eprintln!("skipping: PI_CLI_BIN not set");
             return;
         };
-        let state = state();
+        let mut state = state();
         let dir = tempfile::tempdir().expect("tempdir");
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -6596,7 +7251,7 @@ mod tests {
         let request = SpawnRequest::default();
         let base = state.spawn_base.lock().unwrap().clone().expect("base");
 
-        // 1. A FOLDER chat (a child of <agent_dir>/chats) with the marker: unlocked.
+        // A legacy host or harness must not honour even a folder marker.
         let folder_cwd = agent_dir.join("chats").join("20260101_120000_abcd");
         std::fs::create_dir_all(&folder_cwd).expect("folder");
         let folder_file = dir.path().join("folder.jsonl");
@@ -6604,9 +7259,14 @@ mod tests {
         let plan = build_spawn_plan(&state, &base, &folder_cwd, &folder_file, &request, false)
             .expect("the folder chat plan");
         match plan.shape {
-            session_host::SessionSpawnShape::Chat { unlocked, .. } => {
-                assert!(unlocked, "a folder chat's persisted unlock is honoured");
-            }
+            session_host::SessionSpawnShape::Chat { unlocked, .. } => assert!(!unlocked),
+            _ => panic!("a chat shape, not another kind"),
+        }
+        // Test-only simulation of a future trusted static startup.
+        state.chat_unlock_policy = ChatUnlockPolicy::StaticPackaged;
+        let plan = build_spawn_plan(&state, &base, &folder_cwd, &folder_file, &request, false).unwrap();
+        match plan.shape {
+            session_host::SessionSpawnShape::Chat { unlocked, .. } => assert!(unlocked),
             _ => panic!("a chat shape, not another kind"),
         }
 
@@ -7757,6 +8417,88 @@ mod tests {
         );
 
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn combined_persistent_fence_blocks_registry_writers_and_start_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = state();
+        *host.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        host.registry.with_idle_session_writer("existing", |_| Ok::<_, ()>(())).unwrap();
+        crate::trust_policy_fence::begin(dir.path(), "combined-operation", dir.path()).unwrap();
+        assert!(matches!(
+            host.registry.with_idle_session_writer("existing", |_| -> Result<(), ()> { panic!("pending trust must exclude writers") }),
+            Err(session_host::SessionWriterError::<()>::Busy(_))
+        ));
+        assert!(matches!(
+            host.registry.with_offline_session_writer("existing", Duration::ZERO, || -> Result<(), ()> { panic!("pending trust must exclude offline mutation") }),
+            Err(session_host::SessionWriterError::<()>::Busy(_))
+        ));
+        let file = dir.path().join("existing.jsonl");
+        std::fs::write(&file, "fixture").unwrap();
+        let rejected = host.registry.start_with_plan("existing", &file, "existing", dir.path(), || {
+            panic!("pending trust must prevent even spawn policy evaluation")
+        });
+        assert!(rejected.err().unwrap().to_string().contains("unresolved"));
+        crate::trust_policy_fence::complete(dir.path(), "combined-operation").unwrap();
+        host.registry.with_idle_session_writer("existing", |_| Ok::<_, ()>(())).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_fence_refuses_new_and_resumed_sessions_after_host_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::trust_policy_fence::begin(dir.path(), "operation-a", dir.path()).unwrap();
+        let first = state();
+        *first.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let error = create_session(&first, &json!({"cwd":dir.path(),"type":"prompt","message":"hello"})).unwrap_err();
+        assert_eq!(error.0, "busy");
+        assert_eq!(error.2.unwrap()["accepted"], false);
+        let restarted = state();
+        *restarted.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let error = dispatch_with_resume(&restarted, "agent.command", &json!({"session":"existing","type":"prompt","message":"hello"})).unwrap_err();
+        assert_eq!(error.0, "busy");
+        assert!(error.1.contains("unresolved"));
+        assert!(crate::trust_policy_fence::is_pending(dir.path()));
+    }
+
+    #[test]
+    fn policy_gate_blocks_real_admission_and_defers_background_delivery() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = dir.path().join("delivered");
+        std::fs::write(agent.join("extensions/fixture.js"), format!("export default function(pi) {{ pi.registerCommand('fixture-mark', {{ handler: async () => {{ require('fs').writeFileSync({:?}, 'yes'); }} }}); }}", marker.to_string_lossy())).unwrap();
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent);
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        let created = create_session(&state, &json!({"cwd":cwd,"type":"ensure_session"})).unwrap();
+        let sid = created["sessionId"].as_str().unwrap();
+        let session = state.registry.get(sid).unwrap();
+        let policy = state.policy_gate.try_write().unwrap();
+        assert_eq!(create_session(&state, &json!({"cwd":cwd,"type":"ensure_session"})).unwrap_err().0, "busy");
+        assert_eq!(dispatch_with_resume(&state, "agent.command", &json!({"session":sid,"type":"get_state"})).unwrap_err().0, "busy");
+        assert!(dispatch_with_resume(&state, "agent.interrupt", &json!({"session":sid})).is_ok(), "Stop remains available");
+        assert!(session.command("prompt", json!({"message":"/fixture-mark"}), Some(Duration::from_secs(3))).is_err());
+        session.composer_outbox.enqueue("/fixture-mark", None).unwrap();
+        session.composer_wake();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!marker.exists(), "a parked drain must not send across policy exclusion");
+        assert!(session.composer_outbox.has_items());
+        drop(policy);
+        let admission = state.policy_gate.try_read().unwrap();
+        let trust = send(&state, json!({"v":1,"id":"trust-race","op":"trust.set","args":{"cwd":cwd}}));
+        assert_eq!(trust["error"]["code"], "busy", "{trust}");
+        drop(admission);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(marker.exists(), "deferred delivery resumes after policy unlock");
+        state.registry.remove(sid, Duration::from_secs(5));
     }
 
     /// The composer outbox (queue_composer / take / send) and the state

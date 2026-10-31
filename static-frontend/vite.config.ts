@@ -73,6 +73,10 @@ export default defineConfig({
         replacement: resolve(import.meta.dirname, "src/data/session-actions-service.ts"),
       },
       {
+        find: /^@\/lib\/chat-session-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/chat-session-service.ts"),
+      },
+      {
         // The session-list service (catalogue load, running-set stream,
         // home dir) swaps /api/sessions, /api/agent/running/events and
         // /api/home for sessions.list / agent.subscribeRunning / cwd.home.
@@ -145,6 +149,8 @@ export default defineConfig({
         find: /^@\/lib\/font-service$/,
         replacement: resolve(import.meta.dirname, "src/data/font-service.ts"),
       },
+      { find: /^@\/lib\/update-service$/, replacement: resolve(import.meta.dirname, "src/data/update-service.ts") },
+      { find: /^@\/lib\/distro-service$/, replacement: resolve(import.meta.dirname, "src/data/distro-service.ts") },
       { find: /^@\/lib\/git-status-service$/, replacement: resolve(import.meta.dirname, "src/data/git-status-service.ts") },
       { find: /^@\/lib\/worktree-service$/, replacement: resolve(import.meta.dirname, "src/data/worktree-service.ts") },
       {
@@ -202,6 +208,16 @@ export default defineConfig({
         // over IPC.
         find: /^@\/lib\/provider-auth-login$/,
         replacement: resolve(import.meta.dirname, "src/data/provider-auth-login.ts"),
+      },
+      {
+        // The MCP service swaps Settings › MCP overview and actions for
+        // mcp.configGet / mcp.configAction over IPC.
+        find: /^@\/lib\/mcp-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/mcp-service.ts"),
+      },
+      {
+        find: /^@\/lib\/mcp-sign-in-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/mcp-sign-in-client.ts"),
       },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },

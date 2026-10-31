@@ -59,6 +59,24 @@ fn recv_timeout<T>(rx: &Receiver<T>) -> T {
 }
 
 #[test]
+fn spawn_window_holds_ui_written_before_handler_registration() {
+    let client = PiRpcClient::spawn(mock_exe(), SpawnOptions {
+        env: EnvPolicy::inherit().set("MOCK_PI_SCENARIO", "startup_ui"),
+        ui_attach_timeout: Some(Duration::from_secs(5)),
+        ..SpawnOptions::default()
+    }).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(client.pending_ui_requests(), 1);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let _guard = client.on_ui_bounded("confirm", tx);
+    client.end_ui_attach_window();
+    let request = recv_timeout(&rx);
+    assert_eq!(request.id, "startup");
+    assert!(client.respond_ui(&request.id, json!({"cancelled": true})));
+    assert_eq!(client.close(LONG), Some(0));
+}
+
+#[test]
 fn get_state_handshake_and_echo_roundtrip() {
     let client = spawn_mock(None);
     let state = client

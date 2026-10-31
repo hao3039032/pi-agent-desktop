@@ -220,7 +220,7 @@ test("a chat's row menu can continue it in a project", () => {
   assert.match(source, /onContinueInProject=\{setContinueChat\}/);
   assert.match(source, /onContinueInProject=\{depth === 0 \? onContinueInProject : undefined\}/);
   assert.match(source, /t\("sidebar\.continueInProject"\)/);
-  assert.match(source, /\/continue-in-project`/);
+  assert.match(source, /continueChatInProjectRequest\(chat\.id, cwd\)/);
   // The picker reuses the project picker and never offers the chat workspace itself.
   assert.match(source, /\{continueChat && \(/);
 });

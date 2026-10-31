@@ -122,11 +122,13 @@ pub struct SpawnOptions {
     pub on_log: Option<LogFn>,
     /// Called once when the child exits (orderly or not).
     pub on_exit: Option<ExitFn>,
+    /// Hold early UI before the stdout reader starts, until the session relay attaches.
+    pub ui_attach_timeout: Option<Duration>,
 }
 
 impl Default for SpawnOptions {
     fn default() -> Self {
-        Self { args: Vec::new(), cwd: None, env: EnvPolicy::inherit(), on_log: None, on_exit: None }
+        Self { args: Vec::new(), cwd: None, env: EnvPolicy::inherit(), on_log: None, on_exit: None, ui_attach_timeout: None }
     }
 }
 
@@ -141,10 +143,17 @@ pub struct UiRequest {
 }
 
 #[derive(Clone)]
+enum UiSender {
+    Unbounded(std::sync::mpsc::Sender<UiRequest>),
+    Bounded(std::sync::mpsc::SyncSender<UiRequest>),
+}
+
+#[derive(Clone)]
 struct UiHandlerEntry {
-    tx: std::sync::mpsc::Sender<UiRequest>,
+    tx: UiSender,
     bypass: Option<BypassFn>,
     notify_inline: Option<Arc<dyn Fn(&Value) + Send + Sync>>,
+    forward_plain: Option<std::sync::mpsc::SyncSender<UiRequest>>,
 }
 
 struct PendingEntry {
@@ -292,6 +301,12 @@ impl PiRpcClient {
             pid,
         });
 
+        // Install the bounded window before stdout can dispatch the first record.
+        let client = Arc::new(Self { shared: Arc::clone(&shared) });
+        if let Some(timeout) = options.ui_attach_timeout {
+            client.begin_ui_attach_window(timeout, None);
+        }
+
         // Each reader registers itself so the exit watcher can wait for the
         // pipes to drain before failing pending commands.
         fn reader_guard(shared: &Arc<Shared>) -> ReaderDrained {
@@ -328,7 +343,7 @@ impl PiRpcClient {
             .spawn(move || exit_watcher(child, watcher_shared))
             .map_err(|error| PiRpcError::spawn(format!("exit watcher thread failed: {error}")))?;
 
-        Ok(Arc::new(Self { shared }))
+        Ok(client)
     }
 
     pub fn pid(&self) -> u32 {
@@ -373,9 +388,30 @@ impl PiRpcClient {
     ) -> UiSubscription {
         {
             let mut inner = self.shared.inner.lock().unwrap();
-            inner.ui_handlers.insert(method.to_string(), UiHandlerEntry { tx, bypass, notify_inline: None });
+            inner.ui_handlers.insert(method.to_string(), UiHandlerEntry { tx: UiSender::Unbounded(tx), bypass, notify_inline: None, forward_plain: None });
             flush_buffered_ui(&self.shared, &mut inner);
         }
+        UiSubscription { shared: Arc::clone(&self.shared), method: method.to_string() }
+    }
+
+    /// Register a bounded UI consumer. Overflow cancels dialogs rather than blocking stdout.
+    pub fn on_ui_bounded(&self, method: &str, tx: std::sync::mpsc::SyncSender<UiRequest>) -> UiSubscription {
+        let mut inner = self.shared.inner.lock().unwrap();
+        inner.ui_handlers.insert(method.to_string(), UiHandlerEntry { tx: UiSender::Bounded(tx), bypass: None, notify_inline: None, forward_plain: None });
+        flush_buffered_ui(&self.shared, &mut inner);
+        UiSubscription { shared: Arc::clone(&self.shared), method: method.to_string() }
+    }
+
+    /// Bridge envelopes go to the bridge; ordinary notifies share the ordered UI queue.
+    pub fn on_ui_with_plain_forward(
+        &self, method: &str, tx: std::sync::mpsc::Sender<UiRequest>, bypass: BypassFn,
+        forward: std::sync::mpsc::SyncSender<UiRequest>,
+    ) -> UiSubscription {
+        let mut inner = self.shared.inner.lock().unwrap();
+        inner.ui_handlers.insert(method.to_string(), UiHandlerEntry {
+            tx: UiSender::Unbounded(tx), bypass: Some(bypass), notify_inline: None, forward_plain: Some(forward),
+        });
+        flush_buffered_ui(&self.shared, &mut inner);
         UiSubscription { shared: Arc::clone(&self.shared), method: method.to_string() }
     }
 
@@ -384,7 +420,7 @@ impl PiRpcClient {
     pub fn on_notify_inline(&self, callback: Arc<dyn Fn(&Value) + Send + Sync>) -> UiSubscription {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut inner = self.shared.inner.lock().unwrap();
-        inner.ui_handlers.insert("notify".to_string(), UiHandlerEntry { tx, bypass: None, notify_inline: Some(callback) });
+        inner.ui_handlers.insert("notify".to_string(), UiHandlerEntry { tx: UiSender::Unbounded(tx), bypass: None, notify_inline: Some(callback), forward_plain: None });
         flush_buffered_ui(&self.shared, &mut inner);
         UiSubscription { shared: Arc::clone(&self.shared), method: "notify".to_string() }
     }
@@ -533,11 +569,11 @@ impl PiRpcClient {
 
     /// Answer an `extension_ui_request` (dialog methods block in pi until
     /// this arrives). Silently dropped after shutdown began.
-    pub fn respond_ui(&self, id: &str, payload: Value) {
+    pub fn respond_ui(&self, id: &str, payload: Value) -> bool {
         let mut record = if payload.is_object() { payload } else { json!({}) };
         record["type"] = json!("extension_ui_response");
         record["id"] = json!(id);
-        self.write_record(&record);
+        self.write_record(&record)
     }
 
     /// Orderly shutdown: close stdin, wait for the child to exit (up to
@@ -777,7 +813,7 @@ fn reader_loop<R: Read>(stdout: R, shared: Arc<Shared>) {
     }
 }
 
-fn dispatch(shared: &Shared, record: Value) {
+fn dispatch(shared: &Shared, mut record: Value) {
     let record_type = record.get("type").and_then(Value::as_str);
     if record_type == Some("response") {
         if let Some(id) = record.get("id").and_then(Value::as_str) {
@@ -800,6 +836,10 @@ fn dispatch(shared: &Shared, record: Value) {
         return;
     }
     if record_type == Some("extension_ui_request") {
+        if let Some(timeout) = record.get("timeout").and_then(Value::as_u64).filter(|ms| *ms > 0) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            record["expiresAt"] = json!(now.saturating_add(timeout as u128).min(u64::MAX as u128) as u64);
+        }
         let id = record.get("id").and_then(Value::as_str).map(str::to_string);
         let method = record.get("method").and_then(Value::as_str).map(str::to_string);
         if let (Some(id), Some(method)) = (id, method) {
@@ -908,7 +948,31 @@ fn deliver_ui_request(
     }
     let request =
         UiRequest { id: id.to_string(), method: method.to_string(), record: record.clone() };
-    if registration.tx.send(request).is_err() {
+    let is_bypass = registration.bypass.as_ref().is_some_and(|predicate| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| predicate(record))).unwrap_or(false)
+    });
+    // UI records enter bounded queues; bound each record as well as their count.
+    // Internal bridge envelopes use their own independent transport budget.
+    if !is_bypass && (matches!(&registration.tx, UiSender::Bounded(_)) || registration.forward_plain.is_some())
+        && serde_json::to_vec(record).map_or(true, |bytes| bytes.len() > 262_144)
+    {
+        cancel_ui_request(shared, id, method);
+        return;
+    }
+    let sent = if let Some(forward) = &registration.forward_plain {
+        if !is_bypass { forward.try_send(request).is_ok() } else {
+            match &registration.tx {
+                UiSender::Unbounded(tx) => tx.send(request).is_ok(),
+                UiSender::Bounded(tx) => tx.try_send(request).is_ok(),
+            }
+        }
+    } else {
+        match &registration.tx {
+            UiSender::Unbounded(tx) => tx.send(request).is_ok(),
+            UiSender::Bounded(tx) => tx.try_send(request).is_ok(),
+        }
+    };
+    if !sent {
         // The consumer is gone: answer dialogs so the child does not block.
         cancel_ui_request(shared, id, method);
     }

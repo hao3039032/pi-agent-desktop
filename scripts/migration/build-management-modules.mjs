@@ -40,6 +40,7 @@ export {
 } from "${ROOT}/lib/session-projection.ts";
 export { projectTreeForResponse, toSummaryTree } from "${ROOT}/lib/project-tree.ts";
 export { computeSessionStats } from "${ROOT}/lib/session-stats.ts";
+export { extractActiveSystemPrompt } from "${ROOT}/lib/system-prompt-snapshot.ts";
 export { searchSessionContents } from "${ROOT}/lib/session-search.ts";
 export { patchExportHtml } from "${ROOT}/lib/session-export-html.ts";
 export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";
@@ -52,6 +53,7 @@ export {
   validateSessionToolSelection,
 } from "${ROOT}/lib/session-tool-selection.ts";
 export { chatWorkspacePrompt } from "${ROOT}/lib/chat-workspace-prompt.ts";
+export { copyChatToProject, setOfflineChatUnlock } from "${ROOT}/lib/chat-continue.ts";
 export {
   contextFilesSystemPrompt,
   CHAT_ONLY_RESOURCE_LOADER_OPTIONS,
@@ -73,6 +75,8 @@ export {
 } from "${ROOT}/lib/enabled-models-service.server.ts";
 export { getTerminalSettings, setTerminalShell, resolveTerminalShell } from "${ROOT}/lib/terminal-settings.ts";
 export { readRedactedModelsConfig } from "${ROOT}/lib/models-config-store.ts";
+export { readDistroServiceStatus, applyDistroServiceConfig } from "${ROOT}/lib/distro/service-config.ts";
+export { seedAgentDir } from "${ROOT}/lib/distro/seed.ts";
 export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-config-service.server.ts";
 export {
   composeProviderLists,
@@ -110,6 +114,15 @@ registerBunOAuthFlows();
 export { validateCron, nextCronRuns, nextCronRun, systemTimezone } from "${ROOT}/lib/scheduled-tasks/cron.ts";
 export { buildTask, applyTaskPatch } from "${ROOT}/lib/scheduled-tasks/task-input.ts";
 export { decideSlot } from "${ROOT}/lib/scheduled-tasks/catch-up.ts";
+export {
+  McpServiceError,
+  getMcpConfig,
+  executeMcpAction,
+  getProjectMcpListing,
+  trustProjectFolder,
+} from "${ROOT}/lib/mcp-service.server.ts";
+export { probeMcpServer } from "${ROOT}/lib/mcp-probe-service.server.ts";
+export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn } from "${ROOT}/lib/mcp-sign-in-service.server.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
@@ -130,6 +143,8 @@ export async function bundleProjectionModules() {
     format: "esm",
     platform: "node",
     target: "node20",
+    // MCP internals and the public SDK must resolve from the same managed tree.
+    external: ["@earendil-works/pi-coding-agent"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph

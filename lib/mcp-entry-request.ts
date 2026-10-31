@@ -78,11 +78,11 @@ export function isMcpEntryRefusal(value: unknown): value is McpEntryRefusal {
  * `cwd-denied`) — and only then a directory (400 `cwd-not-directory`), so a
  * folder outside the roots gets the same answer whether or not it exists.
  */
-export async function validateMcpProject(value: unknown): Promise<McpRequestProject | McpEntryRefusal> {
+export async function validateMcpProject(value: unknown, hostRoots?: Set<string>): Promise<McpRequestProject | McpEntryRefusal> {
   if (typeof value !== "string" || !value.trim() || !isAbsolute(value)) {
     return mcpEntryRefusal(400, "cwd-invalid", "cwd must be an absolute path");
   }
-  const allowedRoots = await getAllowedFileRoots();
+  const allowedRoots = hostRoots ?? await getAllowedFileRoots();
   if (!isExistingFilePathAllowed(value, allowedRoots)) return mcpEntryRefusal(403, "cwd-denied", "Access denied");
   const cwd = resolve(value);
   let directory = false;
@@ -155,6 +155,14 @@ export async function readConnectableMcpEntry(req: Request): Promise<McpConnecta
   } catch {
     return mcpEntryRefusal(400, "invalid-request", "Invalid JSON body");
   }
+  return readConnectableMcpBody(body);
+}
+
+/** Shared file/trust checks for HTTP and the host-authorized management instance. */
+export async function readConnectableMcpBody(
+  body: unknown,
+  options: { agentDir?: string; allowedRoots?: Set<string> } = {},
+): Promise<McpConnectableEntry | McpEntryRefusal> {
   if (!isRecord(body)) return mcpEntryRefusal(400, "invalid-request", "Expected a JSON object");
   const scope = readScope(body.scope);
   const name = typeof body.name === "string" && body.name.length > 0 && body.name.length <= 1024 ? body.name : undefined;
@@ -164,7 +172,7 @@ export async function readConnectableMcpEntry(req: Request): Promise<McpConnecta
 
   let project: McpRequestProject | undefined;
   if (body.cwd !== undefined && body.cwd !== null) {
-    const result = await validateMcpProject(body.cwd);
+    const result = await validateMcpProject(body.cwd, options.allowedRoots);
     if (isMcpEntryRefusal(result)) return result;
     project = result;
   }
@@ -173,7 +181,7 @@ export async function readConnectableMcpEntry(req: Request): Promise<McpConnecta
   const internals = await mcpInternalsOrRefusal("connects no MCP server");
   if (isMcpEntryRefusal(internals)) return internals;
 
-  const agentDir = getAgentDir();
+  const agentDir = options.agentDir ?? getAgentDir();
   if (scope === "project" && project) {
     const refused = mcpProjectTrustRefusal(project.cwd, agentDir);
     if (refused) return refused;
