@@ -79,6 +79,8 @@
 
 - **订阅建立时原子交付快照与后续事件**：`kind:"snapshot"` 先到，之后 `kind:"event"` 顺序追加。快照与事件之间不允许丢失或重排。
 - `kind:"reset"`：有界队列超限或纪元变化时发出；前端收到后必须丢弃本地状态、用新 requestId 重新取快照（不重放业务操作）。
+- **`agent.subscribeRunning` 的有界重放语义（Terra P2-1）**：运行集的每次转换（start/settle/子进程退出/移除）记录在宿主内有界环（512 条，`RunningSignal`）。若一条帧的发送被阻塞期间发生了 start+settle，relay 放行后按转换顺序重放中间集合（相邻相同集合合并、每帧之间重查停止标志）——短 run 不会被“最终集合未变”吞掉。环溢出（超过 512 条未消费转换）不重放中间态，而是强制发送一帧当前全量观察（resync）；客户端以整集替换语义消费帧，即完成恢复。帧载荷不变（`{type:"running", runningSessionIds, sessionListVersion}`）。重放游标是独立的密集转换序号（仅 wake 的版本 bump 不消耗它，也不会伪造 gap）。
+- **取消契约（`agent.unsubscribeEvents`，Terra P2-2）**：宿主置停标志并**唤醒**等待中的 relay 线程（不等待 30 s 探测）：静默取消后线程即刻结束、注册项回收。取消时刻之后最多再投递**一帧**（已在发送中的在途帧；多帧重放在每帧之间重查停止标志）。客户端收到取消 ACK 后不得假设存在后续帧，也不得依赖“取消后无帧”做同步。
 - 取消：前端 drop 订阅、页面刷新（WebView 重载）、窗口销毁均释放订阅；宿主侧以 `subscriptionId` 注销（`agent.unsubscribeEvents`），无泄漏。
 - `agent.subscribeEvents` 的第一帧 `kind:"snapshot"` 的 payload 是宿主快照 `{epoch, settledEpoch, state}`，**不是 AgentEvent**；前端适配层把它翻译成连接层等待的 `connected` AgentEvent（`lib/agent-event-stream.ts` 的首个 data 事件语义），后续 `kind:"event"` 帧的 payload 才是真实事件记录。
 - 消费确认与有界队列：工具中间输出可合并（coalesce）；最终消息、错误、UI 确认（extension dialog 请求/回复）不可静默丢弃。隐藏窗口不订阅时，宿主只为仍在运行的对象保留状态，不为无人消费的流无限堆积。

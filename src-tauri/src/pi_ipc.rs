@@ -12,7 +12,7 @@ use task_scheduler::TaskStore;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
@@ -40,6 +40,13 @@ pub struct IpcHostState {
     subscription_counter: AtomicU64,
     /// Live event-stream relays by subscription id (unsubscribe detaches).
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
+    /// Running-set relay THREADS alive right now (the thread-lifetime
+    /// truth, distinct from `event_relays`, which the unsubscribe handler
+    /// clears itself): a relay that ignores its stop flag would hold this
+    /// count up — the leak the cancel contract (Terra P2-2) forbids, so the
+    /// tests watch THIS counter, not the map, to prove the threads really
+    /// end instead of merely being deregistered.
+    running_relay_threads: Arc<AtomicUsize>,
     /// The terminal registry (portable-pty; crates/pty-host).
     pub terminals: pty_host::PtyHost,
     /// The management instances (crates/management-host). The spawn config
@@ -83,6 +90,7 @@ impl IpcHostState {
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
+            running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminals: pty_host::PtyHost::new(),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
@@ -502,24 +510,35 @@ fn derive_running_snapshot(registry: &SessionRegistry, version: &AtomicU64) -> R
 /// unsubscribed — is detected and the relay reaped instead of leaking
 /// forever. Changes themselves arrive on the registry's running signal
 /// (session-host's RunningSignal): every run-state TRANSITION (start,
-/// settle, child exit, removal) wakes the relay at once — no cadence
-/// sampling, so a run shorter than any cadence is still observed at its
-/// transitions.
-///
-/// KNOWN LIMIT (honest, and the reviewer's accepted alternative for it): a
-/// run that starts AND settles between two of the relay's derivations —
-/// only possible while a frame send is still in flight — is observed as
-/// "not running"; the transitions are not replayable from the set. The
-/// client's own state poll covers that corner.
+/// settle, child exit, removal) wakes the relay at once AND is recorded in
+/// the signal's bounded replay ring — a run that starts and settles while a
+/// frame send is blocked is REPLAYED transition-by-transition once the
+/// channel frees (Terra P2-1), never swallowed as "the net set did not
+/// change". A burst that overflows the ring (512 unseen transitions) is
+/// answered with ONE forced resync frame instead of a replay.
 const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(30);
+
+/// Drops of this guard are the relay thread's LAST act (every exit path):
+/// the alive count in `IpcHostState::running_relay_threads` therefore
+/// measures the thread's real lifetime, not its registration.
+struct RunningRelayAlive(Arc<AtomicUsize>);
+impl Drop for RunningRelayAlive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Subscribe to the RUNNING set's stream (the `agent.subscribeRunning` op;
 /// GET /api/agent/running/events): the first frame is the observation at
 /// subscribe time, then a frame whenever the set or the catalogue version
 /// changes. The relay sleeps on the registry's running-change signal (every
-/// run-state transition wakes it) and wakes on the probe deadline; every
-/// path out of the relay detaches: unsubscribe, a failed Channel send, or
-/// the probe on a dead channel.
+/// run-state transition wakes it) and wakes on the probe deadline; after
+/// each wake it first REPLAYS the transitions recorded while it was busy or
+/// blocked (Terra P2-1 — a short run must stay observable) and only then
+/// derives the current net set. Every path out of the relay detaches:
+/// unsubscribe (which also WAKES the waiter — Terra P2-2 — so a quiet relay
+/// ends at once instead of at the probe), a failed Channel send, or the
+/// probe on a dead channel.
 #[tauri::command]
 pub fn pi_ipc_subscribe_running(
     state: State<'_, IpcHostState>,
@@ -546,35 +565,122 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
     let version_counter = Arc::clone(&state.session_list_version);
     let relays_for_thread = Arc::clone(&state.event_relays);
     let running_signal = registry.running_signal();
+    let relays_alive = Arc::clone(&state.running_relay_threads);
     let subscription_for_relay = subscription_id.clone();
+    // Counted the moment the thread exists; the guard's Drop (the thread's
+    // last act on every exit path) decrements it back.
+    state.running_relay_threads.fetch_add(1, Ordering::SeqCst);
     let relay = std::thread::Builder::new()
         .name("ipc-running".into())
         .spawn(move || {
             let subscription_id = subscription_for_relay;
+            let _alive = RunningRelayAlive(relays_alive);
             let detach = || {
                 relays_for_thread.lock().unwrap().remove(&subscription_id);
             };
             let mut last_sent: Option<RunningSnapshot> = None;
             let mut last_sent_at = std::time::Instant::now();
             let mut seq: u64 = 0;
+            // Two deliberately different cursors: `signal_epoch` is the WAIT
+            // token (any bump — transition or wake-only — moves it, so a
+            // catalogue-version change still reaches subscribers at once),
+            // while `replay_seq` is the dense TRANSITION sequence (wake-only
+            // bumps never consume it). Captured before the first derivation:
+            // everything older is net-reflected in the baseline frame, so a
+            // subscription never replays runs that predate it.
             let mut signal_epoch = running_signal.epoch();
+            let mut replay_seq = running_signal.last_seq();
             loop {
                 if stop.load(Ordering::SeqCst) {
                     detach();
                     return;
                 }
+                // Replay the transitions recorded while the relay was busy
+                // or blocked in a send (a slow Channel): a run that started
+                // AND settled in that window must still be observable, so
+                // the intermediate sets are synthesized from the last-sent
+                // set — the current net set alone would swallow the run
+                // (Terra P2-1). Consecutive identical sets coalesce (a
+                // no-op transition carries no observation); the ring is
+                // bounded, so this is at most 512 frames per wake, never an
+                // unbounded burst behind a blocked channel.
+                let mut force_resync = false;
+                if last_sent.is_some() {
+                    let (transitions, gap) = running_signal.changes_since(replay_seq);
+                    if gap {
+                        // The bounded ring dropped transitions this relay had
+                        // not seen: the intermediate sets are unrecoverable.
+                        // Do not synthesize a partial history — advance the
+                        // cursor and force ONE full re-derivation frame below
+                        // (the client consumes frames as whole-set
+                        // replacements, so the net truth IS the recovery).
+                        replay_seq = running_signal.last_seq();
+                        force_resync = true;
+                    } else {
+                        for transition in transitions {
+                            replay_seq = transition.seq;
+                            let mut running =
+                                last_sent.as_ref().expect("baseline checked").running.clone();
+                            if transition.running {
+                                if !running.contains(&transition.session) {
+                                    running.push(transition.session.clone());
+                                    running.sort();
+                                }
+                            } else {
+                                running.retain(|id| id != &transition.session);
+                            }
+                            if running == last_sent.as_ref().expect("baseline checked").running {
+                                continue;
+                            }
+                            let observation = RunningSnapshot {
+                                running,
+                                // Read AFTER the set (derive_running_snapshot's
+                                // conservative order): the version beside a set
+                                // can only be too new, never too old.
+                                version: version_counter.load(Ordering::SeqCst),
+                            };
+                            seq += 1;
+                            let frame = stream_frame(
+                                &subscription_id,
+                                // The host process is this stream's epoch: a
+                                // host restart is a new app process, hence a
+                                // new subscription — never a frame on the old
+                                // epoch.
+                                1,
+                                seq,
+                                "event",
+                                json!({
+                                    "type": "running",
+                                    "runningSessionIds": observation.running,
+                                    "sessionListVersion": observation.version,
+                                }),
+                            );
+                            last_sent = Some(observation);
+                            last_sent_at = std::time::Instant::now();
+                            if on_frame.send(frame).is_err() {
+                                detach();
+                                return;
+                            }
+                            // The cancel contract (Terra P2-2): at most ONE
+                            // frame may leave after an unsubscribe lands —
+                            // re-check the stop flag between frames so a
+                            // multi-frame replay cannot outrun a cancel.
+                            if stop.load(Ordering::SeqCst) {
+                                detach();
+                                return;
+                            }
+                        }
+                    }
+                }
                 let snapshot = derive_running_snapshot(&registry, &version_counter);
                 let changed = last_sent.as_ref() != Some(&snapshot);
-                if changed || last_sent_at.elapsed() >= probe_after {
+                if changed || force_resync || last_sent_at.elapsed() >= probe_after {
                     last_sent = Some(snapshot.clone());
                     last_sent_at = std::time::Instant::now();
                     seq += 1;
                     let kind = if seq == 1 { "snapshot" } else { "event" };
                     let frame = stream_frame(
                         &subscription_id,
-                        // The host process is this stream's epoch: a host
-                        // restart is a new app process, hence a new
-                        // subscription — never a frame on the old epoch.
                         1,
                         seq,
                         kind,
@@ -592,9 +698,9 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                     }
                 }
                 // Event-driven: sleep until a run-state TRANSITION (start,
-                // settle, exit, removal) moves the signal, or the probe
-                // deadline passes (the dead-channel reaper). No cadence
-                // sampling — the signal IS the change notification.
+                // settle, exit, removal) or a wake-only bump (a catalogue
+                // version change, an unsubscribe) moves the signal, or the
+                // probe deadline passes (the dead-channel reaper).
                 signal_epoch = running_signal.wait_for_change(signal_epoch, probe_after);
             }
         });
@@ -602,9 +708,10 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
         Ok(_) => json!({ "subscriptionId": subscription_id }),
         Err(error) => {
             // No relay thread exists to clean up after itself: remove the
-            // handle here and fail the subscription honestly — reporting
-            // success would leave the client waiting on a stream that
-            // never starts.
+            // handle here, undo the alive count, and fail the subscription
+            // honestly — reporting success would leave the client waiting on
+            // a stream that never starts.
+            state.running_relay_threads.fetch_sub(1, Ordering::SeqCst);
             state.event_relays.lock().unwrap().remove(&subscription_id);
             protocol_error(
                 "?",
@@ -1098,6 +1205,16 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     if let Some(session) = state.registry.get(&handle.session_id) {
                         session.unsubscribe(handle.subscriber_id);
                     }
+                    // WAKE the running-set relay's waiter (Terra P2-2): it
+                    // sleeps on the registry's running signal with a 30 s
+                    // probe — without this bump a quiet unsubscribe leaves
+                    // the relay thread (and its liveness count) alive until
+                    // the probe. The bump is wake-only: no transition is
+                    // recorded, nothing replays; the relay re-checks its
+                    // stop flag and detaches at once. The session-events
+                    // relay is unaffected (its recv_timeout is already
+                    // bounded at 500 ms).
+                    state.registry.running_signal().notify();
                     protocol_ok(&id, json!({ "unsubscribed": subscription_id }))
                 }
                 None => protocol_error(&id, "not_found", &format!("no subscription {subscription_id}")),
@@ -4167,6 +4284,257 @@ mod tests {
             frames.lock().unwrap()
         );
         // The second unsubscribe answers not_found (idempotent cleanup).
+        let again = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(again["error"]["code"], "not_found", "{again}");
+    }
+
+    /// A Channel that records every frame AND blocks inside send #`block_at`
+    /// (1-based) until released — the deterministic seam for holding the
+    /// relay mid-send, exactly the interleavings the replay (P2-1) and
+    /// cancel (P2-2) contracts cover. Sends before/after `block_at` pass
+    /// and are recorded.
+    struct GatedChannel {
+        channel: Channel<Value>,
+        frames: Arc<Mutex<Vec<Value>>>,
+        sends_entered: Arc<AtomicU64>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    fn gated_channel(block_at: u64) -> GatedChannel {
+        let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sends_entered = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let sink = Arc::clone(&frames);
+        let counter = Arc::clone(&sends_entered);
+        let block = Arc::clone(&gate);
+        let channel = Channel::new(move |message| {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == block_at {
+                let (lock, cv) = &*block;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }
+            if let tauri::ipc::InvokeResponseBody::Json(text) = message {
+                if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                    sink.lock().unwrap().push(frame);
+                }
+            }
+            Ok(())
+        });
+        GatedChannel { channel, frames, sends_entered, gate }
+    }
+
+    impl GatedChannel {
+        /// Unblock the gated send (stays open for later sends).
+        fn open(&self) {
+            let (lock, cv) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+
+        /// Wait until at least `n` sends have ENTERED the channel closure
+        /// (bounded): send #n has begun on the relay thread — if it is the
+        /// gated one, the relay is deterministically mid-send.
+        fn wait_sends(&self, n: u64, limit: Duration) -> bool {
+            let deadline = std::time::Instant::now() + limit;
+            while std::time::Instant::now() < deadline {
+                if self.sends_entered.load(Ordering::SeqCst) >= n {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            self.sends_entered.load(Ordering::SeqCst) >= n
+        }
+    }
+
+    /// Wait until the running-relay THREAD count falls back to `baseline`
+    /// (bounded) — the thread-lifetime truth (P2-2): a relay that ignored
+    /// its stop flag keeps this count up even after its map entry is gone.
+    fn wait_for_relay_threads(state: &IpcHostState, baseline: usize, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if state.running_relay_threads.load(Ordering::SeqCst) <= baseline {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        state.running_relay_threads.load(Ordering::SeqCst) <= baseline
+    }
+
+    /// Terra P2-1: a run that starts AND settles while the relay is blocked
+    /// in a frame send must still be OBSERVABLE. The relay replays the
+    /// recorded transitions transition-by-transition (intermediate sets
+    /// synthesized from the last-sent set), so both the start `[s1]` and the
+    /// settle `[]` reach the client — an epoch-only relay wakes to an
+    /// unchanged net set and delivers NOTHING (verified by reverting the
+    /// replay: the wait for frame 3 fails).
+    #[test]
+    fn a_short_run_that_settled_while_a_send_was_blocked_is_replayed() {
+        let state = state();
+        let gated = gated_channel(1);
+        let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        // The relay is now deterministically stuck INSIDE its first send.
+        assert!(
+            gated.wait_sends(1, Duration::from_secs(5)),
+            "the first send entered the gate"
+        );
+        // The run starts and settles while nobody can deliver. No real
+        // session is needed: the replay synthesizes from the RECORDED
+        // transitions, not the registry (which still lists nothing).
+        let signal = state.registry.running_signal();
+        signal.notify_transition("s1", true);
+        signal.notify_transition("s1", false);
+        gated.open();
+        assert!(
+            wait_for_frames(&gated.frames, 3, Duration::from_secs(5)),
+            "initial + BOTH transitions: {:?}",
+            gated.frames.lock().unwrap()
+        );
+        let frames = gated.frames.lock().unwrap().clone();
+        assert_eq!(frames[0]["payload"]["runningSessionIds"], json!([]), "the initial snapshot");
+        assert_eq!(
+            frames[1]["payload"]["runningSessionIds"],
+            json!(["s1"]),
+            "the START is observable: {:?}",
+            frames[1]
+        );
+        assert_eq!(
+            frames[2]["payload"]["runningSessionIds"],
+            json!([]),
+            "the SETTLE is observable: {:?}",
+            frames[2]
+        );
+        // The net derivation after the replay equals the last replayed set:
+        // no fourth frame.
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            gated.frames.lock().unwrap().len(),
+            3,
+            "no frame beyond the replay: {:?}",
+            gated.frames.lock().unwrap()
+        );
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(3)));
+    }
+
+    /// The bounded half of P2-1: a burst LONGER than the replay ring is
+    /// never answered with an unbounded frame burst. The dropped head makes
+    /// the intermediate sets unrecoverable — the relay must send exactly
+    /// ONE forced resync frame (the current net set) instead of replaying.
+    #[test]
+    fn a_ring_gap_forces_one_resync_frame_instead_of_replaying_the_burst() {
+        let state = state();
+        let gated = gated_channel(1);
+        let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(gated.wait_sends(1, Duration::from_secs(5)));
+        // 600 recorded transitions overflow the 512-entry ring.
+        let signal = state.registry.running_signal();
+        for n in 0..600 {
+            signal.notify_transition(&format!("s{n}"), true);
+        }
+        gated.open();
+        assert!(
+            wait_for_frames(&gated.frames, 2, Duration::from_secs(5)),
+            "initial + ONE forced resync frame: {:?}",
+            gated.frames.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        let frames = gated.frames.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            2,
+            "no per-transition replay after a gap (bounded): {:?}",
+            frames
+        );
+        assert_eq!(frames[0]["payload"]["runningSessionIds"], json!([]));
+        assert_eq!(
+            frames[1]["payload"]["runningSessionIds"],
+            json!([]),
+            "the resync frame is the current net observation (the fabricated sessions never existed): {:?}",
+            frames[1]
+        );
+        drop(frames);
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(3)));
+    }
+
+    /// Terra P2-2 (a): a QUIET unsubscribe must end the relay THREAD at
+    /// once. The probe here is 60 s — without the unsubscribe wake the
+    /// thread sits in wait_for_change for the whole probe (the old
+    /// behavior). The liveness COUNT, not the registry entry (which the
+    /// handler clears itself), is the proof the thread really finished.
+    #[test]
+    fn unsubscribing_a_quiet_running_relay_ends_its_thread_at_once() {
+        let state = state();
+        let baseline = state.running_relay_threads.load(Ordering::SeqCst);
+        let (channel, frames) = recording_channel();
+        let ack = subscribe_running(&state, channel, Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
+        assert_eq!(
+            state.running_relay_threads.load(Ordering::SeqCst),
+            baseline + 1,
+            "the relay thread is alive"
+        );
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        assert!(
+            wait_for_relay_threads(&state, baseline, Duration::from_secs(3)),
+            "the relay thread ended within 3 s of a quiet unsubscribe (its probe is 60 s): count = {}",
+            state.running_relay_threads.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Terra P2-2 (b): the cancel contract with frames IN FLIGHT. The relay
+    /// is deterministically mid-send (send #2 — the first replay frame of a
+    /// five-transition burst) when the unsubscribe lands: the in-flight
+    /// frame completes, at most ONE more frame may leave, then silence, the
+    /// entry is gone and the thread ends — the between-frames stop check is
+    /// what bounds the multi-frame replay under a cancel.
+    #[test]
+    fn unsubscribing_with_replay_pending_delivers_at_most_one_more_frame() {
+        let state = state();
+        let gated = gated_channel(2);
+        let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        // Frame 1 (the initial snapshot) passes the gate untouched.
+        assert!(wait_for_frames(&gated.frames, 1, Duration::from_secs(5)));
+        // Five transitions pile up behind the quiet relay.
+        let signal = state.registry.running_signal();
+        for n in 0..5 {
+            signal.notify_transition(&format!("s{n}"), true);
+        }
+        // The relay wakes and enters send #2 (its first replay frame) —
+        // which the gate holds open.
+        assert!(
+            gated.wait_sends(2, Duration::from_secs(5)),
+            "the relay is mid-send on its first replay frame"
+        );
+        // The cancel lands while that frame is in flight.
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        gated.open();
+        // The in-flight frame completes (frame 2). At most ONE more frame
+        // may leave after the unsubscribe — here the between-frames stop
+        // check must end the relay before frames 3..6.
+        assert!(wait_for_frames(&gated.frames, 2, Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(800));
+        let frames = gated.frames.lock().unwrap();
+        assert!(
+            frames.len() <= 2,
+            "at most one frame after the unsubscribe (the in-flight one), got {}: {:?}",
+            frames.len(),
+            frames
+        );
+        drop(frames);
+        assert!(!state.event_relays.lock().unwrap().contains_key(&subscription_id));
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(3)));
         let again = unsubscribe_running(&state, &subscription_id);
         assert_eq!(again["error"]["code"], "not_found", "{again}");
     }

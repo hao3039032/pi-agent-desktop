@@ -68,16 +68,21 @@ pub struct RunningSignal {
     cv: std::sync::Condvar,
 }
 
-/// One recorded run-state transition (the replay unit).
+/// One recorded run-state transition (the replay unit). `seq` is the
+/// ring's OWN dense sequence — +1 per recorded transition, never consumed
+/// by the wake-only `notify()` bumps — so a consumer's replay cursor stays
+/// valid across them (an epoch cursor would see spurious gaps wherever a
+/// wake-only bump moved the epoch between two transitions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningTransition {
-    pub epoch: u64,
+    pub seq: u64,
     pub session: String,
     pub running: bool,
 }
 
 struct RunningSignalState {
     epoch: u64,
+    next_seq: u64,
     ring: std::collections::VecDeque<RunningTransition>,
 }
 
@@ -90,6 +95,7 @@ impl Default for RunningSignal {
         Self {
             state: std::sync::Mutex::new(RunningSignalState {
                 epoch: 0,
+                next_seq: 0,
                 ring: std::collections::VecDeque::new(),
             }),
             cv: std::sync::Condvar::new(),
@@ -112,9 +118,10 @@ impl RunningSignal {
     pub fn notify_transition(&self, session: &str, running: bool) {
         let mut state = self.state.lock().unwrap();
         state.epoch += 1;
-        let epoch = state.epoch;
+        state.next_seq += 1;
+        let seq = state.next_seq;
         state.ring.push_back(RunningTransition {
-            epoch,
+            seq,
             session: session.to_string(),
             running,
         });
@@ -146,26 +153,42 @@ impl RunningSignal {
         state.epoch
     }
 
-    /// The transitions recorded after `seen` (in epoch order), and whether
-    /// the ring overflowed in that span: on a gap the caller must fall back
-    /// to a full re-derivation (it cannot reconstruct the intermediate sets
-    /// it missed).
-    pub fn changes_since(&self, seen: u64) -> (Vec<RunningTransition>, bool) {
+    /// The transitions recorded after `seen_seq` (in sequence order), and
+    /// whether the ring dropped any entry the consumer had not yet seen:
+    /// on a gap the caller cannot reconstruct the intermediate sets it
+    /// missed and must fall back to a full re-derivation (a resync).
+    pub fn changes_since(&self, seen_seq: u64) -> (Vec<RunningTransition>, bool) {
         let state = self.state.lock().unwrap();
-        if state.ring.is_empty() {
+        let Some(oldest) = state.ring.front() else {
+            // Empty = nothing was EVER recorded (overflow never empties
+            // the ring) — nothing to replay, no gap possible.
             return (Vec::new(), false);
-        }
-        let oldest = state.ring.front().expect("non-empty").epoch;
-        if oldest > seen + 1 {
+        };
+        if oldest.seq > seen_seq + 1 {
             return (Vec::new(), true);
         }
-        let transitions = state
+        (
+            state
+                .ring
+                .iter()
+                .filter(|transition| transition.seq > seen_seq)
+                .cloned()
+                .collect(),
+            false,
+        )
+    }
+
+    /// The sequence of the most recent recorded transition (0 if none).
+    /// A consumer deriving its own baseline NOW starts its replay cursor
+    /// here: everything older is already net-reflected in that baseline.
+    pub fn last_seq(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap()
             .ring
-            .iter()
-            .filter(|transition| transition.epoch > seen)
-            .cloned()
-            .collect();
-        (transitions, false)
+            .back()
+            .map(|transition| transition.seq)
+            .unwrap_or(0)
     }
 }
 
@@ -1557,6 +1580,85 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod running_signal_tests {
+    use super::*;
+
+    /// A dense replay cursor across wake-only bumps (Terra P2-1): the
+    /// catalogue-version `notify()` bumps must not open holes in the
+    /// transition sequence a consumer replays from.
+    #[test]
+    fn wake_only_bumps_do_not_consume_replay_sequence() {
+        let signal = RunningSignal::default();
+        signal.notify_transition("s1", true);
+        let epoch_after_first = signal.epoch();
+        signal.notify();
+        signal.notify();
+        signal.notify_transition("s1", false);
+        assert_eq!(signal.last_seq(), 2);
+        assert!(signal.epoch() > epoch_after_first, "the bumps moved the epoch");
+        // A consumer that saw seq 1 gets exactly the settle — no gap, even
+        // though the epoch jumped twice in between.
+        let (transitions, gap) = signal.changes_since(1);
+        assert!(!gap);
+        assert_eq!(
+            transitions,
+            vec![RunningTransition { seq: 2, session: "s1".into(), running: false }]
+        );
+    }
+
+    /// The replay unit is the transition pair, so a run that started AND
+    /// settled while a consumer was blocked is fully reconstructable.
+    #[test]
+    fn both_transitions_of_a_short_run_replay_after_the_cursor() {
+        let signal = RunningSignal::default();
+        signal.notify_transition("s1", true);
+        signal.notify_transition("s1", false);
+        signal.notify_transition("s2", true);
+        assert_eq!(signal.last_seq(), 3);
+        let (transitions, gap) = signal.changes_since(0);
+        assert!(!gap);
+        assert_eq!(transitions.len(), 3);
+        assert_eq!(transitions[0], RunningTransition { seq: 1, session: "s1".into(), running: true });
+        assert_eq!(transitions[2], RunningTransition { seq: 3, session: "s2".into(), running: true });
+        // A fully-caught-up consumer sees nothing new.
+        let (caught_up, gap) = signal.changes_since(3);
+        assert!(!gap);
+        assert!(caught_up.is_empty());
+    }
+
+    /// Bounded memory: a burst longer than the ring keeps only the tail and
+    /// answers a GAP for every cursor that lost entries — the consumer's
+    /// fallback is one full re-derivation, never a partial replay.
+    #[test]
+    fn a_burst_longer_than_the_ring_answers_a_gap() {
+        let signal = RunningSignal::default();
+        for n in 0..600 {
+            signal.notify_transition(&format!("s{n}"), true);
+        }
+        // The ring holds the last RUNNING_TRANSITION_RING entries.
+        assert_eq!(signal.last_seq(), 600);
+        let (transitions, gap) = signal.changes_since(600 - RUNNING_TRANSITION_RING as u64);
+        assert!(!gap, "a cursor at the surviving head replays the whole tail");
+        assert_eq!(transitions.len(), RUNNING_TRANSITION_RING);
+        let (_, gap) = signal.changes_since(0);
+        assert!(gap, "a cursor at the start lost the dropped head");
+        let (_, gap) = signal.changes_since(600 - RUNNING_TRANSITION_RING as u64 - 1);
+        assert!(gap, "a cursor one entry before the surviving head lost that entry");
+    }
+
+    /// Nothing recorded: no transitions, no gap, and a baseline cursor of 0.
+    #[test]
+    fn an_untouched_signal_has_nothing_to_replay() {
+        let signal = RunningSignal::default();
+        assert_eq!(signal.last_seq(), 0);
+        let (transitions, gap) = signal.changes_since(0);
+        assert!(!gap);
+        assert!(transitions.is_empty());
+        assert_eq!(signal.epoch(), 0);
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,7 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | 静态 scheduled-tasks 存储（SSE 重试风暴） | `static-frontend/src/data/scheduled-tasks-store.ts`（vite alias `@/hooks/useScheduledTasks`）：`tasks.list` IPC（真实数据），无事件流（M4 未到）——runningTaskIds 空、schedulerOwner null（诚实未知）、完成通知不响，全部明示 |
 | 项目信任读取（trust.status IPC op） | `session_view::project_trust_status`（getProjectTrustStatus 的 Rust 移植：requiresTrust/trusted/decision/decisionPath/inherited/decisionError）+ pi_ipc `trust.status` + `lib/project-trust-client.ts`（HTTP 默认）↔静态 IPC 实现（AppShell 挂载探测改走 seam）。MCP 列表与 POST（信任写入）仍属 M3 |
 | 事件驱动 running 流的短 run 验证 | `real_pi_running_stream_observes_a_short_run_start_and_settle`：真实 pi + 快 provider，60s probe 下仅靠 RunningSignal 在亚秒内观测到 start 与 settle 两个转换 |
+| **running 流有界重放 + 取消契约（Terra P2-1/P2-2）** | `subscribe_running` relay 唤醒后先重放 `changes_since(seen)` 的转换（从最后发送集合合成中间集合、相邻相同集合合并、帧间重查停止标志）；环溢出→强制一帧 resync；重放游标为密集转换序号（wake-only bump 不消耗）。`agent.unsubscribeEvents` 置停后 `notify()` 唤醒 waiter（30s 探测不再拖住取消）。测试：`a_short_run_that_settled_while_a_send_was_blocked_is_replayed`（门控 send#1 + 两条转换 → 3 帧 []/[s1]/[]）、`a_ring_gap_forces_one_resync_frame…`（600 转换→恰 2 帧）、`unsubscribing_a_quiet_running_relay_ends_its_thread_at_once`（线程存活计数而非 map 项）、`unsubscribing_with_replay_pending_delivers_at_most_one_more_frame`（在途帧 barrier）；四者均经临时回退证实旧实现必败。契约记录于 `ipc-protocol.md` §3 |
 
 ### 未修/未完成（明确列出，不越级打勾）
 
