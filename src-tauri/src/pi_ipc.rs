@@ -3007,8 +3007,15 @@ fn session_view_dispatch(
                     let _ = std::fs::remove_file(handoff);
                     result
                 });
-                let prompt_recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool) == Some(true);
-                let prompt = recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str).unwrap_or("");
+                let recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool);
+                let (prompt, prompt_status) = match recorded {
+                    Some(true) => match recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str) {
+                        Some(text) => (text, "recorded"),
+                        None => ("", "unknown"),
+                    },
+                    Some(false) => session.configured_system_prompt().map(|text| (text, "configured")).unwrap_or(("", "unknown")),
+                    None => ("", "unknown"),
+                };
                 let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
@@ -3048,7 +3055,7 @@ fn session_view_dispatch(
                     // usage — unknown is not zero).
                     "contextUsage": context_usage.unwrap_or(Value::Null),
                     "systemPrompt": prompt,
-                    "systemPromptStatus": if prompt_recorded { "recorded" } else { "unknown" },
+                    "systemPromptStatus": prompt_status,
                     "extensionStatuses": extension_statuses,
                     "extensionWidgets": extension_widgets,
                 });
@@ -4464,6 +4471,16 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
         let after = read();
         assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
+        let prompt_file = root_path.join("base-prompt");
+        std::fs::write(&prompt_file, "\u{feff}FIXTURE BASE").unwrap();
+        let (other_file, other_id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut other_config = config.clone();
+        other_config.shape = session_host::SessionSpawnShape::ChatOnly { prompt_file };
+        state.registry.start(&other_id, &other_file, &other_id, &cwd, &other_config).unwrap();
+        let fallback = send(&state, json!({"v":1,"id":"base","op":"sessions.state","args":{"session":other_id}}));
+        assert_eq!(fallback["data"]["state"]["systemPromptStatus"], "configured", "{fallback}");
+        assert_eq!(fallback["data"]["state"]["systemPrompt"], "FIXTURE BASE");
+        state.registry.remove(&other_id, Duration::from_secs(5));
         state.registry.remove(&id, Duration::from_secs(5));
     }
 

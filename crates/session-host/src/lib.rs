@@ -200,6 +200,7 @@ pub struct Session {
     pub session_file_id: String,
     pub session_file: PathBuf,
     pub cwd: PathBuf,
+    configured_system_prompt: Option<String>,
     pub(crate) client: Arc<PiRpcClient>,
     pub(crate) bridge: Arc<Bridge>,
     state: Mutex<SessionState>,
@@ -274,6 +275,11 @@ impl Session {
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::bridge::BridgeError> {
         self.bridge.request(op, args, timeout)
+    }
+
+    /// The exact custom base passed at spawn, not the composed run prompt.
+    pub fn configured_system_prompt(&self) -> Option<&str> {
+        self.configured_system_prompt.as_deref()
     }
 
     /// The current get_state snapshot from the child.
@@ -1166,6 +1172,11 @@ fn spawn_session(
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
     }
 
+    let configured_system_prompt = match &config.shape {
+        SessionSpawnShape::ChatOnly { prompt_file } | SessionSpawnShape::Chat { prompt_file, .. } =>
+            std::fs::read_to_string(prompt_file).ok().map(|s| s.strip_prefix('\u{feff}').unwrap_or(&s).to_owned()),
+        SessionSpawnShape::Project { .. } => None,
+    };
     let client = PiRpcClient::spawn(
         &config.executable,
         SpawnOptions { args, cwd: Some(cwd.to_path_buf()), env, ui_attach_timeout: Some(Duration::from_secs(30)), ..SpawnOptions::default() },
@@ -1190,6 +1201,7 @@ fn spawn_session(
         session_file_id: session_file_id.to_string(),
         session_file: session_file.to_path_buf(),
         cwd: cwd.to_path_buf(),
+        configured_system_prompt,
         client: Arc::clone(&client),
         bridge: Bridge::attach_with_ui_forward(Arc::clone(&client), session_file_id.to_string(), nonce, ui_tx.clone()),
         state: Mutex::new(SessionState {
