@@ -957,6 +957,18 @@ pub fn read_beneath_root(
     resolved_root: &Path,
     resolved_target: &Path,
 ) -> Result<Vec<u8>, std::io::Error> {
+    let mut file = open_file_beneath_root(resolved_root, resolved_target)?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut data)?;
+    Ok(data)
+}
+
+/// Pin the authorized regular file; callers can safely retain the descriptor.
+#[cfg(unix)]
+pub fn open_file_beneath_root(
+    resolved_root: &Path,
+    resolved_target: &Path,
+) -> Result<std::fs::File, std::io::Error> {
     use std::os::fd::FromRawFd;
     let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
     let mut current = root_fd;
@@ -981,17 +993,18 @@ pub fn read_beneath_root(
     }
     let c_name = std::ffi::CString::new(*name)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     use std::os::fd::AsRawFd;
     let fd = unsafe { libc::openat(current.as_raw_fd(), c_name.as_ptr(), flags) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fd from a successful openat; File owns and closes it.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut data)?;
-    Ok(data)
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a regular file"));
+    }
+    Ok(file)
 }
 
 /// Open the directory at `resolved_target` by WALKING from the authorized

@@ -55,6 +55,10 @@ export default defineConfig({
         replacement: resolve(import.meta.dirname, "src/data/state-mirror.ts"),
       },
       {
+        find: /^@\/lib\/file-resource-url$/,
+        replacement: resolve(import.meta.dirname, "src/data/file-resource-url.ts"),
+      },
+      {
         // The file-tree service (listing + linked-directory grant) swaps
         // /api/files for files.list / files.allowLink over IPC.
         find: /^@\/lib\/file-service$/,

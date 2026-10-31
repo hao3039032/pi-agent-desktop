@@ -27,6 +27,7 @@ import type { GitFileDiffResponse } from "@/lib/git-types";
 import { fetchGitDiff as fetchGitDiffRequest } from "@/lib/git-status-service";
 import { getFileIcon } from "./FileIcons";
 import { useI18n } from "@/hooks/useI18n";
+import { useFileResourceUrl } from "@/hooks/useFileResourceUrl";
 import {
   resolveInitialFileDisplayMode,
   type FileViewerDisplayMode as DisplayMode,
@@ -611,7 +612,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     };
   }, [filePath, sourceSessionId, watchEnabled]);
 
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = useFileResourceUrl(filePath, sourceSessionId, bust);
 
   const formatSizeStr = size != null ? formatSize(size) : null;
   const metadata = [
@@ -726,7 +727,7 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     };
   }, [filePath, sourceSessionId, watchEnabled]);
 
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = useFileResourceUrl(filePath, sourceSessionId, bust);
   const metadata = [
     ext || "audio",
     duration != null ? formatDuration(duration) : null,
@@ -847,7 +848,7 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
     };
   }, [filePath, sourceSessionId, watchEnabled]);
 
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = useFileResourceUrl(filePath, sourceSessionId, bust);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>

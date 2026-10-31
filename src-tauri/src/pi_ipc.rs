@@ -1221,7 +1221,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
-        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
+        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" | "sessions.reference" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err((code, message)) => protocol_error(&id, &code, &message),
@@ -2002,25 +2002,40 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, &error.0, &error.1),
             }
         }
-        // Preview resources (crates/resource-protocol): grants are HOST-side
-        // decisions (a session-reported artifact location, a path the index
-        // scan proposed); the frontend can only confirm a path the host
-        // itself named — it can never mint a grant for an arbitrary path.
+        // A resource grant pins a regular file opened beneath a host-authorized
+        // root; a caller-supplied path alone never grants authority.
         "resources.grantFile" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             if path.is_empty() {
                 return protocol_error(&id, "invalid_args", "path is required");
             }
-            if !state.is_proposed(&path) {
-                return protocol_error(
-                    &id,
-                    "unauthorized_scope",
-                    "the host never proposed this path; resources are granted host-side only",
-                );
-            }
-            match state.resources.grant_file(Path::new(path), Duration::from_secs(600)) {
-                Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
-                Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+            #[cfg(unix)]
+            let opened = {
+                let target_path = Path::new(path);
+                let scoped = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, target_path)
+                };
+                let scoped = if scoped.is_some() { scoped } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
+                    if target_path.is_absolute() && !target_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                        match session_file_referenced(state, session, path) {
+                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| (resolved, PathBuf::from("/"))),
+                            Ok(false) => None,
+                            Err((code, message)) => return protocol_error(&id, &code, &message),
+                        }
+                    } else { None }
+                } else { None };
+                scoped.map(|(target, root)| crate::file_access::open_file_beneath_root(&root, &target))
+            };
+            #[cfg(windows)]
+            let opened: Option<Result<std::fs::File, std::io::Error>> = None;
+            match opened {
+                Some(Ok(file)) => match state.resources.grant_open_file(file, Path::new(path), Duration::from_secs(600)) {
+                    Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
+                    Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+                },
+                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
         }
         "resources.read" => {
@@ -2716,6 +2731,29 @@ fn session_info_json(
     info
 }
 
+#[cfg(unix)]
+fn session_file_referenced(state: &IpcHostState, session_id: &str, path: &str) -> Result<bool, (String, String)> {
+    let live = state.registry.get(session_id);
+    let mut handoff = None;
+    let args = if let Some(session) = live {
+        session.lease();
+        let (entries, leaf, tree) = crate::session_view::live_child_snapshot(&session)
+            .map_err(|message| ("agent_child_error".to_string(), message))?;
+        let file = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree)
+            .map_err(|error| ("io".to_string(), error.to_string()))?;
+        let args = json!({ "snapshotFile": file, "path": path });
+        handoff = Some(file);
+        args
+    } else {
+        let summary = session_host::history::find_session_by_id(&state.agent_dir(), session_id)
+            .ok_or_else(|| ("not_found".to_string(), "Session not found".to_string()))?;
+        json!({ "file": summary.file, "path": path })
+    };
+    let result = management_call(state, "session.isFileReferenced", args);
+    if let Some(file) = handoff { let _ = std::fs::remove_file(file); }
+    Ok(result?.get("referenced").and_then(Value::as_bool) == Some(true))
+}
+
 /// sessions.get / sessions.context / sessions.state (the GET /api/sessions/[id]
 /// family). Returns (code, message) failures; the caller maps them onto the
 /// protocol envelope.
@@ -2850,6 +2888,25 @@ fn session_view_dispatch(
                 }));
             }
             Ok(json!({ "running": false }))
+        }
+
+        "sessions.reference" => {
+            let summary = session_host::history::find_session_by_id(&agent_dir, session_id)
+                .ok_or_else(|| ("not_found".to_string(), format!("Session not found: {session_id}")))?;
+            let mut args = json!({ "file": summary.file, "sessionId": session_id });
+            let mut handoff = None;
+            if let Some(session) = state.registry.get(session_id) {
+                session.lease();
+                let (entries, leaf, tree) = crate::session_view::live_child_snapshot(&session)
+                    .map_err(|message| ("agent_child_error".to_string(), message))?;
+                let file = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree)
+                    .map_err(|error| ("io".to_string(), error.to_string()))?;
+                args["snapshotFile"] = json!(file);
+                handoff = Some(file);
+            }
+            let result = management_call(state, "session.reference", args);
+            if let Some(file) = handoff { let _ = std::fs::remove_file(file); }
+            result
         }
 
         // The /api/sessions/[id]/context contract: branch paging over the
@@ -4931,6 +4988,7 @@ mod tests {
         assert_eq!(call("tasks.list", json!({}))["data"]["tasks"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn preview_resources_grant_read_revoke_roundtrip() {
         let state = state();
@@ -4938,8 +4996,8 @@ mod tests {
         let png = dir.path().join("shot.png");
         std::fs::write(&png, vec![1u8; 300]).expect("write");
 
-        // Grant by host-side path decision; the handle is opaque.
-        state.propose_path(&png);
+        // The host authorizes the directory; the handle is opaque.
+        state.file_roots.lock().unwrap().add(dir.path());
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5387,8 +5445,9 @@ mod tests {
         assert_eq!(read["error"]["code"], "unauthorized_scope");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resource_grants_only_accept_host_proposed_paths() {
+    fn resource_grants_require_host_authorized_roots() {
         let state = state();
         let dir = tempfile::tempdir().expect("tempdir");
         let png = dir.path().join("shot.png");
@@ -5401,9 +5460,8 @@ mod tests {
         );
         assert_eq!(denied["error"]["code"], "unauthorized_scope", "{denied}");
 
-        // Once the HOST proposed the path (the session index shape), the
-        // grant is a pure confirmation.
-        state.propose_path(&png);
+        // A host-authorized root permits its files, but never a symlink escape.
+        state.file_roots.lock().unwrap().add(dir.path());
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5415,6 +5473,15 @@ mod tests {
             json!({ "v": 1, "id": "g2", "op": "resources.read", "args": { "handle": handle } }),
         );
         assert_eq!(read["data"]["totalLen"], 8);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let escaped = send(&state, json!({ "v": 1, "id": "g3", "op": "resources.grantFile", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
+        assert_eq!(escaped["error"]["code"], "unauthorized_scope");
+        std::fs::remove_file(&png).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), &png).unwrap();
+        let pinned = send(&state, json!({ "v": 1, "id": "g4", "op": "resources.read", "args": { "handle": handle } }));
+        assert_eq!(pinned["data"]["totalLen"], 8, "grant retains original inode");
     }
 
     #[test]

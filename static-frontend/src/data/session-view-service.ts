@@ -36,6 +36,11 @@ function ensureClient(): IpcClient {
   return client;
 }
 
+export async function fetchSessionReference(session: string, _fetchImpl?: typeof fetch): Promise<string> {
+  const result = await ensureClient().request<{ reference?: string }>("sessions.reference", { session }, { timeoutMs: 20_000 });
+  return result.reference ?? "";
+}
+
 /** An IPC failure mapped onto the HTTP-shaped status the hook logic reads. */
 function failureStatus(failure: IpcFailure): number {
   return failure.error.code === "not_found" ? 404 : 500;

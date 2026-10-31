@@ -117,11 +117,11 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
 }
 
 /** Grant a preview resource handle for an allowed file. */
-export async function grantFileResource(filePath: string): Promise<string> {
+export async function grantFileResource(filePath: string, sessionId?: string | null): Promise<string> {
   try {
     const data = await ensureClient().request<{ handle: string }>(
       "resources.grantFile",
-      { path: filePath },
+      { path: filePath, ...(sessionId ? { sessionId } : {}) },
       { timeoutMs: 15_000 },
     );
     return data.handle;

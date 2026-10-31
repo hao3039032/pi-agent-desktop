@@ -223,7 +223,7 @@ impl ManagementInstance {
         if kind == TaskKind::ReadOnly && !matches!(op,
             "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
             "session.readHeader" | "session.readEntries" | "session.readContext" | "session.readView" |
-            "session.projectSnapshot" | "chat.systemPrompt" | "session.chatOnlyPrompt" |
+            "session.projectSnapshot" | "session.isFileReferenced" | "session.reference" | "chat.systemPrompt" | "session.chatOnlyPrompt" |
             "models.list" | "models.enabledGet" | "modelsConfig.get" | "skills.search" | "skills.list" | "plugins.list" | "skills.check" | "plugins.check" | "auth.loginPoll" | "mcp.configGet" | "trust.projectListing") {
             return Err("operation is not approved as read-only".into());
         }

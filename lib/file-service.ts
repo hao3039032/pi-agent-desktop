@@ -113,7 +113,7 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
 }
 
 /** Grant a preview resource handle for an allowed file. */
-export async function grantFileResource(filePath: string): Promise<string> {
+export async function grantFileResource(filePath: string, _sessionId?: string | null): Promise<string> {
   return filePath;
 }
 

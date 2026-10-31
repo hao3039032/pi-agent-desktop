@@ -20,6 +20,7 @@ const jiti = createJiti(import.meta.url, {
 
 const {
   fetchSessionView,
+  fetchSessionReference,
   fetchSessionContextPage,
   fetchAgentRunningState,
   renewSessionLease,
@@ -35,6 +36,14 @@ function boundService(configure) {
   bindSessionViewService(client);
   return mock;
 }
+
+test("sessions.reference resolves through the bound host", async () => {
+  boundService((transport) => transport.on("sessions.reference", (args) => {
+    assert.deepEqual(args, { session: "s1" });
+    return { reference: "<referenced-session>fixture</referenced-session>" };
+  }));
+  assert.equal(await fetchSessionReference("s1"), "<referenced-session>fixture</referenced-session>");
+});
 
 test("sessions.get sends the view flags and maps the answer", async () => {
   const mock = boundService((transport) => {

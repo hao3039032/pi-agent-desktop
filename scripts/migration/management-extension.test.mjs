@@ -16,13 +16,14 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createJiti } from "jiti";
 import { resolvePiCliBin } from "../../lib/pi-rpc/test-utils.mjs";
 import { stageManagedTree } from "./stage-managed-tree.mjs";
+import { buildProjectionInto } from "./build-management-modules.mjs";
 
 const jiti = createJiti(import.meta.url, { interopDefault: true, moduleCache: false });
 const { PiRpcClient } = await jiti.import("../../lib/pi-rpc/client.ts");
@@ -36,7 +37,16 @@ const HERE = import.meta.dirname;
  */
 async function stageVendoredTree(managed) {
   await mkdir(managed, { recursive: true });
-  await stageManagedTree(managed);
+  if (process.env.PI_TEST_LINK_MANAGED_TREE === "1") {
+    const source = join(HERE, "../../node_modules");
+    for (const name of await readdir(source)) {
+      if (name === ".bin") continue;
+      await symlink(join(source, name), join(managed, name), "dir");
+    }
+    await buildProjectionInto(managed);
+  } else {
+    await stageManagedTree(managed);
+  }
 }
 
 test(
@@ -464,6 +474,20 @@ test(
       // The repo's own projection, run in-process: the differential oracle.
       const projection = await jiti.import("../../lib/session-projection.ts");
       const stats = await jiti.import("../../lib/session-stats.ts");
+
+      const reference = await call("session.reference", { file: sessionFile, sessionId: "proj-s1" });
+      assert.equal(reference.ok, true, JSON.stringify(reference));
+      assert.match(reference.result.reference, /after compaction/);
+      assert.doesNotMatch(reference.result.reference, /the abandoned branch/);
+      const referenceSnapshot = join(root, "reference-snapshot.json");
+      await writeFile(referenceSnapshot, JSON.stringify({ entries: [
+        { type: "message", message: { role: "user", content: "open /tmp/user-file.txt" } },
+        { type: "message", message: { role: "toolResult", toolName: "remote", content: [{ type: "text", text: "/tmp/remote-secret.txt" }] } },
+      ] }));
+      const allowedReference = await call("session.isFileReferenced", { snapshotFile: referenceSnapshot, path: "/tmp/user-file.txt" });
+      assert.equal(allowedReference.result.referenced, true, JSON.stringify(allowedReference));
+      const deniedReference = await call("session.isFileReferenced", { snapshotFile: referenceSnapshot, path: "/tmp/remote-secret.txt" });
+      assert.equal(deniedReference.result.referenced, false, JSON.stringify(deniedReference));
 
       // 1. readView: the disk half of GET /api/sessions/[id].
       const view = await call("session.readView", {

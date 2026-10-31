@@ -72,6 +72,7 @@ struct Grant {
     /// a symlink/junction whose target moved is a different resource.
     original_target: PathBuf,
     expires_at: Instant,
+    pinned_file: Option<std::fs::File>,
 }
 
 /// The registry of grants. `create` picks the handle; nothing else does.
@@ -127,8 +128,26 @@ impl ResourceRegistry {
                 scope,
                 original_target: canonical,
                 expires_at: Instant::now() + ttl,
+                pinned_file: None,
             },
         );
+        Ok(handle)
+    }
+
+    /// Grant an already authorized and opened regular file, pinning its inode.
+    pub fn grant_open_file(&self, file: std::fs::File, name: &Path, ttl: Duration) -> Result<Handle, DenyReason> {
+        if !file.metadata().map_err(|_| DenyReason::IoError)?.is_file() {
+            return Err(DenyReason::InvalidPath);
+        }
+        let handle = self.random_handle()?;
+        let mut grants = self.grants.lock().unwrap();
+        grants.retain(|_, grant| grant.expires_at > Instant::now());
+        if grants.len() >= 1024 { return Err(DenyReason::IoError); }
+        grants.insert(handle.clone(), Grant {
+            canonical: name.to_path_buf(), scope: Scope::File,
+            original_target: name.to_path_buf(), expires_at: Instant::now() + ttl,
+            pinned_file: Some(file),
+        });
         Ok(handle)
     }
 
@@ -154,12 +173,26 @@ impl ResourceRegistry {
         subpath: &str,
         range: Option<(u64, u64)>,
     ) -> ResourceResponse {
-        let grants = self.grants.lock().unwrap();
-        let Some(grant) = grants.get(handle) else {
+        let mut grants = self.grants.lock().unwrap();
+        let Some(grant) = grants.get_mut(handle) else {
             return ResourceResponse::Denied(DenyReason::UnknownHandle);
         };
         if Instant::now() >= grant.expires_at {
             return ResourceResponse::Denied(DenyReason::Expired);
+        }
+        if let Some(file) = grant.pinned_file.as_mut() {
+            use std::io::{Read, Seek, SeekFrom};
+            if !subpath.is_empty() { return ResourceResponse::Denied(DenyReason::InvalidPath); }
+            let Ok(total_len) = file.metadata().map(|m| m.len()) else { return ResourceResponse::Denied(DenyReason::IoError) };
+            let (start, length, applied) = match range {
+                Some((start, end)) if start <= end && start < total_len => (start, end.min(total_len - 1) - start + 1, true),
+                Some((start, _)) if start >= total_len => (0, 0, true),
+                _ => (0, total_len, false),
+            };
+            if file.seek(SeekFrom::Start(start)).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
+            let mut bytes = Vec::new();
+            if file.take(length).read_to_end(&mut bytes).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
+            return ResourceResponse::Ok { mime: mime_for(&grant.canonical), bytes, total_len, range_applied: applied };
         }
         // Re-validate the anchor itself: the canonical location must still
         // resolve to the SAME target (a replaced symlink is a different

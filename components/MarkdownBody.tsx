@@ -5,6 +5,7 @@ import { type Components, type ExtraProps } from "react-markdown";
 import { useStreamingMarkdownText } from "@/hooks/useStreamingMarkdown";
 import { StreamingMarkdown } from "./StreamingMarkdown";
 import { useFileContextMenu } from "@/hooks/useFileContextMenu";
+import { useFileResourceUrl } from "@/hooks/useFileResourceUrl";
 import { useI18n } from "@/hooks/useI18n";
 import { fenceFilePaths, inlineCodeFilePath } from "@/lib/file-context-menu";
 import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
@@ -46,9 +47,8 @@ function MarkdownImage({
   delete props.node;
   const href = typeof src === "string" ? src : undefined;
   const filePath = href ? resolveLocalFileHref(href, cwd) : null;
-  const imageSrc = filePath
-    ? `/api/files/${encodeFilePathForApi(filePath)}?type=read`
-    : href;
+  const localSrc = useFileResourceUrl(filePath);
+  const imageSrc = filePath ? localSrc : href;
   // Dynamic local paths are served directly by the file API.
   // eslint-disable-next-line @next/next/no-img-element
   const image = <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;

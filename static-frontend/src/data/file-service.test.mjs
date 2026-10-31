@@ -156,6 +156,7 @@ test("resource protocol functions roundtrip through resources.* ops", async () =
   const mock = boundService(null);
   mock.on("resources.grantFile", (args) => {
     assert.equal(args.path, "/proj/img.png");
+    assert.equal(args.sessionId, "session-1");
     return { handle: "handle-123" };
   });
   mock.on("resources.read", (args) => {
@@ -172,7 +173,7 @@ test("resource protocol functions roundtrip through resources.* ops", async () =
     return { revoked: true };
   });
 
-  const handle = await grantFileResource("/proj/img.png");
+  const handle = await grantFileResource("/proj/img.png", "session-1");
   assert.equal(handle, "handle-123");
   const readRes = await readFileResource(handle);
   assert.equal(readRes.mime, "image/png");
