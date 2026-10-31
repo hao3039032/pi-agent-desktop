@@ -17,7 +17,10 @@ import { AppShell } from "../../components/AppShell";
 import { I18nProvider } from "../../hooks/useI18n";
 import { DistroSetupGate } from "../../components/distro";
 import { bindAgentClient } from "./data/agent-client.ts";
+import { bindDesktopConnection } from "./data/desktop-connection.ts";
 import { bindFileService } from "./data/file-service.ts";
+import { bindProjectTrustClient } from "./data/project-trust-client.ts";
+import { bindScheduledTasksStore } from "./data/scheduled-tasks-store.ts";
 import { bindSessionListService } from "./data/session-list-service.ts";
 import { bindSessionViewService } from "./data/session-view-service.ts";
 import { bindStateMirrorClient, importStateMirrorBeforeMount } from "./data/state-mirror.ts";
@@ -35,6 +38,9 @@ async function boot(): Promise<void> {
   bindSessionViewService(client);
   bindSessionListService(client);
   bindWorkspaceService(client);
+  bindDesktopConnection(client);
+  bindScheduledTasksStore(client);
+  bindProjectTrustClient(client);
   bindStateMirrorClient(client);
   // The transition mirror imports BEFORE React mounts (plan §七.4): the
   // exported snapshot lands in localStorage while the UI still holds no

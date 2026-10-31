@@ -399,6 +399,86 @@ fn nearest_trust_entry(agent_dir: &Path, cwd: &Path) -> Option<bool> {
     }
 }
 
+/// The full trust status (`lib/project-trust.ts` getProjectTrustStatus),
+/// the shape `GET /api/project-trust` answers and the UI's trust banner and
+/// dialog consume: requiresTrust/trusted plus the nearest decision and
+/// whether it was inherited. `decision_error` covers the one TS case a
+/// no-trust folder still reports an unreadable store in.
+pub fn project_trust_status(agent_dir: &Path, cwd: &Path) -> serde_json::Value {
+    let requires_trust = has_trust_requiring_project_resources(cwd);
+    let read = nearest_trust_entry_detailed(agent_dir, cwd);
+    let mut status = serde_json::Map::new();
+    status.insert("requiresTrust".into(), serde_json::Value::Bool(requires_trust));
+    if !requires_trust {
+        status.insert("trusted".into(), serde_json::Value::Bool(true));
+        match read {
+            Ok(Some((decision, path))) => {
+                let inherited = path != canonical(cwd).to_string_lossy();
+                status.insert("decision".into(), serde_json::Value::Bool(decision));
+                status.insert("decisionPath".into(), serde_json::Value::String(path));
+                status.insert("inherited".into(), serde_json::Value::Bool(inherited));
+            }
+            Ok(None) => {
+                status.insert("decision".into(), serde_json::Value::Null);
+                status.insert("inherited".into(), serde_json::Value::Bool(false));
+            }
+            Err(message) => {
+                status.insert("decision".into(), serde_json::Value::Null);
+                status.insert("inherited".into(), serde_json::Value::Bool(false));
+                status.insert("decisionError".into(), serde_json::Value::String(message));
+            }
+        }
+        return serde_json::Value::Object(status);
+    }
+    let trusted = matches!(read, Ok(Some((true, _))));
+    status.insert("trusted".into(), serde_json::Value::Bool(trusted));
+    match read {
+        Ok(Some((decision, path))) => {
+            let inherited = path != canonical(cwd).to_string_lossy();
+            status.insert("decision".into(), serde_json::Value::Bool(decision));
+            status.insert("decisionPath".into(), serde_json::Value::String(path));
+            status.insert("inherited".into(), serde_json::Value::Bool(inherited));
+        }
+        _ => {
+            status.insert("decision".into(), serde_json::Value::Null);
+            status.insert("inherited".into(), serde_json::Value::Bool(false));
+        }
+    }
+    serde_json::Value::Object(status)
+}
+
+/// The nearest trust decision AND the path it is recorded for (the TS
+/// `findNearestTrustEntry` shape); Err when trust.json exists but cannot be
+/// parsed — the distinction `project_trust_status` reports as decisionError.
+fn nearest_trust_entry_detailed(agent_dir: &Path, cwd: &Path) -> Result<Option<(bool, String)>, String> {
+    let path = agent_dir.join("trust.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Ok(None), // no store yet: no decision, no error
+    };
+    let trimmed = text.trim_start_matches('\u{feff}');
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|error| format!("failed to parse {}: {error}", path.to_string_lossy()))?;
+    let store = parsed
+        .as_object()
+        .ok_or_else(|| format!("{} is not a trust store object", path.to_string_lossy()))?;
+    let mut current = canonical(cwd);
+    loop {
+        if let Some(value) = store.get(current.to_string_lossy().as_ref()) {
+            match value {
+                serde_json::Value::Bool(decision) => {
+                    return Ok(Some((*decision, current.to_string_lossy().into_owned())))
+                }
+                _ => return Ok(None),
+            }
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = canonical(parent),
+            _ => return Ok(None),
+        }
+    }
+}
+
 /// The effective project trust for a cwd (`getProjectTrustStatus`): a cwd
 /// with nothing trust-requiring is trusted; otherwise the store decides.
 pub fn project_trusted(agent_dir: &Path, cwd: &Path) -> bool {

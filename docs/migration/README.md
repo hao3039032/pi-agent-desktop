@@ -58,15 +58,20 @@ PI_CLI_BIN=$HOME/.pi/agent/bin/pi cargo test --test real_pi   # 在 crates/pi-ho
 | 链接目录授权（files.allowLink：显示目标校验、重指向拒绝、主机侧授权） | pi_ipc.rs files_allow_link 测试 |
 | 文件树服务 seam（lib/file-service.ts ↔ 静态 IPC 版；FileExplorer 消费） | file-service.test.mjs（3 测试） |
 | 工具选择器（agent.getTools/setTools 经 bridge；隐藏工具撤下；ToolEntry 投影） | pi_ipc.rs real_pi_agent_get_tools（真实 pi 双向） |
+| **静态 UI 纵向验收**（项目+Chat：创建→发送→真实流式→停止→队列编辑/立即发送→重开历史） | `node scripts/migration/static-ui-acceptance.mjs` **exit 0 全链路 PASS**（真实静态 bundle + 真实 Rust host（mock_app）+ 真实 pi child + 本地 fixture provider；进程树回收/CSRF token/硬 deadline 实测）。剩余 /api 清单由驱动器如实列出（models×N/worktrees/cwd-status/chat-access/updates/distro/fonts）＝生产验收阻塞未过 |
+| 静态桌面连接探测（desktop-connection 假 offline） | `static-frontend/src/data/desktop-connection.ts`（vite alias）：`desktop.identity` IPC 探测替代 `/api/home`；stale-probe token 保护；验收断言回归必挂 |
+| 静态 scheduled-tasks 存储（SSE 重试风暴） | `static-frontend/src/data/scheduled-tasks-store.ts`（vite alias `@/hooks/useScheduledTasks`）：`tasks.list` IPC（真实数据），无事件流（M4 未到）——runningTaskIds 空、schedulerOwner null（诚实未知）、完成通知不响，全部明示 |
+| 项目信任读取（trust.status IPC op） | `session_view::project_trust_status`（getProjectTrustStatus 的 Rust 移植：requiresTrust/trusted/decision/decisionPath/inherited/decisionError）+ pi_ipc `trust.status` + `lib/project-trust-client.ts`（HTTP 默认）↔静态 IPC 实现（AppShell 挂载探测改走 seam）。MCP 列表与 POST（信任写入）仍属 M3 |
+| 事件驱动 running 流的短 run 验证 | `real_pi_running_stream_observes_a_short_run_start_and_settle`：真实 pi + 快 provider，60s probe 下仅靠 RunningSignal 在亚秒内观测到 start 与 settle 两个转换 |
 
 ### 未修/未完成（明确列出，不越级打勾）
 
 | 项 | 现状 |
 |---|---|
-| 数据域迁移主体（models/MCP/插件技能/git 状态/文件索引搜索/上传下载/worktree/scheduled/appearance/desktop） | 文件树列表/链接授权已迁（fetch 计数从 121 降）；sessions.catalogue 宿主 op 已就绪但**未接 UI**（messageCount/workspaceKind/relation/running 未从头部扫描可得，接 UI 前必须补齐——README 此行即约束）；其余未替换；生产合规检查未过 |
+| 数据域迁移主体（models/MCP/插件技能/git 状态/文件索引搜索/上传下载/worktree/剩余 scheduled 写面/appearance/desktop） | 文件树列表/链接授权/desktop-connection/scheduled 读面/信任读已迁（fetch 计数从 121 降）；sessions.catalogue 宿主 op 已就绪但**未接 UI**（messageCount/workspaceKind/relation/running 未从头部扫描可得，接 UI 前必须补齐——README 此行即约束）；models 域（选择器/默认值/enabledModels）、worktrees、cwd/status、chat-access、updates、distro、appearance/fonts 仍走 fetch——生产合规检查未过（验收驱动器实时列出 /api 清单） |
 | 主机层命令（fork/fork_branch/clone/navigate_tree/get_state 丰富化/extension_ui_response 输入；get_tools/setTools 已迁移） | 未实现项回 not_supported；HOST_LEVEL_COMMAND_OPS 表随迁移增长 |
 | 会话事件流 ACK/背压（有界队列、工具中间更新合并、超限 reset） | 未实现；当前无界转发 |
-| 会话完整闭环（目录消费、上下文读取/投影、创建、聊天发送的队列/分支语义） | catalogue 已是 TS 扫描器语义（差分测试 8 fixtures 全字段一致：session_info 改名、坏尾容忍、附件感知标题、活动时间 modified、完整 ISO）；上下文投影（session.readContext + buildSessionContext 的纯函数抽取）与 /api/agent/new 创建、发送闭环未实现 — 下一域 |
+| 会话完整闭环（目录消费、上下文读取/投影、创建、聊天发送的队列/分支语义） | catalogue 已是 TS 扫描器语义（差分测试 8 fixtures 全字段一致）；创建/发送/流式/停止/队列编辑/立即发送/重开历史已由静态 UI 纵向验收端到端跑通（真实 pi）；fork/clone/navigate_tree 等树操作仍属主机层命令表未实现项 |
 | 子 UI 请求转发（agent.respondUi 等）与 pendingExtensionUiIds 权威来源 | 快照带机器视角列表（事件观测）；子进程 UI 未接入转发 |
 | 调度器生产集成（宿主 30s tick、RunSpawner、marker 确认、隐藏窗口运行） | 引擎/存储/账本就位，未接线 |
 | OAuth loopback | M0 PoC 已有（state 不匹配绝不成、取消、PKCE）；未接入宿主真实登录流 |

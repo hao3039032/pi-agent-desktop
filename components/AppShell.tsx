@@ -103,6 +103,7 @@ import type { BlockingExtensionUiRequest, CacheWarmingInfo, LeafChangeOptions, S
 import { shouldShowUsageBreakdown, UNATTRIBUTED_USAGE_KEY } from "@/lib/usage-breakdown";
 import { cacheWarmingRows } from "@/lib/cache-warming-display";
 import type { McpErrorResponse, ProjectTrustStatus } from "@/lib/api-types";
+import { fetchProjectTrustStatus } from "@/lib/project-trust-client";
 import type { ChatInputHandle } from "./ChatInput";
 import type { FileExplorerHandle } from "./FileExplorer";
 import type { SessionStatsInfo } from "@/lib/pi-types";
@@ -1841,13 +1842,10 @@ export function AppShell() {
     const controller = new AbortController();
     // The answer also lists the project's MCP servers (`mcpFile`, `mcpServers`), unused here: the
     // trust dialog fetches the listing again when it opens, since the file can change in between.
-    fetch(`/api/project-trust?cwd=${encodeURIComponent(projectTrustCwd)}`, {
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        const data = await response.json() as ProjectTrustStatus & { error?: string };
-        if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
-        setProjectTrust(data);
+    fetchProjectTrustStatus(projectTrustCwd, controller.signal)
+      .then((result) => {
+        if (!result.ok) throw new Error(result.error);
+        setProjectTrust(result);
       })
       .catch((error) => {
         if (error instanceof DOMException && error.name === "AbortError") return;

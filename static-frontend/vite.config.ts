@@ -83,6 +83,29 @@ export default defineConfig({
         find: /^@\/lib\/workspace-service$/,
         replacement: resolve(import.meta.dirname, "src/data/workspace-service.ts"),
       },
+      {
+        // The connection probe swaps the /api/home health check for a real
+        // host round trip (desktop.identity over IPC): the static app has no
+        // HTTP server, so /api/home would always paint a fake offline banner.
+        find: /^@\/lib\/desktop-connection$/,
+        replacement: resolve(import.meta.dirname, "src/data/desktop-connection.ts"),
+      },
+      {
+        // The scheduled-tasks store swaps the /api/scheduled-tasks list and
+        // its EventSource for the host's tasks.list (real data) with no
+        // event stream yet — the scheduler's host wiring (M4) will add one.
+        // Without this the stream retries the SPA fallback forever.
+        find: /^@\/hooks\/useScheduledTasks$/,
+        replacement: resolve(import.meta.dirname, "src/data/scheduled-tasks-store.ts"),
+      },
+      {
+        // The project-trust mount probe swaps GET /api/project-trust's status
+        // half for trust.status over IPC (the Rust port of
+        // getProjectTrustStatus). The MCP listing and the trust WRITE stay
+        // on the HTTP route until their M3 ops land.
+        find: /^@\/lib\/project-trust-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/project-trust-client.ts"),
+      },
       // The repo's path alias: the existing components/hooks/lib compile as-is.
       { find: /^@\/(.*)$/, replacement: resolve(root, "$1") },
     ],
