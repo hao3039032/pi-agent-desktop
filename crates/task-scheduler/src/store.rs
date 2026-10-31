@@ -315,18 +315,40 @@ fn iso_to_ms_impl(value: &str) -> Option<i64> {
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return None;
     }
+    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') { return None; }
     let year: i64 = value.get(0..4)?.parse().ok()?;
     let month: i64 = value.get(5..7)?.parse().ok()?;
     let day: i64 = value.get(8..10)?.parse().ok()?;
     let hour: i64 = value.get(11..13)?.parse().ok()?;
     let minute: i64 = value.get(14..16)?.parse().ok()?;
     let second: i64 = value.get(17..19)?.parse().ok()?;
-    let millis: i64 = value
-        .get(20..23)
-        .and_then(|fraction| fraction.parse().ok())
-        .unwrap_or(0);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, 2 if leap => 29, 2 => 28, _ => return None };
+    if day < 1 || day > month_days || hour > 23 || minute > 59 || second > 59 { return None; }
+    let mut pos = 19;
+    let mut millis = 0;
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        let start = pos;
+        while bytes.get(pos).is_some_and(u8::is_ascii_digit) { pos += 1; }
+        if pos == start { return None; }
+        let fraction = value.get(start..pos)?;
+        let mut first_three = fraction.bytes().take(3).map(|byte| (byte - b'0') as i64);
+        millis = first_three.next().unwrap_or(0) * 100 + first_three.next().unwrap_or(0) * 10 + first_three.next().unwrap_or(0);
+    }
+    let offset = match bytes.get(pos)? {
+        b'Z' if pos + 1 == bytes.len() => 0,
+        sign @ (b'+' | b'-') if pos + 6 == bytes.len() && bytes.get(pos + 3) == Some(&b':') => {
+            let hours: i64 = value.get(pos + 1..pos + 3)?.parse().ok()?;
+            let minutes: i64 = value.get(pos + 4..pos + 6)?.parse().ok()?;
+            if hours > 23 || minutes > 59 { return None; }
+            let seconds = hours * 3600 + minutes * 60;
+            if *sign == b'+' { seconds } else { -seconds }
+        }
+        _ => return None,
+    };
     let days = days_from_civil(year, month, day);
-    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000 + millis)
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second - offset) * 1000 + millis)
 }
 
 /// epoch ms → ISO-8601 (Zulu, millisecond precision).
@@ -481,5 +503,11 @@ mod tests {
         assert_eq!(iso_to_ms(&ms_to_iso(1_772_342_220_123)), Some(1_772_342_220_123));
         assert_eq!(iso_to_ms("2026-03-01T05:17:00.000Z"), Some(1_772_342_220_000));
         assert_eq!(iso_to_ms("not a date"), None);
+        assert_eq!(iso_to_ms("2026-03-01T13:17:00.000+08:00"), Some(1_772_342_220_000));
+        assert_eq!(iso_to_ms("2026-03-01T00:17:00-05:00"), Some(1_772_342_220_000));
+        assert_eq!(iso_to_ms("2026-03-01T05:17:00.1Z"), Some(1_772_342_220_100));
+        assert_eq!(iso_to_ms("2026-13-01T05:17:00Z"), None);
+        assert_eq!(iso_to_ms("2026-02-30T05:17:00Z"), None);
+        assert_eq!(iso_to_ms("2026-03-01T05:17:00garbage"), None);
     }
 }
