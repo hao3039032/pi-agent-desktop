@@ -267,6 +267,11 @@ impl Session {
         self.activity_gate.try_write().map_err(|_| "session is busy")
     }
 
+    /// Whether the child transport is closing or has exited.
+    pub fn is_transport_closing(&self) -> bool {
+        self.client.is_closing()
+    }
+
     /// One bridge request (nonce/session-verified by pi-host).
     pub fn bridge_request(
         &self,

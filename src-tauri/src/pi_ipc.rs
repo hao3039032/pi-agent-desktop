@@ -1441,7 +1441,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "agent.subagentsStatus" | "agent.subagentsAction" => match crate::session_fleet::dispatch(state, op, &args) {
             Ok(data) => protocol_ok(&id, data),
-            Err((code, message)) => protocol_error(&id, &code, &message),
+            Err((reason, message)) => {
+                let code = match reason.as_str() {
+                    "invalid_args" | "invalid_params" | "invalid_request" | "unsupported_method" | "unsupported_version" | "capability-unavailable" => "invalid_args",
+                    "not_found" => "not_found",
+                    "session-closed" | "invalid_state" | "no_active_session" => "busy",
+                    "unresponsive" => "timeout",
+                    "chat-workspace" => "unauthorized_scope",
+                    "not-loaded" | "unknown" => "not_supported",
+                    _ => "io",
+                };
+                protocol_error_value(&id, json!({"code":code,"reason":reason,"message":message,"retryable":false}))
+            }
         },
         "agent.respondUi" => {
             let session_id = args.get("session").and_then(Value::as_str).unwrap_or("");
