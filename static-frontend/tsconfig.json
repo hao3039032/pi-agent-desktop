@@ -61,6 +61,9 @@
       "@/hooks/useScheduledTasks": [
         "./static-frontend/src/data/scheduled-tasks-store.ts"
       ],
+      "@/lib/scheduled-tasks/client": [
+        "./static-frontend/src/data/scheduled-tasks-client.ts"
+      ],
       "@/lib/project-trust-client": [
         "./static-frontend/src/data/project-trust-client.ts"
       ],
