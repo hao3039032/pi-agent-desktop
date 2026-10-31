@@ -51,13 +51,24 @@ pub struct PtyOptions {
     pub env: Vec<(String, String)>,
     /// Host-selected executable and arguments, never supplied by a client.
     pub shell: Option<(std::path::PathBuf, Vec<String>)>,
+    /// An authorized directory pinned by the Linux host through spawn.
+    #[cfg(target_os = "linux")]
+    pub cwd_handle: Option<std::fs::File>,
     /// Diagnostics (spawn trouble, read errors).
     pub on_log: Option<LogFn>,
 }
 
 impl Default for PtyOptions {
     fn default() -> Self {
-        Self { cols: 80, rows: 24, env: Vec::new(), shell: None, on_log: None }
+        Self {
+            cols: 80,
+            rows: 24,
+            env: Vec::new(),
+            shell: None,
+            #[cfg(target_os = "linux")]
+            cwd_handle: None,
+            on_log: None,
+        }
     }
 }
 
@@ -351,6 +362,23 @@ impl PtyHost {
         let mut command = portable_pty::CommandBuilder::new(shell);
         for arg in args { command.arg(arg); }
         if let Some(cwd) = cwd {
+            #[cfg(target_os = "linux")]
+            if let Some(handle) = options.cwd_handle.as_ref() {
+                use std::os::fd::AsRawFd;
+                // portable-pty closes inherited fds in its child pre-exec;
+                // the parent's fd stays open until spawn_command returns.
+                let pinned = format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd());
+                // CommandBuilder otherwise silently falls back to HOME for a
+                // cwd it cannot stat, which would bypass the host's scope.
+                if !std::path::Path::new(&pinned).is_dir() {
+                    return Err("pinned terminal cwd is unavailable".to_string());
+                }
+                command.cwd(pinned);
+                command.env("PWD", cwd);
+            } else {
+                command.cwd(cwd);
+            }
+            #[cfg(not(target_os = "linux"))]
             command.cwd(cwd);
         }
         command.env_remove("PI_WEB_PASSWORD");
@@ -669,6 +697,17 @@ mod tests {
         host.create("same", Some(a.path()), PtyOptions::default()).unwrap();
         assert!(host.create("same", Some(b.path()), PtyOptions::default()).is_err());
         host.close("same");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invalid_pinned_cwd_never_falls_back_to_home() {
+        let host = PtyHost::new();
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("not-directory")).unwrap();
+        let result = host.create("invalid-anchor", Some(dir.path()), PtyOptions { cwd_handle: Some(file), ..PtyOptions::default() });
+        assert!(result.is_err());
+        assert!(host.get("invalid-anchor").is_none());
     }
 
     #[cfg(unix)]

@@ -1281,18 +1281,30 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Ok(cwd) => cwd,
                 Err(code) => return protocol_error(&id, code, "terminal cwd is not an authorized project directory"),
             };
+            #[cfg(not(target_os = "linux"))]
+            return protocol_error(&id, "not_supported", "secure terminal cwd spawn is not available on this platform");
+            #[cfg(target_os = "linux")]
             match state.terminal_streams.reuse(terminal_id, &cwd) {
                 Ok(true) => return protocol_ok(&id, json!({ "id": terminal_id })),
                 Ok(false) => {},
                 Err(error) => return protocol_error(&id, "invalid_args", &error),
             }
+            #[cfg(target_os = "linux")]
+            let cwd_handle = match crate::terminal_host::pin_cwd(&state.file_roots.lock().unwrap(), &state.agent_dir(), &cwd) {
+                Ok(handle) => handle,
+                Err(code) => return protocol_error(&id, code, "terminal cwd could not be pinned safely"),
+            };
+            #[cfg(target_os = "linux")]
             let cols = args.get("cols").and_then(Value::as_u64).unwrap_or(80).clamp(2, 1000) as u16;
+            #[cfg(target_os = "linux")]
             let rows = args.get("rows").and_then(Value::as_u64).unwrap_or(24).clamp(2, 1000) as u16;
+            #[cfg(target_os = "linux")]
             let shell = match terminal_shell(state) {
                 Ok(shell) => shell,
                 Err((code, message)) => return protocol_error(&id, &code, &message),
             };
-            match state.terminal_streams.create(terminal_id, &cwd, pty_host::PtyOptions { cols, rows, shell: Some(shell), ..Default::default() }) {
+            #[cfg(target_os = "linux")]
+            match state.terminal_streams.create(terminal_id, &cwd, pty_host::PtyOptions { cols, rows, shell: Some(shell), cwd_handle: Some(cwd_handle), ..Default::default() }) {
                 Ok(()) => protocol_ok(&id, json!({ "id": terminal_id })),
                 Err(error) => protocol_error(&id, "io", &error),
             }
@@ -4747,7 +4759,10 @@ mod tests {
             &state,
             json!({ "v": 1, "id": "tc2", "op": "terminal.create", "args": { "id": "t-b", "cwd": project.display().to_string() } }),
         );
+        #[cfg(target_os = "linux")]
         assert_eq!(inside["ok"], true, "{inside}");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(inside["error"]["code"], "not_supported", "{inside}");
         // An arbitrary cwd: refused before any PTY exists.
         let refused = send(
             &state,
@@ -5485,6 +5500,7 @@ mod tests {
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminal_roundtrip_over_the_dispatch_table() {
         let state = state();
