@@ -70,6 +70,15 @@ tempfile = "3"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# Test-only: the static-UI acceptance harness (src/bin/static-ui-harness.rs).
+# Gates the bin out of every normal build (cargo build / desktop packaging);
+# `cargo run --features harness --bin static-ui-harness` opts in explicitly.
+harness = ["tauri/test"]
+
+[[bin]]
+name = "static-ui-harness"
+path = "src/bin/static-ui-harness.rs"
+required-features = ["harness"]
 
 [profile.release]
 panic = "abort"

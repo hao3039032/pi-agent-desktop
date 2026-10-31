@@ -283,6 +283,19 @@ impl ManagementHost {
             .map(|(scope, _)| scope.clone())
             .collect()
     }
+
+    /// Shut every live instance down (stdin EOF then a grace kill) and drop
+    /// the registry entries. Host shutdown path (the acceptance harness's
+    /// graceful stop): without it an idle instance outlives the decision to
+    /// exit only until its 60 s recycle timer — and nothing recycles when the
+    /// process is about to die.
+    pub fn shutdown_all(&self, grace: Duration) {
+        let instances: Vec<Arc<ManagementInstance>> =
+            self.instances.lock().unwrap().drain().map(|(_, value)| value).collect();
+        for instance in instances {
+            instance.shutdown(grace);
+        }
+    }
 }
 
 /// base64url without padding (RFC 4648 §5).
@@ -374,11 +387,7 @@ impl ManagementInstance {
 #[cfg(test)]
 impl ManagementHost {
     fn recycle_expired_all_for_tests(&self) {
-        let instances: Vec<Arc<ManagementInstance>> =
-            self.instances.lock().unwrap().drain().map(|(_, value)| value).collect();
-        for instance in instances {
-            instance.shutdown(Duration::from_secs(5));
-        }
+        self.shutdown_all(Duration::from_secs(5));
     }
 }
 

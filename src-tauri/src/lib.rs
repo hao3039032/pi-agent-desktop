@@ -20,7 +20,11 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, Url};
 mod file_access;
 mod logging;
 mod native_prefs;
-mod pi_ipc;
+// `pi_ipc` is pub for the static-UI acceptance harness bin (same crate,
+// feature-gated): it drives the REAL command functions (`dispatch_envelope`,
+// the `pi_ipc_subscribe_*` streams) over a browser bridge instead of the
+// Tauri WebView plumbing. No other module needs the exposure.
+pub mod pi_ipc;
 mod session_view;
 mod shell;
 mod update_install;
