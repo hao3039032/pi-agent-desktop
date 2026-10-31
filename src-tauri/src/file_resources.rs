@@ -571,6 +571,25 @@ pub fn handle_desktop_save_file(state: &IpcHostState, id: &str, args: &Value) ->
     protocol_error(id, "invalid_args", "sourcePath or data is required")
 }
 
+// Render a DOCX via the fixed management tree, from an already-authorized handle.
+pub fn handle_docx_preview(state: &IpcHostState, id: &str, args: &Value) -> Value {
+    let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
+    let (bytes, length) = match state.resources.read(handle, "", Some((0, CHAT_ATTACHMENT_EXTRACT_MAX_BYTES as u64))) {
+        resource_protocol::ResourceResponse::Ok { bytes, total_len, .. } => (bytes, total_len),
+        _ => return protocol_error(id, "unauthorized_scope", "Invalid resource handle"),
+    };
+    if length == 0 || length > CHAT_ATTACHMENT_EXTRACT_MAX_BYTES as u64 {
+        return protocol_error(id, "payload_too_large", "DOCX too large for preview (>10MB)");
+    }
+    let dir = match tempfile::tempdir() { Ok(dir) => dir, Err(error) => return protocol_error(id, "io", &error.to_string()) };
+    let path = dir.path().join("preview.docx");
+    if let Err(error) = std::fs::write(&path, bytes) { return protocol_error(id, "io", &error.to_string()); }
+    match crate::pi_ipc::management_call(state, "docx.renderHtml", json!({ "path": path })) {
+        Ok(value) => protocol_ok(id, value),
+        Err((code, message)) => protocol_error(id, &code, &message),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // chats.extractAttachmentText
 // ---------------------------------------------------------------------------

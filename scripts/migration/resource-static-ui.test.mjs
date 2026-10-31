@@ -2,24 +2,34 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { build } from "../../static-frontend/node_modules/vite/dist/node/index.js";
+import JSZip from "jszip";
+import { buildProjectionInto } from "./build-management-modules.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const sandbox = await mkdtemp(join(tmpdir(), "resource-static-"));
 let harness, browser, page, url, token;
 try {
-  const project = join(sandbox, "project"), agent = join(sandbox, "agent"), home = join(sandbox, "home"), dist = join(sandbox, "dist");
-  await Promise.all([mkdir(project), mkdir(agent), mkdir(home)]);
+  const project = join(sandbox, "project"), agent = join(sandbox, "agent"), home = join(sandbox, "home"), dist = join(sandbox, "dist"), managed = join(sandbox, "managed", "node_modules");
+  await Promise.all([mkdir(project), mkdir(agent), mkdir(home), mkdir(managed, { recursive: true })]);
+  for (const name of await readdir(join(root, "node_modules"))) {
+    if (name !== ".bin") await symlink(join(root, "node_modules", name), join(managed, name), "dir");
+  }
+  await buildProjectionInto(managed);
   await writeFile(join(project, "image.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=", "base64"));
   await writeFile(join(project, "index.html"), '<!doctype html><link rel="stylesheet" href="style.css"><p id="fixture">preview</p><script>parent.__previewScriptRan=true</script>');
   await writeFile(join(project, "style.css"), "#fixture { color: rgb(12, 34, 56) }");
   await writeFile(join(sandbox, "secret.txt"), "not authorized");
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+  zip.file("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>DOCX fixture content</w:t></w:r></w:p></w:body></w:document>');
+  await writeFile(join(project, "document.docx"), await zip.generateAsync({ type: "nodebuffer" }));
   await build({ configFile: join(root, "static-frontend/vite.config.ts"), logLevel: "error", build: { outDir: dist, emptyOutDir: true, rollupOptions: { input: join(root, "scripts/migration/resource-fixture.html") } } });
   async function findHtml(dir) {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -32,7 +42,7 @@ try {
   token = randomBytes(32).toString("hex");
   harness = spawn(join(root, "target/debug/static-ui-harness"), ["--static-dir", dist, "--port", "0"], {
     cwd: join(root, "src-tauri"), detached: true, stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agent, STATIC_UI_HARNESS_TOKEN: token, STATIC_UI_HARNESS_FIXTURE_ROOT: project, PI_PACKAGE_DIR: undefined, PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT: undefined, JITI_ALIAS: undefined },
+    env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agent, PI_CLI_BIN: "/home/hao/.pi/agent/bin/pi", PI_WEB_MANAGED_MODULES: managed, STATIC_UI_HARNESS_TOKEN: token, STATIC_UI_HARNESS_FIXTURE_ROOT: project, PI_PACKAGE_DIR: undefined, PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT: undefined, JITI_ALIAS: undefined },
   });
   let logs = ""; harness.stderr.on("data", chunk => { logs += chunk; });
   url = await Promise.race([new Promise((ready, reject) => {
@@ -47,10 +57,13 @@ try {
   await page.addInitScript(`window.__STATIC_UI_HARNESS_TOKEN__ = ${JSON.stringify(token)}; ${polyfill}`);
   await page.goto(`${url}${html.slice(dist.length)}?cwd=${encodeURIComponent(project)}`);
   await page.waitForFunction(() => { const img = document.querySelector(".markdown-image img"); return img instanceof HTMLImageElement && img.complete && img.naturalWidth === 1; }, null, { timeout: 20_000 });
-  const frame = page.frameLocator('.file-viewer-content iframe');
+  const frame = page.frameLocator('.file-viewer-content iframe').first();
   await frame.locator("#fixture").waitFor({ timeout: 20_000 });
   await page.waitForFunction(() => { const f = document.querySelector('.file-viewer-content iframe'); return f?.contentDocument?.querySelector('#fixture') && getComputedStyle(f.contentDocument.querySelector('#fixture')).color === 'rgb(12, 34, 56)'; });
   assert.equal(await page.evaluate(() => window.__previewScriptRan), undefined);
+  await page.frameLocator('.file-viewer-document-stage iframe').getByText('DOCX fixture content').waitFor({ timeout: 30_000 });
+  await writeFile(join(project, "index.html"), '<!doctype html><link rel="stylesheet" href="style.css"><p id="fixture">updated preview</p>');
+  await frame.getByText("updated preview").waitFor({ timeout: 10_000 });
   await page.locator('input[type="file"]').setInputFiles({ name: "uploaded.txt", mimeType: "text/plain", buffer: Buffer.from("browser fixture") });
   for (let attempts = 0; attempts < 100; attempts++) {
     try { if ((await readFile(join(project, "uploaded.txt"), "utf8")) === "browser fixture") break; } catch {}
@@ -71,7 +84,7 @@ try {
   }, { project, outside: join(sandbox, "secret.txt") });
   assert.deepEqual(checks, { denied: "unauthorized_scope", status: 206, text: "#fixtur", contentRange: "bytes 0-6/35", revoked: 404 });
   assert.deepEqual(errors, []);
-  console.log("resource static UI: Markdown image, authorized text preview, relative CSS and script blocking passed (browser bridge, not native ACL)");
+  console.log("resource static UI: Markdown image, live HTML/CSS preview, DOCX via real pi, upload, range/revoke and script blocking passed (browser bridge, not native ACL)");
 } catch (error) {
   if (page) console.error("resource fixture:", await page.locator("body").innerHTML().catch(() => "unavailable"), await page.evaluate(() => window.__harnessInvokes).catch(() => []));
   throw error;

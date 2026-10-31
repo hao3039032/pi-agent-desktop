@@ -121,6 +121,25 @@ export async function readFileContent(filePath: string): Promise<{ mime: string;
   }
 }
 
+export async function renderDocxPreview(filePath: string, sessionId?: string | null): Promise<string> {
+  const handle = await grantFileResource(filePath, sessionId);
+  try {
+    const result = await ensureClient().request<{ html: string }>("files.docxPreview", { handle }, { timeoutMs: 120_000 });
+    return result.html;
+  } finally {
+    await revokeFileResource(handle).catch(() => {});
+  }
+}
+
+export async function fetchResourceMetadata(filePath: string, sessionId?: string | null): Promise<{ size: number; revision: string }> {
+  const handle = await grantFileResource(filePath, sessionId);
+  try {
+    return await ensureClient().request("resources.metadata", { handle }, { timeoutMs: 15_000 });
+  } finally {
+    await revokeFileResource(handle).catch(() => {});
+  }
+}
+
 export async function checkProjectUploadTargets(directory: string, fileNames: string[]): Promise<{ conflicts: string[]; nonReplaceable: string[] }> {
   return ensureClient().request("files.uploadCheck", { directory, fileNames }, { timeoutMs: 15_000 });
 }

@@ -2064,6 +2064,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(windows)]
             { let _ = path; protocol_error(&id, "unauthorized_scope", "preview resources are unavailable on this platform") }
         }
+        "resources.metadata" => {
+            let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
+            match state.resources.file_metadata(handle) {
+                Ok((size, revision)) => protocol_ok(&id, json!({ "size": size, "revision": revision })),
+                Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+            }
+        }
         "resources.read" => {
             let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
             let subpath = args.get("subpath").and_then(Value::as_str).unwrap_or_default();
@@ -2295,6 +2302,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             { let _ = path; protocol_error(&id, "not_supported", "Secure directory reveal is not supported on this platform") }
         }
         "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
+        "files.docxPreview" => crate::file_resources::handle_docx_preview(state, &id, &args),
         "files.importDropped" => crate::native_import::import_dropped(state, &id, &args),
         "files.uploadCheck" => crate::project_upload::check(state, &id, &args),
         "files.uploadFile" => crate::project_upload::upload_one(state, &id, &args),

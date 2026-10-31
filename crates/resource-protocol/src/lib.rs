@@ -191,6 +191,21 @@ impl ResourceRegistry {
         Ok(handle)
     }
 
+    /// Metadata of a pinned file for explicit live-change polling.
+    pub fn file_metadata(&self, handle: &str) -> Result<(u64, String), DenyReason> {
+        let grants = self.grants.lock().unwrap();
+        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
+        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        let file = grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?;
+        let meta = file.metadata().map_err(|_| DenyReason::IoError)?;
+        let modified = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|time| time.as_nanos()).unwrap_or(0);
+        #[cfg(unix)]
+        let identity = { use std::os::unix::fs::MetadataExt; format!("{}:{}:{}:{}:{}", meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec(), modified) };
+        #[cfg(not(unix))]
+        let identity = modified.to_string();
+        Ok((meta.len(), format!("{identity}:{}", meta.len())))
+    }
+
     /// Duplicate a live single-file descriptor for an authorized native save.
     pub fn clone_open_file(&self, handle: &str) -> Result<std::fs::File, DenyReason> {
         let grants = self.grants.lock().unwrap();

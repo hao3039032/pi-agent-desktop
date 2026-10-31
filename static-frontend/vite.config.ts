@@ -55,6 +55,10 @@ export default defineConfig({
         replacement: resolve(import.meta.dirname, "src/data/state-mirror.ts"),
       },
       {
+        find: /^@\/lib\/file-viewer-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/file-viewer-service.ts"),
+      },
+      {
         find: /^@\/lib\/project-file-upload-client$/,
         replacement: resolve(import.meta.dirname, "src/data/project-file-upload-client.ts"),
       },

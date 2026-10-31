@@ -227,6 +227,9 @@ test(
         const extractedFromPath = await call("docx.extractText", { path: tempDocxPath });
         assert.equal(extractedFromPath.ok, true);
         assert.equal(extractedFromPath.result.text, "Hello world attachment");
+        const htmlPreview = await call("docx.renderHtml", { path: tempDocxPath });
+        assert.equal(htmlPreview.ok, true, JSON.stringify(htmlPreview));
+        assert.match(htmlPreview.result.html, /Hello world attachment/);
 
         // 5. No session files were created by the management child itself.
         const agentSessions = join(agentDir, "sessions");

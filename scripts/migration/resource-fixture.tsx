@@ -15,6 +15,7 @@ bindFileService(new IpcClient(detectTransport().transport));
 const cwd = new URLSearchParams(location.search).get("cwd") ?? "";
 createRoot(document.getElementById("root")!).render(<I18nProvider>
   <MarkdownBody cwd={cwd}>{"![fixture](image.png)"}</MarkdownBody>
-  <div style={{ height: 600 }}><FileViewer filePath={`${cwd}/index.html`} cwd={cwd} initialDisplayMode="preview" watchEnabled={false} /></div>
+  <div style={{ height: 600 }}><FileViewer filePath={`${cwd}/index.html`} cwd={cwd} initialDisplayMode="preview" /></div>
+  <div style={{ height: 300 }}><FileViewer filePath={`${cwd}/document.docx`} cwd={cwd} watchEnabled={false} /></div>
   <div style={{ height: 300 }}><FileExplorer cwd={cwd} onOpenFile={() => {}} changesCollapsed={true} /></div>
 </I18nProvider>);

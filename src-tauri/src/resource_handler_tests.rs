@@ -13,6 +13,12 @@ fn token_range_revoke_and_expiry() {
     assert_eq!(result.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(result.headers()["content-range"], "bytes 1-3/6");
     assert_eq!(result.body(), b"bcd");
+    let (size, revision) = registry.file_metadata(&handle).unwrap();
+    assert_eq!(size, 6);
+    std::fs::write(&path, b"abcdefg").unwrap();
+    let (new_size, new_revision) = registry.file_metadata(&handle).unwrap();
+    assert_eq!(new_size, 7);
+    assert_ne!(revision, new_revision);
     assert!(result.headers()["content-security-policy"].to_str().unwrap().contains("sandbox"));
     assert_eq!(respond(&registry, request(&handle).header("Range", "bytes=99-").body(vec![]).unwrap()).status(), StatusCode::RANGE_NOT_SATISFIABLE);
     assert_eq!(respond(&registry, request("not-a-token").body(vec![]).unwrap()).status(), StatusCode::NOT_FOUND);
