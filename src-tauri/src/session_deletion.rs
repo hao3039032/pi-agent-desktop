@@ -64,17 +64,15 @@ fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl Schedu
     if args.get("trashChatFolder").is_some_and(|v| !v.is_boolean()) {
         return Err(error("invalid_args", "trashChatFolder must be a boolean"));
     }
-    if args.get("trashChatFolder").and_then(Value::as_bool) == Some(true) {
-        return Err(error("not_supported", "Deleting a chat folder requires recoverable multi-file deletion, which is not available yet."));
-    }
-    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled))
+    let trash_chat_folder = args.get("trashChatFolder").and_then(Value::as_bool) == Some(true);
+    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled, trash_chat_folder))
         .map_err(|error| match error {
             session_host::SessionWriterError::Busy(message) => self::error("busy", message),
             session_host::SessionWriterError::Operation(error) => error,
         })
 }
 
-fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences) -> Result<Value, (String, String)> {
+fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool) -> Result<Value, (String, String)> {
     if scheduled.is_referenced(id) {
         return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
     }
@@ -87,6 +85,8 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     let mut files = Vec::new();
     files_in(&root, &mut files)?;
     let mut target: Option<(PathBuf, std::fs::File)> = None;
+    let mut target_cwd: Option<PathBuf> = None;
+    let mut session_cwds = Vec::new();
     let mut references = Vec::new();
     for file in files {
         let handle = std::fs::File::open(&file).map_err(|e| error("io", e))?;
@@ -95,6 +95,11 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         let header = bounded_line(&mut reader, 64 * 1024)?.ok_or_else(|| error("not_supported", "Cannot verify an empty session file."))?;
         if header.get("type").and_then(Value::as_str) != Some("session") { return Err(error("not_supported", "Cannot verify a session header.")); }
         let child_id = header.get("id").and_then(Value::as_str).ok_or_else(|| error("not_supported", "Cannot verify a session id."))?;
+        let cwd = match header.get("cwd") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(PathBuf::from(value)),
+            _ => return Err(error("not_supported", "Cannot verify a session working directory.")),
+        };
         let parent = match header.get("parentSession") {
             None | Some(Value::Null) => None,
             Some(Value::String(value)) => Some(PathBuf::from(value)),
@@ -122,8 +127,10 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
             if subagent_parent.is_some() { return Err(error("not_supported", "Subagent deletion requires the full cascade operation.")); }
+            target_cwd = cwd.clone();
             target = Some((file.clone(), reader.into_inner()));
         }
+        session_cwds.push((child_id.to_string(), cwd));
         references.push((child_id.to_string(), parent, subagent_parent));
     }
     let (target, target_handle) = target.ok_or_else(|| error("not_found", "Session not found"))?;
@@ -139,6 +146,14 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
                 if same_path(&path, &canonical_target) { return Err(error("not_supported", "Session has child branches and requires the full cascade operation.")); }
             } else if same_path(&parent, &canonical_target) {
                 return Err(error("not_supported", "Session has child branches and requires the full cascade operation."));
+            }
+        }
+    }
+    if trash_chat_folder {
+        if let Some(cwd) = target_cwd.filter(|cwd| crate::session_view::is_chat_folder_path(cwd, &state.agent_dir()) && cwd.exists()) {
+            let shared = session_cwds.iter().any(|(session_id, other)| session_id != id && other.as_ref().is_some_and(|other| same_path(other, &cwd)));
+            if !shared {
+                return Err(error("not_supported", "Moving an unshared chat folder requires recoverable multi-file deletion."));
             }
         }
     }
@@ -261,11 +276,29 @@ mod tests {
         let child = session(&root, "child", Some(&target));
         assert_eq!(delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
         assert!(target.exists() && child.exists());
+        let chat = state.agent_dir().join("chats/chat-1");
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(&child, format!("{}\n", json!({"type":"session","id":"child","cwd":chat,"parentSession":target}))).unwrap();
         assert_eq!(delete(&state, &json!({"session":"child","trashChatFolder":true})).unwrap_err().0, "not_supported");
         assert!(child.exists());
         state.registry.composer_outbox_for("child").enqueue("queued", None).unwrap();
         assert_eq!(delete(&state, &json!({"session":"child"})).unwrap_err().0, "busy");
         assert!(child.exists());
+    }
+    #[test]
+    fn deleting_one_shared_chat_session_keeps_the_folder() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-1");
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("kept.txt"), "kept").unwrap();
+        let parent = root.join("parent.jsonl");
+        let child = root.join("child.jsonl");
+        std::fs::write(&parent, format!("{}\n", json!({"type":"session","id":"parent","cwd":chat}))).unwrap();
+        std::fs::write(&child, format!("{}\n", json!({"type":"session","id":"child","cwd":chat,"parentSession":parent}))).unwrap();
+        let result = super::delete(&state, &json!({"session":"child","trashChatFolder":true})).unwrap();
+        assert_eq!(result["folderTrashed"], false);
+        assert!(parent.exists() && chat.join("kept.txt").exists());
+        assert!(!child.exists());
     }
     #[test]
     fn rejects_subagent_references_and_keeps_shared_chat_folder() {
