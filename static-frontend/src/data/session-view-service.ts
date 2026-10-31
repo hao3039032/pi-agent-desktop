@@ -41,6 +41,14 @@ function failureStatus(failure: IpcFailure): number {
   return failure.error.code === "not_found" ? 404 : 500;
 }
 
+export async function fetchBashOutput(sessionId: string, path: string): Promise<{ output?: string; error?: string }> {
+  try {
+    return await ensureClient().request<{ output: string }>("agent.bashOutput", { session: sessionId, path }, { timeoutMs: 20_000 });
+  } catch (error) {
+    return { error: error instanceof IpcFailure ? error.error.message : String(error) };
+  }
+}
+
 export async function fetchThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
   const data = await ensureClient().request<{ thinking?: unknown }>("sessions.thinking", { session: sessionId, entryId, blockIndex }, { timeoutMs: 20_000 });
   if (typeof data.thinking !== "string") throw new Error("Invalid thinking response");

@@ -1265,6 +1265,22 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "agent.bashOutput" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            if sid.is_empty() || path.is_empty() || path.len() > 4096 {
+                return protocol_error(&id, "invalid_args", "session and path required");
+            }
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            match file {
+                Some(file) => match management_call(state, "session.readBashOutput", json!({"file":file.display().to_string(),"sessionId":sid,"path":path})) {
+                    Ok(data) => protocol_ok(&id, data),
+                    Err((code, message)) => protocol_error(&id, &code, &message),
+                },
+                None => protocol_error(&id, "not_found", "session not found"),
+            }
+        }
         "sessions.thinking" => {
             let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
             let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
@@ -2695,6 +2711,9 @@ pub(crate) fn management_error_code(error: &str) -> (String, String) {
             "unknown_op"
                 | "invalid_args"
                 | "not_found"
+                | "too_large"
+                | "not_supported"
+                | "unauthorized_scope"
                 | "op_failed"
                 | "invalid_cron"
                 | "project_scope"
@@ -4436,12 +4455,24 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(managed.join("@earendil-works")).unwrap();
         std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works/pi-coding-agent").canonicalize().unwrap(), managed.join("@earendil-works/pi-coding-agent")).unwrap();
         let (file, id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut bash = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        write!(bash, "fixture bash output").unwrap();
+        bash.flush().unwrap();
+        let unreferenced = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        let large = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        large.as_file().set_len(5 * 1024 * 1024 + 1).unwrap();
+        let link = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        std::fs::remove_file(link.path()).unwrap();
+        std::os::unix::fs::symlink(bash.path(), link.path()).unwrap();
         let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
         for (entry, parent, text) in [("root", Value::Null, "ROOT"), ("a", json!("root"), "BRANCH A"), ("b", json!("root"), "BRANCH B")] {
             writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
         }
         writeln!(writer, "{}", json!({"type":"message","id":"think","parentId":"b","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"fixture hidden reasoning"}]}})).unwrap();
         writeln!(writer, "{}", json!({"type":"message","id":"media","parentId":"think","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"t1","content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"},{"type":"image","data":"PGh0bWw+","mimeType":"image/png"}]}})).unwrap();
+        for (entry, parent, path) in [("bash1", "media", bash.path()), ("bash2", "bash1", large.path()), ("bash3", "bash2", link.path())] {
+            writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"bashExecution","command":"fixture","output":"","exitCode":0,"fullOutputPath":path}})).unwrap();
+        }
         drop(writer);
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
@@ -4464,6 +4495,12 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
         let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
         assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
+        let read_bash = |path: &Path| send(&state, json!({"v":1,"id":"bash","op":"agent.bashOutput","args":{"session":id,"path":path}}));
+        assert_eq!(read_bash(bash.path())["data"]["output"], "fixture bash output");
+        assert_eq!(read_bash(large.path())["error"]["code"], "too_large");
+        assert_eq!(read_bash(link.path())["error"]["code"], "not_found");
+        assert_eq!(read_bash(unreferenced.path())["error"]["code"], "unauthorized_scope");
+        assert_eq!(read_bash(&root_path.join("not-allowed.log"))["error"]["code"], "invalid_args");
         let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
         assert_eq!(missing["ok"], false, "{missing}");
         let output = root_path.join("image.bin");
