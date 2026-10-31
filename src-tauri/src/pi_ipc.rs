@@ -2205,20 +2205,26 @@ fn create_session(
     }
     let command_type = command_type(args);
     let agent_dir = state.agent_dir();
-    // The cwd is folded BEFORE classification (normalizeCwd's path.resolve
-    // semantics): an absolute path carrying `..` that POINTS at a chat
-    // folder must classify as a chat (and the session header carry the
-    // folded identity), never smuggle the chat into a project spawn
-    // (Terra P1-4). Relative inputs keep the original behavior (the Next
-    // route used the raw string; the UI only ever sends absolute paths).
-    let requested_cwd = {
-        let raw = PathBuf::from(cwd_text);
-        if raw.is_absolute() {
-            PathBuf::from(lexical_fold(cwd_text, cfg!(windows)))
-        } else {
-            raw
-        }
-    };
+    // The cwd is resolved to ONE absolute lexical identity BEFORE any
+    // classification or probe (Terra P1-4 + round-4): an absolute path
+    // carrying `..` that POINTS at a chat folder must classify as a chat
+    // (and the session header carry the folded identity), and a RELATIVE
+    // path is anchored at the host's working directory — the same place the
+    // Next server's raw-string cwd effectively landed (its existsSync and
+    // its spawn resolved relatives against the server process cwd). Keeping
+    // relatives raw here would let a relative form that points at a chat
+    // folder classify as a PROJECT and spawn with project policy.
+    // `~` is NOT expanded at this entry: the Next route never did (a literal
+    // `~` failed its existsSync), and the UI only ever sends the absolute
+    // identity the cwd picker already resolved.
+    let requested_cwd = resolve_cwd_identity(
+        cwd_text,
+        false,
+        &user_home_dir(),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cfg!(windows),
+    )
+    .map_err(|message| invalid(&message, command_type.as_deref()))?;
 
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
@@ -2446,29 +2452,142 @@ fn user_home_dir() -> PathBuf {
 /// and cannot slip a chat folder past `is_chat_workspace_path` as a
 /// project (Terra P1-4). Lexical only — never `canonicalize`: symlink
 /// targets keep their meaning.
-fn normalize_cwd(raw: &str) -> PathBuf {
+fn normalize_cwd(raw: &str) -> Result<PathBuf, String> {
     normalize_cwd_with_home(raw, user_home_dir())
 }
 
 /// `normalize_cwd` against an explicit home (the pure core, testable
-/// without the process-global env).
-fn normalize_cwd_with_home(raw: &str, home: PathBuf) -> PathBuf {
-    if raw == "~" {
-        return PathBuf::from(lexical_fold(&home.to_string_lossy(), cfg!(windows)));
+/// without the process-global env). `~`/`~/…` expand against `home`.
+fn normalize_cwd_with_home(raw: &str, home: PathBuf) -> Result<PathBuf, String> {
+    resolve_cwd_identity(
+        raw,
+        true,
+        &home,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        cfg!(windows),
+    )
+}
+
+/// Resolve one accepted cwd string to its single ABSOLUTE lexical identity
+/// (Terra round-4: both cwd entries — `agent.create` and
+/// `workspace.validateCwd` — classify and probe against ONE resolved form,
+/// so no accepted spelling can bypass the chat classification):
+///
+/// - `~` / `~/rest` expand against `home` (only where the old contract did:
+///   the validate route's normalizeCwd; the create route kept raw strings);
+/// - absolute paths fold lexically (`.` dropped, `..` pops, prefixes kept);
+/// - plain relative paths anchor at `current_dir` — the same place the Next
+///   server's process cwd anchored them (its existsSync and its spawn
+///   resolved relatives there), never a guessed parent;
+/// - Windows root-relative (`\work`) anchors at the current directory's
+///   drive — the anchor `path.resolve` used — instead of being STRING-JOINED
+///   onto the current directory (the old join produced `C:\current\work`,
+///   touching the wrong directory);
+/// - Windows drive-relative (`C:work`) resolves against `current_dir` when
+///   the drive matches; a DIFFERENT drive's working directory is per-drive
+///   OS state the host cannot see, so it is REFUSED honestly (the old join
+///   silently produced `C:\current\work` for `D:work` — a mis-resolve);
+/// - UNC/verbatim forms fold with their prefix intact.
+///
+/// Lexical only — never `canonicalize`: symlink targets keep their meaning.
+pub(crate) fn resolve_cwd_identity(
+    raw: &str,
+    expand_home: bool,
+    home: &Path,
+    current_dir: &Path,
+    windows: bool,
+) -> Result<PathBuf, String> {
+    let home_text = lexical_fold(&home.to_string_lossy(), windows);
+    if expand_home {
+        if raw == "~" {
+            return Ok(PathBuf::from(home_text));
+        }
+        if let Some(rest) = raw.strip_prefix("~/") {
+            return Ok(PathBuf::from(lexical_fold(&format!("{home_text}/{rest}"), windows)));
+        }
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        let home_text = lexical_fold(&home.to_string_lossy(), cfg!(windows));
-        let joined = format!("{home_text}/{rest}");
-        return PathBuf::from(lexical_fold(&joined, cfg!(windows)));
+    if !windows {
+        return if raw.starts_with('/') {
+            Ok(PathBuf::from(lexical_fold(raw, false)))
+        } else {
+            let anchor = lexical_fold(&current_dir.to_string_lossy(), false);
+            Ok(PathBuf::from(lexical_fold(&format!("{anchor}/{raw}"), false)))
+        };
     }
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        PathBuf::from(lexical_fold(raw, cfg!(windows)))
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let joined = format!("{}/{raw}", cwd.display());
-        PathBuf::from(lexical_fold(&joined, cfg!(windows)))
+    // Windows: classify by PREFIX (the string carries anchors
+    // `Path::is_absolute` cannot see — it calls `\work` and `C:work`
+    // relative, and the old code then STRING-JOINED both onto the current
+    // directory, which is only correct for the plain-relative form).
+    let normalized = raw.replace('\\', "/");
+    let is_verbatim_or_unc = normalized.starts_with("//?/") || normalized.starts_with("//");
+    let is_drive_absolute = normalized.len() >= 3
+        && normalized.as_bytes()[1] == b':'
+        && normalized.as_bytes()[2] == b'/';
+    let is_drive_relative = normalized.len() >= 2
+        && normalized.as_bytes()[1] == b':'
+        && !is_drive_absolute;
+    if is_verbatim_or_unc || is_drive_absolute {
+        return Ok(PathBuf::from(lexical_fold(raw, true)));
     }
+    if is_drive_relative {
+        let drive = normalized[..2].to_ascii_uppercase();
+        let rest = &normalized[2..];
+        let anchor = lexical_fold(&current_dir.to_string_lossy(), true);
+        if anchor.len() >= 2 && anchor.as_bytes()[1] == b':' && anchor[..2].to_ascii_uppercase() == drive {
+            // The SAME drive as the working directory: anchor there.
+            let rest = rest.trim_start_matches('/');
+            return Ok(PathBuf::from(lexical_fold(&format!("{anchor}/{rest}"), true)));
+        }
+        return Err(format!(
+            "cannot resolve the drive-relative path {raw:?}: drive {}'s working directory is per-drive OS state this host cannot see — use an absolute path",
+            &drive[..1]
+        ));
+    }
+    // Root-relative (`\work` / `/work`): anchor at the working directory's
+    // own root — the drive prefix (`C:`) for a drive cwd, the share root
+    // (`\\\\server\\share\\`) for a UNC cwd.
+    if normalized.starts_with('/') {
+        let anchor = lexical_fold(&current_dir.to_string_lossy(), true);
+        if anchor.len() >= 2 && anchor.as_bytes()[1] == b':' {
+            return Ok(PathBuf::from(lexical_fold(
+                &format!("{}/{}", &anchor[..2], normalized.trim_start_matches('/')),
+                true,
+            )));
+        }
+        if let Some(tail) = anchor.strip_prefix("\\\\?\\UNC\\") {
+            let mut parts = tail.splitn(3, '\\');
+            let server = parts.next().unwrap_or("");
+            let share = parts.next().unwrap_or("");
+            if !server.is_empty() && !share.is_empty() {
+                return Ok(PathBuf::from(lexical_fold(
+                    &format!("\\\\{server}\\{share}\\{}", normalized.trim_start_matches('/')),
+                    true,
+                )));
+            }
+        }
+        if let Some(tail) = anchor.strip_prefix("\\\\") {
+            // A regular UNC working directory (\\\\server\\share\\…): its
+            // share root is the anchor a root-relative path resolves
+            // against.
+            let mut parts = tail.splitn(2, '\\');
+            let server = parts.next().unwrap_or("");
+            let after = parts.next().unwrap_or("");
+            let share = after.split('\\').next().unwrap_or("");
+            if !server.is_empty() && !share.is_empty() {
+                return Ok(PathBuf::from(lexical_fold(
+                    &format!("\\\\{server}\\{share}\\{}", normalized.trim_start_matches('/')),
+                    true,
+                )));
+            }
+        }
+        return Err(format!(
+            "cannot resolve the root-relative path {raw:?}: the working directory {} has no drive or share anchor to resolve it against — use an absolute path",
+            current_dir.display()
+        ));
+    }
+    // Plain relative: anchor at the working directory.
+    let anchor = lexical_fold(&current_dir.to_string_lossy(), true);
+    Ok(PathBuf::from(lexical_fold(&format!("{anchor}/{raw}"), true)))
 }
 
 /// Lexically fold `.` and `..` out of a path string — Node `path.resolve`'s
@@ -2564,7 +2683,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
     if cwd_text.is_empty() {
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
-    let cwd = normalize_cwd(cwd_text);
+    let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
         // A chat's own folder (or the legacy shared cwd) stays what it is;
@@ -2901,16 +3020,157 @@ mod tests {
         // directory the server did — a `~/project` the user types must not
         // become a missing relative path.
         let home = PathBuf::from("/home/fixture-user");
-        assert_eq!(normalize_cwd_with_home("~", home.clone()), home);
+        assert_eq!(normalize_cwd_with_home("~", home.clone()).unwrap(), home);
         assert_eq!(
-            normalize_cwd_with_home("~/work", home.clone()),
+            normalize_cwd_with_home("~/work", home.clone()).unwrap(),
             PathBuf::from("/home/fixture-user/work")
         );
-        let absolute = normalize_cwd_with_home("/opt/projects", home.clone());
+        let absolute = normalize_cwd_with_home("/opt/projects", home.clone()).unwrap();
         assert_eq!(absolute, PathBuf::from("/opt/projects"));
         let cwd = std::env::current_dir().expect("the test process has a cwd");
-        let relative = normalize_cwd_with_home("some/relative", home);
+        let relative = normalize_cwd_with_home("some/relative", home).unwrap();
         assert_eq!(relative, cwd.join("some/relative"));
+    }
+
+    #[test]
+    fn cwd_identity_handles_the_windows_prefixes_the_join_never_saw() {
+        // Terra round-4: `normalize_cwd_with_home` used to STRING-JOIN every
+        // non-absolute input onto the working directory first, so the
+        // Windows anchored forms were mis-resolved BEFORE `lexical_fold`
+        // ever saw them: `\work` became `C:\current\work` (root-relative
+        // means the DRIVE root) and `D:work` on a C: cwd silently became
+        // `C:\current\work` (a different drive's directory entirely). The
+        // resolver classifies by prefix and anchors each form where
+        // `path.resolve` anchored it — or refuses honestly.
+        let home = PathBuf::from(r"C:\Users\fixture");
+        let current = PathBuf::from(r"C:\Users\fixture\app");
+
+        // Root-relative: the current directory's DRIVE root, not its folder.
+        assert_eq!(
+            resolve_cwd_identity(r"\work", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"C:\work")
+        );
+        assert_eq!(
+            resolve_cwd_identity("/work/sub/../x", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"C:\work\x")
+        );
+        // Drive-relative on the SAME drive as the working directory:
+        // anchored there, lexically folded.
+        assert_eq!(
+            resolve_cwd_identity(r"C:work", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"C:\Users\fixture\app\work")
+        );
+        assert_eq!(
+            resolve_cwd_identity(r"c:..\shared", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"C:\Users\fixture\shared"),
+            "the drive letter matches case-insensitively and `..` still folds"
+        );
+        // Drive-relative on ANOTHER drive: per-drive OS state the host
+        // cannot see — refused, never guessed (the old join answered
+        // C:\Users\fixture\app\work for this input).
+        let refused = resolve_cwd_identity(r"D:work", false, &home, &current, true).unwrap_err();
+        assert!(refused.contains("drive-relative"), "the honest refusal: {refused}");
+        assert!(refused.contains('D'), "names the drive: {refused}");
+        // Plain relative still anchors at the working directory.
+        assert_eq!(
+            resolve_cwd_identity(r"sub\..\x", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"C:\Users\fixture\app\x")
+        );
+        // The absolute forms are untouched (folding only).
+        assert_eq!(
+            resolve_cwd_identity(r"D:\work", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"D:\work")
+        );
+        assert_eq!(
+            resolve_cwd_identity(r"\\srv\share\a\..\b", false, &home, &current, true).unwrap(),
+            PathBuf::from(r"\\srv\share\b")
+        );
+        // A UNC working directory anchors root-relative paths at its share
+        // root.
+        let unc_cwd = PathBuf::from(r"\\srv\share\deep\cwd");
+        assert_eq!(
+            resolve_cwd_identity(r"\work", false, &home, &unc_cwd, true).unwrap(),
+            PathBuf::from(r"\\srv\share\work")
+        );
+        // A working directory with NO drive/share anchor cannot anchor a
+        // root-relative path — refused honestly rather than joined.
+        let anchorless = PathBuf::from(r"\\\\?\\UNC\\onlyserver");
+        assert!(resolve_cwd_identity(r"\work", false, &home, &anchorless, true).is_err());
+
+        // `~` expands only where the old contract did (validate's
+        // normalizeCwd) — the create entry passes expand_home=false and a
+        // `~` reaches its directory probe as the literal it is.
+        assert_eq!(
+            resolve_cwd_identity("~", true, &home, &current, true).unwrap(),
+            home
+        );
+        let unix_home = PathBuf::from("/home/fixture-user");
+        let unix_current = PathBuf::from("/home/fixture-user/app");
+        assert_eq!(
+            resolve_cwd_identity("~/work", true, &unix_home, &unix_current, false).unwrap(),
+            PathBuf::from("/home/fixture-user/work")
+        );
+        assert_eq!(
+            resolve_cwd_identity("~", false, &unix_home, &unix_current, false).unwrap(),
+            PathBuf::from("/home/fixture-user/app/~"),
+            "the create entry keeps `~` a literal"
+        );
+    }
+
+    #[test]
+    fn a_windows_flavored_relative_chat_path_classifies_through_the_resolver() {
+        // The reviewer's chain requirement for round-4: the Windows prefix
+        // handling must hold through the RESOLUTION→CLASSIFICATION call
+        // chain, not only in `lexical_fold`'s pure string tests. The pure
+        // core is exercised with windows=true (this host runs Unix; the
+        // on-Windows op path shares this exact resolver, only the flavor
+        // flag comes from cfg!(windows)).
+        let home = PathBuf::from(r"C:\Users\fixture");
+        let agent = PathBuf::from(r"C:\Users\fixture\.pi\agent");
+        let current = PathBuf::from(r"C:\Users\fixture\app");
+
+        // A drive-relative form of the chat ROOT (same drive as the cwd):
+        // resolves to the absolute chat root, which classifies as one.
+        let rel_root = resolve_cwd_identity(
+            r"C:..\.pi\agent\chats",
+            false,
+            &home,
+            &current,
+            true,
+        )
+        .unwrap();
+        let chat_root = agent.join("chats");
+        assert!(crate::session_view::is_chat_root_path(&rel_root, &agent), "{} vs {}", rel_root.display(), chat_root.display());
+
+        // A root-relative form of a chat FOLDER (\Users\fixture\.pi\agent\chats\<id>):
+        // anchored at the drive root, folded, classified as a chat folder.
+        let rel_folder = resolve_cwd_identity(
+            r"\Users\fixture\.pi\agent\chats\20260101-120000-abcd",
+            false,
+            &home,
+            &current,
+            true,
+        )
+        .unwrap();
+        let rel_folder_posix = PathBuf::from(rel_folder.to_string_lossy().replace('\\', "/"));
+        assert!(crate::session_view::is_chat_folder_path(&rel_folder_posix, &agent), "{}", rel_folder.display());
+        assert!(crate::session_view::is_chat_workspace_path(&rel_folder_posix, &agent));
+
+        // The legacy shared cwd through the same drive-relative form stays
+        // the legacy workspace.
+        let rel_legacy = resolve_cwd_identity(
+            r"C:..\.pi\agent\chat-workspace",
+            false,
+            &home,
+            &current,
+            true,
+        )
+        .unwrap();
+        assert!(crate::session_view::is_legacy_chat_workspace_path(&rel_legacy, &agent));
+
+        // An ordinary project through the same form is NOT a chat.
+        let rel_project = resolve_cwd_identity(r"C:..\work\proj", false, &home, &current, true).unwrap();
+        assert!(!crate::session_view::is_chat_workspace_path(&rel_project, &agent));
     }
 
     #[test]
@@ -2953,21 +3213,25 @@ mod tests {
         let through_dots = normalize_cwd_with_home(
             "~/.pi/agent/chats/../chats/20260101-120000-abcd",
             home.clone(),
-        );
+        )
+        .expect("resolves");
         assert_eq!(through_dots, folder, "the folded path equals the plain folder path");
         assert!(crate::session_view::is_chat_folder_path(&through_dots, &agent));
 
         // A relative form folding onto the chat root.
-        let root_through_dots = normalize_cwd_with_home("~/.pi/agent/x/../chats", home.clone());
+        let root_through_dots =
+            normalize_cwd_with_home("~/.pi/agent/x/../chats", home.clone()).expect("resolves");
         assert!(crate::session_view::is_chat_root_path(&root_through_dots, &agent));
 
         // The legacy shared cwd through dots stays the legacy workspace.
-        let legacy = normalize_cwd_with_home("~/.pi/agent/chats/../chat-workspace", home.clone());
+        let legacy =
+            normalize_cwd_with_home("~/.pi/agent/chats/../chat-workspace", home.clone())
+                .expect("resolves");
         assert!(crate::session_view::is_legacy_chat_workspace_path(&legacy, &agent));
 
         // An ordinary project through the SAME dots machinery is untouched
         // in identity (still a project, still its own folder).
-        let project = normalize_cwd_with_home("~/work/../work/proj", home);
+        let project = normalize_cwd_with_home("~/work/../work/proj", home).expect("resolves");
         assert_eq!(project, PathBuf::from("/home/fixture-user/work/proj"));
         assert!(!crate::session_view::is_chat_workspace_path(&project, &agent));
     }
@@ -4646,6 +4910,152 @@ mod tests {
         assert_eq!(again["ok"], true, "{again}");
         // Cleanup: shut the child down.
         state.registry.remove(&file_id, std::time::Duration::from_secs(5));
+    }
+
+    /// Terra round-4 (the reviewer's requirement): a RELATIVE cwd must reach
+    /// the same absolute identity the absolute form does — BEFORE
+    /// classification — so a relative path that points at the chat root, a
+    /// chat folder or the legacy chat cwd still spawns a CHAT (and a
+    /// relative project path still spawns a project). Verified through the
+    /// FINAL SPAWN SHAPE (the child's live tool loadout) and the session
+    /// header's cwd, not just `workspace.validateCwd`.
+    #[test]
+    fn real_pi_create_resolves_a_relative_cwd_before_classification() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let managed = stage_managed_tree(dir.path());
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            extensions: vec![
+                std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
+                    .canonicalize()
+                    .expect("management asset"),
+            ],
+            env: vec![(
+                "PI_WEB_MANAGED_MODULES".to_string(),
+                managed.display().to_string(),
+            )],
+        });
+
+        // A GENUINE relative path: built from the test process's cwd to the
+        // target, exactly the form a client would send. The create entry
+        // must resolve it against the host's working directory (where the
+        // Next server's raw-string cwd effectively landed) and classify on
+        // the ABSOLUTE identity.
+        let relative_to = |target: &Path| {
+            let cwd = std::env::current_dir().expect("the test process has a cwd");
+            let cwd_parts: Vec<_> = cwd.components().collect();
+            let target_parts: Vec<_> = target.components().collect();
+            let mut common = 0;
+            while common < cwd_parts.len()
+                && common < target_parts.len()
+                && cwd_parts[common] == target_parts[common]
+            {
+                common += 1;
+            }
+            let mut rel = PathBuf::new();
+            for _ in common..cwd_parts.len() {
+                rel.push("..");
+            }
+            for part in &target_parts[common..] {
+                rel.push(part.as_os_str());
+            }
+            rel.to_string_lossy().into_owned()
+        };
+        let active_tools = |session_id: &str| -> Vec<String> {
+            let tools = send(
+                &state,
+                json!({ "v": 1, "id": "reltools", "op": "agent.getTools", "args": { "session": session_id } }),
+            );
+            assert_eq!(tools["ok"], true, "{tools}");
+            tools["data"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .filter(|tool| tool["active"] == true)
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        };
+        let create = |rel: &str| -> Value {
+            send(
+                &state,
+                json!({ "v": 1, "id": "relnew", "op": "agent.create", "args": {
+                    "cwd": rel,
+                    "type": "ensure_session",
+                }}),
+            )
+        };
+
+        // 1. A relative path pointing at a CHAT FOLDER: the folder shape
+        //    (read+write active, no shell) and the header cwd is the folder.
+        let folder = crate::session_view::chat_workspace_dir(&agent_dir).join("20260101-120000-abcd");
+        std::fs::create_dir_all(&folder).expect("the chat folder exists");
+        let created = create(&relative_to(&folder));
+        assert_eq!(created["ok"], true, "the folder chat created through a relative cwd: {created}");
+        let folder_id = created["data"]["sessionId"].as_str().expect("id").to_string();
+        let summary = session_host::history::find_session_by_id(&agent_dir, &folder_id).expect("the file");
+        assert_eq!(
+            PathBuf::from(&summary.cwd), folder,
+            "the session header carries the ABSOLUTE chat folder identity"
+        );
+        let tools = active_tools(&folder_id);
+        assert!(tools.contains(&"read".to_string()) && tools.contains(&"write".to_string()), "a folder chat's loadout: {tools:?}");
+        assert!(!tools.contains(&"bash".to_string()), "a locked chat has no shell: {tools:?}");
+        state.registry.remove(&folder_id, std::time::Duration::from_secs(5));
+
+        // 2. A relative path pointing at the chat ROOT: the request becomes
+        //    a folder of its own (the root itself is never a session cwd).
+        let chat_root = crate::session_view::chat_workspace_dir(&agent_dir);
+        std::fs::create_dir_all(&chat_root).expect("the chat root");
+        let created = create(&relative_to(&chat_root));
+        assert_eq!(created["ok"], true, "the root request created a folder chat: {created}");
+        let root_id = created["data"]["sessionId"].as_str().expect("id").to_string();
+        let summary = session_host::history::find_session_by_id(&agent_dir, &root_id).expect("the file");
+        assert!(
+            crate::session_view::is_chat_folder_path(Path::new(&summary.cwd), &agent_dir),
+            "the root request landed in a NEW folder: {}",
+            summary.cwd
+        );
+        let tools = active_tools(&root_id);
+        assert!(tools.contains(&"write".to_string()) && !tools.contains(&"bash".to_string()), "the folder loadout: {tools:?}");
+        state.registry.remove(&root_id, std::time::Duration::from_secs(5));
+
+        // 3. A relative path pointing at the LEGACY shared chat cwd: the
+        //    legacy shape (read alone — no file tools, no shell).
+        let legacy = agent_dir.join("chat-workspace");
+        std::fs::create_dir_all(&legacy).expect("the legacy cwd");
+        let created = create(&relative_to(&legacy));
+        assert_eq!(created["ok"], true, "the legacy chat created: {created}");
+        let legacy_id = created["data"]["sessionId"].as_str().expect("id").to_string();
+        let summary = session_host::history::find_session_by_id(&agent_dir, &legacy_id).expect("the file");
+        assert_eq!(PathBuf::from(&summary.cwd), legacy, "the legacy cwd identity");
+        let tools = active_tools(&legacy_id);
+        assert!(tools.contains(&"read".to_string()) && !tools.contains(&"write".to_string()) && !tools.contains(&"bash".to_string()), "the legacy loadout is read alone: {tools:?}");
+        state.registry.remove(&legacy_id, std::time::Duration::from_secs(5));
+
+        // 4. A relative path pointing at an ordinary PROJECT: the project
+        //    shape (the coding domain, shell included).
+        let project_cwd = dir.path().join("work");
+        std::fs::create_dir_all(&project_cwd).expect("the project cwd");
+        let created = create(&relative_to(&project_cwd));
+        assert_eq!(created["ok"], true, "the project created through a relative cwd: {created}");
+        let project_id = created["data"]["sessionId"].as_str().expect("id").to_string();
+        let summary = session_host::history::find_session_by_id(&agent_dir, &project_id).expect("the file");
+        assert_eq!(PathBuf::from(&summary.cwd), project_cwd, "the project cwd identity");
+        let tools = active_tools(&project_id);
+        assert!(tools.contains(&"bash".to_string()), "a project keeps the coding domain: {tools:?}");
+        state.registry.remove(&project_id, std::time::Duration::from_secs(5));
     }
 
     /// The vertical create loop against the REAL pi (PI_CLI_BIN, sandboxed
