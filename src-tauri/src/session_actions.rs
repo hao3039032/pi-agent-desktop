@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::pi_ipc::{dispatch_with_resume, management_call, IpcHostState};
 
 pub(crate) fn export(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
     let id = args.get("session").and_then(Value::as_str).filter(|id| !id.is_empty())
         .ok_or_else(|| ("invalid_args".into(), "session is required".into()))?;
     dispatch_with_resume(state, "agent.command", &json!({"session": id, "type": "get_state"}))?;
@@ -32,6 +33,7 @@ pub(crate) fn export(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
 }
 
 pub(crate) fn rename(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
     let id = args.get("session").and_then(Value::as_str).filter(|id| !id.is_empty())
         .ok_or_else(|| ("invalid_args".into(), "session is required".into()))?;
     let name = args.get("name").and_then(Value::as_str)
@@ -47,6 +49,7 @@ pub(crate) fn rename(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
 }
 
 pub(crate) fn branch(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".into(), "Session policy change is in progress".into()))?;
     let kind = args.get("type").and_then(Value::as_str).unwrap_or("");
     if kind == "navigate_tree" && args.get("summarize").is_some_and(|value| !value.is_boolean()) {
         return Err(("invalid_args".into(), "summarize must be a boolean".into()));

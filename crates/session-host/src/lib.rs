@@ -224,6 +224,8 @@ pub struct Session {
     composer_delivering: Mutex<bool>,
     /// Serializes host branch changes against prompt admission and outbox delivery.
     activity_gate: std::sync::RwLock<()>,
+    /// Host-wide policy changes exclude prompt admission and queued delivery.
+    policy_gate: Arc<std::sync::RwLock<()>>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
     /// The registry-wide running-set signal (shared with the relay).
@@ -245,6 +247,9 @@ impl Session {
         data: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
+        let _policy = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
+            Some(self.policy_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session policy change is in progress"))?)
+        } else { None };
         let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
@@ -644,6 +649,7 @@ pub struct SessionRegistry {
     composer_outboxes: Mutex<HashMap<String, Arc<composer_outbox::ComposerOutbox>>>,
     /// The running-set change signal the running stream derives on.
     running_signal: Arc<RunningSignal>,
+    policy_gate: Arc<std::sync::RwLock<()>>,
 }
 
 impl Default for SessionRegistry {
@@ -654,11 +660,16 @@ impl Default for SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
+        Self::with_policy_gate(Arc::new(std::sync::RwLock::new(())))
+    }
+
+    pub fn with_policy_gate(policy_gate: Arc<std::sync::RwLock<()>>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
             composer_outboxes: Mutex::new(HashMap::new()),
             running_signal: Arc::new(RunningSignal::default()),
+            policy_gate,
         }
     }
 
@@ -691,6 +702,7 @@ impl SessionRegistry {
         cwd: &Path,
         config: &SessionSpawnConfig,
     ) -> Result<Arc<Session>, SessionHostError> {
+        let _policy = self.policy_gate.try_read().map_err(|_| SessionHostError::Spawn("session policy change is in progress".to_string()))?;
         if let Some(existing) = self.get(id) {
             if !existing.is_idle_expired() {
                 return Ok(existing);
@@ -731,6 +743,7 @@ impl SessionRegistry {
             config,
             composer_outbox,
             Arc::clone(&self.running_signal),
+            Arc::clone(&self.policy_gate),
         )?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
         Ok(session)
@@ -838,6 +851,7 @@ fn spawn_session(
     config: &SessionSpawnConfig,
     composer_outbox: Arc<composer_outbox::ComposerOutbox>,
     running_signal: Arc<RunningSignal>,
+    policy_gate: Arc<std::sync::RwLock<()>>,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -1019,6 +1033,7 @@ fn spawn_session(
         composer_generation,
         composer_delivering: Mutex::new(false),
         activity_gate: std::sync::RwLock::new(()),
+        policy_gate,
         settle_cv: std::sync::Condvar::new(),
         running_signal,
     });

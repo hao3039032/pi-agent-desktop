@@ -32,6 +32,8 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// outlive the request that opened them.
 pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
+    /// Global policy transaction gate shared with session admission and drains.
+    pub(crate) policy_gate: Arc<std::sync::RwLock<()>>,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -109,8 +111,10 @@ struct EventRelayHandle {
 impl IpcHostState {
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
+        let policy_gate = Arc::new(std::sync::RwLock::new(()));
         Self {
-            registry: Arc::new(SessionRegistry::new()),
+            registry: Arc::new(SessionRegistry::with_policy_gate(Arc::clone(&policy_gate))),
+            policy_gate,
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1303,6 +1307,10 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             protocol_ok(&id, status)
         }
         "trust.set" => {
+            let _policy = match state.policy_gate.try_write() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session admission is in progress"),
+            };
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else {
                 return protocol_error(&id, "invalid_params", "trust.set needs a cwd");
             };
@@ -3371,6 +3379,10 @@ pub(crate) fn create_session(
     state: &IpcHostState,
     args: &Value,
 ) -> Result<Value, (String, String, Option<Value>)> {
+    let _policy = state.policy_gate.try_read().map_err(|_| (
+        "busy".to_string(), "Session policy change is in progress".to_string(),
+        (command_type(args).as_deref() == Some("prompt")).then(|| json!({ "code": "prompt_rejected", "accepted": false })),
+    ))?;
     let invalid = |message: &str, command_type: Option<&str>| -> (String, String, Option<Value>) {
         let rejected = command_type == Some("prompt");
         (
@@ -4110,6 +4122,12 @@ pub(crate) fn dispatch_with_resume(
     op: &str,
     args: &Value,
 ) -> Result<Value, (String, String)> {
+    // Stop remains available during a policy change, but never cold-starts a child.
+    if op == "agent.interrupt" || (op == "agent.command" && matches!(args.get("type").and_then(Value::as_str), Some("abort" | "abort_bash" | "abort_retry"))) {
+        return session_host::dispatch_session_op(&state.registry, op, args, None)
+            .map_err(|error| (error.code().to_string(), error.to_string()));
+    }
+    let _policy = state.policy_gate.try_read().map_err(|_| ("busy".to_string(), "Session policy change is in progress".to_string()))?;
     let base = state.spawn_base.lock().unwrap().clone();
     let agent_dir = state.agent_dir();
     let Some(base) = base else {
@@ -8112,6 +8130,44 @@ mod tests {
         );
 
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn policy_gate_blocks_real_admission_and_defers_background_delivery() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|s| !s.is_empty()) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = dir.path().join("delivered");
+        std::fs::write(agent.join("extensions/fixture.js"), format!("export default function(pi) {{ pi.registerCommand('fixture-mark', {{ handler: async () => {{ require('fs').writeFileSync({:?}, 'yes'); }} }}); }}", marker.to_string_lossy())).unwrap();
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent);
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+        let created = create_session(&state, &json!({"cwd":cwd,"type":"ensure_session"})).unwrap();
+        let sid = created["sessionId"].as_str().unwrap();
+        let session = state.registry.get(sid).unwrap();
+        let policy = state.policy_gate.try_write().unwrap();
+        assert_eq!(create_session(&state, &json!({"cwd":cwd,"type":"ensure_session"})).unwrap_err().0, "busy");
+        assert_eq!(dispatch_with_resume(&state, "agent.command", &json!({"session":sid,"type":"get_state"})).unwrap_err().0, "busy");
+        assert!(dispatch_with_resume(&state, "agent.interrupt", &json!({"session":sid})).is_ok(), "Stop remains available");
+        assert!(session.command("prompt", json!({"message":"/fixture-mark"}), Some(Duration::from_secs(3))).is_err());
+        session.composer_outbox.enqueue("/fixture-mark", None).unwrap();
+        session.composer_wake();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!marker.exists(), "a parked drain must not send across policy exclusion");
+        assert!(session.composer_outbox.has_items());
+        drop(policy);
+        let admission = state.policy_gate.try_read().unwrap();
+        let trust = send(&state, json!({"v":1,"id":"trust-race","op":"trust.set","args":{"cwd":cwd}}));
+        assert_eq!(trust["error"]["code"], "busy", "{trust}");
+        drop(admission);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(marker.exists(), "deferred delivery resumes after policy unlock");
+        state.registry.remove(sid, Duration::from_secs(5));
     }
 
     /// The composer outbox (queue_composer / take / send) and the state
