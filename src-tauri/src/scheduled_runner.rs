@@ -50,20 +50,20 @@ pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
         "read-only" => vec!["read", "grep", "find", "ls"],
         "default" => vec!["read", "bash", "edit", "write"],
         "full" => vec!["bash", "read", "edit", "write", "grep", "find", "ls"],
-        _ => { finish_run(&agent, task_id, &run_id, failure("Invalid task tool preset"))?; return Err("Invalid task tool preset".into()); }
+        _ => return finish_early(state, &agent, &task, &run_id, failure("Invalid task tool preset")),
     };
     let mut args = json!({ "cwd": task["cwd"], "type": "ensure_session", "toolNames": names });
     if task["model"].is_object() { args["provider"] = task["model"]["provider"].clone(); args["modelId"] = task["model"]["modelId"].clone(); }
     if task["thinkingLevel"].is_string() { args["thinkingLevel"] = task["thinkingLevel"].clone(); }
     let created = match create_session(state, &args) {
         Ok(value) => value,
-        Err((_, message, _)) => { let outcome = failure(message); return finish_run(&agent, task_id, &run_id, outcome); }
+        Err((_, message, _)) => return finish_early(state, &agent, &task, &run_id, failure(message)),
     };
     let Some(session_id) = created["sessionId"].as_str() else {
-        return finish_run(&agent, task_id, &run_id, failure("Session creation omitted id"));
+        return finish_early(state, &agent, &task, &run_id, failure("Session creation omitted id"));
     };
     let Some(session) = state.registry.get(session_id) else {
-        return finish_run(&agent, task_id, &run_id, failure("Created session disappeared"));
+        return finish_early(state, &agent, &task, &run_id, failure("Created session disappeared"));
     };
     let task_id = task_id.to_string();
     let prompt = task["prompt"].as_str().unwrap_or("").to_string();
@@ -73,6 +73,8 @@ pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
     let thread_agent = agent.clone();
     let thread_task = task_id.clone();
     let thread_run = run_id.clone();
+    let events = std::sync::Arc::clone(&state.scheduled_events);
+    let task_name = task["name"].as_str().unwrap_or("").to_string();
     let spawned = std::thread::Builder::new().name(format!("scheduled-run-{run_id}")).spawn(move || {
         let link_tx = ready_tx.clone();
         let outcome = run_session(&session, marker, &prompt, Duration::from_secs(duration * 60), |session_id| {
@@ -81,20 +83,57 @@ pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
                 run["sessionId"] = json!(session_id);
                 Ok(run.clone())
             })?;
+            events.emit(json!({ "type": "run_started", "taskId": thread_task, "taskName": task_name, "runId": thread_run, "sessionId": session_id, "trigger": "manual" }));
+            events.emit(json!({ "type": "task_changed", "taskId": thread_task }));
             let _ = link_tx.send(Ok(linked));
             Ok(())
         });
+        // Even a marker refusal produced a real session. Keep the history
+        // link so that failed setup cannot leak it into the project tree.
+        if outcome.status == "failed" {
+            let _ = TaskRepository::new(&thread_agent).mutate_runs(&thread_task, |runs| {
+                if let Some(run) = runs.iter_mut().find(|run| run["runId"] == thread_run) {
+                    if run.get("sessionId").is_none() { run["sessionId"] = json!(session.id); }
+                }
+                Ok(())
+            });
+        }
+        let status = outcome.status;
+        let error = outcome.error.clone();
+        let error_code = outcome.error_code;
         let finished = finish_run(&thread_agent, &thread_task, &thread_run, outcome);
-        let _ = ready_tx.try_send(finished);
+        if let Ok((run, auto_paused)) = &finished {
+            let mut event = json!({ "type": "run_finished", "taskId": thread_task, "taskName": task_name, "runId": thread_run, "trigger": "manual", "status": status });
+            if run["sessionId"].is_string() { event["sessionId"] = run["sessionId"].clone(); }
+            if let Some(error) = error { event["error"] = json!(error); }
+            if let Some(code) = error_code { event["errorCode"] = json!(code); }
+            if *auto_paused { event["autoPaused"] = json!(true); }
+            events.emit(event);
+            events.emit(json!({ "type": "task_changed", "taskId": thread_task }));
+        }
+        let _ = ready_tx.try_send(finished.map(|(run, _)| run));
     });
     if let Err(error) = spawned {
         state.registry.remove(session_id, Duration::from_secs(5));
-        return finish_run(&agent, &task_id, &run_id, failure(format!("failed to start scheduled runner: {error}")));
+        return finish_early(state, &agent, &task, &run_id, failure(format!("failed to start scheduled runner: {error}")));
     }
     ready_rx.recv_timeout(Duration::from_secs(60)).map_err(|_| "scheduled run readiness timed out; its outcome may be unknown".to_string())?
 }
 
-fn finish_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: RunOutcome) -> Result<Value, String> {
+fn finish_early(state: &IpcHostState, agent: &std::path::Path, task: &Value, run_id: &str, outcome: RunOutcome) -> Result<Value, String> {
+    let task_id = task["id"].as_str().ok_or("Invalid task id")?;
+    let status = outcome.status;
+    let error = outcome.error.clone();
+    let (run, auto_paused) = finish_run(agent, task_id, run_id, outcome)?;
+    let mut event = json!({ "type": "run_finished", "taskId": task_id, "taskName": task["name"], "runId": run_id, "trigger": "manual", "status": status });
+    if let Some(error) = error { event["error"] = json!(error); }
+    if auto_paused { event["autoPaused"] = json!(true); }
+    state.scheduled_events.emit(event);
+    state.scheduled_events.emit(json!({ "type": "task_changed", "taskId": task_id }));
+    Ok(run)
+}
+
+fn finish_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: RunOutcome) -> Result<(Value, bool), String> {
     let repo = TaskRepository::new(agent);
     let finished = repo.mutate_runs(task_id, |runs| {
         let run = runs.iter_mut().find(|run| run["runId"] == run_id).ok_or("Run not found")?;
@@ -104,6 +143,7 @@ fn finish_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: Run
         if let Some(code) = outcome.error_code { run["errorCode"] = json!(code); }
         Ok(run.clone())
     })?;
+    let mut auto_paused = false;
     repo.mutate(|tasks| {
         if let Some(task) = tasks.iter_mut().find(|task| task["id"] == task_id) {
             if outcome.status == "succeeded" { task["consecutiveFailures"] = json!(0); }
@@ -111,6 +151,7 @@ fn finish_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: Run
                 let failures = task["consecutiveFailures"].as_u64().unwrap_or(0) + 1;
                 task["consecutiveFailures"] = json!(failures);
                 if failures >= 5 && task["enabled"] == true {
+                    auto_paused = true;
                     task["enabled"] = json!(false);
                     task["autoPausedReason"] = json!(outcome.error.as_deref().unwrap_or("unknown error"));
                 }
@@ -118,7 +159,7 @@ fn finish_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: Run
         }
         Ok(())
     })?;
-    Ok(finished)
+    Ok((finished, auto_paused))
 }
 
 /// The marker acknowledgement and durable session link are both required

@@ -50,7 +50,7 @@ use tauri::App;
 use tauri::Manager;
 
 use pi_agent_desktop_lib::pi_ipc::{
-    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, IpcHostState,
+    dispatch_envelope_gated, pi_ipc_subscribe_events, pi_ipc_subscribe_running, pi_ipc_subscribe_scheduled, IpcHostState,
 };
 
 /// One call the host thread (which owns the `App` and therefore the
@@ -64,6 +64,7 @@ use pi_agent_desktop_lib::pi_ipc::{
 enum HostCall {
     SubscribeEvents { session: String, cb: u32 },
     SubscribeRunning { cb: u32 },
+    SubscribeScheduled { cb: u32 },
     /// Orderly teardown of everything the host owns children-wise (sessions,
     /// management instances, PTYs). The connection thread exits the process
     /// once the reply is flushed.
@@ -374,6 +375,9 @@ fn main() {
                 HostCall::SubscribeRunning { cb } => {
                     pi_ipc_subscribe_running(app.state::<Arc<IpcHostState>>(), bridge_for_host.channel(cb))
                 }
+                HostCall::SubscribeScheduled { cb } => {
+                    pi_ipc_subscribe_scheduled(app.state::<Arc<IpcHostState>>(), bridge_for_host.channel(cb))
+                }
                 HostCall::Shutdown => {
                     // Orderly teardown, the same paths the product uses per
                     // child (stdin EOF + grace kill of the child's process
@@ -646,6 +650,12 @@ fn handle_invoke(
                 return json!({ "harnessError": "pi_ipc_subscribe_running needs an onFrame channel" });
             };
             HostCall::SubscribeRunning { cb }
+        }
+        "pi_ipc_subscribe_scheduled" => {
+            let Some(cb) = args.get("onEvent").and_then(channel_ref) else {
+                return json!({ "harnessError": "pi_ipc_subscribe_scheduled needs an onEvent channel" });
+            };
+            HostCall::SubscribeScheduled { cb }
         }
         other => return json!({ "harnessError": format!("the harness host does not implement '{other}'") }),
     };

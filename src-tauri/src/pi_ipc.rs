@@ -56,6 +56,7 @@ pub struct IpcHostState {
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     /// The scheduled-task store root (the agent dir the host runs against).
     pub task_agent_dir: Mutex<Option<PathBuf>>,
+    pub(crate) scheduled_events: Arc<crate::scheduled_events::ScheduledEvents>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
     /// The file access allow-list (the /api/files security boundary).
@@ -98,6 +99,7 @@ impl IpcHostState {
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             task_agent_dir: Mutex::new(None),
+            scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
             resources: ResourceRegistry::new(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
@@ -389,6 +391,14 @@ fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &str, payload
         "kind": kind,
         "payload": payload,
     })
+}
+
+#[tauri::command]
+pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event: Channel<Value>) -> Value {
+    match state.scheduled_events.subscribe(on_event) {
+        Ok(subscription_id) => json!({ "subscriptionId": subscription_id, "epoch": 1 }),
+        Err(error) => protocol_error("?", "io", &error),
+    }
 }
 
 /// Subscribe to a session's event stream on a Tauri Channel. The first
@@ -1461,9 +1471,19 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
+        "tasks.unsubscribe" => {
+            if let Some(id) = args.get("subscriptionId").and_then(Value::as_str) { state.scheduled_events.unsubscribe(id); }
+            protocol_ok(&id, json!({ "success": true }))
+        }
         "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" | "tasks.run" => {
             match crate::scheduler_host::dispatch(state, &op, &args) {
-                Ok(data) => protocol_ok(&id, data),
+                Ok(data) => {
+                    if matches!(op, "tasks.create" | "tasks.update" | "tasks.delete" | "tasks.markSeen") {
+                        let task_id = args.get("id").and_then(Value::as_str).or_else(|| data["task"]["id"].as_str());
+                        if let Some(task_id) = task_id { state.scheduled_events.emit(json!({ "type": "task_changed", "taskId": task_id })); }
+                    }
+                    protocol_ok(&id, data)
+                },
                 Err(error) => {
                     let mut body = json!({ "code": error.code, "message": error.message, "retryable": false });
                     if let Some(key) = error.key { body["reason"] = json!(key); }
@@ -4015,6 +4035,12 @@ mod tests {
         let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
         let task_id = "12345678-1234-1234-1234-123456789abc";
         repo.mutate(|tasks| { tasks.push(json!({ "id": task_id, "name": "run now fixture", "prompt": "second fixture prompt", "cwd": project, "enabled": true, "schedule": {"kind":"manual"}, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 })); Ok(()) }).unwrap();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = body { let _ = event_tx.send(text); }
+            Ok(())
+        });
+        let subscription = state.scheduled_events.subscribe(channel).unwrap();
         let started = send(&state, json!({ "v": 1, "id": "run", "op": "tasks.run", "args": { "id": task_id } }));
         assert_eq!(started["ok"], true, "{started}");
         let run = &started["data"]["run"];
@@ -4028,6 +4054,14 @@ mod tests {
             assert!(std::time::Instant::now() < until, "run did not settle");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let mut types = Vec::new();
+        while types.len() < 4 {
+            let frame: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+            types.push(frame["payload"]["type"].as_str().unwrap_or("").to_string());
+        }
+        assert!(types.iter().any(|kind| kind == "run_started"));
+        assert!(types.iter().any(|kind| kind == "run_finished"));
+        state.scheduled_events.unsubscribe(&subscription);
         server.join().unwrap();
     }
 

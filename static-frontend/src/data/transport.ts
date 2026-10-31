@@ -166,7 +166,9 @@ class HostBridgeTransport implements IpcTransport {
               ? "pi_ipc_subscribe_running"
               : op === "terminal.subscribeOutput"
                 ? "pi_ipc_subscribe_terminal"
-                : null;
+                : op === "tasks.subscribeEvents"
+                  ? "pi_ipc_subscribe_scheduled"
+                  : null;
         if (command === null) {
           handle.stopLocalDelivery();
           onError({ code: "unknown_op", message: `no stream handler for '${op}'`, retryable: false });
@@ -177,7 +179,9 @@ class HostBridgeTransport implements IpcTransport {
             ? { session: args?.session, onEvent: handle.channel }
             : command === "pi_ipc_subscribe_running"
               ? { onFrame: handle.channel }
-              : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
+              : command === "pi_ipc_subscribe_scheduled"
+                ? { onEvent: handle.channel }
+                : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
         const ack = await invoke(command, payload);
         if (closed) {
           handle.stopLocalDelivery();
@@ -201,12 +205,12 @@ class HostBridgeTransport implements IpcTransport {
             // ends with its terminal (or page reload).
             if (
               subscriptionId !== null
-              && (command === "pi_ipc_subscribe_events" || command === "pi_ipc_subscribe_running")
+              && (command === "pi_ipc_subscribe_events" || command === "pi_ipc_subscribe_running" || command === "pi_ipc_subscribe_scheduled")
             ) {
               const request: IpcRequest = {
                 v: IPC_PROTOCOL_VERSION,
                 id: `unsubscribe-${subscriptionId}`,
-                op: "agent.unsubscribeEvents",
+                op: command === "pi_ipc_subscribe_scheduled" ? "tasks.unsubscribe" : "agent.unsubscribeEvents",
                 args: { subscriptionId },
               };
               try {

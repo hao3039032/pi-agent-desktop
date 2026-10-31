@@ -4,7 +4,7 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url, { alias: { "@": new URL("../../../", import.meta.url).pathname } });
 const { IpcClient, MockTransport } = await jiti.import("../ipc/client.ts");
 const { bindScheduledTasksClient, scheduledApi } = await jiti.import("./scheduled-tasks-client.ts");
-const { bindScheduledTasksStore } = await jiti.import("./scheduled-tasks-store.ts");
+const { bindScheduledTasksStore, onScheduledTaskEvent, retainScheduledTaskStream, isScheduledRunSession } = await jiti.import("./scheduled-tasks-store.ts");
 
 test("scheduled preview uses the host IPC and preserves validation details", async () => {
   const transport = new MockTransport().on("tasks.previewCron", (args) => {
@@ -32,4 +32,20 @@ test("task editing uses IPC rather than HTTP", async () => {
   await scheduledApi.remove("fixture");
   assert.deepEqual(seen.map(([op]) => op), ["tasks.create", "tasks.get", "tasks.update", "tasks.delete"]);
   assert.deepEqual(seen[2][1], { id: "fixture", patch: { name: "renamed" } });
+});
+
+test("scheduled event subscribers receive real host events and detach", () => {
+  const transport = new MockTransport().on("tasks.subscribeEvents", () => ({})).on("tasks.list", () => ({ tasks: [] }));
+  bindScheduledTasksStore(new IpcClient(transport));
+  const seen = [];
+  const off = onScheduledTaskEvent((event) => seen.push(event));
+  const release = retainScheduledTaskStream();
+  const event = { type: "run_started", taskId: "task", taskName: "T", runId: "run", sessionId: "session", trigger: "manual" };
+  transport.emit({ subscriptionId: "sub", epoch: 1, seq: 1, kind: "event", payload: event });
+  assert.deepEqual(seen, [event]);
+  assert.equal(isScheduledRunSession("session"), true);
+  release();
+  transport.emit({ subscriptionId: "sub", epoch: 1, seq: 2, kind: "event", payload: event });
+  assert.equal(seen.length, 1);
+  off();
 });

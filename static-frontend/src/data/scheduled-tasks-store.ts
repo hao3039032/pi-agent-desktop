@@ -1,23 +1,6 @@
 /**
- * The static app's scheduled-tasks store (the vite alias for
- * `@/hooks/useScheduledTasks`).
- *
- * The Next hook shared one EventSource (`/api/scheduled-tasks/events`) with
- * the scheduler server. The static app has no HTTP server, so that stream
- * would only ever hit the SPA fallback and retry forever (the MIME-error
- * storm). Until the host's scheduler wiring (M4) exposes its own event
- * stream over IPC, this store is list-only and HONEST about it:
- *
- * - the task list comes from the REAL host (`tasks.list` reads the store
- *   the scheduler owns — no client-side reimplementation of the format);
- * - there is no event source, so `runningTaskIds` stays empty and
- *   run-finished notifications do not fire in the static app yet;
- * - `schedulerOwner` stays null (unknown): the host does not report the
- *   lease state through `tasks.list` yet. The UI renders null as
- *   "unknown", not as "owner" — no fake ownership.
- *
- * Each of these gaps disappears when the M4 host ops land; none of them is
- * papered over here.
+ * The static app's scheduled-tasks store. One retained host IPC stream
+ * delivers changes to the page, sidebar and notification hook.
  */
 
 import { useEffect, useSyncExternalStore } from "react";
@@ -54,7 +37,7 @@ export interface ScheduledTasksState {
   /** Null (unknown) until the host reports the lease over IPC. */
   schedulerOwner: boolean | null;
   schedulerOwnerInfo: SchedulerOwnerInfo | null;
-  /** Task ids with a run in progress. Empty until the host event stream lands. */
+  /** Task ids with a run in progress observed by this window. */
   runningTaskIds: ReadonlySet<string>;
 }
 
@@ -70,6 +53,10 @@ const INITIAL: ScheduledTasksState = {
 let state = INITIAL;
 const listeners = new Set<() => void>();
 let loadId = 0;
+let streamRefs = 0;
+let stopStream: (() => void) | null = null;
+let streamError: string | null = null;
+const eventHandlers = new Set<(event: ScheduledTaskEvent) => void>();
 /** Sessions known to be produced by a scheduled run (each task's latest run). */
 const scheduledSessionIds = new Set<string>();
 
@@ -86,28 +73,45 @@ export async function refreshScheduledTasks(): Promise<void> {
     for (const task of data.tasks as ScheduledTaskView[]) {
       if (task.lastRun?.sessionId) scheduledSessionIds.add(task.lastRun.sessionId);
     }
-    setState({ tasks: data.tasks as ScheduledTaskView[], loaded: true, error: null });
+    setState({ tasks: data.tasks as ScheduledTaskView[], loaded: true, error: streamError });
   } catch (error) {
     if (id !== loadId) return;
     setState({ loaded: true, error: error instanceof Error ? error.message : String(error) });
   }
 }
 
-/**
- * The Next hook's exact contract (a typed handler in, an unsubscriber
- * out). No event source exists yet (M4): the handler is accepted but
- * nothing can ever fire it — run-finished notifications honestly stay off
- * in the static app until the host's tasks event stream lands, so this is
- * deliberately NOT a working event subscription.
- */
 export function onScheduledTaskEvent(handler: (event: ScheduledTaskEvent) => void): () => void {
-  void handler;
-  return () => {};
+  eventHandlers.add(handler);
+  return () => { eventHandlers.delete(handler); };
 }
 
-/** No event source exists yet (M4). Kept as a no-op for the consumer surface. */
 export function retainScheduledTaskStream(): () => void {
-  return () => {};
+  streamRefs += 1;
+  if (streamRefs === 1) {
+    stopStream = clientForTasks().subscribe<ScheduledTaskEvent>("tasks.subscribeEvents", undefined, (frame) => {
+      if (frame.kind !== "event" || !frame.payload || typeof frame.payload.type !== "string") return;
+      streamError = null;
+      const event = frame.payload;
+      const running = new Set(state.runningTaskIds);
+      if (event.type === "run_started") {
+        running.add(event.taskId);
+        if (event.sessionId) scheduledSessionIds.add(event.sessionId);
+      } else if (event.type === "run_finished") {
+        running.delete(event.taskId);
+        if (event.sessionId) scheduledSessionIds.add(event.sessionId);
+      }
+      setState({ runningTaskIds: running, ...(event.type === "scheduler_owner" ? { schedulerOwner: event.owner } : {}) });
+      for (const handler of eventHandlers) handler(event);
+      void refreshScheduledTasks();
+    }, (error) => { streamError = error.message; setState({ error: streamError }); });
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    streamRefs -= 1;
+    if (streamRefs === 0) { stopStream?.(); stopStream = null; streamError = null; }
+  };
 }
 
 export function isScheduledRunSession(sessionId: string): boolean {
@@ -118,8 +122,6 @@ function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   if (listeners.size === 1) {
     void refreshScheduledTasks();
-    // Without an event stream, visibility is the honest refresh trigger
-    // (returning to the window re-reads the scheduler's store).
     document.addEventListener("visibilitychange", onVisible);
   }
   return () => {
@@ -149,8 +151,7 @@ export function useScheduledTasks(): ScheduledTasksState {
 export function summarizeScheduledTasks(tasks: readonly ScheduledTaskView[], running: ReadonlySet<string>) {
   return {
     unread: tasks.reduce((total, task) => total + task.unreadRuns, 0),
-    // The static store has no event source yet (M4); a run begun before
-    // this window opened still shows on the task itself.
+    // A run begun before this window opened still shows on the task itself.
     running: running.size > 0 || tasks.some((task) => task.lastRun?.status === "running"),
     attention: tasks.some((task) => Boolean(task.autoPausedReason)),
   };
