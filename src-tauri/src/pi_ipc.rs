@@ -1394,25 +1394,40 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
-        "plugins.install.start" => {
+        "skills.install.start" | "skills.update.start" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
             if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
-            let Some(source) = args.get("source").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 4096) else { return protocol_error(&id, "invalid_args", "invalid source"); };
+            let Some(package) = args.get("package").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && !s.starts_with('-') && s.len() <= 4096) else { return protocol_error(&id, "invalid_args", "invalid package"); };
             let Some(scope) = args.get("scope").and_then(Value::as_str).filter(|s| *s == "global" || *s == "project") else { return protocol_error(&id, "invalid_args", "invalid scope"); };
             let Some(config) = state.management_config.lock().unwrap().clone() else { return protocol_error(&id, "management_unavailable", "management instance is not configured"); };
             let instance = match state.management.instance("global", &config) { Ok(instance) => instance, Err(error) => return protocol_error(&id, "management_unavailable", &error) };
-            match instance.start_exclusive_task("plugins.install", json!({"cwd": lexical_fold(cwd, cfg!(windows)), "source": source, "scope": scope}), std::time::Duration::from_secs(600), config) {
+            let mutation = op.strip_suffix(".start").unwrap();
+            match instance.start_exclusive_task(mutation, json!({"cwd": lexical_fold(cwd, cfg!(windows)), "package": package, "scope": scope}), std::time::Duration::from_secs(60), config) {
                 Ok(handle) => protocol_ok(&id, json!({"handle": handle})), Err(error) => protocol_error(&id, "io", &error),
             }
         }
-        "plugins.install.status" | "plugins.install.cancel" => {
+        "plugins.install.start" | "plugins.remove.start" | "plugins.update.start" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
+            let source = args.get("source").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty() && s.len() <= 4096);
+            if source.is_none() && (op != "plugins.update.start" || args.get("source").is_some_and(|v| !v.is_null())) { return protocol_error(&id, "invalid_args", "invalid source"); }
+            let Some(scope) = args.get("scope").and_then(Value::as_str).filter(|s| *s == "global" || *s == "project") else { return protocol_error(&id, "invalid_args", "invalid scope"); };
+            let Some(config) = state.management_config.lock().unwrap().clone() else { return protocol_error(&id, "management_unavailable", "management instance is not configured"); };
+            let instance = match state.management.instance("global", &config) { Ok(instance) => instance, Err(error) => return protocol_error(&id, "management_unavailable", &error) };
+            let mutation = op.strip_suffix(".start").unwrap();
+            match instance.start_exclusive_task(mutation, json!({"cwd": lexical_fold(cwd, cfg!(windows)), "source": source, "scope": scope}), std::time::Duration::from_secs(600), config) {
+                Ok(handle) => protocol_ok(&id, json!({"handle": handle})), Err(error) => protocol_error(&id, "io", &error),
+            }
+        }
+        "skills.mutation.status" | "skills.mutation.cancel" | "plugins.mutation.status" | "plugins.mutation.cancel" | "plugins.install.status" | "plugins.install.cancel" => {
             let Some(handle) = args.get("handle").and_then(Value::as_str).filter(|s| s.starts_with("task-") && s.len() <= 64) else { return protocol_error(&id, "invalid_args", "invalid handle"); };
             let Some(config) = state.management_config.lock().unwrap().clone() else { return protocol_error(&id, "management_unavailable", "management instance is not configured"); };
             let instance = match state.management.instance("global", &config) { Ok(instance) => instance, Err(error) => return protocol_error(&id, "management_unavailable", &error) };
-            if op == "plugins.install.cancel" {
-                return match instance.cancel_exclusive_task(handle) { Ok(()) => protocol_ok(&id, json!({"requested": true})), Err(error) => protocol_error(&id, "io", &error) };
+            let domain = if op.starts_with("skills.") { "skills" } else { "plugins" };
+            if op.ends_with(".cancel") {
+                return match instance.cancel_exclusive_task(handle, domain) { Ok(()) => protocol_ok(&id, json!({"requested": true})), Err(error) => protocol_error(&id, "io", &error) };
             }
-            match instance.exclusive_task_snapshot(handle) {
+            match instance.exclusive_task_snapshot(handle, domain) {
                 Ok(snapshot) => protocol_ok(&id, json!({"status": format!("{:?}", snapshot.status).to_lowercase(), "progress": snapshot.progress, "result": snapshot.result, "error": snapshot.error})),
                 Err(error) => protocol_error(&id, "io", &error),
             }
@@ -1481,7 +1496,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 payload["disableModelInvocation"] = json!(disabled);
                 payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
             }
-            match management_call_scoped(state, op, &payload, Path::new(&cwd)) {
+            let result = if op == "skills.setDisabled" { management_serial_scoped_call(state, op, payload, Path::new(&cwd)) } else { management_read_scoped(state, op, &payload, Path::new(&cwd)) };
+            match result {
                 Ok(result) => protocol_ok(&id, result),
                 Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
             }
@@ -5147,7 +5163,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn real_pi_plugin_install_ipc_success_and_cancel_unknown() {
+    fn real_pi_plugin_install_remove_and_skill_task_cancel() {
         use std::os::unix::fs::PermissionsExt;
         let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|v| !v.is_empty()) else { return };
         let dir = tempfile::tempdir().unwrap();
@@ -5184,6 +5200,57 @@ mod tests {
         }
         let settings: Value = serde_json::from_slice(&std::fs::read(agent.join("settings.json")).unwrap()).unwrap();
         assert_eq!(settings["packages"].as_array().unwrap().len(), 1);
+        let update = call("plugins.update.start", json!({"cwd":project,"source":package,"scope":"global"}));
+        assert_eq!(update["ok"], true, "{update}");
+        let update_handle = update["data"]["handle"].as_str().unwrap();
+        loop {
+            let status = call("plugins.mutation.status", json!({"handle":update_handle}));
+            if status["data"]["status"] != "running" { assert_eq!(status["data"]["status"], "succeeded", "{status}"); break; }
+            assert!(std::time::Instant::now() < until); std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let removed = call("plugins.remove.start", json!({"cwd":project,"source":package,"scope":"global"}));
+        assert_eq!(removed["ok"], true, "{removed}");
+        let remove_handle = removed["data"]["handle"].as_str().unwrap();
+        loop {
+            let status = call("plugins.mutation.status", json!({"handle":remove_handle}));
+            if status["data"]["status"] != "running" { assert_eq!(status["data"]["status"], "succeeded", "{status}"); break; }
+            assert!(std::time::Instant::now() < until); std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let settings: Value = serde_json::from_slice(&std::fs::read(agent.join("settings.json")).unwrap()).unwrap();
+        assert!(settings["packages"].as_array().unwrap().is_empty());
+        let bad_skill = call("skills.install.start", json!({"cwd":project,"package":"--global","scope":"project"}));
+        assert_eq!(bad_skill["ok"], false, "{bad_skill}");
+        let skill = call("skills.install.start", json!({"cwd":project,"package":"fixture/repo","scope":"global"}));
+        assert_eq!(skill["ok"], true, "{skill}");
+        let skill_handle = skill["data"]["handle"].as_str().unwrap();
+        let cross_domain = call("plugins.mutation.cancel", json!({"handle":skill_handle}));
+        assert_eq!(cross_domain["ok"], false, "{cross_domain}");
+        let stop = call("skills.mutation.cancel", json!({"handle":skill_handle}));
+        assert_eq!(stop["ok"], true, "{stop}");
+        let skill_status = call("skills.mutation.status", json!({"handle":skill_handle}));
+        assert_eq!(skill_status["data"]["status"], "unknown", "{skill_status}");
+        state.management.shutdown_all(std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_pi_plugin_hanging_install_cancel_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|v| !v.is_empty()) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent"); let project = dir.path().join("project"); let other = dir.path().join("other"); let package = dir.path().join("fixture"); let managed = dir.path().join("managed");
+        for path in [&agent, &project, &other, &package] { std::fs::create_dir_all(path).unwrap(); }
+        std::fs::write(package.join("package.json"), r#"{"name":"fixture","version":"1.0.0"}"#).unwrap();
+        std::fs::write(agent.join("settings.json"), json!({"packages":[package],"npmCommand":[dir.path().join("npm-fixture")]}).to_string()).unwrap();
+        let script = dir.path().join("npm-fixture"); let marker = dir.path().join("npm-started");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300 &\necho $! > \"$FIXTURE_MARKER\"\nwait\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
+        let state = state();
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig { executable, agent_dir: Some(agent), extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()], env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("FIXTURE_MARKER".into(), marker.display().to_string())] });
+        state.propose_path(&project); state.propose_path(&other);
+        let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let started = call("plugins.install.start", json!({"cwd": project, "source":"npm:fixture", "scope":"global"}));
         assert_eq!(started["ok"], true, "{started}");
         let handle = started["data"]["handle"].as_str().unwrap();

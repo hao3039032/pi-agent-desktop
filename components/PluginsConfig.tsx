@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
-import { checkPlugins, installPluginPackage, listPlugins, setPluginsEnabled } from "@/lib/plugins-client";
+import { checkPlugins, installPluginPackage, listPlugins, mutatePluginPackage, setPluginsEnabled } from "@/lib/plugins-client";
 import type {
   PluginPackageInfo,
   PluginStandaloneExtensionInfo,
@@ -333,6 +333,7 @@ function PackageDetail({
   pkg,
   cwd,
   busyKey,
+  progress,
   actionError,
   actionMessage,
   sessionId,
@@ -342,10 +343,12 @@ function PackageDetail({
   onAction,
   onCheckUpdate,
   onReloadSession,
+  onCancelMutation,
 }: {
   pkg: PluginPackageInfo;
   cwd: string;
   busyKey: string | null;
+  progress: string | null;
   actionError: string | null;
   actionMessage: string | null;
   sessionId: string | null;
@@ -355,6 +358,7 @@ function PackageDetail({
   onAction: (action: PluginAction, pkg: PluginPackageInfo) => void;
   onCheckUpdate: () => void;
   onReloadSession: () => void;
+  onCancelMutation: () => void;
 }) {
   const { t } = useI18n();
   const key = packageKey(pkg);
@@ -412,6 +416,8 @@ function PackageDetail({
           </ConfigDetailHeaderInfo>
 
           <ConfigDetailActions>
+            {(busyKey === `update:${key}` || busyKey === `remove:${key}`) && progress && <span role="status">{busyKey.startsWith("update:") ? t("i18n.updating") : t("i18n.removing")}</span>}
+            {(busyKey === `update:${key}` || busyKey === `remove:${key}`) && <ConfigButton size="small" onClick={onCancelMutation}>{t("i18n.cancel")}</ConfigButton>}
             <ConfigButton
               size="small"
               variant={updateAvailable ? "primary" : undefined}
@@ -702,14 +708,11 @@ export function PluginsConfig({
     setActionError(null);
     setActionMessage(null);
     setUpdateError(null);
+    const controller = new AbortController();
+    installController.current = controller;
+    setInstallProgress(null);
     try {
-      const res = await fetch("/api/plugins", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "update", cwd }),
-      });
-      const next = (await res.json()) as PluginsResponse & { error?: string };
-      if (!res.ok || next.error) throw new Error(next.error ?? `HTTP ${res.status}`);
+      const next = await mutatePluginPackage(cwd, "update", undefined, "global", controller.signal, setInstallProgress);
       setData(next);
       setUpdateStatuses({});
       setActionMessage(t("i18n.packagesUpdated"));
@@ -719,6 +722,7 @@ export function PluginsConfig({
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
     } finally {
+      if (installController.current === controller) installController.current = null;
       setUpdatingAll(false);
     }
   }, [cwd, sessionId, t]);
@@ -734,14 +738,14 @@ export function PluginsConfig({
       if (action === "enable" || action === "disable") {
         next = await setPluginsEnabled(cwd, action, [{ source: pkg.source, scope: pkg.scope }], true);
       } else {
-        const res = await fetch("/api/plugins", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action, source: pkg.source, scope: pkg.scope, cwd }),
-        });
-        const data = (await res.json()) as PluginsResponse & { error?: string };
-        if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
-        next = data;
+        const controller = new AbortController();
+        installController.current = controller;
+        setInstallProgress(null);
+        try {
+          next = await mutatePluginPackage(cwd, action, pkg.source, pkg.scope, controller.signal, setInstallProgress);
+        } finally {
+          if (installController.current === controller) installController.current = null;
+        }
       }
       setData(next);
       if (action === "remove") {
@@ -1017,6 +1021,7 @@ export function PluginsConfig({
                 pkg={selectedPackage}
                 cwd={cwd}
                 busyKey={busyKey}
+                progress={installProgress}
                 actionError={actionError}
                 actionMessage={actionMessage}
                 sessionId={sessionId}
@@ -1026,6 +1031,7 @@ export function PluginsConfig({
                 onAction={runAction}
                 onCheckUpdate={() => void checkForUpdates(selectedPackage)}
                 onReloadSession={reloadSession}
+                onCancelMutation={() => installController.current?.abort()}
               />
               ) : (
                 <ConfigEmptyState>{t("i18n.selectPackage")}</ConfigEmptyState>
@@ -1053,6 +1059,8 @@ export function PluginsConfig({
             )}
         >
           {!embedded && <ConfigButton onClick={onClose}>{t("i18n.close")}</ConfigButton>}
+          {updatingAll && installProgress && <span role="status">{t("i18n.updating")}</span>}
+          {updatingAll && <ConfigButton onClick={() => installController.current?.abort()}>{t("i18n.cancel")}</ConfigButton>}
           {hasCheckablePackages && (
             <ConfigButton
               variant={availableUpdateCount > 0 ? "primary" : "secondary"}

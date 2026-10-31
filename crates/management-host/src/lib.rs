@@ -205,6 +205,9 @@ impl ManagementInstance {
 
     /// A killable child owned by one task; never reuse it for reads or other mutations.
     pub fn start_exclusive_task(&self, op: &str, args: Value, deadline: Duration, config: ManagementSpawnConfig) -> Result<String, String> {
+        if self.scope != "global" || !matches!(op, "plugins.install" | "plugins.remove" | "plugins.update" | "skills.install" | "skills.update") {
+            return Err("operation is not approved for exclusive management".into());
+        }
         #[cfg(windows)]
         { let _ = (op, args, deadline, config); return Err("exclusive management mutations are unsupported on Windows".into()); }
         #[cfg(unix)]
@@ -229,6 +232,9 @@ impl ManagementInstance {
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
             if state.closing || self.client.has_exited() { return Err("management instance is closing".into()); }
             if state.tasks.len() >= 128 { return Err("management task capacity reached".into()); }
+            if op.starts_with("plugins.") || op.starts_with("skills.") {
+                if kind == TaskKind::Mutation && !serial_scope { return Err("configuration mutation requires the physical scope slot".into()); }
+            }
             if serial_scope && state.tasks.values().any(|task| { let task = task.lock().unwrap(); task.serial_scope && task.finished_at.is_none() }) {
                 return Err("management configuration scope is busy".into());
             }
@@ -280,6 +286,10 @@ impl ManagementInstance {
             }
             match result {
                 Ok(value) => { record.snapshot.status = TaskStatus::Succeeded; record.snapshot.result = Some(value); record.finished_at = Some(Instant::now()); }
+                Err(error) if error.starts_with("[outcome_unknown]") => {
+                    record.snapshot.status = TaskStatus::Unknown;
+                    record.snapshot.error = Some(error);
+                }
                 Err(error) if error.starts_with('[') => {
                     record.snapshot.status = if error.starts_with("[cancelled]") { TaskStatus::Cancelled } else { TaskStatus::Failed };
                     record.snapshot.error = Some(error); record.finished_at = Some(Instant::now());
@@ -320,15 +330,15 @@ impl ManagementInstance {
         Ok(handle)
     }
 
-    pub fn exclusive_task_snapshot(&self, handle: &str) -> Result<TaskSnapshot, String> {
+    pub fn exclusive_task_snapshot(&self, handle: &str, domain: &str) -> Result<TaskSnapshot, String> {
         let state = self.state.lock().unwrap();
         let task = state.tasks.get(handle).ok_or("management task not found")?.lock().unwrap();
-        if !task.exclusive || task.operation != "plugins.install" { return Err("management task not found".into()); }
+        if !task.exclusive || !matches!((domain, task.operation.as_str()), ("plugins", "plugins.install" | "plugins.remove" | "plugins.update") | ("skills", "skills.install" | "skills.update")) { return Err("management task not found".into()); }
         Ok(task.snapshot.clone())
     }
 
-    pub fn cancel_exclusive_task(&self, handle: &str) -> Result<(), String> {
-        self.exclusive_task_snapshot(handle)?;
+    pub fn cancel_exclusive_task(&self, handle: &str, domain: &str) -> Result<(), String> {
+        self.exclusive_task_snapshot(handle, domain)?;
         self.cancel_task(handle)
     }
 
