@@ -82,6 +82,14 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
             let next = next_run(state, &task)?;
             Ok(json!({ "task": view(task, next, &runs) }))
         }
+        "tasks.run" => {
+            let result = crate::scheduled_runner::run_now(state, id(args)?).map_err(|e| {
+                if e == "Task not found" { err("not_found", e) }
+                else if e == "This task is already running" { err("busy", e) }
+                else { err("io", e) }
+            })?;
+            Ok(json!({ "run": result }))
+        }
         "tasks.runs" => {
             let task_id = id(args)?;
             task(&repo, task_id)?;

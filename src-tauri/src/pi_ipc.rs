@@ -1461,7 +1461,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // Scheduled tasks (crates/task-scheduler): list/preview read the
         // store; the tick loop itself runs on the host's 30 s timer (M4
         // wiring), never through request dispatch.
-        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" => {
+        "tasks.list" | "tasks.create" | "tasks.get" | "tasks.update" | "tasks.delete" | "tasks.runs" | "tasks.markSeen" | "tasks.run" => {
             match crate::scheduler_host::dispatch(state, &op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err(error) => {
@@ -2562,7 +2562,7 @@ fn chat_only_prompt(state: &IpcHostState, cwd: &Path) -> Result<String, String> 
 /// never reached the child answers `prompt_rejected` with `accepted:false`
 /// (details on the protocol error object) — the composer's no-blind-retry
 /// admission signal.
-fn create_session(
+pub(crate) fn create_session(
     state: &IpcHostState,
     args: &Value,
 ) -> Result<Value, (String, String, Option<Value>)> {
@@ -3946,15 +3946,17 @@ mod tests {
         let server = std::thread::spawn(move || {
             use std::io::{BufRead, BufReader, Read, Write};
             let until = std::time::Instant::now() + Duration::from_secs(20);
+            let mut answered = 0;
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let handled = (|| -> bool {
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut length = 0;
                         loop {
                             let mut line = String::new();
-                            if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 { return false; }
                             let line = line.trim_end();
                             if line.is_empty() { break; }
                             if let Some((key, value)) = line.split_once(':') {
@@ -3962,9 +3964,12 @@ mod tests {
                             }
                         }
                         let mut body = vec![0; length];
-                        if reader.read_exact(&mut body).is_err() { return; }
+                        if reader.read_exact(&mut body).is_err() { return false; }
                         let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"fixture answer\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
-                        return;
+                        true
+                        })();
+                        if handled { answered += 1; }
+                        if answered == 2 { return; }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
                     Err(_) => return,
@@ -3979,7 +3984,7 @@ mod tests {
             fn drop(&mut self) { for id in self.0.registry.ids() { self.0.registry.remove(&id, Duration::from_secs(5)); } }
         }
         let _shutdown = Shutdown(&state);
-        *state.task_agent_dir.lock().unwrap() = Some(agent);
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         let bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         let created = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"] })).expect("start session");
@@ -4007,6 +4012,22 @@ mod tests {
         assert_eq!(finished.status, "succeeded", "{finished:?}");
         assert!(!finished.counts_as_failure);
         assert!(finished.error_code.is_none());
+        let repo = task_scheduler::task_repository::TaskRepository::new(&agent);
+        let task_id = "12345678-1234-1234-1234-123456789abc";
+        repo.mutate(|tasks| { tasks.push(json!({ "id": task_id, "name": "run now fixture", "prompt": "second fixture prompt", "cwd": project, "enabled": true, "schedule": {"kind":"manual"}, "toolPreset": "read-only", "maxDurationMin": 1, "consecutiveFailures": 0 })); Ok(()) }).unwrap();
+        let started = send(&state, json!({ "v": 1, "id": "run", "op": "tasks.run", "args": { "id": task_id } }));
+        assert_eq!(started["ok"], true, "{started}");
+        let run = &started["data"]["run"];
+        let linked_session = run["sessionId"].as_str().expect("the session is linked before the run is returned");
+        let index = crate::scheduled_session_index::ScheduledSessionIndex::load(&agent).unwrap();
+        assert!(index.is_referenced(linked_session));
+        let until = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let runs = repo.runs(task_id).unwrap();
+            if runs[0]["status"] != "running" { assert_eq!(runs[0]["status"], "succeeded", "{:?}", runs); break; }
+            assert!(std::time::Instant::now() < until, "run did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         server.join().unwrap();
     }
 
