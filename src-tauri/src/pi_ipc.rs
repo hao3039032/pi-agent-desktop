@@ -3395,6 +3395,10 @@ pub(crate) fn create_session(
         "busy".to_string(), "Session policy change is in progress".to_string(),
         (command_type(args).as_deref() == Some("prompt")).then(|| json!({ "code": "prompt_rejected", "accepted": false })),
     ))?;
+    if crate::trust_policy_fence::is_pending(&state.agent_dir()) {
+        return Err(("busy".into(), "Trust policy outcome is unresolved; session admission is blocked".into(),
+            (command_type(args).as_deref() == Some("prompt")).then(|| json!({"code":"prompt_rejected", "accepted":false}))));
+    }
     let invalid = |message: &str, command_type: Option<&str>| -> (String, String, Option<Value>) {
         let rejected = command_type == Some("prompt");
         (
@@ -4140,6 +4144,9 @@ pub(crate) fn dispatch_with_resume(
             .map_err(|error| (error.code().to_string(), error.to_string()));
     }
     let _policy = state.policy_gate.try_read().map_err(|_| ("busy".to_string(), "Session policy change is in progress".to_string()))?;
+    if crate::trust_policy_fence::is_pending(&state.agent_dir()) {
+        return Err(("busy".into(), "Trust policy outcome is unresolved; session admission is blocked".into()));
+    }
     let base = state.spawn_base.lock().unwrap().clone();
     let agent_dir = state.agent_dir();
     let Some(base) = base else {
@@ -8147,6 +8154,24 @@ mod tests {
         );
 
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_fence_refuses_new_and_resumed_sessions_after_host_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::trust_policy_fence::begin(dir.path(), "operation-a", dir.path()).unwrap();
+        let first = state();
+        *first.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let error = create_session(&first, &json!({"cwd":dir.path(),"type":"prompt","message":"hello"})).unwrap_err();
+        assert_eq!(error.0, "busy");
+        assert_eq!(error.2.unwrap()["accepted"], false);
+        let restarted = state();
+        *restarted.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        let error = dispatch_with_resume(&restarted, "agent.command", &json!({"session":"existing","type":"prompt","message":"hello"})).unwrap_err();
+        assert_eq!(error.0, "busy");
+        assert!(error.1.contains("unresolved"));
+        assert!(crate::trust_policy_fence::is_pending(dir.path()));
     }
 
     #[test]
