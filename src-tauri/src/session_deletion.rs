@@ -49,36 +49,58 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     if crate::trust_policy_fence::is_pending(&agent) {
         return Err(error("busy", "Trust policy outcome is unresolved"));
     }
+    let id = args.get("session").and_then(Value::as_str).filter(|value| !value.is_empty())
+        .ok_or_else(|| error("invalid_args", "session is required"))?;
+    if args.get("trashChatFolder").is_some_and(|value| !value.is_boolean()) {
+        return Err(error("invalid_args", "trashChatFolder must be a boolean"));
+    }
+    if state.registry.get(id).is_some() {
+        // Check every disk-side refusal before closing an idle child. The
+        // actual deletion repeats all checks after the child really exits.
+        {
+            let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
+                .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
+            crate::session_deletion_journal::recover_pending(state, &agent)?;
+            let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
+                .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
+            delete_with_index(state, args, &index, true)?;
+        }
+        state.registry.with_offline_session_writer(id, std::time::Duration::from_secs(5), || Ok::<_, (String, String)>(()))
+            .map_err(|failure| match failure {
+                session_host::SessionWriterError::Busy(message) => error("busy", message),
+                session_host::SessionWriterError::Operation(error) => error,
+            })?;
+    }
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
     crate::session_deletion_journal::recover_pending(state, &agent)?;
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
-    delete_with_index(state, args, &index)
+    delete_with_index(state, args, &index, false)
 }
 
 
-fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences) -> Result<Value, (String, String)> {
+fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl ScheduledReferences, preflight: bool) -> Result<Value, (String, String)> {
     let id = args.get("session").and_then(Value::as_str).filter(|v| !v.is_empty())
         .ok_or_else(|| error("invalid_args", "session is required"))?;
     if args.get("trashChatFolder").is_some_and(|v| !v.is_boolean()) {
         return Err(error("invalid_args", "trashChatFolder must be a boolean"));
     }
     let trash_chat_folder = args.get("trashChatFolder").and_then(Value::as_bool) == Some(true);
-    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled, trash_chat_folder))
+    state.registry.with_idle_session_writers(&[id.to_string()], |_| delete_locked(state, id, scheduled, trash_chat_folder, preflight))
         .map_err(|error| match error {
             session_host::SessionWriterError::Busy(message) => self::error("busy", message),
             session_host::SessionWriterError::Operation(error) => error,
         })
 }
 
-fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool) -> Result<Value, (String, String)> {
+fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool, preflight: bool) -> Result<Value, (String, String)> {
     if scheduled.is_referenced(id) {
         return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
     }
     // Never stop a writer on the user's behalf; removal waits for a truly
     // inactive child, and prevents a stale queued message from disappearing.
-    if state.registry.get(id).is_some() {
+    if !preflight && state.registry.get(id).is_some() {
         return Err(error("busy", "Close the session and wait for queued messages before deleting it."));
     }
     let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
@@ -156,6 +178,7 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
             }
         }
     }
+    if preflight { return Ok(json!({"ok": true, "folderTrashed": false})); }
     crate::session_deletion_journal::remove(&root, &state.agent_dir(), id, &canonical_target, &target_metadata)?;
     Ok(json!({"ok": true, "folderTrashed": false}))
 }
@@ -169,7 +192,7 @@ mod tests {
         fn is_referenced(&self, id: &str) -> bool { self.0.iter().any(|entry| entry == id) }
     }
     fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
-        delete_with_index(state, args, &FixtureIndex(Vec::new()))
+        delete_with_index(state, args, &FixtureIndex(Vec::new()), false)
     }
 
     fn fixture() -> (tempfile::TempDir, IpcHostState, PathBuf) {
@@ -191,8 +214,58 @@ mod tests {
         let (_dir, state, root) = fixture();
         let target = session(&root, "target", None);
         let args = json!({"session":"target"});
-        assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["target".into()])).unwrap_err().0, "not_supported");
+        assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["target".into()]), false).unwrap_err().0, "not_supported");
         assert!(target.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn idle_live_child_is_closed_only_after_preflight_and_real_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let bridge = dir.path().join("bridge.mjs");
+        std::fs::write(&bridge, "// fixture").unwrap();
+        let script = r##"#!/usr/bin/env node
+const readline = require('node:readline');
+const bridge = BRIDGE_PATH;
+const emit = x => process.stdout.write(JSON.stringify(x) + '\n');
+readline.createInterface({input:process.stdin}).on('line', line => {
+  const r = JSON.parse(line);
+  const reply = data => emit({type:'response',id:r.id,command:r.type,success:true,data});
+  if (r.type === 'get_state') return reply({sessionId:'target',isStreaming:false,isCompacting:false,thinkingLevel:'off'});
+  if (r.type === 'get_commands') return reply({commands:[{name:'pi-web:bridge',source:'extension',sourceInfo:{path:bridge}}]});
+  if (r.type === 'prompt' && r.message.startsWith('/pi-web:bridge ')) {
+    const [, rid, encoded] = r.message.split(' '); const payload = JSON.parse(Buffer.from(encoded,'base64url'));
+    reply({disposition:'handled'});
+    return emit({type:'extension_ui_request',id:'notice',method:'notify',message:'PI_WEB_BRIDGE_V1 '+JSON.stringify({sid:'target',rid,nonce:payload.nonce,ok:true,result:{}})});
+  }
+  reply({});
+});
+"##.replace("BRIDGE_PATH", &serde_json::to_string(&bridge.to_string_lossy()).unwrap());
+        let executable = dir.path().join("mock-pi");
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = session_host::SessionSpawnConfig {
+            executable: executable.to_string_lossy().into_owned(), agent_dir: Some(dir.path().to_path_buf()),
+            session_dir: Some(root.clone()), bridge_asset: bridge, artifacts_asset: None, chat_asset: None,
+            chat_asset_sha256: None, shape: session_host::SessionSpawnShape::Project { tool_args: None },
+            initial_model: None, thinking_level: None, extra_args: Vec::new(),
+        };
+        let live = state.registry.start("target", &target, "target", &root, &config).unwrap();
+        let runs = dir.path().join("scheduled-tasks/runs"); std::fs::create_dir_all(&runs).unwrap();
+        let archive = runs.join("12345678-1234-1234-1234-123456789abc.archive.jsonl");
+        std::fs::write(&archive, format!("{}\n", json!({"runId":"r","sessionId":"target"}))).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(state.registry.get("target").is_some() && target.exists());
+        std::fs::remove_file(archive).unwrap();
+        let child = session(&root, "child", Some(&target));
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(state.registry.get("target").is_some() && target.exists());
+        std::fs::remove_file(child).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
+        assert!(state.registry.get("target").is_none());
+        assert!(!target.exists());
+        drop(live);
     }
     #[test]
     fn production_delete_rejects_policy_and_unresolved_writer_fences() {
