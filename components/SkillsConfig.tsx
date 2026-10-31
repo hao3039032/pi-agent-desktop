@@ -11,7 +11,7 @@ import type {
   ProjectTrustStatus,
 } from "@/lib/api-types";
 import { displayPathWithin, shortenPath } from "@/lib/display-path";
-import { listSkills, searchSkills, setSkillsDisabled } from "@/lib/skills-client";
+import { checkSkills, listSkills, searchSkills, setSkillsDisabled } from "@/lib/skills-client";
 import {
   getLastSettingsSelection,
   setLastSettingsSelection,
@@ -598,23 +598,10 @@ export function SkillsConfig({
     setCheckingUpdates((current) => new Set([...current, ...keys]));
     if (!skill) setCheckingAll(true);
     try {
-      const res = await fetch("/api/skills/check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cwd,
-          package: skill?.install?.package,
-          scope: skill?.install?.scope,
-        }),
-      });
-      const data = (await res.json()) as {
-        updates?: SkillUpdateResult[];
-        error?: string;
-      };
-      if (!res.ok || data.error) throw new Error(data.error ?? `HTTP ${res.status}`);
+      const updates = await checkSkills(cwd, skill?.install?.package, skill?.install?.scope);
       setUpdateStatuses((current) => {
         const next = { ...current };
-        for (const update of data.updates ?? []) {
+        for (const update of updates) {
           next[`${update.scope}\0${update.package}`] = update;
         }
         return next;

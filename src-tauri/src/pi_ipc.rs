@@ -1394,6 +1394,20 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // function the Next /api/models route serves. Without the packaged
         // spawn config the answer is management_unavailable — never a
         // fallback, never a lie.
+        "plugins.check" | "skills.check" => {
+            let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else { return protocol_error(&id, "invalid_args", "cwd is required"); };
+            if let Err(error) = validate_scoped_cwd(state, cwd) { return protocol_error(&id, &error.0, &error.1); }
+            let field = if op == "plugins.check" { "source" } else { "package" };
+            let source = args.get(field).and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 4096);
+            let scope = args.get("scope").and_then(Value::as_str);
+            if source.is_some() != scope.is_some() || scope.is_some_and(|s| s != "global" && s != "project") { return protocol_error(&id, "invalid_args", "source and scope must be provided together"); }
+            let cwd = lexical_fold(cwd, cfg!(windows));
+            let mut payload = json!({"cwd": cwd});
+            if let Some(source) = source { payload[field] = json!(source); payload["scope"] = json!(scope); }
+            match management_read_scoped(state, op, &payload, Path::new(&cwd)) {
+                Ok(result) => protocol_ok(&id, result), Err(error) => protocol_error(&id, &error.0, &error.1),
+            }
+        }
         "skills.search" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str).filter(|cwd| !cwd.is_empty()) else {
                 return protocol_error(&id, "invalid_args", "cwd is required");
@@ -5055,6 +5069,9 @@ mod tests {
         let first = send(&state, json!({"v": 1, "id": "first", "op": "plugins.list", "args": {"cwd": cwd}}));
         assert_eq!(first["ok"], true, "{first}");
         assert_eq!(first["data"]["packages"][0]["disabled"], false);
+        let check = send(&state, json!({"v": 1, "id": "check", "op": "plugins.check", "args": {"cwd": cwd}}));
+        assert_eq!(check["ok"], true, "{check}");
+        assert_eq!(check["data"]["updates"][0]["state"], "unsupported");
         std::fs::write(agent.join("settings.json"), json!({"packages": [{"source": package, "extensions": [], "skills": [], "prompts": [], "themes": []}]}).to_string()).unwrap();
         let second = send(&state, json!({"v": 1, "id": "second", "op": "plugins.list", "args": {"cwd": cwd}}));
         assert_eq!(second["ok"], true, "{second}");
@@ -5085,6 +5102,8 @@ mod tests {
         let skill = agent.join("skills/fixture/SKILL.md");
         std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents")).unwrap();
+        std::fs::write(dir.path().join(".agents/.skill-lock.json"), r#"{"skills":{"fixture":{"source":"local/fixture","sourceType":"local","skillPath":"SKILL.md"}}}"#).unwrap();
         std::fs::write(&skill, "---\nname: fixture\ndescription: isolated fixture\n---\nbody\n").unwrap();
         let build = std::process::Command::new("node")
             .args(["../scripts/migration/build-management-modules.mjs", "--out"])
@@ -5103,6 +5122,7 @@ mod tests {
                 ("USERPROFILE".into(), dir.path().display().to_string()),
                 ("PI_AGENT_HOME".into(), dir.path().display().to_string()),
                 ("SKILLS_API_URL".into(), search_url),
+                ("XDG_STATE_HOME".into(), String::new()),
             ],
         });
         state.propose_path(&project);
@@ -5111,6 +5131,9 @@ mod tests {
         assert_eq!(search["ok"], true, "{search}");
         assert_eq!(search["data"]["results"][0]["package"], "fixture/repo@demo");
         server.join().unwrap();
+        let check = send(&state, json!({ "v": 1, "id": "check", "op": "skills.check", "args": { "cwd": cwd } }));
+        assert_eq!(check["ok"], true, "{check}");
+        assert_eq!(check["data"]["updates"][0]["state"], "unsupported");
         let file = skill.to_string_lossy();
         let first = send(&state, json!({ "v": 1, "id": "list1", "op": "skills.list", "args": { "cwd": cwd } }));
         assert_eq!(first["ok"], true, "{first}");
