@@ -1388,6 +1388,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             pi_ipc::pi_ipc,
             pi_ipc::pi_ipc_subscribe_events,
+            pi_ipc::pi_ipc_subscribe_running,
             pi_ipc::pi_ipc_subscribe_terminal,
             get_desktop_api_token,
             open_external_url,

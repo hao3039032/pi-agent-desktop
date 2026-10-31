@@ -7,6 +7,7 @@
   "permissions": [
     "allow-pi-ipc",
     "allow-pi-ipc-subscribe-events",
+    "allow-pi-ipc-subscribe-running",
     "allow-pi-ipc-subscribe-terminal"
   ]
 }

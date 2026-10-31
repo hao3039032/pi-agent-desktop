@@ -28,9 +28,11 @@ use session_host::SessionRegistry;
 /// docs/migration/ipc-protocol.md).
 pub const IPC_PROTOCOL_VERSION: i64 = 1;
 
-/// The managed host state (one registry per app process).
+/// The managed host state (one registry per app process). The registry and
+/// version counter are Arc-backed so stream relays (the running-set stream)
+/// outlive the request that opened them.
 pub struct IpcHostState {
-    pub registry: SessionRegistry,
+    pub registry: Arc<SessionRegistry>,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -63,7 +65,7 @@ pub struct IpcHostState {
     /// `getSessionListVersion`): bumped by every host-visible mutation that
     /// changes the list a client holds (a create, a rename). Clients compare
     /// and refetch — the cross-window staleness contract.
-    session_list_version: AtomicU64,
+    session_list_version: Arc<AtomicU64>,
 }
 
 /// Handle that ends one event-stream relay thread on unsubscribe.
@@ -77,7 +79,7 @@ struct EventRelayHandle {
 impl IpcHostState {
     pub fn new() -> Self {
         Self {
-            registry: SessionRegistry::new(),
+            registry: Arc::new(SessionRegistry::new()),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -97,7 +99,7 @@ impl IpcHostState {
             },
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
-            session_list_version: AtomicU64::new(1),
+            session_list_version: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -436,6 +438,137 @@ pub fn pi_ipc_subscribe_events(
         .ok();
 
     json!({ "subscriptionId": subscription_id, "epoch": epoch })
+}
+
+/// One observation of the RUNNING set beside the catalogue version. The
+/// ids are SORTED so "the set did not change" compares equal no matter the
+/// registry's hash iteration order (an unsorted Vec would re-emit an
+/// identical set as a spurious change).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunningSnapshot {
+    running: Vec<String>,
+    version: u64,
+}
+
+/// Derive one running-set observation. Order matters for the client's
+/// staleness check: the set is derived FIRST and the version read AFTER,
+/// so the pair is conservative — the version beside a set can only be too
+/// new (an extra refetch), never too old (a stale catalogue believed
+/// fresh). This is a point-in-time observation over the live registry, not
+/// a locked snapshot: a create/rename that lands mid-derivation is simply
+/// the next frame.
+fn derive_running_snapshot(registry: &SessionRegistry, version: &AtomicU64) -> RunningSnapshot {
+    let mut running: Vec<String> = registry
+        .ids()
+        .into_iter()
+        .filter(|id| registry.get(id).is_some_and(|session| session.run_state().is_running()))
+        .collect();
+    running.sort();
+    RunningSnapshot { running, version: version.load(Ordering::SeqCst) }
+}
+
+/// The running stream's derive cadence (how often the relay re-checks the
+/// registry) and its channel probe (how often a quiet stream is re-sent so
+/// a dead Channel — a page reload that never unsubscribed — is detected
+/// and the relay reaped instead of leaking forever).
+const RUNNING_DERIVE_CADENCE: Duration = Duration::from_millis(1_000);
+const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(30);
+
+/// Subscribe to the RUNNING set's stream (the `agent.subscribeRunning` op;
+/// GET /api/agent/running/events): the first frame is the observation at
+/// subscribe time, then a frame whenever the set or the catalogue version
+/// changes. The relay re-derives the observation on a short cadence (a
+/// cheap in-memory check over the live registry) — the same liveness the
+/// SSE stream's pushOnChange carried, without a per-event broadcast hook
+/// through every session's machine. Every path out of the relay detaches:
+/// unsubscribe, a failed Channel send, or the 30s probe on a dead channel.
+#[tauri::command]
+pub fn pi_ipc_subscribe_running(
+    state: State<'_, IpcHostState>,
+    on_frame: Channel<Value>,
+) -> Value {
+    subscribe_running(&state, on_frame, RUNNING_CHANNEL_PROBE)
+}
+
+fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after: Duration) -> Value {
+    let subscription_id = format!(
+        "run-{}",
+        state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    state.event_relays.lock().unwrap().insert(
+        subscription_id.clone(),
+        EventRelayHandle {
+            stop: Arc::clone(&stop),
+            subscriber_id: 0,
+            session_id: String::new(),
+        },
+    );
+    let registry = Arc::clone(&state.registry);
+    let version_counter = Arc::clone(&state.session_list_version);
+    let relays_for_thread = Arc::clone(&state.event_relays);
+    let subscription_for_relay = subscription_id.clone();
+    let relay = std::thread::Builder::new()
+        .name("ipc-running".into())
+        .spawn(move || {
+            let subscription_id = subscription_for_relay;
+            let detach = || {
+                relays_for_thread.lock().unwrap().remove(&subscription_id);
+            };
+            let mut last_sent: Option<RunningSnapshot> = None;
+            let mut last_sent_at = std::time::Instant::now();
+            let mut seq: u64 = 0;
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    detach();
+                    return;
+                }
+                let snapshot = derive_running_snapshot(&registry, &version_counter);
+                let changed = last_sent.as_ref() != Some(&snapshot);
+                if changed || last_sent_at.elapsed() >= probe_after {
+                    last_sent = Some(snapshot.clone());
+                    last_sent_at = std::time::Instant::now();
+                    seq += 1;
+                    let kind = if seq == 1 { "snapshot" } else { "event" };
+                    let frame = stream_frame(
+                        &subscription_id,
+                        // The host process is this stream's epoch: a host
+                        // restart is a new app process, hence a new
+                        // subscription — never a frame on the old epoch.
+                        1,
+                        seq,
+                        kind,
+                        json!({
+                            "type": "running",
+                            "runningSessionIds": snapshot.running,
+                            "sessionListVersion": snapshot.version,
+                        }),
+                    );
+                    if on_frame.send(frame).is_err() {
+                        // The Channel died (page reload, window closed):
+                        // end the relay and free its registry entry.
+                        detach();
+                        return;
+                    }
+                }
+                std::thread::sleep(RUNNING_DERIVE_CADENCE);
+            }
+        });
+    match relay {
+        Ok(_) => json!({ "subscriptionId": subscription_id }),
+        Err(error) => {
+            // No relay thread exists to clean up after itself: remove the
+            // handle here and fail the subscription honestly — reporting
+            // success would leave the client waiting on a stream that
+            // never starts.
+            state.event_relays.lock().unwrap().remove(&subscription_id);
+            protocol_error(
+                "?",
+                "internal",
+                &format!("running-stream relay failed to start: {error}"),
+            )
+        }
+    }
 }
 
 /// Stream one terminal's output over a Channel: the first frame carries the
@@ -3287,6 +3420,191 @@ mod tests {
         assert_eq!(malformed["error"]["code"], "invalid_args");
     }
 
+    /// A Channel that records every frame it is sent (the relay's own
+    /// serialization path: InvokeResponseBody::Json).
+    fn recording_channel() -> (Channel<Value>, Arc<Mutex<Vec<Value>>>) {
+        let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&frames);
+        let channel = Channel::new(move |message| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = message {
+                if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                    sink.lock().unwrap().push(frame);
+                }
+            }
+            Ok(())
+        });
+        (channel, frames)
+    }
+
+    /// Poll until the recorder holds at least `count` frames (bounded).
+    fn wait_for_frames(frames: &Arc<Mutex<Vec<Value>>>, count: usize, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if frames.lock().unwrap().len() >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        frames.lock().unwrap().len() >= count
+    }
+
+    fn unsubscribe_running(state: &IpcHostState, subscription_id: &str) -> Value {
+        send(
+            state,
+            json!({ "v": 1, "id": format!("u-{subscription_id}"), "op": "agent.unsubscribeEvents", "args": { "subscriptionId": subscription_id } }),
+        )
+    }
+
+    #[test]
+    fn subscribe_running_first_frame_is_the_observation_at_subscribe_time() {
+        let state = state();
+        let (channel, frames) = recording_channel();
+        let ack = subscribe_running(&state, channel, Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(
+            wait_for_frames(&frames, 1, Duration::from_secs(5)),
+            "the first frame arrives immediately: {:?}",
+            frames.lock().unwrap()
+        );
+        let frame = frames.lock().unwrap()[0].clone();
+        assert_eq!(frame["subscriptionId"], json!(subscription_id));
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["seq"], 1);
+        assert_eq!(frame["epoch"], 1);
+        assert_eq!(frame["payload"]["type"], "running");
+        assert_eq!(frame["payload"]["runningSessionIds"], json!([]));
+        assert_eq!(
+            frame["payload"]["sessionListVersion"],
+            json!(state.session_list_version()),
+            "the version beside the (empty) set"
+        );
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+    }
+
+    #[test]
+    fn subscribe_running_emits_one_frame_per_change_and_nothing_between() {
+        let state = state();
+        let (channel, frames) = recording_channel();
+        let ack = subscribe_running(&state, channel, Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
+        // A quiet observation sends NOTHING: two full derive cadences pass
+        // without a second frame.
+        std::thread::sleep(Duration::from_millis(2_400));
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            1,
+            "an unchanged observation is not re-emitted: {:?}",
+            frames.lock().unwrap()
+        );
+        // A catalogue-version change alone IS a change (the sidebar's
+        // cross-window staleness contract).
+        bump_session_list_version(&state);
+        assert!(
+            wait_for_frames(&frames, 2, Duration::from_secs(5)),
+            "the version change lands within the cadence: {:?}",
+            frames.lock().unwrap()
+        );
+        let frames_now = frames.lock().unwrap();
+        let second = frames_now[1].clone();
+        assert_eq!(second["kind"], "event");
+        assert_eq!(second["seq"], 2);
+        assert_eq!(second["payload"]["runningSessionIds"], json!([]));
+        assert_eq!(second["payload"]["sessionListVersion"], json!(state.session_list_version()));
+        drop(frames_now);
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+    }
+
+    #[test]
+    fn subscribe_running_probe_resends_a_quiet_observation() {
+        // The probe is how a DEAD channel gets detected on a quiet stream
+        // (a page reload never unsubscribes): without it the relay would
+        // sleep forever holding its registry entry.
+        let state = state();
+        let (channel, frames) = recording_channel();
+        let ack = subscribe_running(&state, channel, Duration::from_millis(1_200));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
+        assert!(
+            wait_for_frames(&frames, 2, Duration::from_secs(5)),
+            "the probe re-sends the quiet observation: {:?}",
+            frames.lock().unwrap()
+        );
+        let frames_now = frames.lock().unwrap();
+        assert_eq!(frames_now[1]["payload"], frames_now[0]["payload"], "identical observation re-sent");
+        assert_eq!(frames_now[1]["seq"], 2);
+        assert_eq!(frames_now[1]["kind"], "event");
+        drop(frames_now);
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+    }
+
+    #[test]
+    fn subscribe_running_channel_death_detaches_the_relay() {
+        let state = state();
+        // The channel accepts the FIRST send and fails every later one
+        // (the WebView went away between two frames).
+        let sends = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&sends);
+        let channel = Channel::new(move |_| {
+            let mut count = counter.lock().unwrap();
+            *count += 1;
+            if *count == 1 {
+                Ok(())
+            } else {
+                Err(tauri::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "channel closed",
+                )))
+            }
+        });
+        // A short probe forces the second send without touching the state.
+        let ack = subscribe_running(&state, channel, Duration::from_millis(1_200));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.event_relays.lock().unwrap().contains_key(&subscription_id)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !state.event_relays.lock().unwrap().contains_key(&subscription_id),
+            "the dead channel's relay detached (no leaked entry)"
+        );
+        // The entry is gone: a late unsubscribe answers not_found instead of
+        // leaking a second handle.
+        let late = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(late["error"]["code"], "not_found", "{late}");
+    }
+
+    #[test]
+    fn subscribe_running_unsubscribe_ends_the_relay_and_frees_the_entry() {
+        let state = state();
+        let (channel, frames) = recording_channel();
+        let ack = subscribe_running(&state, channel, Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
+        // A pending change exists (the version bumped) — after unsubscribe
+        // it must NOT be delivered: the relay is stopped.
+        bump_session_list_version(&state);
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        assert!(!state.event_relays.lock().unwrap().contains_key(&subscription_id));
+        let delivered = frames.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(2_400));
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            delivered,
+            "no frames after unsubscribe: {:?}",
+            frames.lock().unwrap()
+        );
+        // The second unsubscribe answers not_found (idempotent cleanup).
+        let again = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(again["error"]["code"], "not_found", "{again}");
+    }
+
     /// The tool picker over the REAL bridge (PI_CLI_BIN, sandboxed): the
     /// child's authoritative registry lists with active flags, and setting
     /// the active set round-trips.
@@ -3679,6 +3997,129 @@ mod tests {
         );
         assert!(poll["data"]["state"].get("systemPrompt").is_some(), "the system-prompt field exists");
         state.registry.remove(&sid, std::time::Duration::from_secs(5));
+    }
+
+    /// The running-set stream against the REAL pi (PI_CLI_BIN, sandboxed):
+    /// two sessions stuck on a model endpoint that accepts connections and
+    /// never answers (deterministic — no model, no network) hold the running
+    /// set; the stream's observation lists them SORTED and does not re-emit
+    /// an unchanged observation.
+    #[test]
+    fn real_pi_running_stream_lists_sorted_ids_and_skips_unchanged() {
+        let Some(executable) = std::env::var("PI_CLI_BIN").ok().filter(|value| !value.is_empty()) else {
+            eprintln!("skipping: PI_CLI_BIN not set");
+            return;
+        };
+        // The stalled endpoint: accept every connection, never answer.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                // Hold the socket open without ever writing a response.
+                std::mem::forget(stream);
+            }
+        });
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs")
+            .canonicalize()
+            .expect("the shipped bridge asset resolves");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let models = json!({
+            "providers": {
+                "stall": {
+                    "baseUrl": format!("http://{endpoint}"),
+                    "apiKey": "stall-not-a-credential",
+                    "api": "openai-completions",
+                    "models": [{
+                        "id": "stuck",
+                        "name": "Stuck",
+                        "reasoning": false,
+                        "input": ["text"],
+                        "contextWindow": 200000,
+                        "maxTokens": 4096,
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+                    }]
+                }
+            }
+        });
+        std::fs::write(agent_dir.join("models.json"), models.to_string()).expect("models");
+        std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions");
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"defaultProvider":"stall","defaultModel":"stuck"}"#,
+        )
+        .expect("settings");
+
+        let state = state();
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
+
+        // Two sessions, both prompted at the stalled endpoint: each holds
+        // the running set while its model call hangs.
+        let mut ids: Vec<String> = Vec::new();
+        for n in 0..2 {
+            let created = send(
+                &state,
+                json!({ "v": 1, "id": format!("rs-c{n}"), "op": "sessions.create", "args": {
+                    "cwd": cwd.display().to_string(), "type": "prompt",
+                    "message": format!("hold {n}"),
+                }}),
+            );
+            assert_eq!(created["ok"], true, "session {n} created: {created}");
+            ids.push(created["data"]["sessionId"].as_str().expect("id").to_string());
+        }
+        let mut sorted_expected = ids.clone();
+        sorted_expected.sort();
+
+        // Subscribe: the first frame lists both ids sorted.
+        let (channel, frames) = recording_channel();
+        let ack = subscribe_running(&state, channel, Duration::from_secs(60));
+        let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
+        let mut both_running = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if frames.lock().unwrap().iter().any(|frame| {
+                frame["payload"]["runningSessionIds"] == json!(sorted_expected)
+            }) {
+                both_running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            both_running,
+            "a frame lists both sessions sorted {sorted_expected:?}: {:?}",
+            frames.lock().unwrap()
+        );
+        // An unchanged observation is not re-emitted (no probe in 60s; two
+        // cadences settle below the frame count that arrived).
+        let settled = frames.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(2_400));
+        assert!(
+            frames.lock().unwrap().len() <= settled,
+            "no spurious duplicate frames for an unchanged set: {:?}",
+            frames.lock().unwrap()
+        );
+        // Every frame's payload is a valid observation (never a partial set
+        // with an unsorted pair).
+        for frame in frames.lock().unwrap().iter() {
+            let listed: Vec<String> = frame["payload"]["runningSessionIds"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let mut listed_sorted = listed.clone();
+            listed_sorted.sort();
+            assert_eq!(listed, listed_sorted, "every frame lists sorted ids: {frame}");
+        }
+        let done = unsubscribe_running(&state, &subscription_id);
+        assert_eq!(done["ok"], true, "{done}");
+        for id in &ids {
+            state.registry.remove(id, std::time::Duration::from_secs(5));
+        }
     }
 
     #[test]
