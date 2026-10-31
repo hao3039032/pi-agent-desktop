@@ -174,9 +174,29 @@ impl ComposerOutbox {
         !self.state.lock().unwrap().items.is_empty()
     }
 
-    fn pop_front(&self) -> Option<PendingComposerMessage> {
+    /// Whether the front is deliverable RIGHT NOW: there is an item, the
+    /// queue is not paused, and the front is not parked outcome-unknown
+    /// (that one is re-sent only by an explicit user action —
+    /// `composer_send_now`). This is the WAKE's cheap pre-check and the
+    /// drain's exit re-check; the authoritative decision is
+    /// [`ComposerOutbox::claim_front_for_delivery`], which makes the same
+    /// decision and the pop ATOMIC.
+    pub fn has_deliverable_front(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.paused && !state.front_is_unknown_locked() && !state.items.is_empty()
+    }
+
+    /// Atomically decide "the front is deliverable" and claim it: ONE lock
+    /// covers the paused check, the unknown-front check and the pop. The
+    /// check and the claim must not be separable: between a check under one
+    /// acquisition and a `pop` under another, a concurrent `send_now` whose
+    /// outcome turned UNKNOWN can `park_unknown` a item at the front — a
+    /// plain `pop_front` would then remove the UNKNOWN item and deliver it,
+    /// re-executing a prompt that may already be running, without the
+    /// user's explicit confirmation (Terra P1-2).
+    pub fn claim_front_for_delivery(&self) -> Option<PendingComposerMessage> {
         let mut state = self.state.lock().unwrap();
-        if state.items.is_empty() {
+        if state.paused || state.front_is_unknown_locked() || state.items.is_empty() {
             return None;
         }
         let item = state.items.remove(0);
@@ -201,10 +221,17 @@ impl Session {
     }
 
     /// `take_composer_message`: remove one item (edit/delete) and answer the
-    /// {item, pending, pendingVersion} snapshot.
-    pub fn composer_take(&self, id: &str) -> Value {
+    /// {item, pending, pendingVersion} snapshot. Taking the UNKNOWN front
+    /// resolves the barrier it held — and that resolution WAKES delivery:
+    /// nothing else will (a settle only follows a run; an idle session with
+    /// a resolved barrier would otherwise strand the rest of the queue
+    /// until some unrelated event woke it — Terra P1-3). The wake is a
+    /// guarded no-op while the queue is still paused or its front still
+    /// unknown.
+    pub fn composer_take(self: &Arc<Self>, id: &str) -> Value {
         let item = self.composer_outbox.take(id);
         self.emit_composer_update();
+        self.composer_wake();
         self.composer_answer(item.as_ref().map(|item| item.to_json()))
     }
 
@@ -329,7 +356,7 @@ impl Session {
     /// strand its item (the JS original closed this race by being
     /// single-threaded — `drain`'s `finally { this.wake() }`).
     pub fn composer_wake(self: &Arc<Self>) {
-        if !self.composer_can_deliver_front() {
+        if !self.composer_outbox.has_deliverable_front() {
             return;
         }
         let session = Arc::clone(self);
@@ -337,14 +364,6 @@ impl Session {
             .name("composer-drain".into())
             .spawn(move || session.drain_once())
             .ok();
-    }
-
-    /// The drain's and the wake's shared precondition: there is an item,
-    /// the queue is not paused, and the front is not parked as
-    /// outcome-unknown (that one is re-sent only by an explicit user
-    /// action — `composer_send_now`).
-    fn composer_can_deliver_front(&self) -> bool {
-        !self.composer_outbox.is_paused() && !self.composer_outbox.front_is_unknown()
     }
 
     /// One drain pass under the delivering flag. The exit path re-checks
@@ -361,14 +380,17 @@ impl Session {
                 *delivering = true;
             }
             loop {
-                if !self.composer_can_deliver_front() || !self.composer_outbox.has_items() {
-                    break;
-                }
                 // canDeliver: alive and not running (the machine's view).
                 if self.run_state().is_running() || self.client.has_exited() {
                     break;
                 }
-                let Some(item) = self.composer_outbox.pop_front() else { break };
+                self.drain_barrier("claim");
+                // The check and the claim are ONE call: a `park_unknown`
+                // that lands while this thread is at the barrier (or anywhere
+                // else) pauses the queue or marks the front unknown, and the
+                // claim answers None — an unknown outcome is never popped and
+                // delivered by the drain (Terra P1-2).
+                let Some(item) = self.composer_outbox.claim_front_for_delivery() else { break };
                 self.emit_composer_update();
                 if let Err(error) = self.deliver_composer(&item, "followUp") {
                     match error.kind {
@@ -383,14 +405,18 @@ impl Session {
                     break;
                 }
             }
+            // The exit window: the last loop-top check is behind us; the
+            // flag is still held. A wake that arrives HERE finds
+            // `delivering == true` and returns — only the re-check under the
+            // same lock can observe its work.
+            self.drain_barrier("exit");
             // Exit: clear the flag and re-check under the SAME lock. Work
             // that arrived after the loop's last check but whose waker saw
             // `delivering == true` (and returned) is caught here.
             {
                 let mut delivering = self.composer_delivering.lock().unwrap();
                 *delivering = false;
-                if self.composer_can_deliver_front()
-                    && self.composer_outbox.has_items()
+                if self.composer_outbox.has_deliverable_front()
                     && !self.run_state().is_running()
                     && !self.client.has_exited()
                 {
@@ -398,6 +424,39 @@ impl Session {
                 }
             }
             return;
+        }
+    }
+
+    /// A deterministic-interleaving seam for the drain tests (Terra P1-2 /
+    /// P1-3): with `PI_COMPOSER_DRAIN_BARRIER=<session-id>:<point>:<dir>`
+    /// naming THIS session and THIS point, the drain signals
+    /// `<dir>/<point>.reached` and waits for `<dir>/<point>.release`
+    /// (bounded; a missing or late release never wedges the drain). Points:
+    /// `claim` (immediately before the atomic claim — where a concurrent
+    /// `park_unknown` must be observed) and `exit` (the exit window between
+    /// the last deliverability check and clearing the delivering flag).
+    /// Inert without the env var: no production path sets it, and the
+    /// id/point match keeps parallel tests on other sessions unaffected.
+    fn drain_barrier(&self, point: &str) {
+        let Ok(spec) = std::env::var("PI_COMPOSER_DRAIN_BARRIER") else { return };
+        let mut parts = spec.splitn(3, ':');
+        let dir = match (parts.next(), parts.next(), parts.next()) {
+            (Some(id), Some(at), Some(dir)) if id == self.id && at == point => {
+                std::path::PathBuf::from(dir)
+            }
+            _ => return,
+        };
+        let reached = dir.join(format!("{point}.reached"));
+        let release = dir.join(format!("{point}.release"));
+        if std::fs::write(&reached, b"1\n").is_err() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !release.exists() {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 }
@@ -461,9 +520,53 @@ mod tests {
         assert_eq!(items[0]["unknown"], json!(true));
         assert_eq!(items[1]["unknown"], Value::Null, "B is a plain pending item");
 
-        // pop_front (what a drain would do) is barred by the caller's
-        // front-unknown check — verified here by the state the check reads.
+        // The claim (what a drain does) refuses the unknown front atomically
+        // — verified here against the exact state the claim reads, and
+        // exercised end-to-end against the real drain in
+        // `the_drain_never_claims_an_item_parked_unknown_in_the_check_window`.
         assert!(outbox.front_is_unknown());
+        assert!(outbox.claim_front_for_delivery().is_none(), "the claim refuses the unknown front");
+        let (items_after, _) = outbox.snapshot();
+        assert_eq!(items_after.len(), 2, "the refused claim changed nothing");
+    }
+
+    #[test]
+    fn the_claim_is_one_atomic_decision() {
+        // Terra P1-2: the deliverability decision and the pop share ONE
+        // lock. Each refusal leaves the queue untouched (no version bump,
+        // no item lost) — a claim that had checked under one acquisition
+        // and popped under another could remove an item a concurrent
+        // park_unknown had just marked unknown.
+        let outbox = ComposerOutbox::new();
+        // Paused: refused, untouched.
+        let a = outbox.enqueue("A", None).expect("A");
+        outbox.take(&a.id).expect("pop A");
+        outbox.restore_front(a.clone());
+        assert!(outbox.is_paused());
+        let (_, version) = outbox.snapshot();
+        assert!(outbox.claim_front_for_delivery().is_none(), "paused refuses the claim");
+        let (items, version_after) = outbox.snapshot();
+        assert_eq!(items.len(), 1, "the refused claim did not touch the items");
+        assert_eq!(version_after, version, "the refused claim did not bump the version");
+
+        // Front unknown: refused, untouched (the user's confirmation is the
+        // only way that item leaves again).
+        let taken = outbox.take(&a.id).expect("resolve the refusal");
+        outbox.park_unknown(taken);
+        assert!(outbox.is_paused());
+        assert!(outbox.claim_front_for_delivery().is_none(), "an unknown front refuses the claim");
+        assert!(outbox.has_items(), "the refused claim kept the item");
+
+        // Deliverable: claimed (removed) under the same decision, with the
+        // version bump the client's staleness check keys on.
+        let front = outbox.snapshot().0.first().and_then(|item| item.get("id")).and_then(|id| id.as_str()).map(str::to_string).expect("front id");
+        outbox.take(&front).expect("resolve the barrier");
+        let b = outbox.enqueue("B", None).expect("B");
+        let claimed = outbox.claim_front_for_delivery().expect("a deliverable front is claimed");
+        assert_eq!(claimed.id, b.id);
+        assert!(!outbox.has_items(), "the claim removed the item");
+        assert!(!outbox.has_deliverable_front());
+        assert!(outbox.claim_front_for_delivery().is_none(), "an empty queue refuses the claim");
     }
 
     #[test]

@@ -17,7 +17,11 @@
 //! - `--mock-prompt-events <b64l>`   base64 JSONL records emitted before
 //!   each prompt response (agent_start / message_update / agent_settled …);
 //! - `--mock-prompt-disposition <d>` the prompt response's disposition
-//!   (default "started").
+//!   (default "started");
+//! - `--mock-prompt-log <path>`       append one line per prompt MESSAGE the
+//!   child receives (the drain tests assert exactly which queued messages
+//!   reached which child — a replacement child must never see a message
+//!   the old child already claimed).
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -50,6 +54,7 @@ struct Config {
     prompt_hold: bool,
     prompt_events: Vec<serde_json::Value>,
     prompt_disposition: String,
+    prompt_log: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Config {
@@ -59,6 +64,7 @@ fn parse_args() -> Config {
         prompt_hold: false,
         prompt_events: Vec::new(),
         prompt_disposition: "started".into(),
+        prompt_log: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -88,6 +94,11 @@ fn parse_args() -> Config {
             "--mock-prompt-disposition" => {
                 if let Some(value) = args.next() {
                     config.prompt_disposition = value;
+                }
+            }
+            "--mock-prompt-log" => {
+                if let Some(value) = args.next() {
+                    config.prompt_log = Some(std::path::PathBuf::from(value));
                 }
             }
             _ => {}
@@ -139,6 +150,22 @@ fn main() {
                         respond(&mut out, &id, "interrupt", serde_json::Value::Null);
                     }
                     "prompt" => {
+                        if let Some(log) = &config.prompt_log {
+                            use std::io::Write as _;
+                            // The host's command record is FLAT: the
+                            // message sits at the top level beside `type`.
+                            let message = record
+                                .get("message")
+                                .and_then(|message| message.as_str())
+                                .unwrap_or("");
+                            if let Ok(mut file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(log)
+                            {
+                                let _ = writeln!(file, "{message}");
+                            }
+                        }
                         if config.prompt_hold {
                             // Hold the delivery mid-flight until the test
                             // releases it (answering get_state probes read
