@@ -67,9 +67,9 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingState::Clear,
                 Err(_) => PendingState::Uninspectable,
                 Ok(_) if !key_exists => PendingState::Uninspectable,
-                Ok(_) => match management_host::ledger::OperationLedger::inspect(agent) {
-                    Ok(records) if records.is_empty() => PendingState::Clear,
-                    Ok(_) => PendingState::Pending,
+                Ok(_) => match management_host::ledger::OperationLedger::inspect_unresolved(agent) {
+                    Ok(false) => PendingState::Clear,
+                    Ok(true) => PendingState::Pending,
                     Err(_) => PendingState::Uninspectable,
                 },
             }

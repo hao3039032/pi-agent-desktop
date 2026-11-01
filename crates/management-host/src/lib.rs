@@ -181,6 +181,7 @@ struct TaskRecord {
     ledger_operation_id: Option<String>,
     mcp_target: Option<ledger::McpCredentialTarget>,
     mcp_guard: Option<McpGuardAdmission>,
+    revoked: bool,
     runner: Option<Arc<ManagementInstance>>,
 }
 
@@ -217,6 +218,9 @@ pub struct McpCooperativeReservation {
     client: Arc<PiRpcClient>,
     agent_dir: PathBuf,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
+    blockers: Vec<String>,
+    #[cfg(test)]
+    fail_after: Option<usize>,
 }
 impl McpCooperativeReservation {
     /// Checks a routed ACK against this live reservation; never clears a ledger.
@@ -227,6 +231,47 @@ impl McpCooperativeReservation {
         admission.reservation == Some(self.reservation_id) && self.instance_id == proof.instance_id
             && self.target.primary_digest() == proof.target_fingerprint
             && self.config_fingerprint == proof.config_fingerprint && proof.generation > self.previous_generation
+    }
+
+    /// Persist only revocation of the exact local writers proven by this ACK.
+    /// Any interrupted/partial transaction leaves remaining records pending.
+    pub fn persist_revocation(&self, proof: &VerifiedMcpRevocation) -> Result<(), String> {
+        if !self.matches_revocation(proof) { return Err("MCP revocation is not confirmed".into()); }
+        {
+            let admission = self.admission.try_lock().map_err(|_| "management admission busy")?;
+            if admission.reservation != Some(self.reservation_id) { return Err("MCP reservation ended".into()); }
+            let state = self.state.try_lock().map_err(|_| "management instance busy")?;
+            if state.closing || self.client.has_exited() || self.agent_dir_check.as_ref().is_some_and(|check| check(&self.agent_dir).is_err()) { return Err("management instance changed".into()); }
+            let pending = ledger::OperationLedger::inspect(&self.agent_dir)?;
+            if pending.len() != self.blockers.len() || pending.iter().any(|record| !self.blockers.contains(&record.operation_id) || record.mcp_target.as_ref() != Some(&self.target)) {
+                return Err("management pending evidence changed".into());
+            }
+            let mut tasks = Vec::new();
+            for id in &self.blockers {
+                let task = state.tasks.values().find(|task| task.try_lock().ok().is_some_and(|record| record.ledger_operation_id.as_deref() == Some(id))).ok_or("MCP writer identity changed")?;
+                let record = task.try_lock().map_err(|_| "MCP writer busy")?;
+                let guard = record.mcp_guard.as_ref().ok_or("MCP guard evidence is missing")?;
+                if record.revoked || record.finished_at.is_some() || guard.target != self.target
+                    || guard.config_fingerprint != self.config_fingerprint || guard.generation >= proof.generation {
+                    return Err("MCP writer evidence changed".into());
+                }
+                drop(record);
+                tasks.push(Arc::clone(task));
+            }
+            // Monotonic in memory before any disk transition: late callbacks
+            // cannot overwrite an already authorized revocation.
+            for task in tasks { task.lock().map_err(|_| "MCP writer unavailable")?.revoked = true; }
+        }
+        let ledger = ledger::OperationLedger::open(&self.agent_dir)?;
+        for (index, id) in self.blockers.iter().enumerate() {
+            #[cfg(test)]
+            if self.fail_after == Some(index) { return Err("injected ledger write failure".into()); }
+            #[cfg(not(test))]
+            let _ = index;
+            if !self.matches_revocation(proof) { return Err("MCP reservation or instance changed".into()); }
+            ledger.mark_revoked(id, &self.target, proof.generation)?;
+        }
+        Ok(())
     }
 }
 impl Drop for McpCooperativeReservation {
@@ -382,7 +427,7 @@ impl ManagementInstance {
         let handle = format!("task-{}", uuid::Uuid::new_v4());
         let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
             status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
-        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, runner: None }));
+        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None }));
         let (activity, evidence) = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
@@ -394,7 +439,7 @@ impl ManagementInstance {
             if serial_scope && state.tasks.values().any(|task| { let task = task.lock().unwrap(); task.serial_scope && task.finished_at.is_none() }) {
                 return Err("management configuration scope is busy".into());
             }
-            if kind == TaskKind::Mutation && state.tasks.values().any(|task| task.lock().unwrap().snapshot.status == TaskStatus::Unknown) {
+            if kind == TaskKind::Mutation && state.tasks.values().any(|task| { let task = task.lock().unwrap(); !task.revoked && task.snapshot.status == TaskStatus::Unknown }) {
                 return Err("management scope has an unknown outcome".into());
             }
             let evidence = if policy == OperationPolicy::PersistentMutation {
@@ -451,6 +496,12 @@ impl ManagementInstance {
             };
             let mut record = worker_task.lock().unwrap();
             record.runner = None;
+            if record.revoked {
+                record.snapshot.status = TaskStatus::Unknown;
+                record.snapshot.error = Some("local credential writes were revoked; task outcome remains unknown".into());
+                record.finished_at = Some(Instant::now());
+                drop(record); drop(activity); return;
+            }
             if record.exclusive && record.snapshot.status == TaskStatus::Unknown {
                 drop(record);
                 drop(activity);
@@ -571,7 +622,10 @@ impl ManagementInstance {
         let reservation_id = uuid::Uuid::new_v4();
         admission.reservation = Some(reservation_id);
         Ok(McpCooperativeReservation { admission: Arc::clone(&self.admission), reservation_id, instance_id: self.instance_id, target: target.clone(), config_fingerprint, previous_generation,
-            state: Arc::clone(&self.state), client: Arc::clone(&self.client), agent_dir: self.agent_dir.clone(), agent_dir_check: self.agent_dir_check.clone() })
+            state: Arc::clone(&self.state), client: Arc::clone(&self.client), agent_dir: self.agent_dir.clone(), agent_dir_check: self.agent_dir_check.clone(),
+            blockers: pending.into_iter().map(|record| record.operation_id).collect(),
+            #[cfg(test)]
+            fail_after: None })
     }
 
     /// Interpret only a nonce-routed terminal response for the named private
@@ -1293,7 +1347,7 @@ mod tests {
         let pending = Mutex::new(HashMap::new());
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, runner: None }));
+        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None }));
         let task_a = task();
         pending.lock().unwrap().insert("a".to_string(), PendingTask { tx: a_tx, task: Arc::clone(&task_a), nonce: "good".into() });
         pending.lock().unwrap().insert("b".to_string(), PendingTask { tx: b_tx, task: task(), nonce: "good".into() });

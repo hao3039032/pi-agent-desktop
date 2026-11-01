@@ -124,10 +124,11 @@ for line in sys.stdin:
     rid=parts[1]
     data=json.loads(base64.urlsafe_b64decode(parts[2] + '='*((-len(parts[2]))%4)))
     root=os.environ['PI_CODING_AGENT_DIR']
-    records=os.listdir(os.path.join(root,'pi-web','management-operations'))
-    assert len(records) == 1
-    record=open(os.path.join(root,'pi-web','management-operations',records[0])).read()
-    assert 'secret-fixture' not in record and json.loads(record)['phase'] == 'pending'
+    directory=os.path.join(root,'pi-web','management-operations')
+    records=[open(os.path.join(directory, name)).read() for name in os.listdir(directory)]
+    pending=[record for record in records if json.loads(record)['phase']=='pending']
+    assert len(pending) == 1
+    assert 'secret-fixture' not in pending[0]
     with open(os.path.join(root,'effect-marker'),'a') as marker: marker.write('effect\n')
     print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
     if os.environ.get('MODE') == 'die': os._exit(2)
@@ -188,7 +189,7 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
         snapshot: super::TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false },
         finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
         ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
-        mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), runner: None,
+        mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), revoked: false, runner: None,
     }));
     instance.state.lock().unwrap().tasks.insert("active".into(), Arc::clone(&task));
     assert!(instance.reserve_mcp_cooperation(&other).is_err());
@@ -220,6 +221,89 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
 }
 
 #[test]
+fn partial_revocation_persistence_leaves_remaining_writer_blocked() {
+    use std::sync::{Arc, Mutex};
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "ok");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let _key = super::target_key::ManagementTargetKey::load_or_create(temp.path()).unwrap();
+    let ledger = OperationLedger::open(temp.path()).unwrap();
+    let target = McpCredentialTarget::new("a".repeat(64), "b".repeat(64)).unwrap();
+    let desc = MutationDescriptor::new("mcp.signInStart", OperationScope::Global).unwrap().with_mcp_target(target.clone()).unwrap();
+    let first = ledger.begin(&desc).unwrap();
+    let root = temp.path().join("pi-web/management-operations");
+    let mut second_record: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("{first}.json"))).unwrap()).unwrap();
+    let second = uuid::Uuid::new_v4().to_string();
+    second_record["operationId"] = serde_json::json!(second);
+    let second_path = root.join(format!("{second}.json"));
+    std::fs::write(&second_path, second_record.to_string()).unwrap();
+    std::fs::set_permissions(&second_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for id in [&first, &second] {
+        let task = super::TaskRecord {
+            snapshot: super::TaskSnapshot { status: TaskStatus::Unknown, progress: None, result: None, error: Some("unknown".into()), cancel_requested: false },
+            finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
+            ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
+            mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), revoked: false, runner: None,
+        };
+        instance.state.lock().unwrap().tasks.insert(id.clone(), Arc::new(Mutex::new(task)));
+    }
+    let mut reservation = instance.reserve_mcp_cooperation(&target).unwrap();
+    let proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
+    reservation.fail_after = Some(1);
+    assert!(reservation.persist_revocation(&proof).is_err());
+    assert_eq!(ledger.list_pending().unwrap().len(), 1, "unwritten record remains pending");
+    drop(reservation);
+    assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+    host.shutdown_all(Duration::from_secs(1));
+    let restarted = ManagementHost::new();
+    let instance = restarted.instance("global", &config).unwrap();
+    assert!(instance.reserve_mcp_cooperation(&target).is_err(), "restart has no local writer proof");
+    assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+    restarted.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn confirmed_local_revocation_is_monotonic_and_allows_new_generation() {
+    use std::sync::{Arc, Mutex};
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "ok");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let _key = super::target_key::ManagementTargetKey::load_or_create(temp.path()).unwrap();
+    let ledger = OperationLedger::open(temp.path()).unwrap();
+    let target = McpCredentialTarget::new("a".repeat(64), "b".repeat(64)).unwrap();
+    let descriptor = MutationDescriptor::new("mcp.signInStart", OperationScope::Global).unwrap().with_mcp_target(target.clone()).unwrap();
+    let id = ledger.begin(&descriptor).unwrap();
+    let task = Arc::new(Mutex::new(super::TaskRecord {
+        snapshot: super::TaskSnapshot { status: TaskStatus::Unknown, progress: None, result: None, error: Some("outcome unknown".into()), cancel_requested: true },
+        finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
+        ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
+        mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), revoked: false, runner: None,
+    }));
+    instance.state.lock().unwrap().tasks.insert("old".into(), Arc::clone(&task));
+    let reservation = instance.reserve_mcp_cooperation(&target).unwrap();
+    let proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
+    reservation.persist_revocation(&proof).unwrap();
+    assert!(task.lock().unwrap().revoked);
+    assert_eq!(task.lock().unwrap().snapshot.status, TaskStatus::Unknown);
+    let record_path = temp.path().join("pi-web/management-operations").join(format!("{id}.json"));
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["phase"], "revoked");
+    assert_eq!(record["originalOutcome"], "unknown");
+    assert!(OperationLedger::inspect_unresolved(temp.path()).unwrap(), "revoked writes do not make the remote outcome known");
+    assert!(ledger.finish(&id).is_err(), "a late success cannot replace revocation");
+    assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+    drop(reservation);
+    let result = instance.management_call("auth.logout", serde_json::json!({}), Duration::from_secs(5)).unwrap();
+    assert_eq!(result["success"], true);
+    assert!(record_path.exists(), "revoked evidence must not be pruned");
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(record_path).unwrap()).unwrap()["phase"], "revoked");
+    host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
 fn cooperative_revocation_evidence_is_instance_and_target_bound() {
     use std::sync::{Arc, Mutex};
     let temp = tempfile::tempdir().unwrap();
@@ -234,7 +318,7 @@ fn cooperative_revocation_evidence_is_instance_and_target_bound() {
             result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"configKey":"trusted-config","generation":3}})),
             error: None, cancel_requested: false },
         finished_at: Some(Instant::now()), serial_scope: false, exclusive: false,
-        operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, runner: None,
+        operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None,
     }));
     instance.state.lock().unwrap().tasks.insert("fake-routed".into(), Arc::clone(&task));
     let proof = instance.verified_mcp_revocation("fake-routed", &fingerprint, "trusted-config").unwrap();

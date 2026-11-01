@@ -68,6 +68,9 @@ pub struct PendingOperation {
     pub created_at_ms: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LedgerPhase { Pending, Succeeded, Revoked }
+
 /// A directory pinned to the host's chosen agent directory. Opening and
 /// enumerating do not authorize replay, repair or removal.
 pub struct OperationLedger { directory: std::fs::File, path: PathBuf }
@@ -106,9 +109,19 @@ impl OperationLedger {
     #[cfg(not(target_os = "linux"))]
     pub fn open(_agent_dir: &Path) -> Result<Self, String> { Err("safe management ledger is unavailable on this platform".into()) }
 
-    /// Inspect existing evidence without creating directories or changing records.
-    #[cfg(target_os = "linux")]
+    /// Inspect pending admission fences without creating or changing anything.
     pub fn inspect(agent_dir: &Path) -> Result<Vec<PendingOperation>, String> {
+        Ok(Self::inspect_records(agent_dir)?.into_iter().filter_map(|(record, phase)| (phase == LedgerPhase::Pending).then_some(record)).collect())
+    }
+
+    /// A locally revoked writer can still have an unknown remote outcome;
+    /// recovery diagnostics must not report it as an all-clear success.
+    pub fn inspect_unresolved(agent_dir: &Path) -> Result<bool, String> {
+        Ok(Self::inspect_records(agent_dir)?.iter().any(|(_, phase)| *phase != LedgerPhase::Succeeded))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_records(agent_dir: &Path) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::fd::AsRawFd;
         let root = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(agent_dir).map_err(|e| e.to_string())?;
@@ -123,18 +136,20 @@ impl OperationLedger {
         let pi_web = child_directory(&root, "pi-web", false, false)?;
         let directory = child_directory(&pi_web, "management-operations", true, false)?;
         let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-        Self { directory, path }.list_pending()
+        let ledger = Self { directory, path };
+        let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
+        ledger.read_records()
     }
     #[cfg(not(target_os = "linux"))]
-    pub fn inspect(_agent_dir: &Path) -> Result<Vec<PendingOperation>, String> { Err("safe management ledger is unavailable on this platform".into()) }
+    fn inspect_records(_agent_dir: &Path) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
 
     pub fn list_pending(&self) -> Result<Vec<PendingOperation>, String> {
         let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
-        Ok(self.read_records()?.into_iter().filter_map(|(record, pending)| pending.then_some(record)).collect())
+        Ok(self.read_records()?.into_iter().filter_map(|(record, phase)| (phase == LedgerPhase::Pending).then_some(record)).collect())
     }
 
     #[cfg(target_os = "linux")]
-    fn read_records(&self) -> Result<Vec<(PendingOperation, bool)>, String> {
+    fn read_records(&self) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> {
         use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
         let directory = self.directory.metadata().map_err(|e| e.to_string())?;
         if directory.uid() != unsafe { libc::geteuid() } || directory.mode() & 0o077 != 0 {
@@ -163,18 +178,22 @@ impl OperationLedger {
                 _ => return Err("invalid MCP target".into()),
             };
             let fields = 7 + usize::from(mcp_target.is_some());
-            let pending = match v["phase"].as_str() {
-                Some("pending") if obj.len() == fields => true,
-                Some("succeeded") if obj.len() == fields + 1 && v["completedAtMs"].as_u64().is_some() => false,
+            let phase = match v["phase"].as_str() {
+                Some("pending") if obj.len() == fields => LedgerPhase::Pending,
+                Some("succeeded") if obj.len() == fields + 1 && v["completedAtMs"].as_u64().is_some() => LedgerPhase::Succeeded,
+                Some("revoked") if obj.len() == fields + 3 && v["completedAtMs"].as_u64().is_some()
+                    && v["revokedGeneration"].as_u64().is_some_and(|n| n <= 9_007_199_254_740_991) && v["originalOutcome"] == "unknown"
+                    && mcp_target.is_some() => LedgerPhase::Revoked,
                 _ => return Err("invalid management ledger phase".into()),
             };
             if v["version"] != 1 || v["operationId"] != uuid.to_string() { return Err("invalid management ledger record".into()); }
             let operation = v["operation"].as_str().ok_or("invalid operation")?;
             let target = target_for(operation).ok_or("unknown ledger operation")?;
-            if v["target"] != target_name(target) || (mcp_target.is_some() && !matches!(operation, "mcp.signInStart" | "mcp.configAction" | "mcp.test")) { return Err("invalid ledger target".into()); }
+            if v["target"] != target_name(target) || (mcp_target.is_some() && !matches!(operation, "mcp.signInStart" | "mcp.configAction" | "mcp.test"))
+                || (phase == LedgerPhase::Revoked && !matches!(operation, "mcp.signInStart" | "mcp.test")) { return Err("invalid ledger target".into()); }
             let scope = match v["scope"].as_str() { Some("global") => OperationScope::Global, Some(p) if p.starts_with('/') && p.len() <= 4096 => OperationScope::Project { path: p.to_string() }, _ => return Err("invalid ledger scope".into()) };
             let created_at_ms = v["createdAtMs"].as_u64().ok_or("invalid ledger timestamp")?;
-            records.push((PendingOperation { operation_id: uuid.to_string(), operation: operation.into(), scope, target, mcp_target, created_at_ms }, pending));
+            records.push((PendingOperation { operation_id: uuid.to_string(), operation: operation.into(), scope, target, mcp_target, created_at_ms }, phase));
         }
         Ok(records)
     }
@@ -188,11 +207,15 @@ impl OperationLedger {
         let records = self.read_records()?;
         // All current management configuration mutations share the global
         // physical coordination slot; conservatively fence any pending scope.
-        if records.iter().any(|(_, pending)| *pending) { return Err("management outcome unresolved; mutation not admitted".into()); }
-        // Terminal success records are bounded by deleting only verified
-        // completed entries before another admission; pending is never evicted.
-        for (record, _) in records {
-            std::fs::remove_file(self.path.join(format!("{}.json", record.operation_id))).map_err(|e| e.to_string())?;
+        if records.iter().any(|(_, phase)| *phase == LedgerPhase::Pending) { return Err("management outcome unresolved; mutation not admitted".into()); }
+        // Revocation evidence is retained; only ordinary successes are eligible
+        // for pruning. Capacity exhaustion rejects rather than deleting evidence.
+        let retained = records.iter().filter(|(_, phase)| *phase == LedgerPhase::Revoked).count();
+        if retained >= MAX_PENDING { return Err("management ledger capacity reached".into()); }
+        for (record, phase) in records {
+            if phase == LedgerPhase::Succeeded {
+                std::fs::remove_file(self.path.join(format!("{}.json", record.operation_id))).map_err(|e| e.to_string())?;
+            }
         }
         self.directory.sync_all().map_err(|e| e.to_string())?;
         let scope_text = match &descriptor.scope { OperationScope::Global => "global", OperationScope::Project { path } if path.starts_with('/') && path.len() <= 4096 => path, _ => return Err("invalid management scope".into()) };
@@ -208,11 +231,13 @@ impl OperationLedger {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn read_records(&self) -> Result<Vec<(PendingOperation, bool)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
+    fn read_records(&self) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn begin(&self, _: &MutationDescriptor) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn finish(&self, _: &str) -> Result<(), String> { Err("safe management ledger is unavailable on this platform".into()) }
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn mark_revoked(&self, _: &str, _: &McpCredentialTarget, _: u64) -> Result<(), String> { Err("safe management ledger is unavailable on this platform".into()) }
 
     /// Only the live owner may finish a proven successful operation. There is
     /// intentionally no public recovery/clear entry point.
@@ -221,13 +246,32 @@ impl OperationLedger {
         let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
         use std::os::unix::fs::OpenOptionsExt;
         let records = self.read_records()?;
-        let record = records.into_iter().find(|(r, pending)| r.operation_id == id && *pending).map(|(r, _)| r).ok_or("management ledger operation missing")?;
+        let record = records.into_iter().find(|(r, phase)| r.operation_id == id && *phase == LedgerPhase::Pending).map(|(r, _)| r).ok_or("management ledger operation missing")?;
         let scope = match &record.scope { OperationScope::Global => "global", OperationScope::Project { path } => path };
         let completed_at_ms: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
         let mut value = json!({"version":1,"operationId":record.operation_id,"operation":record.operation,"scope":scope,"target":target_name(record.target),"phase":"succeeded","createdAtMs":record.created_at_ms,"completedAtMs":completed_at_ms});
         if let Some(target) = &record.mcp_target {
             value["mcpTarget"] = json!({"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()});
         }
+        let temp = self.path.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&temp).map_err(|e| e.to_string())?;
+        file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).and_then(|_| std::fs::rename(&temp, self.path.join(format!("{id}.json")))).and_then(|_| self.directory.sync_all()).map_err(|e| e.to_string())
+    }
+
+    /// Caller must hold the live host reservation and validate its routed ACK.
+    /// This transition retains the original unknown outcome, and is monotonic.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mark_revoked(&self, id: &str, target: &McpCredentialTarget, generation: u64) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
+        let record = self.read_records()?.into_iter().find(|(r, phase)| r.operation_id == id && *phase == LedgerPhase::Pending)
+            .map(|(r, _)| r).ok_or("management ledger operation missing")?;
+        if record.mcp_target.as_ref() != Some(target) || !matches!(record.operation.as_str(), "mcp.signInStart" | "mcp.test") || generation > 9_007_199_254_740_991 {
+            return Err("invalid MCP revocation evidence".into());
+        }
+        let scope = match &record.scope { OperationScope::Global => "global", OperationScope::Project { path } => path };
+        let timestamp: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
+        let value = json!({"version":1,"operationId":record.operation_id,"operation":record.operation,"scope":scope,"target":target_name(record.target),"mcpTarget":{"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()},"phase":"revoked","createdAtMs":record.created_at_ms,"completedAtMs":timestamp,"originalOutcome":"unknown","revokedGeneration":generation});
         let temp = self.path.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&temp).map_err(|e| e.to_string())?;
         file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).and_then(|_| std::fs::rename(&temp, self.path.join(format!("{id}.json")))).and_then(|_| self.directory.sync_all()).map_err(|e| e.to_string())
