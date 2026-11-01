@@ -29,9 +29,10 @@ in place across host restart. A proven pre-append refusal or confirmed success
 first replaces the fence atomically with a durable `phase: "resolved"` record
 (`outcome: "not_applied"` or `"applied"`), then attempts removal. Chat access,
 continue and staged fork use the same terminal-before-cleanup rule only after
-writer exit and result verification. A cleanup error reports the known outcome
-and a persistent warning, not an unknown mutation or an invitation to retry.
-A surviving resolved record still blocks writes and is reported separately from
+writer exit and result verification. The outcome records what was confirmed by the live operation; it does not
+assert that all SDK-managed session data is power-loss durable. A cleanup error
+reports the known outcome and a persistent warning, not an unknown mutation or
+an invitation to retry. A surviving resolved record still blocks writes and is reported separately from
 an unresolved record; it never grants recovery permission and is not auto-cleared.
 Its source prefix is bounded diagnostic data only and does not assert
 that an actively written file is frozen. A previously admitted run can continue
