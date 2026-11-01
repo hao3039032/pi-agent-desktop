@@ -115,7 +115,7 @@ export const ROUTE_MAP = {
   },
   "app/api/agent/[id]/bash-output/route.ts": {
     domain: "agent", owner: "session-bridge", milestone: "M2",
-    methods: { GET: { op: "agent.bashOutput", notes: "bashId-correlated tool output of the session child" } },
+    methods: { GET: { op: "agent.bashOutput", notes: "session-referenced temp output; inline capped at 5 MiB, download pins a file resource for streaming native save" } },
   },
   "app/api/agent/[id]/lease/route.ts": {
     domain: "agent", owner: "rust-host", milestone: "M2",

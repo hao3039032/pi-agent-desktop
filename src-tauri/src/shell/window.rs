@@ -57,7 +57,9 @@ pub fn build_window(app: &tauri::AppHandle, app_url: Url) -> tauri::Result<Webvi
         // Keep Tauri's native drag/drop handler enabled: only native events
         // expose absolute file and folder paths to hooks/useDesktopDragDrop.ts.
         .on_navigation(move |url| {
-            if same_origin(url, &navigation_origin) || is_inline_frame_document(url) {
+            if same_origin(url, &navigation_origin) || is_inline_frame_document(url)
+                || (url.scheme() == "pi-resource" && url.host_str() == Some("localhost"))
+                || (url.scheme() == "http" && url.host_str() == Some("pi-resource.localhost")) {
                 true
             } else {
                 open_external(url);

@@ -118,10 +118,11 @@ export function mayReadProjectConfigNow(cwd: string, agentDir: string): boolean 
   }
 }
 
-export function trustProject(cwd: string, agentDir: string): ProjectTrustStatus {
+export function trustProject(cwd: string, agentDir: string, onBeforeTrustWrite?: () => void): ProjectTrustStatus {
   const status = getProjectTrustStatus(cwd, agentDir);
   if (!status.requiresTrust) return status;
 
+  onBeforeTrustWrite?.();
   new ProjectTrustStore(agentDir).set(cwd, true);
   // Built from what was just written, not read back: a second read can fail
   // (the lock held past the store's wait), and the route would then report a
@@ -392,7 +393,7 @@ export async function trustFreshFolderAndWrite<T>(
   cwd: string,
   agentDir: string,
   write: () => Promise<T> | T,
-  options: { knownFolders: Iterable<string>; home?: string },
+  options: { knownFolders: Iterable<string>; home?: string; onBeforeTrustWrite?: () => void },
 ): Promise<FreshFolderTrustResult<T>> {
   const breadth = freshFolderTrustBreadth(cwd, { agentDir, knownFolders: options.knownFolders, home: options.home });
   if (breadth) {
@@ -424,6 +425,7 @@ export async function trustFreshFolderAndWrite<T>(
     const nested = findInheritingTrustProject(cwd, agentDir);
     if (nested) return { ok: false, reason: "trust-too-broad", breadth: nested, error: `Trusting ${cwd} would also trust ${nested.path}` };
     try {
+      options.onBeforeTrustWrite?.();
       store.set(cwd, true);
     } catch (error) {
       return { ok: false, reason: "trust-unreadable", error: message(error) };

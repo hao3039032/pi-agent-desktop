@@ -1,5 +1,6 @@
 import type { AgentMessage, SessionInfo } from "./types";
 import { fetchSessionList } from "@/lib/session-list-service";
+import { fetchSessionReference } from "@/lib/session-view-service";
 
 // The visible token contains the session name, not its id. Quoted names keep
 // spaces intact, e.g. #"Design review".
@@ -119,10 +120,7 @@ export async function resolveSessionReferences(
     .filter((id): id is string => Boolean(id));
   const references = await Promise.all(targetIds.map(async (id) => {
     try {
-      const response = await fetchImpl(`/api/sessions/${encodeURIComponent(id)}/reference`);
-      if (!response.ok) return [id, ""] as const;
-      const data = await response.json() as { reference?: string };
-      return [id, data.reference ?? ""] as const;
+      return [id, await fetchSessionReference(id, fetchImpl)] as const;
     } catch {
       return [id, ""] as const;
     }

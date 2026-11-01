@@ -1,4 +1,5 @@
 import { isTauriDesktop } from "@/lib/desktop-updater";
+import { usesStaticFileHost } from "@/lib/file-service";
 import { normalizeInstalledFonts, type InstalledFont } from "@/lib/installed-fonts";
 import { isFontServiceBound, listInstalledFontsFromService } from "@/lib/font-service";
 import {
@@ -300,6 +301,11 @@ async function ipcInvoke<T>(op: string, args: Record<string, unknown>): Promise<
   return (raw.data ?? null) as T | null;
 }
 
+export async function saveResourceAsNative(handle: string, defaultFileName: string): Promise<boolean> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<boolean>("save_resource_as", { handle, defaultFileName });
+}
+
 /**
  * Desktop: save-dialog + server-side copy of an allowed local file.
  * Web: trigger download via the files API.
@@ -359,8 +365,9 @@ export async function describeDroppedPaths(paths: string[]): Promise<DesktopDrop
     try {
       const data = await ipcInvoke<{ items?: DesktopDropPathInfo[] }>("desktop.describePaths", { paths });
       if (data && Array.isArray(data.items)) return data.items;
-    } catch {
-      // Fall through to HTTP fetch
+      if (usesStaticFileHost()) throw new Error("The host returned an invalid drop description");
+    } catch (error) {
+      if (usesStaticFileHost()) throw error;
     }
   }
   const response = await fetch("/api/desktop/describe-paths", {
@@ -400,8 +407,9 @@ export async function readDesktopImageAttachments(paths: string[]): Promise<Desk
           previewUrl: `data:${file.mimeType};base64,${file.data}`,
         }));
       }
-    } catch {
-      // Fall through to HTTP fetch
+      if (usesStaticFileHost()) throw new Error("The host returned invalid image attachments");
+    } catch (error) {
+      if (usesStaticFileHost()) throw error;
     }
   }
   const response = await fetch("/api/desktop/read-images", {
@@ -463,6 +471,13 @@ export async function importLocalFiles(options: {
   conflict: "error" | "overwrite" | "skip";
   encodeDestPath: (path: string) => string;
 }): Promise<{ status: number; data: DesktopImportResult & { error?: string; conflicts?: string[]; nonReplaceable?: string[] } }> {
+  if (usesStaticFileHost()) {
+    const result = await ipcInvoke<{ status: number; data: DesktopImportResult & { error?: string; conflicts?: string[]; nonReplaceable?: string[] } }>(
+      "files.importDropped", { destDirectory: options.destDirectory, sourcePaths: options.sourcePaths, conflict: options.conflict },
+    );
+    if (!result) throw new Error("The host returned no import result");
+    return result;
+  }
   const response = await fetch(
     `/api/files/${options.encodeDestPath(options.destDirectory)}?type=import&conflict=${options.conflict}`,
     {

@@ -20,16 +20,16 @@ export function TurnImageReference() {
   }}>{t("chat.viewResultImages")}</button>;
 }
 
-export function TurnImageOwner({ id, images, children }: { id: string; images: readonly TurnResultImage[]; children: React.ReactNode }) {
+export function TurnImageOwner({ id, images, sessionId, children }: { id: string; images: readonly TurnResultImage[]; sessionId?: string; children: React.ReactNode }) {
   return (
     <>
       <TurnImageTargetContext.Provider value={images.length ? id : null}>{children}</TurnImageTargetContext.Provider>
-      <TurnResultImages id={id} images={images} />
+      <TurnResultImages id={id} images={images} sessionId={sessionId} />
     </>
   );
 }
 
-export const TurnResultImages = memo(function TurnResultImages({ id, images }: { id: string; images: readonly TurnResultImage[] }) {
+export const TurnResultImages = memo(function TurnResultImages({ id, images, sessionId }: { id: string; images: readonly TurnResultImage[]; sessionId?: string }) {
   const { t } = useI18n();
   const [showAll, setShowAll] = useState(false);
   if (!images.length) return null;
@@ -39,7 +39,7 @@ export const TurnResultImages = memo(function TurnResultImages({ id, images }: {
       <div className="turn-result-images-grid" data-multiple={images.length > 1 || undefined}>
         {shown.map((item, index) => (
           <div key={item.key} className="turn-result-image" data-image-key={item.key}>
-            <ResultImage image={item.image} index={index} />
+            <ResultImage image={item.image} index={index} sessionId={sessionId} />
             {item.isError && <div className="result-image-failure" role="status">{t("chat.imageSourceError")}</div>}
           </div>
         ))}

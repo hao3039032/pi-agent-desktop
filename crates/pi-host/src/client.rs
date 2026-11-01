@@ -354,6 +354,11 @@ impl PiRpcClient {
         self.shared.inner.lock().unwrap().exited
     }
 
+    /// True as soon as shutdown starts, or after the child has exited.
+    pub fn is_closing(&self) -> bool {
+        self.shared.exiting.load(Ordering::SeqCst) || self.has_exited()
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         self.shared.inner.lock().unwrap().exit_code
     }

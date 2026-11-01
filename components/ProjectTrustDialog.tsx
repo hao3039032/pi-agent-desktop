@@ -31,6 +31,7 @@ export const MCP_LISTING_TIMEOUT_MS = 10_000;
 export interface ProjectTrustFailure {
   error: string;
   reason?: McpRefusalReason;
+  trustPolicyPending?: boolean;
 }
 
 /** What the dialog knows about the project's `.pi/mcp.json`, and its trust as the same answer read it. */
@@ -292,7 +293,7 @@ function ProjectTrustError({ error }: { error: ProjectTrustFailure }) {
   return (
     <div role="alert" className="project-trust-error">
       {translated ? t(`mcp.reason.${error.reason}`) : t("trust.trustFailed")}
-      {!translated && <code className="project-trust-error-detail">{revealHiddenCharacters(error.error)}</code>}
+      {(!translated || error.trustPolicyPending) && <code className="project-trust-error-detail">{revealHiddenCharacters(error.error)}</code>}
     </div>
   );
 }

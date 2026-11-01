@@ -41,7 +41,11 @@ export {
 export { projectTreeForResponse, toSummaryTree } from "${ROOT}/lib/project-tree.ts";
 export { computeSessionStats } from "${ROOT}/lib/session-stats.ts";
 export { extractActiveSystemPrompt } from "${ROOT}/lib/system-prompt-snapshot.ts";
+export { isBashOutputPathReferencedByEntries, isValidSessionId } from "${ROOT}/lib/session-file-references-core.ts";
+export { resolveBashOutputPath } from "${ROOT}/lib/bash-output.ts";
 export { searchSessionContents } from "${ROOT}/lib/session-search.ts";
+export { isFilePathReferencedByEntries } from "${ROOT}/lib/session-file-references-core.ts";
+export { formatSessionReference } from "${ROOT}/lib/session-reference.ts";
 export { patchExportHtml } from "${ROOT}/lib/session-export-html.ts";
 export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";
 export {
@@ -93,7 +97,7 @@ export {
 } from "${ROOT}/lib/provider-auth-login.server.ts";
 export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
 export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
-export { projectTrustReloadOptions } from "${ROOT}/lib/project-trust.ts";
+export { projectTrustReloadOptions, getProjectTrustStatus } from "${ROOT}/lib/project-trust.ts";
 export {
   queryModelCatalog,
   discoverModels,

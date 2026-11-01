@@ -23,12 +23,10 @@ export interface TextContent {
 
 export interface ImageContent {
   type: "image";
-  source: {
-    type: "base64" | "url";
-    media_type?: string;
-    data?: string;
-    url?: string;
-  };
+  source:
+    | { type: "base64"; media_type?: string; data?: string }
+    | { type: "url"; media_type?: string; url?: string }
+    | { type: "session"; media_type?: string; sessionId: string; entryId: string; blockIndex: number };
 }
 
 export interface ThinkingContent {
@@ -227,6 +225,14 @@ export interface RoutedModelInfo {
   provider: string;
   id: string;
   thinkingLevel?: string;
+}
+
+/** The last public pre-override cache-warming proposal observed in this child run. */
+export interface RecentCacheWarmingDecision {
+  action: "warm" | "stop";
+  warmCost: number;
+  missCost: number;
+  continuationProbability: number;
 }
 
 /** pi's prompt-cache warming: the global mode plus the session's next decision, as `/session` shows it. */

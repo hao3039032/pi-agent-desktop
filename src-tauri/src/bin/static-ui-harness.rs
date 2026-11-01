@@ -199,6 +199,7 @@ struct Request {
     body: Vec<u8>,
     /// The `x-harness-token` header (the bridge endpoints' CSRF check).
     token_header: Option<String>,
+    range_header: Option<String>,
 }
 
 /// Request-line/header bound: a peer must not be able to grow memory with
@@ -225,6 +226,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
     let path = parts.next().unwrap_or("/").to_string();
     let mut content_length = 0usize;
     let mut token_header: Option<String> = None;
+    let mut range_header: Option<String> = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header)? == 0 {
@@ -244,6 +246,8 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
                 })?;
             } else if name.trim().eq_ignore_ascii_case("x-harness-token") {
                 token_header = Some(value.trim().to_string());
+            } else if name.trim().eq_ignore_ascii_case("range") {
+                range_header = Some(value.trim().to_string());
             }
         }
     }
@@ -254,7 +258,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
     if content_length > 0 {
         reader.read_exact(&mut body)?;
     }
-    Ok(Some(Request { method, path, body, token_header }))
+    Ok(Some(Request { method, path, body, token_header, range_header }))
 }
 
 fn write_response(
@@ -353,6 +357,12 @@ fn main() {
     // Envelope requests share the state Arc directly and dispatch through
     // the product's gated entry from their connection threads.
     let host_state = Arc::new(IpcHostState::new());
+    if let Some(root) = std::env::var_os("STATIC_UI_HARNESS_FIXTURE_ROOT") {
+        let root = PathBuf::from(root).canonicalize().expect("fixture root exists");
+        let temp = std::env::temp_dir().canonicalize().expect("temporary directory resolves");
+        if !root.starts_with(&temp) || root == temp { panic!("fixture root must be an isolated temporary directory"); }
+        host_state.propose_path(&root);
+    }
     if let Some(agent) = scheduler_agent_dir {
         let isolated = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).and_then(|path| path.canonicalize().ok());
         let agent = agent.canonicalize().expect("scheduler fixture agent dir must exist");
@@ -512,6 +522,20 @@ fn main() {
                         }
                         bridge.unregister_sse(sse_id);
                         return;
+                    }
+                    ("GET", path) if path.starts_with("/__harness__/resource/") => {
+                        let resource_path = request.path.strip_prefix("/__harness__/resource").unwrap();
+                        let mut builder = tauri::http::Request::builder().uri(resource_path);
+                        if let Some(range) = &request.range_header { builder = builder.header("range", range); }
+                        let Ok(resource_request) = builder.body(Vec::new()) else { return };
+                        let response = pi_agent_desktop_lib::resource_handler::respond(&host_state.resources, resource_request);
+                        let mut head = format!("HTTP/1.1 {}\r\n", response.status());
+                        for (name, value) in response.headers() {
+                            if let Ok(value) = value.to_str() { head.push_str(&format!("{name}: {value}\r\n")); }
+                        }
+                        if !response.headers().contains_key("content-length") { head.push_str(&format!("Content-Length: {}\r\n", response.body().len())); }
+                        head.push_str("Connection: keep-alive\r\n\r\n");
+                        if stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(response.body())).and_then(|_| stream.flush()).is_err() { return; }
                     }
                     ("GET", _) => {
                         if !serve_static(&mut stream, &static_dir, &request.path) {

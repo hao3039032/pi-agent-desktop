@@ -1,5 +1,12 @@
 "use client";
 
+export async function fetchSessionReference(session: string, fetchImpl: typeof fetch = fetch): Promise<string> {
+  const response = await fetchImpl(`/api/sessions/${encodeURIComponent(session)}/reference`);
+  if (!response.ok) return "";
+  const data = await response.json() as { reference?: string };
+  return data.reference ?? "";
+}
+
 /**
  * The session-view service seam (migration M2): the data calls the session
  * loop makes — reading a session's view (GET /api/sessions/[id]), paging its
@@ -67,6 +74,17 @@ export interface SessionViewResponse {
   ok: boolean;
   data: unknown | null;
   error?: string;
+}
+
+export async function downloadBashOutput(sessionId: string, path: string): Promise<boolean> {
+  const { downloadUrlAsFile } = await import("./desktop-native");
+  return downloadUrlAsFile(`/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(path)}&download=1`, "bash-output.log");
+}
+
+export async function fetchBashOutput(sessionId: string, path: string): Promise<{ output?: string; error?: string }> {
+  const response = await fetch(`/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(path)}`);
+  const data = await response.json() as { success?: boolean; data?: { output?: string }; error?: string };
+  return data.success ? { output: data.data?.output ?? "" } : { error: data.error ?? "failed" };
 }
 
 export async function fetchThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {

@@ -2,7 +2,7 @@
 
 import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useMemo, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
-import type { SkillsResponse } from "@/lib/api-types";
+import { listSkills } from "@/lib/skills-client";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
 import type { UnavailableWorkspace } from "@/lib/workspace-availability";
 import type { TextContent, UserMessage } from "@/lib/types";
@@ -27,7 +27,7 @@ import {
 } from "@/lib/file-fuzzy";
 import { fetchFileIndex, searchFileIndex } from "@/lib/file-service";
 import { resolveSessionReferences } from "@/lib/session-reference";
-import type { RoutedModelInfo } from "@/lib/types";
+import type { RecentCacheWarmingDecision, RoutedModelInfo } from "@/lib/types";
 import { getMarkdownListContinuation } from "@/lib/markdown-list-continuation";
 import { isBareMcpCommand, isBuiltinMcpCommand } from "@/lib/mcp-command";
 import { FolderIcon, getFileIcon } from "./FileIcons";
@@ -128,6 +128,7 @@ interface Props {
   onAbortRetry?: () => void;
   /** Under a virtual model, the physical model the latest response was routed to. */
   routedModel?: RoutedModelInfo | null;
+  recentCacheDecision?: RecentCacheWarmingDecision | null;
   /** A summarized branch switch is generating its summary (blocking; abortable). */
   branchSummaryPending?: boolean;
   onAbortBranchSummary?: () => void;
@@ -449,7 +450,7 @@ function getSlashDescription(command: SlashCommandPaletteItem, t: (key: string) 
 }
 
 // Skill slash commands are named "skill:<skillName>"; look the skill up in the
-// dormancy map fetched from /api/skills. Unknown skills are treated as active.
+// dormancy map loaded through the skills service. Unknown skills are treated as active.
 function isDormantSkillCommand(command: SlashCommandPaletteItem, dormancy: Record<string, boolean>): boolean {
   if (command.source !== "skill" || !command.name.startsWith("skill:")) return false;
   return dormancy[command.name.slice("skill:".length)] === true;
@@ -809,7 +810,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   onCompact, onAbortCompaction, isCompacting, compactError, compactNotice, compactResult, summarizationRetry, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
   savedDefaultThinkingLevel, onSetDefaultThinkingLevel,
-  retryInfo, onAbortRetry, routedModel, branchSummaryPending = false, onAbortBranchSummary, automation, onSetAutomation, queuedMessages, onQueuedMessageAction, inputHistory = [], onRecallQueue,
+  retryInfo, onAbortRetry, routedModel, recentCacheDecision, branchSummaryPending = false, onAbortBranchSummary, automation, onSetAutomation, queuedMessages, onQueuedMessageAction, inputHistory = [], onRecallQueue,
   slashCommands, slashCommandsLoading, onLoadSlashCommands,
   onBuiltinCommand,
   onAudioUnlock,
@@ -1982,11 +1983,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     const requestCwd = cwd;
     let cancelled = false;
     setSkillDormancyState({ cwd: requestCwd, values: {} });
-    fetch(`/api/skills?cwd=${encodeURIComponent(requestCwd)}`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`skills fetch failed: ${res.status}`);
-        return res.json() as Promise<Partial<SkillsResponse>>;
-      })
+    listSkills(requestCwd)
       .then((data) => {
         if (cancelled) return;
         const dormancy: Record<string, boolean> = {};
@@ -2934,6 +2931,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 title={t("chat.routedModelHint", { model: `${routedModel.provider}/${routedModel.id}${routedModel.thinkingLevel ? ` • ${routedModel.thinkingLevel}` : ""}` })}
               >
                 → {routedModelName}{routedModel.thinkingLevel && !isNarrow ? ` • ${routedModel.thinkingLevel}` : ""}
+              </span>
+            )}
+            {recentCacheDecision && (
+              <span className="routed-model-hint" title={t("session.cacheWarmingProposalHint")}>
+                {t("session.cacheWarmingProposal")}: {t(recentCacheDecision.action === "warm" ? "session.cacheWarmingWarm" : "session.cacheWarmingStop")}
               </span>
             )}
             <ContextUsageRing contextUsage={contextUsage} sessionStats={sessionStats} onOpenStats={onSessionStatsPanelOpen} />

@@ -1180,6 +1180,8 @@ export interface McpActionFailure extends McpLoadFailure {
   trust?: ProjectTrustStatus;
   /** The add trusted the fresh folder and could not take that back after its write failed. */
   trustKept?: boolean;
+  /** A trust writer may have changed the file and session admission is fenced. */
+  trustPolicyPending?: boolean;
 }
 
 export type McpActionResult = { ok: true; data: McpActionResponse } | { ok: false; error: McpActionFailure };

@@ -89,6 +89,11 @@ description = "Allows the app WebView to call the typed IPC bridge (protocol v1)
 commands.allow = ["pi_ipc"]
 
 [[permission]]
+identifier = "allow-save-resource-as"
+description = "Save an authorized resource through a host-owned dialog."
+commands.allow = ["save_resource_as"]
+
+[[permission]]
 identifier = "allow-pi-ipc-subscribe-events"
 description = "Allows the app WebView to subscribe a session's event stream over a Tauri Channel (snapshot-then-events, monotonic seq, host epoch)."
 commands.allow = ["pi_ipc_subscribe_events"]

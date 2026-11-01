@@ -24,6 +24,14 @@ mod worktrees;
 pub mod file_resources;
 mod logging;
 mod native_prefs;
+mod native_drop;
+mod native_import;
+mod project_upload;
+mod resource_save;
+#[cfg(feature = "harness")]
+pub mod resource_handler;
+#[cfg(not(feature = "harness"))]
+mod resource_handler;
 // The provider sign-in domain's host wiring (auth.* IPC arms + the OAuth
 // login stream relay). A standalone module so the auth domain's logic does
 // not grow inside the shared dispatcher; pi_ipc only routes to it.
@@ -38,8 +46,12 @@ pub mod pi_ipc;
 mod session_view;
 pub mod settings_extras;
 mod session_search;
+mod session_fleet;
+mod session_bash;
 mod session_actions;
+mod session_fork;
 mod trust_policy_fence;
+mod trust_policy_mutation;
 mod chat_sessions;
 mod session_writer_fence;
 mod session_deletion;
@@ -1364,6 +1376,17 @@ pub fn run() {
     #[cfg(feature = "custom-protocol")]
     let server_instance_id = desktop_instance_id.clone();
     let app = tauri::Builder::default()
+        .on_webview_event(|webview, event| {
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                if let Some(state) = webview.app_handle().try_state::<Arc<pi_ipc::IpcHostState>>() {
+                    state.native_drops.register(&state, paths);
+                }
+            }
+        })
+        .register_uri_scheme_protocol("pi-resource", |ctx, request| {
+            let state = ctx.app_handle().state::<Arc<pi_ipc::IpcHostState>>();
+            resource_handler::respond(&state.resources, request)
+        })
         // Launch at login. The OS entry (LaunchAgent / registry Run key /
         // .desktop file) is the source of truth; the UI reads it back through
         // the plugin instead of keeping its own copy. The flag lets a login
@@ -1421,6 +1444,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             workspace_picker::select_project_directory,
             pi_ipc::pi_ipc,
+            resource_save::save_resource_as,
             pi_ipc::pi_ipc_subscribe_events,
             pi_ipc::pi_ipc_subscribe_scheduled,
             pi_ipc::pi_ipc_subscribe_running,

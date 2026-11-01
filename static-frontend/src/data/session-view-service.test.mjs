@@ -21,6 +21,9 @@ const jiti = createJiti(import.meta.url, {
 const {
   fetchSessionView,
   fetchThinkingContent,
+  fetchBashOutput,
+  downloadBashOutput,
+  fetchSessionReference,
   fetchSessionContextPage,
   fetchAgentRunningState,
   renewSessionLease,
@@ -37,12 +40,49 @@ function boundService(configure) {
   return mock;
 }
 
+test("full bash output uses the session-bound IPC operation", async () => {
+  boundService((transport) => transport.on("agent.bashOutput", (args) => {
+    assert.deepEqual(args, { session: "s1", path: "/tmp/pi-bash-fixture.log" });
+    return { output: "fixture output" };
+  }));
+  assert.deepEqual(await fetchBashOutput("s1", "/tmp/pi-bash-fixture.log"), { output: "fixture output" });
+});
+
+test("bash download saves a resource handle and always revokes it", async () => {
+  const original = globalThis.window;
+  const revoked = [];
+  boundService((transport) => {
+    transport.on("agent.bashOutput", (args) => {
+      assert.deepEqual(args, { session: "s1", path: "/tmp/pi-bash-fixture.log", download: true });
+      return { handle: "opaque" };
+    });
+    transport.on("resources.revoke", ({ handle }) => { revoked.push(handle); return { revoked: true }; });
+  });
+  try {
+    globalThis.window = { __TAURI_INTERNALS__: { invoke: async (command, args) => {
+      assert.equal(command, "save_resource_as");
+      assert.deepEqual(args, { handle: "opaque", defaultFileName: "bash-output.log" });
+      return false;
+    } } };
+    assert.equal(await downloadBashOutput("s1", "/tmp/pi-bash-fixture.log"), false);
+    assert.deepEqual(revoked, ["opaque"]);
+  } finally { if (original === undefined) delete globalThis.window; else globalThis.window = original; }
+});
+
 test("deferred thinking uses the typed session and entry IPC operation", async () => {
-  boundService((transport) => transport.on("sessions.thinking", (args) => {
+  boundService((transport) => transport.on("sessions.entryThinking", (args) => {
     assert.deepEqual(args, { session: "s1", entryId: "e1", blockIndex: 2 });
     return { thinking: "fixture trace" };
   }));
   assert.equal(await fetchThinkingContent("s1", "e1", 2), "fixture trace");
+});
+
+test("sessions.reference resolves through the bound host", async () => {
+  boundService((transport) => transport.on("sessions.reference", (args) => {
+    assert.deepEqual(args, { session: "s1" });
+    return { reference: "<referenced-session>fixture</referenced-session>" };
+  }));
+  assert.equal(await fetchSessionReference("s1"), "<referenced-session>fixture</referenced-session>");
 });
 
 test("sessions.get sends the view flags and maps the answer", async () => {

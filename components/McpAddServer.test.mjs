@@ -312,6 +312,8 @@ test("a refused Add says why; host variables are added only through an explicit 
   });
   assert.match(text(html), /Not added: .* Pi Web trusted ~?\/?.*repo for this step and could not take that back, so the folder stays trusted\./);
   assert.doesNotMatch(text(html), /the folder stays trusted$/m, "not the English diagnostic");
+  html = pane({ draft: { text: "npx x", scope: "project" }, failure: { error: "trust policy outcome is unresolved and recovery is required", reason: "locked", trustPolicyPending: true } });
+  assert.match(text(html), /trust policy outcome is unresolved and recovery is required/);
 
   // Refusals worded as an Add's, not as the switch's, Test's or a session's.
   html = pane({ draft: { text: "https://api.example.com/mcp" }, failure: { error: 'server "server": url must be an http or https URL', reason: "server-invalid", name: "server" } });

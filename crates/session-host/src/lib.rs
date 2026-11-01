@@ -203,6 +203,7 @@ pub struct Session {
     pub session_file_id: String,
     pub session_file: PathBuf,
     pub cwd: PathBuf,
+    configured_system_prompt: Option<String>,
     pub(crate) client: Arc<PiRpcClient>,
     pub(crate) bridge: Arc<Bridge>,
     state: Mutex<SessionState>,
@@ -274,6 +275,11 @@ impl Session {
         Ok(guard)
     }
 
+    /// Whether the child transport is closing or has exited.
+    pub fn is_transport_closing(&self) -> bool {
+        self.client.is_closing()
+    }
+
     /// One bridge request (nonce/session-verified by pi-host).
     pub fn bridge_request(
         &self,
@@ -281,7 +287,47 @@ impl Session {
         args: Option<Value>,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::bridge::BridgeError> {
+        // Steering can execute new work even through a retained Session Arc.
+        // Status and stop/interrupt remain available to inspect or stop work.
+        let refusal = |message: String| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+            op: op.to_string(), message, code: Some("busy".into()),
+        });
+        let _branch_policy = if matches!(op, "tree.navigate" | "session.rename") {
+            Some(self.policy_gate.try_read().map_err(|_| refusal("session policy change is in progress".into()))?)
+        } else { None };
+        let _branch = if _branch_policy.is_some() {
+            Some(self.try_branch_activity().map_err(|message| refusal(message.into()))?)
+        } else { None };
+        let _policy = if op == "subagents.steer" {
+            Some(self.policy_gate.try_read().map_err(|_| refusal("session policy change is in progress".into()))?)
+        } else { None };
+        let _admission = if op == "subagents.steer" {
+            Some(self.activity_gate.try_read().map_err(|_| refusal("session branch operation is in progress".into()))?)
+        } else { None };
+        if _admission.is_some() { (self.fence_checker)(&self.id).map_err(refusal)?; }
         self.bridge.request(op, args, timeout)
+    }
+
+    /// Issue a branch mutation while the caller holds this session's activity
+    /// guard. This avoids reacquiring the guard in composite host operations.
+    pub fn bridge_request_with_activity(
+        &self, _guard: &std::sync::RwLockWriteGuard<'_, ()>, op: &str,
+        args: Option<Value>, timeout: Option<Duration>,
+    ) -> Result<Value, pi_host::bridge::BridgeError> {
+        if !matches!(op, "tree.navigate" | "session.rename") {
+            return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+                op: op.to_string(), message: "invalid guarded branch operation".into(), code: Some("invalid_args".into()),
+            }));
+        }
+        (self.fence_checker)(&self.id).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+            op: op.to_string(), message, code: Some("busy".into()),
+        }))?;
+        self.bridge.request(op, args, timeout)
+    }
+
+    /// The exact custom base passed at spawn, not the composed run prompt.
+    pub fn configured_system_prompt(&self) -> Option<&str> {
+        self.configured_system_prompt.as_deref()
     }
 
     /// The current get_state snapshot from the child.
@@ -792,7 +838,7 @@ impl SessionRegistry {
         &self, id: &str, operation: impl FnOnce(Option<&Arc<Session>>) -> Result<T, E>,
     ) -> Result<T, SessionWriterError<E>> {
         let lock = self.start_lock_for(id);
-        let _start = lock.lock().unwrap();
+        let _start = lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))?;
         (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         // Include exited entries: their in-flight delivery can still restore an
         // unknown message to the persistent outbox after the process exits.
@@ -808,6 +854,39 @@ impl SessionRegistry {
         operation(session.as_ref()).map_err(SessionWriterError::Operation)
     }
 
+    /// Run a snapshot-based copy while admission is held. When the copy is
+    /// ready, optionally close the exact guarded source before finalizing its
+    /// fences. Neither callback may re-enter this session's admission gate.
+    pub fn with_idle_session_copy<T, U, E>(
+        &self, id: &str, grace: Duration,
+        copy: impl FnOnce(Option<&Arc<Session>>) -> Result<(T, bool), E>,
+        finalize: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<U, SessionWriterError<E>> {
+        match self.with_idle_session_writer(id, |session| {
+            let (value, close_source) = copy(session).map_err(SessionWriterError::Operation)?;
+            if close_source {
+                if let Some(session) = session {
+                    if session.run_state().is_running() || session.composer_outbox.has_pending_or_in_flight()
+                        || session.bridge_request("tree.assertIdle", None, Some(grace)).is_err() {
+                        return Err(SessionWriterError::Busy("copy completed but source is no longer idle; do not retry"));
+                    }
+                    if !session.client.close_without_kill(grace) {
+                        return Err(SessionWriterError::Busy("copy completed but source exit is unconfirmed; do not retry"));
+                    }
+                    self.remove_locked(id, Duration::ZERO);
+                    if !session.client.has_exited() {
+                        return Err(SessionWriterError::Busy("copy completed but source exit is unconfirmed; do not retry"));
+                    }
+                }
+            }
+            finalize(value).map_err(SessionWriterError::Operation)
+        }) {
+            Ok(value) => Ok(value),
+            Err(SessionWriterError::Busy(message)) => Err(SessionWriterError::Busy(message)),
+            Err(SessionWriterError::Operation(error)) => Err(error),
+        }
+    }
+
     /// Try to lock writers in lexical id order, then acquire their activity
     /// guards in the same order. Busy gates refuse instead of waiting while a
     /// caller may hold a scheduler transaction. The closure must not re-enter.
@@ -818,10 +897,9 @@ impl SessionRegistry {
         ids.sort();
         ids.dedup();
         let locks: Vec<_> = ids.iter().map(|id| self.start_lock_for(id)).collect();
-        let mut starts = Vec::with_capacity(locks.len());
-        for lock in &locks {
-            starts.push(lock.try_lock().map_err(|_| SessionWriterError::Busy("session writer is busy"))?);
-        }
+        let _starts: Vec<_> = locks.iter().map(|lock| {
+            lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))
+        }).collect::<Result<_, _>>()?;
         let sessions: Vec<_> = {
             let registry = self.sessions.lock().unwrap();
             ids.iter().map(|id| registry.get(id).cloned()).collect()
@@ -1013,6 +1091,19 @@ impl SessionRegistry {
             self.remove(id, Duration::from_secs(5));
         }
         expired
+    }
+
+    /// Registered sessions, including exited children whose outbox may still be unwinding.
+    pub fn registered_sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Outboxes survive closed children and must be considered by policy changes.
+    pub fn pending_composer_session_ids(&self) -> Vec<String> {
+        self.composer_outboxes.lock().unwrap().iter()
+            .filter(|(_, outbox)| outbox.has_pending_or_in_flight())
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Live session ids (diagnostics/tests).
@@ -1207,6 +1298,11 @@ fn spawn_session(
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
     }
 
+    let configured_system_prompt = match &config.shape {
+        SessionSpawnShape::ChatOnly { prompt_file } | SessionSpawnShape::Chat { prompt_file, .. } =>
+            std::fs::read_to_string(prompt_file).ok().map(|s| s.strip_prefix('\u{feff}').unwrap_or(&s).to_owned()),
+        SessionSpawnShape::Project { .. } => None,
+    };
     let client = PiRpcClient::spawn(
         &config.executable,
         SpawnOptions { args, cwd: Some(cwd.to_path_buf()), env, ui_attach_timeout: Some(Duration::from_secs(30)), ..SpawnOptions::default() },
@@ -1231,6 +1327,7 @@ fn spawn_session(
         session_file_id: session_file_id.to_string(),
         session_file: session_file.to_path_buf(),
         cwd: cwd.to_path_buf(),
+        configured_system_prompt,
         client: Arc::clone(&client),
         bridge: Bridge::attach_with_ui_forward(Arc::clone(&client), session_file_id.to_string(), nonce, ui_tx.clone()),
         state: Mutex::new(SessionState {
@@ -2056,6 +2153,28 @@ mod dispatch_tests {
             release_tx.send(()).unwrap();
             writer.join().unwrap().unwrap();
             assert!(start.join().unwrap().err().unwrap().to_string().contains("session file no longer exists"));
+        });
+    }
+
+    #[test]
+    fn idle_writer_admission_never_waits_on_an_in_progress_start() {
+        let registry = SessionRegistry::new();
+        let locked = registry.start_lock_for("b");
+        let held = locked.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let single = registry.with_idle_session_writer("b", |_| Ok::<_, ()>(()));
+                let multi = registry.with_idle_session_writers(&["a".into(), "b".into()], |_| Ok::<_, ()>(()));
+                tx.send((matches!(single, Err(SessionWriterError::Busy(_))), matches!(multi, Err(SessionWriterError::Busy(_))))).unwrap();
+            });
+            let answer = rx.recv_timeout(Duration::from_secs(2));
+            // Release before joining even on failure, so a regression cannot
+            // strand the test thread on the very lock under test.
+            drop(held);
+            worker.join().unwrap();
+            assert_eq!(answer.unwrap(), (true, true));
+            assert!(registry.start_lock_for("a").try_lock().is_ok());
         });
     }
 

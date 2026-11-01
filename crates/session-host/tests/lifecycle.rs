@@ -504,6 +504,26 @@ fn mock_session_exe() -> &'static str {
     env!("CARGO_BIN_EXE_mock_pi_session")
 }
 
+#[test]
+fn offline_writer_refuses_child_busy_after_prompt_ack_before_start_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&agent, &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-assert-busy-after-prompt"]);
+    let registry = SessionRegistry::new();
+    let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let ack = session.command("prompt", json!({"message":"hello"}), Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(ack["disposition"], "started");
+    assert!(!session.run_state().is_running(), "the projected agent_start is deliberately missing");
+    let result = registry.with_offline_session_writer(&id, Duration::from_secs(3), || -> Result<(), ()> { panic!("must not run writer") });
+    assert!(matches!(result, Err(session_host::SessionWriterError::Busy(_))));
+    assert!(registry.get(&id).is_some());
+    registry.remove(&id, Duration::from_secs(3));
+}
+
 use base64::Engine as _;
 
 fn b64(value: &serde_json::Value) -> String {
@@ -590,6 +610,28 @@ fn offline_writer_timeout_never_kills_child_or_runs_mutation() {
         Ok::<_, ()>(())
     });
     assert!(matches!(result, Err(session_host::SessionWriterError::Busy(_))));
+    assert!(!child.client_has_exited_for_tests());
+    assert!(registry.get(&id).is_some());
+    child.client_kill_for_tests();
+    registry.remove(&id, Duration::from_secs(2));
+}
+
+#[test]
+fn copy_writer_keeps_finalize_blocked_when_preflight_or_source_exit_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&agent, &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-stay-after-eof"]);
+    let registry = SessionRegistry::new();
+    let child = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let rejected: Result<(), _> = registry.with_idle_session_copy(&id, Duration::from_millis(100), |_| Err::<((), bool), _>("preflight"), |_| panic!("must not finalize"));
+    assert!(matches!(rejected, Err(session_host::SessionWriterError::Operation("preflight"))));
+    assert!(!child.client_has_exited_for_tests());
+    let timeout = registry.with_idle_session_copy(&id, Duration::from_millis(500), |_| Ok::<_, ()>(((), true)), |_| -> Result<(), ()> { panic!("must not finalize before confirmed exit") });
+    assert!(matches!(timeout, Err(session_host::SessionWriterError::Busy(_))));
     assert!(!child.client_has_exited_for_tests());
     assert!(registry.get(&id).is_some());
     child.client_kill_for_tests();
@@ -1272,6 +1314,8 @@ fn session_writer_fence_blocks_live_admissions_and_drain() {
     assert!(registry.start(id, &file, id, &cwd, &config).is_err());
     assert!(session.command("prompt", json!({"message":"blocked"}), Some(Duration::from_secs(2))).is_err());
     assert!(session.composer_enqueue("blocked", None).is_err());
+    let steer = session.bridge_request("subagents.steer", Some(json!({"params":{"id":"run","message":"blocked"}})), Some(Duration::from_secs(2)));
+    assert!(matches!(steer, Err(pi_host::bridge::BridgeError::Op(error)) if error.code.as_deref() == Some("busy")));
     session.composer_outbox.enqueue("queued", None).unwrap();
     session.composer_wake();
     std::thread::sleep(Duration::from_millis(200));

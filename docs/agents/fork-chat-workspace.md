@@ -166,6 +166,14 @@ The client then re-attaches like after a tool-preset change (`handleChatAccessRe
 - The switch lives in the composer's run menu (`ChatAccessRows`), with a confirmation
   (`ChatConfirmDialog`) in both directions; locking again goes back to the folder-confined
   loadout.
+- The migrating static host uses explicit `sessions.chatAccessGet/Set` IPC. Its current
+  production startup and browser harness deny unlock, including stored unlocks: only a
+  future trusted packaged static WebView startup may enable that policy. The test-only
+  host policy exercises the full path; it is not native WebView or frame-ACL evidence.
+  Session-file mutations run after confirmed child exit under the shared admission gate,
+  with a private persistent session-writer fence and a short-lived management pi. A lost
+  response or unverified exit leaves the fence in place across restart; never retry it
+  automatically. User-facing reconciliation of such fences remains a migration gate.
 
 ## Files on this computer: the chat folder, naming a path
 
@@ -231,7 +239,10 @@ chosen project and leaves the chat alone. The copy drops the chat's system messa
 (they declare the chat's tool loadout, which pi would restore) and records a cleared
 tool selection, so the project session builds its own prompt and default tools. The files
 the chat made stay in its folder; the response carries `chatFolder` and the sidebar shows
-where they are. A chat that is still running is refused.
+where they are. A chat that is still running is refused. In the static host the target must
+already be authorized by the host, and neither the chat root nor any descendant is a
+project target. The copied session gets a host-generated identity before the writer starts;
+source and target are both fenced until the copy and writer exit are verified.
 
 ## Deleting and forking
 

@@ -331,7 +331,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     showScrollToBottom,
     sessionIdRef, scrollContainerRef,
     lastUserMsgRef, promptAnchorActive,
-    branchSummaryPending, handleAbortBranchSummary, routedModel,
+    branchSummaryPending, handleAbortBranchSummary, routedModel, recentCacheDecision,
     stopPending, forceStopTarget, forceStopBusy, handleForceStop, dismissForceStop,
     handleSend, handleAbort, handleAbortRetry, handleFork, handleEditContent, cancelEdit, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction, handleQueuedMessageAction,
@@ -1422,6 +1422,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
       onAbortRetry={handleAbortRetry}
       branchSummaryPending={branchSummaryPending}
       routedModel={routedModel}
+      recentCacheDecision={recentCacheDecision}
       onAbortBranchSummary={handleAbortBranchSummary}
       automation={automation}
       onSetAutomation={handleSetAutomation}
@@ -1767,7 +1768,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
                           would otherwise stay open once its answer shows up, e.g. when
                           switching between an answered and an unanswered leaf of the same
                           turn. Manual toggles survive every other re-render. */}
-                      <TurnImageOwner id={turnImageId} images={turnImages}>
+                      <TurnImageOwner id={turnImageId} images={turnImages} sessionId={messageKeySessionId ?? undefined}>
                         {processViews.length > 0 && <ProcessDetailsGroup key={finalAnswerMessage ? "answered" : "unanswered"} messageCount={processViews.length} toolCallCount={processToolCount} defaultExpanded={!finalAnswerMessage} reveal={revealProcess} t={t}>
                           {processViews}
                         </ProcessDetailsGroup>}

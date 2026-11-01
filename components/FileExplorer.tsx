@@ -4,7 +4,6 @@ import { forwardRef, useState, useCallback, useEffect, useImperativeHandle, useM
 import { getFileIcon, FolderIcon } from "./FileIcons";
 import { DismissButton } from "./DismissButton";
 import {
-  encodeFilePathForApi,
   getFileDirectory,
   getFileName,
   getRelativeFilePath,
@@ -13,15 +12,16 @@ import {
 } from "@/lib/file-paths";
 import {
   allowOutsideLink as allowOutsideLinkViaService,
+  downloadFile,
   fetchFileEntries,
   searchFileIndex,
 } from "@/lib/file-service";
 import type { GitFileStatus, GitFileStatusKind } from "@/lib/git-types";
 import { fetchGitStatus } from "@/lib/git-status-service";
-import type { FileIndexEntry } from "@/lib/file-fuzzy";
 import { buildSearchTree, type SearchTreeNode } from "@/lib/search-tree";
 import { useI18n } from "@/hooks/useI18n";
 import { isImeComposing } from "@/lib/ime";
+import { checkProjectUpload, uploadProjectFiles } from "@/lib/project-file-upload-client";
 type Translate = ReturnType<typeof useI18n>["t"];
 
 interface FileEntry {
@@ -92,17 +92,6 @@ interface PendingConflict {
   nonReplaceable: string[];
 }
 
-async function responseError(res: Response, fallback: string): Promise<Error> {
-  let message = `${fallback} (HTTP ${res.status})`;
-  try {
-    const data = await res.json() as { error?: string };
-    if (data.error) message = data.error;
-  } catch {
-    // ignore non-JSON error bodies
-  }
-  return new Error(message);
-}
-
 // The listing and the linked-directory grant travel through the service
 // seam (lib/file-service.ts): the static build swaps it for the typed IPC
 // bridge through a vite alias, exactly like lib/agent-client.ts.
@@ -148,41 +137,6 @@ function GitStatusBadge({ status, t }: { status: GitFileStatus; t: Translate }) 
       {status.code}
     </span>
   );
-}
-
-function uploadFiles(
-  targetDirectory: string,
-  files: File[],
-  strategy: UploadConflictStrategy,
-  onProgress: (progress: number) => void,
-): Promise<{ status: number; data: UploadResponse }> {
-  return new Promise((resolve, reject) => {
-    const formData = new FormData();
-    files.forEach((file) => formData.append("files", file, file.name));
-
-    const xhr = new XMLHttpRequest();
-    xhr.open(
-      "POST",
-      `/api/files/${encodeFilePathForApi(targetDirectory)}?type=upload&conflict=${strategy}`,
-    );
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        onProgress(Math.round((event.loaded / event.total) * 100));
-      }
-    };
-    xhr.onerror = () => reject(new Error("Network error while uploading files"));
-    xhr.onabort = () => reject(new Error("Upload cancelled"));
-    xhr.onload = () => {
-      let data: UploadResponse = {};
-      try {
-        data = JSON.parse(xhr.responseText) as UploadResponse;
-      } catch {
-        if (xhr.responseText) data.error = xhr.responseText;
-      }
-      resolve({ status: xhr.status, data });
-    };
-    xhr.send(formData);
-  });
 }
 
 function MentionIcon({ size = 11 }: { size?: number }) {
@@ -446,10 +400,9 @@ export function TreeNode({
           </button>
         )}
         {hovered && !node.isDir && (
-          <a
-            href={`/api/files/${encodeFilePathForApi(node.fullPath)}?type=download`}
-            download
-            onClick={(e) => e.stopPropagation()}
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); void downloadFile(node.fullPath).catch((error) => console.error("Failed to save file:", error)); }}
             title={t("files.download")}
             style={{
               position: "absolute",
@@ -478,7 +431,7 @@ export function TreeNode({
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-          </a>
+          </button>
         )}
       </div>
       {node.isDir && open && pendingLinkTarget && (
@@ -751,14 +704,8 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     setSearchLoading(true);
     setSearchError(false);
     const timer = setTimeout(() => {
-      const url = `/api/file-index?cwd=${encodeURIComponent(cwd)}&q=${encodeURIComponent(query)}`;
-      const request = typeof window !== "undefined" && (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__
-        ? searchFileIndex(cwd, query, controller.signal)
-        : fetch(url, { signal: controller.signal })
-            .then((response) => response.ok ? response.json() as Promise<{ matches?: FileIndexEntry[] }> : Promise.reject(new Error("Search failed")))
-            .then((data) => data.matches ?? []);
-      request
-        .then((matches) => setSearchPaths((matches ?? []).filter((entry) => !entry.isDir).map((entry) => entry.path)))
+      searchFileIndex(cwd, query, controller.signal)
+        .then((matches) => { if (!controller.signal.aborted) setSearchPaths(matches.filter((entry) => !entry.isDir).map((entry) => entry.path)); })
         .catch(() => {
           if (!controller.signal.aborted) {
             setSearchPaths([]);
@@ -860,7 +807,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     setUploadPhase("uploading");
 
     try {
-      const { status, data } = await uploadFiles(cwd, files, strategy, setUploadProgress);
+      const { status, data } = await uploadProjectFiles(cwd, files, strategy, setUploadProgress);
       if (status === 409 && data.conflicts?.length) {
         setPendingConflict({
           files,
@@ -891,16 +838,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     setUploadPhase("checking");
 
     try {
-      const res = await fetch(
-        `/api/files/${encodeFilePathForApi(cwd)}?type=upload-check`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileNames: files.map((file) => file.name) }),
-        },
-      );
-      const data = await res.json().catch(() => ({})) as UploadResponse;
-      if (!res.ok) throw new Error(data.error ?? `Upload check failed (HTTP ${res.status})`);
+      const data = await checkProjectUpload(cwd, files.map((file) => file.name));
 
       if (data.conflicts?.length) {
         setPendingConflict({

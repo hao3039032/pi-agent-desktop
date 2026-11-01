@@ -41,6 +41,10 @@ export default defineConfig({
       // The data-layer swaps (M2): typed IPC implementations replace the
       // HTTP clients module-by-module. The Next app keeps the originals.
       {
+        find: /^@\/lib\/subagent-fleet-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/subagent-fleet-client.ts"),
+      },
+      {
         find: /^@\/lib\/agent-client$/,
         replacement: resolve(import.meta.dirname, "src/data/agent-client.ts"),
       },
@@ -53,6 +57,18 @@ export default defineConfig({
         // import itself runs before mount in app-main.tsx.
         find: /^@\/hooks\/useStateMirror$/,
         replacement: resolve(import.meta.dirname, "src/data/state-mirror.ts"),
+      },
+      {
+        find: /^@\/lib\/file-viewer-service$/,
+        replacement: resolve(import.meta.dirname, "src/data/file-viewer-service.ts"),
+      },
+      {
+        find: /^@\/lib\/project-file-upload-client$/,
+        replacement: resolve(import.meta.dirname, "src/data/project-file-upload-client.ts"),
+      },
+      {
+        find: /^@\/lib\/file-resource-url$/,
+        replacement: resolve(import.meta.dirname, "src/data/file-resource-url.ts"),
       },
       {
         // The file-tree service (listing + linked-directory grant) swaps

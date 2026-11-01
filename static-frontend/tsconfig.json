@@ -34,6 +34,9 @@
       "next/link": [
         "./static-frontend/src/shims/next/link.tsx"
       ],
+      "@/lib/subagent-fleet-client": [
+        "./static-frontend/src/data/subagent-fleet-client.ts"
+      ],
       "@/lib/agent-client": [
         "./static-frontend/src/data/agent-client.ts"
       ],
@@ -45,6 +48,15 @@
       ],
       "@/lib/file-service": [
         "./static-frontend/src/data/file-service.ts"
+      ],
+      "@/lib/file-viewer-service": [
+        "./static-frontend/src/data/file-viewer-service.ts"
+      ],
+      "@/lib/project-file-upload-client": [
+        "./static-frontend/src/data/project-file-upload-client.ts"
+      ],
+      "@/lib/file-resource-url": [
+        "./static-frontend/src/data/file-resource-url.ts"
       ],
       "@/lib/session-view-service": [
         "./static-frontend/src/data/session-view-service.ts"

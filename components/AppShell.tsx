@@ -29,7 +29,7 @@ const ScheduledView = dynamic(() => import("./scheduled/ScheduledView").then((m)
 import { openFileTab, saveFileViewerState } from "./file-tab-state";
 import { SettingsPanel } from "./SettingsPanel";
 import { keepDocumentTitle } from "@/lib/document-title";
-import { fetchSessionView } from "@/lib/session-view-service";
+import { fetchAgentRunningState, fetchSessionView } from "@/lib/session-view-service";
 import { fetchSessionList } from "@/lib/session-list-service";
 import { autoNameSession, viewSessionHistory } from "@/lib/session-actions-service";
 import { fetchChatWorkspaceRoot, validateWorkspaceCwd } from "@/lib/workspace-service";
@@ -587,10 +587,9 @@ export function AppShell() {
     setPanelCacheWarming(null);
     if (!sessionPanelSessionId) return;
     let cancelled = false;
-    fetch(`/api/agent/${encodeURIComponent(sessionPanelSessionId)}`)
-      .then((res) => res.json() as Promise<{ running?: boolean; state?: { cacheWarming?: CacheWarmingInfo } }>)
+    fetchAgentRunningState(sessionPanelSessionId)
       .then((data) => {
-        if (!cancelled && data.state?.cacheWarming) setPanelCacheWarming(data.state.cacheWarming);
+        if (!cancelled && data?.state?.cacheWarming) setPanelCacheWarming(data.state.cacheWarming as CacheWarmingInfo);
       })
       .catch(() => { /* the snapshot from the last state sync stays */ });
     return () => { cancelled = true; };
@@ -1855,7 +1854,7 @@ export function AppShell() {
       const data = response.data;
       if (!response.ok || data.error) {
         // The dialog translates the reason; the English error is only its diagnostic.
-        setProjectTrustError({ error: data.error ?? `HTTP ${response.status}`, ...(data.reason ? { reason: data.reason } : {}) });
+        setProjectTrustError({ error: data.error ?? `HTTP ${response.status}`, ...(data.reason ? { reason: data.reason } : {}), ...(data.trustPolicyPending ? { trustPolicyPending: true } : {}) });
         return;
       }
       setProjectTrust(data as ProjectTrustStatus);

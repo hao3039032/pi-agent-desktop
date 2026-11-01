@@ -30,12 +30,38 @@ pub(crate) fn assert_session_writable(agent_dir: &Path, session_id: &str) -> Res
 
 /// Caller holds the session offline-writer gate. A failed or interrupted write
 /// deliberately leaves a refusing fence, never a falsely clean state.
-pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>) -> Result<(), String> {
+pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>, target_id: Option<&str>) -> Result<(), String> {
+    begin_record(agent_dir, session_id, operation_id, operation, source, target, target_id, None)
+}
+
+pub(crate) fn begin_fork(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: &Path, target_id: &str, staging: &Path) -> Result<(), String> {
+    begin_record(agent_dir, session_id, operation_id, operation, source, Some(target), Some(target_id), Some(staging))
+}
+
+fn begin_record(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>, target_id: Option<&str>, staging: Option<&Path>) -> Result<(), String> {
     assert_session_writable(agent_dir, session_id)?;
     let path = fence_path(agent_dir, session_id);
     let dir = path.parent().ok_or("Invalid fence path")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     assert_session_writable(agent_dir, session_id)?;
+    let metadata = std::fs::metadata(source).map_err(|e| format!("Cannot identify session source: {e}"))?;
+    if !metadata.is_file() { return Err("Session source is not a file".into()); }
+    let mut reader = std::fs::File::open(source).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut reader, &mut digest).map_err(|e| e.to_string())?;
+    let fingerprint = digest.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        json!({"path":source,"sha256":fingerprint,"size":metadata.len(),"device":metadata.dev(),"inode":metadata.ino()})
+    };
+    #[cfg(not(unix))]
+    let identity = json!({"path":source,"sha256":fingerprint,"size":metadata.len()});
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)] {
@@ -43,7 +69,7 @@ pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, oper
         options.mode(0o600);
     }
     let mut file = options.open(&path).map_err(|e| format!("Cannot create session writer fence: {e}"))?;
-    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":operation,"source":source,"target":target});
+    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":operation,"source":identity,"target":target,"targetId":target_id,"staging":staging});
     file.write_all(record.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     std::fs::File::open(dir).and_then(|directory| directory.sync_all()).map_err(|e| e.to_string())?;
@@ -78,8 +104,15 @@ mod tests {
         let agent = temp.path();
         let file = fence_path(agent, "session");
         assert!(assert_session_writable(agent, "session").is_ok());
-        begin(agent, "session", "op-1", "continue", Path::new("/source"), Some(Path::new("/project"))).unwrap();
-        assert!(begin(agent, "session", "op-2", "continue", Path::new("/source"), None).is_err());
+        let source = agent.join("source.jsonl");
+        std::fs::write(&source, "fixture").unwrap();
+        begin(agent, "session", "op-1", "continue", &source, Some(Path::new("/project")), Some("target")).unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(file.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert!(begin(agent, "session", "op-2", "continue", &source, None, None).is_err());
         assert!(finish(agent, "session", "op-2").is_err());
         assert!(assert_session_writable(agent, "session").is_err());
         finish(agent, "session", "op-1").unwrap();

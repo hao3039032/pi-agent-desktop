@@ -6,7 +6,7 @@ import { MarkdownBody } from "./MarkdownBody";
 import { ImagePreview } from "./ImagePreview";
 import { ThinkingIcon } from "./ThinkingIcon";
 import { copyText } from "@/lib/clipboard";
-import { fetchThinkingContent } from "@/lib/session-view-service";
+import { downloadBashOutput, fetchBashOutput, fetchThinkingContent } from "@/lib/session-view-service";
 import { useI18n } from "@/hooks/useI18n";
 import { useDiffViewMode } from "@/hooks/useDiffViewMode";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
@@ -287,10 +287,10 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
   const turnImageTarget = useContext(TurnImageTargetContext);
   const generatedImage = customGeneratedImage(message);
   if (generatedImage) {
-    return turnImageTarget ? null : <ToolResultImages images={[generatedImage]} isError={false} />;
+    return turnImageTarget ? null : <ToolResultImages images={[generatedImage]} isError={false} sessionId={sessionId} />;
   }
   if (message.role === "user") {
-    return <UserMessageView message={message as UserMessage} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onEditContent={onEditContent} editDisabled={editDisabled} onCancelEdit={onCancelEdit} isEditing={isEditing} />;
+    return <UserMessageView message={message as UserMessage} sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile} entryId={entryId} onFork={onFork} forking={forking} onEditContent={onEditContent} editDisabled={editDisabled} onCancelEdit={onCancelEdit} isEditing={isEditing} />;
   }
   if (message.role === "assistant") {
     return <AssistantMessageView message={message as AssistantMessage} isStreaming={isStreaming} toolResults={toolResults} modelNames={modelNames} cwd={cwd} onOpenFile={onOpenFile} onOpenSession={onOpenSession} showTimestamp={showTimestamp} prevTimestamp={prevTimestamp} sessionId={sessionId} entryId={entryId} searchBlock={searchBlock} writtenFiles={writtenFiles} onCompact={onCompact} isCompacting={isCompacting} compactError={compactError} />;
@@ -301,12 +301,12 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
   }
   if (message.role === "custom") {
     if ((message as CustomMessage).customType === "compaction") {
-      return <CompactionMessageView message={message as CustomMessage} />;
+      return <CompactionMessageView message={message as CustomMessage} sessionId={sessionId} />;
     }
     if ((message as CustomMessage).customType === "branch_summary") {
-      return <CompactionMessageView message={message as CustomMessage} kind="branch_summary" />;
+      return <CompactionMessageView message={message as CustomMessage} sessionId={sessionId} kind="branch_summary" />;
     }
-    return <CustomMessageView message={message as CustomMessage} cwd={cwd} onOpenFile={onOpenFile} />;
+    return <CustomMessageView message={message as CustomMessage} sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile} />;
   }
   if (message.role === "bashExecution") {
     return <BashExecutionView message={message as BashExecutionMessage} sessionId={sessionId} />;
@@ -336,8 +336,9 @@ export const MessageView = memo(function MessageView({ message, isStreaming, too
     && prev.compactError === next.compactError;
 });
 
-function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, onEditContent, editDisabled, onCancelEdit, isEditing }: {
+function UserMessageView({ message, sessionId, cwd, onOpenFile, entryId, onFork, forking, onEditContent, editDisabled, onCancelEdit, isEditing }: {
   message: UserMessage;
+  sessionId?: string;
   cwd?: string;
   onOpenFile?: (filePath: string, page?: number) => void;
   entryId?: string;
@@ -488,14 +489,14 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                 )}
               </div>
               {expanded && (
-                <MarkdownBody className="markdown-user-message" keepLineBreaks cwd={cwd} onOpenFile={onOpenFile}>{content}</MarkdownBody>
+                <MarkdownBody className="markdown-user-message" keepLineBreaks sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile}>{content}</MarkdownBody>
               )}
             </div>
           ) : (
             <>
               {imageBlocksNode}
               {attachedFiles.length > 0 && <AttachedFileList files={attachedFiles} />}
-              {bodyText && <CollapsibleUserText text={bodyText} cwd={cwd} onOpenFile={onOpenFile} />}
+              {bodyText && <CollapsibleUserText text={bodyText} sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile} />}
             </>
           )}
         </div>
@@ -970,7 +971,7 @@ function AssistantMessageView({
 
 function BlockView({ block, searchTarget, toolResults, isStreaming, streamingDuration, toolCallDurations, cwd, onOpenFile, onOpenSession, sessionId, entryId, blockIndex }: { block: AssistantContentBlock; searchTarget?: boolean; toolResults?: Map<string, ToolResultMessage>; isStreaming?: boolean; streamingDuration?: number; toolCallDurations?: Map<string, number>; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void; onOpenSession?: (sessionId: string) => void; sessionId?: string; entryId?: string; blockIndex: number }) {
   if (block.type === "text") {
-    return <div data-message-text data-search-target={searchTarget || undefined}><TextBlock block={block as TextContent} isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} /></div>;
+    return <div data-message-text data-search-target={searchTarget || undefined}><TextBlock block={block as TextContent} isStreaming={isStreaming} sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile} /></div>;
   }
   if (block.type === "thinking") {
     return <ThinkingBlock block={block as ThinkingContent} duration={streamingDuration} sessionId={sessionId} entryId={entryId} blockIndex={blockIndex} />;
@@ -982,13 +983,13 @@ function BlockView({ block, searchTarget, toolResults, isStreaming, streamingDur
     // A loaded (non-streaming) message whose toolCall has no paired result
     // means the run was interrupted before the tool finished — render that
     // honestly instead of the success styling.
-    return <ToolCallBlock block={tc} result={result} duration={duration} onOpenSession={onOpenSession} aborted={!isStreaming && !result} />;
+    return <ToolCallBlock block={tc} result={result} duration={duration} onOpenSession={onOpenSession} sessionId={sessionId} aborted={!isStreaming && !result} />;
   }
   return null;
 }
 
-function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
-  return <SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile} artifacts>{block.text}</SafeMarkdownBody>;
+function TextBlock({ block, isStreaming, sessionId, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; sessionId?: string; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
+  return <SafeMarkdownBody isStreaming={isStreaming} sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile} artifacts>{block.text}</SafeMarkdownBody>;
 }
 
 export function ThinkingBlock({ block, duration, sessionId, entryId, blockIndex }: {
@@ -1113,7 +1114,7 @@ function isSubagentToolDetails(value: unknown): value is SubagentToolDetails {
   return details.kind === "pi-web-subagent" && typeof details.sessionId === "string";
 }
 
-function ToolCallBlock({ block, result, duration, aborted, defaultExpanded, onOpenSession }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number; aborted?: boolean; defaultExpanded?: boolean; onOpenSession?: (sessionId: string) => void }) {
+function ToolCallBlock({ block, result, duration, aborted, defaultExpanded, onOpenSession, sessionId }: { block: ToolCallContent; result?: ToolResultMessage; duration?: number; aborted?: boolean; defaultExpanded?: boolean; onOpenSession?: (sessionId: string) => void; sessionId?: string }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(() => defaultExpanded ?? isToolCallExpanded(block.toolCallId));
   const toggleExpanded = () => {
@@ -1268,7 +1269,7 @@ function ToolCallBlock({ block, result, duration, aborted, defaultExpanded, onOp
       )}
 
       {/* ── Result images — always visible, independent of the collapsed details ── */}
-      {resultImages.length > 0 && <ToolResultImages images={resultImages} isError={isError} />}
+      {resultImages.length > 0 && <ToolResultImages images={resultImages} isError={isError} sessionId={sessionId} />}
       {promotedIndices.size > 0 && <TurnImageReference />}
 
       {/* ── A file the chat saved to Downloads — always visible ── */}
@@ -1705,8 +1706,9 @@ function PairedResult({ text, isEmpty, isError }: {
 }
 
 const USER_TEXT_COLLAPSE_HEIGHT = 220;
-function CollapsibleUserText({ text, cwd, onOpenFile }: {
+function CollapsibleUserText({ text, sessionId, cwd, onOpenFile }: {
   text: string;
+  sessionId?: string;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
 }) {
@@ -1736,7 +1738,7 @@ function CollapsibleUserText({ text, cwd, onOpenFile }: {
           WebkitMaskImage: fade,
         } : undefined}
       >
-        <MarkdownBody className="markdown-user-message" keepLineBreaks cwd={cwd} onOpenFile={onOpenFile}>{text}</MarkdownBody>
+        <MarkdownBody className="markdown-user-message" keepLineBreaks sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile}>{text}</MarkdownBody>
       </div>
       {overflowing && (
         <button
@@ -1764,7 +1766,7 @@ function CollapsibleUserText({ text, cwd, onOpenFile }: {
   );
 }
 
-function CompactionMessageView({ message, kind = "compaction" }: { message: CustomMessage; kind?: "compaction" | "branch_summary" }) {
+function CompactionMessageView({ message, sessionId, kind = "compaction" }: { message: CustomMessage; sessionId?: string; kind?: "compaction" | "branch_summary" }) {
   const { t } = useI18n();
   const summary = getMessageText(message.content);
   const parsedSummary = useMemo(() => parseCompactionSummary(summary), [summary]);
@@ -1805,7 +1807,7 @@ function CompactionMessageView({ message, kind = "compaction" }: { message: Cust
              {t(kind === "branch_summary" ? "i18n.branchSummaryDescription" : "i18n.compactionDescription")}
           </div>
           {parsedSummary.body ? (
-            <MarkdownBody className="markdown-compaction-message">{parsedSummary.body}</MarkdownBody>
+            <MarkdownBody className="markdown-compaction-message" sessionId={sessionId}>{parsedSummary.body}</MarkdownBody>
           ) : (
              <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("i18n.noSummary")}</span>
           )}
@@ -1847,7 +1849,7 @@ function CompactionFileList({ title, files }: { title: string; files: string[] }
   );
 }
 
-function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessage; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
+function CustomMessageView({ message, sessionId, cwd, onOpenFile }: { message: CustomMessage; sessionId?: string; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
   const { t } = useI18n();
   const isHiddenDisplay = message.display === false;
   const [contentExpanded, setContentExpanded] = useState(!isHiddenDisplay);
@@ -1917,7 +1919,7 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
                 })}
               </div>
             )}
-             {text ? <MarkdownBody className="markdown-custom-message" cwd={cwd} onOpenFile={onOpenFile}>{text}</MarkdownBody> : <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("i18n.noMessage")}</span>}
+             {text ? <MarkdownBody className="markdown-custom-message" sessionId={sessionId} cwd={cwd} onOpenFile={onOpenFile}>{text}</MarkdownBody> : <span style={{ color: "var(--text-dim)", fontSize: 12 }}>{t("i18n.noMessage")}</span>}
           </div>
         ) : (
           <button
@@ -2109,23 +2111,20 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
   // long `!command` explains itself instead of looking stuck.
   const isPending = isRunning && !message.output;
   const isError = message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0);
-  const fullOutputUrl = sessionId && message.fullOutputPath
-    ? `/api/agent/${encodeURIComponent(sessionId)}/bash-output?path=${encodeURIComponent(message.fullOutputPath)}`
-    : null;
-  const showFullButton = message.truncated && fullOutputUrl && fullOutput === null;
+  const hasFullOutput = Boolean(sessionId && message.fullOutputPath);
+  const showFullButton = message.truncated && hasFullOutput && fullOutput === null;
   const displayOutput = fullOutput ?? message.output;
 
   async function loadFullOutput() {
-    if (!fullOutputUrl) return;
+    if (!sessionId || !message.fullOutputPath) return;
     setLoadingFull(true);
     setFullError(null);
     try {
-      const res = await fetch(fullOutputUrl);
-      const d = await res.json() as { success?: boolean; data?: { output?: string }; error?: string };
-      if (d.success) {
-        setFullOutput(d.data?.output ?? "");
+      const result = await fetchBashOutput(sessionId, message.fullOutputPath);
+      if (result.output !== undefined) {
+        setFullOutput(result.output);
       } else {
-        setFullError(d.error ?? "failed");
+        setFullError(result.error ?? "failed");
       }
     } catch (e) {
       setFullError(String(e));
@@ -2157,7 +2156,7 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
   return (
     <div style={{ margin: "6px 0" }}>
       <ToolCallBlock block={block} result={result} defaultExpanded={isRunning} />
-      {message.truncated && fullOutputUrl && (
+      {message.truncated && hasFullOutput && (
         <div style={{ padding: "4px 10px", fontSize: 11, marginTop: -1 }}>
           {showFullButton && (
             <button
@@ -2171,9 +2170,9 @@ function BashExecutionView({ message, sessionId }: { message: BashExecutionMessa
           <button
             type="button"
             onClick={() => {
-              void import("@/lib/desktop-native").then(({ downloadUrlAsFile }) =>
-                downloadUrlAsFile(`${fullOutputUrl}&download=1`, "bash-output.log"),
-              );
+              if (!sessionId || !message.fullOutputPath) return;
+              setFullError(null);
+              void downloadBashOutput(sessionId, message.fullOutputPath).catch((error) => setFullError(String(error)));
             }}
             style={{
               marginLeft: showFullButton ? 10 : 0,

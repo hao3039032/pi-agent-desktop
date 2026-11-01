@@ -80,6 +80,7 @@ pub struct IpcHostState {
     pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
+    pub(crate) native_drops: crate::native_drop::NativeDrops,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
     /// Authorized save destinations (bound via native dialog selections).
@@ -102,6 +103,8 @@ pub struct IpcHostState {
     session_list_version: Arc<AtomicU64>,
     /// Set only by a future packaged static-app startup path, never by IPC.
     chat_unlock_policy: ChatUnlockPolicy,
+    #[cfg(test)]
+    pub(crate) session_writer_timeout: Mutex<Duration>,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
@@ -204,6 +207,7 @@ impl IpcHostState {
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
+            native_drops: crate::native_drop::NativeDrops::default(),
             file_roots: {
                 let mut roots = crate::file_access::AllowedRoots::new();
                 // The legacy default-cwd layouts stay browsable across
@@ -221,6 +225,8 @@ impl IpcHostState {
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
             chat_unlock_policy: ChatUnlockPolicy::Denied,
+            #[cfg(test)]
+            session_writer_timeout: Mutex::new(Duration::from_secs(60)),
         }
     }
 
@@ -1361,11 +1367,103 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "sessions.chatAccessSet" => match crate::chat_sessions::set_access(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.continueInProject" => match crate::chat_sessions::continue_in_project(state, &args) {
+            Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) },
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "sessions.search" => match crate::session_search::search(state, &args) {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
-        "sessions.thinking" => {
+        "sessions.entryToolResultImage" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
+            let index = args.get("blockIndex").and_then(Value::as_u64);
+            if sid.is_empty() || entry.is_empty() || entry.len() > 256 || index.is_none() || index.is_some_and(|n| n > 9_007_199_254_740_991) {
+                return protocol_error(&id, "invalid_args", "session, entryId and a valid blockIndex are required");
+            }
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            let Some(file) = file else { return protocol_error(&id, "not_found", "session not found") };
+            let dir = match tempfile::Builder::new().prefix("pi-session-image-").tempdir() {
+                Ok(dir) => dir,
+                Err(error) => return protocol_error(&id, "io", &error.to_string()),
+            };
+            let output = dir.path().join("image");
+            let result = match management_call(state, "session.extractToolResultImage", json!({"file":file.display().to_string(),"entryId":entry,"blockIndex":index,"outputFile":output.display().to_string()})) {
+                Ok(result) => result,
+                Err((code, message)) => return protocol_error(&id, &code, &message),
+            };
+            let Some(mime) = result.get("mime").and_then(Value::as_str) else { return protocol_error(&id, "io", "invalid image metadata") };
+            let Some(size) = result.get("size").and_then(Value::as_u64).filter(|size| *size > 0 && *size <= resource_protocol::MAX_RESOURCE_IMAGE_BYTES as u64) else { return protocol_error(&id, "io", "invalid image size") };
+            let bytes = {
+                use std::io::Read;
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC); }
+                let opened = match options.open(&output) {
+                    Ok(file) if file.metadata().is_ok_and(|metadata| metadata.is_file()) => file,
+                    _ => return protocol_error(&id, "io", "image handoff is unavailable"),
+                };
+                let mut bytes = Vec::new();
+                if opened.take(size + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != size {
+                    return protocol_error(&id, "io", "invalid image handoff size");
+                }
+                bytes
+            };
+            match state.resources.grant_image_bytes(bytes, mime, Duration::from_secs(600)) {
+                Ok(handle) => protocol_ok(&id, json!({"handle":handle,"mime":mime})),
+                Err(_) => protocol_error(&id, "io", "image resource grant failed"),
+            }
+        }
+        "agent.bashOutput" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+            if sid.is_empty() || path.is_empty() || path.len() > 4096 {
+                return protocol_error(&id, "invalid_args", "session and path required");
+            }
+            let download = match args.get("download") { None => false, Some(Value::Bool(value)) => *value, _ => return protocol_error(&id, "invalid_args", "download must be a boolean") };
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            let Some(file) = file else { return protocol_error(&id, "not_found", "session not found") };
+            #[cfg(not(unix))]
+            { let _ = (file, download); protocol_error(&id, "not_supported", "Secure bash output access is not supported on this platform") }
+            #[cfg(unix)]
+            {
+                use std::io::Read;
+                const MAX: u64 = 5 * 1024 * 1024;
+                // Pin the directory before checking the session reference; a
+                // later ancestor replacement cannot redirect the open.
+                let prepared = match crate::session_bash::PreparedBashOutput::prepare(path) {
+                    Ok(prepared) => prepared,
+                    Err(message) => return protocol_error(&id, "invalid_args", message),
+                };
+                if let Err((code, message)) = management_call(state, "session.authorizeBashOutput", json!({"file":file.display().to_string(),"sessionId":sid,"path":path})) {
+                    return protocol_error(&id, &code, &message);
+                }
+                let opened = match prepared.open() {
+                    Ok(file) => file,
+                    Err(_) => return protocol_error(&id, "not_found", "full output unavailable"),
+                };
+                if download {
+                    match state.resources.grant_open_file(opened, Path::new(path), Duration::from_secs(600)) {
+                        Ok(handle) => protocol_ok(&id, json!({"handle":handle})),
+                        Err(_) => protocol_error(&id, "io", "bash output grant failed"),
+                    }
+                } else {
+                    let mut bytes = Vec::new();
+                    if opened.take(MAX + 1).read_to_end(&mut bytes).is_err() { return protocol_error(&id, "io", "full output unavailable"); }
+                    if bytes.len() as u64 > MAX { return protocol_error(&id, "too_large", "Full output is too large to display (limit 5242880 bytes)"); }
+                    protocol_ok(&id, json!({"output":String::from_utf8_lossy(&bytes)}))
+                }
+            }
+        }
+        "sessions.entryThinking" => {
             let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
             let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
             let index = args.get("blockIndex").and_then(Value::as_u64);
@@ -1382,7 +1480,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 None => protocol_error(&id, "not_found", "session not found"),
             }
         }
-        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" => {
+        "sessions.get" | "sessions.context" | "sessions.state" | "sessions.lease" | "sessions.reference" => {
             match session_view_dispatch(state, op, &args) {
                 Ok(data) => protocol_ok(&id, data),
                 Err((code, message)) => protocol_error(&id, &code, &message),
@@ -1485,17 +1583,19 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             if current.get("requiresTrust").and_then(Value::as_bool) != Some(true) {
                 return protocol_error(&id, "trust-not-required", "This project has no resources that require trust");
             }
-            for sid in state.registry.ids() {
-                if let Some(session) = state.registry.get(&sid) {
-                    if session.run_state().is_running() {
-                        return protocol_error(&id, "session-busy", "Wait for the active session to finish before trusting this project");
-                    }
-                }
+            if crate::trust_policy_fence::is_pending(&agent_dir) {
+                return protocol_error(&id, "busy", "Trust policy outcome is unresolved; recovery is required");
+            }
+            if !cfg!(unix) {
+                return protocol_error(&id, "not_supported", "Durable trust policy fencing is unavailable on this platform");
+            }
+            if let Err(error) = crate::trust_policy_mutation::close_affected_sessions(state, Path::new(cwd)) {
+                return protocol_error_value(&id, json!({"code":"busy", "reason":"session-busy", "message":error, "retryable":false}));
             }
             let call_args = json!({ "cwd": cwd, "agentDir": agent_dir.to_string_lossy() });
-            match management_call(state, "trust.set", call_args) {
+            match crate::trust_policy_mutation::run(state, Path::new(cwd), "trust.setFenced", call_args) {
                 Ok(new_status) => mcp_management_response(&id, new_status),
-                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
+                Err(error) => protocol_error(&id, "io", &error),
             }
         }
         // POST /api/agent/new: a brand-new session (the factory + the
@@ -1523,6 +1623,21 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "agent.subagentsStatus" | "agent.subagentsAction" => match crate::session_fleet::dispatch(state, op, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((reason, message)) => {
+                let code = match reason.as_str() {
+                    "invalid_args" | "invalid_params" | "invalid_request" | "unsupported_method" | "unsupported_version" | "capability-unavailable" => "invalid_args",
+                    "not_found" => "not_found",
+                    "session-closed" | "invalid_state" | "no_active_session" => "busy",
+                    "unresponsive" => "timeout",
+                    "chat-workspace" => "unauthorized_scope",
+                    "not-loaded" | "unknown" => "not_supported",
+                    _ => "io",
+                };
+                protocol_error_value(&id, json!({"code":code,"reason":reason,"message":message,"retryable":false}))
+            }
+        },
         "agent.respondUi" => {
             let session_id = args.get("session").and_then(Value::as_str).unwrap_or("");
             let request_id = args.get("id").and_then(Value::as_str).unwrap_or("");
@@ -2170,6 +2285,27 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 if let Err(error) = validate_scoped_cwd(state, cwd) {
                     return mcp_cwd_error(&id, &error);
                 }
+                if args.get("action").and_then(Value::as_str) == Some("add")
+                    && args.get("scope").and_then(Value::as_str) == Some("project")
+                    && args.get("trustFolder").and_then(Value::as_bool) == Some(true) {
+                    let _policy = match state.policy_gate.try_write() {
+                        Ok(guard) => guard,
+                        Err(_) => return protocol_error(&id, "busy", "Session admission is in progress"),
+                    };
+                    if crate::trust_policy_fence::is_pending(&agent_dir) {
+                        return protocol_error(&id, "busy", "Trust policy outcome is unresolved; recovery is required");
+                    }
+                    if !cfg!(unix) {
+                        return protocol_error(&id, "not_supported", "Durable trust policy fencing is unavailable on this platform");
+                    }
+                    if let Err(error) = crate::trust_policy_mutation::close_affected_sessions(state, Path::new(cwd)) {
+                        return protocol_error_value(&id, json!({"code":"busy", "reason":"session-busy", "message":error, "retryable":false}));
+                    }
+                    return match crate::trust_policy_mutation::run(state, Path::new(cwd), "mcp.trustFolderAdd", payload) {
+                        Ok(result) => mcp_management_response(&id, result),
+                        Err(error) => protocol_error(&id, "io", &error),
+                    };
+                }
                 match management_call(state, "mcp.configAction", payload) {
                     Ok(result) => mcp_management_response(&id, result),
                     Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
@@ -2211,24 +2347,70 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err(error) => protocol_error(&id, &error.0, &error.1),
             }
         }
-        // Preview resources (crates/resource-protocol): grants are HOST-side
-        // decisions (a session-reported artifact location, a path the index
-        // scan proposed); the frontend can only confirm a path the host
-        // itself named — it can never mint a grant for an arbitrary path.
+        // A resource grant pins a regular file opened beneath a host-authorized
+        // root; a caller-supplied path alone never grants authority.
         "resources.grantFile" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             if path.is_empty() {
                 return protocol_error(&id, "invalid_args", "path is required");
             }
-            if !state.is_proposed(&path) {
-                return protocol_error(
-                    &id,
-                    "unauthorized_scope",
-                    "the host never proposed this path; resources are granted host-side only",
-                );
+            #[cfg(unix)]
+            let opened = {
+                let target_path = Path::new(path);
+                let scoped = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, target_path)
+                };
+                let scoped = if scoped.is_some() { scoped } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
+                    if target_path.is_absolute() && !target_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                        match session_file_referenced(state, session, path) {
+                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| (resolved, PathBuf::from("/"))),
+                            Ok(false) => None,
+                            Err((code, message)) => return protocol_error(&id, &code, &message),
+                        }
+                    } else { None }
+                } else { None };
+                scoped.map(|(target, root)| crate::file_access::open_file_beneath_root(&root, &target))
+            };
+            #[cfg(windows)]
+            let opened: Option<Result<std::fs::File, std::io::Error>> = None;
+            match opened {
+                Some(Ok(file)) => match state.resources.grant_open_file(file, Path::new(path), Duration::from_secs(600)) {
+                    Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
+                    Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+                },
+                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
-            match state.resources.grant_file(Path::new(path), Duration::from_secs(600)) {
-                Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
+        }
+        "resources.grantPreview" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+            #[cfg(unix)]
+            {
+                let scoped = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, Path::new(path))
+                };
+                let Some((target, root)) = scoped else { return protocol_error(&id, "unauthorized_scope", "preview path is outside authorized roots"); };
+                let Some(parent) = target.parent() else { return protocol_error(&id, "invalid_args", "invalid preview path"); };
+                let Some(name) = target.file_name().and_then(|name| name.to_str()) else { return protocol_error(&id, "invalid_args", "invalid preview filename"); };
+                if crate::file_access::open_file_beneath_root(&root, &target).is_err() { return protocol_error(&id, "unauthorized_scope", "preview file cannot be opened safely"); }
+                let directory = match crate::file_access::open_directory_beneath_root(&root, parent) {
+                    Ok(directory) => directory,
+                    Err(error) => return protocol_error(&id, "unauthorized_scope", &error.to_string()),
+                };
+                match state.resources.grant_open_directory(directory, Duration::from_secs(600)) {
+                    Ok(handle) => protocol_ok(&id, json!({ "handle": handle, "name": name })),
+                    Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
+                }
+            }
+            #[cfg(windows)]
+            { let _ = path; protocol_error(&id, "unauthorized_scope", "preview resources are unavailable on this platform") }
+        }
+        "resources.metadata" => {
+            let handle = args.get("handle").and_then(Value::as_str).unwrap_or_default();
+            match state.resources.file_metadata(handle) {
+                Ok((size, revision)) => protocol_ok(&id, json!({ "size": size, "revision": revision })),
                 Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
             }
         }
@@ -2438,9 +2620,37 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 }
             }
         }
+        "files.revealSupport" => {
+            let platform = if cfg!(target_os = "macos") { "darwin" } else if cfg!(target_os = "windows") { "win32" } else { "linux" };
+            protocol_ok(&id, json!({ "supported": cfg!(unix), "reason": if cfg!(unix) { None } else { Some("unsupported-platform") }, "platform": platform }))
+        }
+        "files.reveal" => {
+            let path = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
+            #[cfg(unix)]
+            {
+                let resolved = {
+                    let roots = state.file_roots.lock().unwrap();
+                    crate::file_access::resolved_read_target_with_root(&roots, path)
+                };
+                let Some((target, root)) = resolved else { return protocol_error(&id, "unauthorized_scope", "access-denied") };
+                if crate::file_access::open_directory_beneath_root(&root, &target).is_err() {
+                    return protocol_error(&id, "unauthorized_scope", "not-a-directory");
+                }
+                match crate::open_path_with_default_app(&target) {
+                    Ok(()) => protocol_ok(&id, json!({ "opened": true })),
+                    Err(error) => protocol_error(&id, "io", &error),
+                }
+            }
+            #[cfg(not(unix))]
+            { let _ = path; protocol_error(&id, "not_supported", "Secure directory reveal is not supported on this platform") }
+        }
         "files.index" => crate::file_resources::handle_files_index(state, &id, &args),
-        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(&id, &args),
-        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(&id, &args),
+        "files.docxPreview" => crate::file_resources::handle_docx_preview(state, &id, &args),
+        "files.importDropped" => crate::native_import::import_dropped(state, &id, &args),
+        "files.uploadCheck" => crate::project_upload::check(state, &id, &args),
+        "files.uploadFile" => crate::project_upload::upload_one(state, &id, &args),
+        "desktop.describePaths" => crate::file_resources::handle_desktop_describe_paths(state, &id, &args),
+        "desktop.readImages" => crate::file_resources::handle_desktop_read_images(state, &id, &args),
         "desktop.saveFile" => crate::file_resources::handle_desktop_save_file(state, &id, &args),
         "chats.extractAttachmentText" => {
             crate::file_resources::handle_chats_extract_attachment_text(state, &id, &args)
@@ -2518,8 +2728,21 @@ pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -
 /// comes from the `AppHandle` (not a `State<'_, _>` argument) because an
 /// async command must return a `Result` to carry borrowed arguments — the
 /// envelope is the reply shape, so the handle is the honest input.
+pub(crate) fn is_trusted_static_chat_window(label: &str, url: &tauri::Url) -> bool {
+    if label != crate::shell::WINDOW_LABEL || url.host_str() != Some(if cfg!(windows) { "tauri.localhost" } else { "localhost" })
+        || url.port().is_some() || !matches!(url.path(), "/" | "/index.html") {
+        return false;
+    }
+    url.scheme() == if cfg!(windows) { "http" } else { "tauri" }
+}
+
 #[tauri::command]
-pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value {
+pub async fn pi_ipc(app: tauri::AppHandle, window: tauri::WebviewWindow, request: Value) -> Value {
+    if request.get("op").and_then(Value::as_str) == Some("sessions.chatAccessSet")
+        && !window.url().ok().is_some_and(|url| is_trusted_static_chat_window(window.label(), &url)) {
+        let id = request.get("id").and_then(Value::as_str).unwrap_or("");
+        return protocol_error(id, "access_denied", "Chat access changes require the trusted packaged desktop window");
+    }
     let state = app.state::<Arc<IpcHostState>>().inner().clone();
     dispatch_envelope_gated(state, request).await
 }
@@ -2791,6 +3014,9 @@ pub(crate) fn management_error_code(error: &str) -> (String, String) {
             "unknown_op"
                 | "invalid_args"
                 | "not_found"
+                | "too_large"
+                | "not_supported"
+                | "unauthorized_scope"
                 | "op_failed"
                 | "invalid_cron"
                 | "project_scope"
@@ -3028,6 +3254,29 @@ fn session_info_json(
     info
 }
 
+#[cfg(unix)]
+fn session_file_referenced(state: &IpcHostState, session_id: &str, path: &str) -> Result<bool, (String, String)> {
+    let live = state.registry.get(session_id);
+    let mut handoff = None;
+    let args = if let Some(session) = live {
+        session.lease();
+        let (entries, leaf, tree) = crate::session_view::live_child_snapshot(&session)
+            .map_err(|message| ("agent_child_error".to_string(), message))?;
+        let file = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree)
+            .map_err(|error| ("io".to_string(), error.to_string()))?;
+        let args = json!({ "snapshotFile": file, "path": path });
+        handoff = Some(file);
+        args
+    } else {
+        let summary = session_host::history::find_session_by_id(&state.agent_dir(), session_id)
+            .ok_or_else(|| ("not_found".to_string(), "Session not found".to_string()))?;
+        json!({ "file": summary.file, "path": path })
+    };
+    let result = management_call(state, "session.isFileReferenced", args);
+    if let Some(file) = handoff { let _ = std::fs::remove_file(file); }
+    Ok(result?.get("referenced").and_then(Value::as_bool) == Some(true))
+}
+
 /// sessions.get / sessions.context / sessions.state (the GET /api/sessions/[id]
 /// family). Returns (code, message) failures; the caller maps them onto the
 /// protocol envelope.
@@ -3088,6 +3337,8 @@ fn session_view_dispatch(
                     }));
                 let model = raw.get("model").cloned().unwrap_or(Value::Null);
                 let (extension_statuses, extension_widgets) = session.extension_ui_state();
+                let recent_cache_decision = session.bridge_request("cache.recentDecision", None, Some(Duration::from_secs(3)))
+                    .ok().and_then(|result| result.get("decision").filter(|value| value.is_object()).cloned());
                 // Only the child's active entries/leaf can identify a recorded prompt.
                 // A failed read or absence of a record is unknown (a spawn-time
                 // custom prompt may still exist); never invent a composed prompt.
@@ -3103,8 +3354,15 @@ fn session_view_dispatch(
                     let _ = std::fs::remove_file(handoff);
                     result
                 });
-                let prompt_recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool) == Some(true);
-                let prompt = recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str).unwrap_or("");
+                let recorded = recorded_prompt.as_ref().and_then(|v| v.get("recorded")).and_then(Value::as_bool);
+                let (prompt, prompt_status) = match recorded {
+                    Some(true) => match recorded_prompt.as_ref().and_then(|v| v.get("text")).and_then(Value::as_str) {
+                        Some(text) => (text, "recorded"),
+                        None => ("", "unknown"),
+                    },
+                    Some(false) => session.configured_system_prompt().map(|text| (text, "configured")).unwrap_or(("", "unknown")),
+                    None => ("", "unknown"),
+                };
                 let (pending, pending_version) = session.composer_outbox.snapshot();
                 let queued_messages = json!({
                     "steering": machine.steering_queue,
@@ -3144,9 +3402,10 @@ fn session_view_dispatch(
                     // usage — unknown is not zero).
                     "contextUsage": context_usage.unwrap_or(Value::Null),
                     "systemPrompt": prompt,
-                    "systemPromptStatus": if prompt_recorded { "recorded" } else { "unknown" },
+                    "systemPromptStatus": prompt_status,
                     "extensionStatuses": extension_statuses,
                     "extensionWidgets": extension_widgets,
+                    "recentCacheDecision": recent_cache_decision,
                 });
                 return Ok(json!({ "running": session.run_state().is_running(), "state": state_json }));
             }
@@ -3178,13 +3437,32 @@ fn session_view_dispatch(
             Ok(json!({ "running": false }))
         }
 
+        "sessions.reference" => {
+            let summary = session_host::history::find_session_by_id(&agent_dir, session_id)
+                .ok_or_else(|| ("not_found".to_string(), format!("Session not found: {session_id}")))?;
+            let mut args = json!({ "file": summary.file, "sessionId": session_id });
+            let mut handoff = None;
+            if let Some(session) = state.registry.get(session_id) {
+                session.lease();
+                let (entries, leaf, tree) = crate::session_view::live_child_snapshot(&session)
+                    .map_err(|message| ("agent_child_error".to_string(), message))?;
+                let file = crate::session_view::write_snapshot_handoff(&entries, leaf.as_deref(), &tree)
+                    .map_err(|error| ("io".to_string(), error.to_string()))?;
+                args["snapshotFile"] = json!(file);
+                handoff = Some(file);
+            }
+            let result = management_call(state, "session.reference", args);
+            if let Some(file) = handoff { let _ = std::fs::remove_file(file); }
+            result
+        }
+
         // The /api/sessions/[id]/context contract: branch paging over the
         // append-only file (explicit leafId / before always address the disk
         // view, exactly like the route).
         "sessions.context" => {
             let summary = session_host::history::find_session_by_id(&agent_dir, session_id)
                 .ok_or_else(|| ("not_found".to_string(), format!("Session not found: {session_id}")))?;
-            let mut call_args = json!({ "file": summary.file.display().to_string() });
+            let mut call_args = json!({ "file": summary.file.display().to_string(), "sessionId": session_id });
             for field in ["leafId", "before"] {
                 if let Some(value) = args.get(field).and_then(Value::as_str) {
                     call_args[field] = json!(value);
@@ -3249,6 +3527,7 @@ fn session_view_dispatch(
             } else {
                 let call_args = json!({
                     "file": file.display().to_string(),
+                    "sessionId": session_id,
                     "summaryTree": summary_tree,
                     "deferThinking": defer_thinking,
                     "deferMedia": defer_media,
@@ -3428,6 +3707,7 @@ fn build_spawn_plan(
         // windows and the test harness cannot honour a stored unlock.
         let unlocked = state.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
             && chat_folder
+            && crate::chat_sessions::is_owned_chat_folder(cwd, &agent_dir)
             && session_host::spawn_plan::read_chat_unlocked(session_file);
         // Chats read Settings › Chats while they are still empty.
         let (chat_model, chat_thinking) = if file_has_messages(session_file) {
@@ -4486,6 +4766,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let state = state();
         let session = state.registry.start(&id, &file, &id, &cwd, &config).unwrap();
         let (_sub, events, _) = session.subscribe_with_ui();
+        let cache = session.bridge_request("cache.recentDecision", None, Some(Duration::from_secs(10))).unwrap();
+        assert!(cache["decision"].is_null(), "no cache event must remain unknown: {cache}");
         let prompt = Arc::clone(&session);
         let handle = std::thread::spawn(move || prompt.command("prompt", json!({"message":"/fixture-confirm"}), Some(Duration::from_secs(10))));
         let event = loop {
@@ -4527,11 +4809,24 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(managed.join("@earendil-works")).unwrap();
         std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works/pi-coding-agent").canonicalize().unwrap(), managed.join("@earendil-works/pi-coding-agent")).unwrap();
         let (file, id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut bash = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        write!(bash, "fixture bash output").unwrap();
+        bash.flush().unwrap();
+        let unreferenced = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        let large = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        large.as_file().set_len(5 * 1024 * 1024 + 1).unwrap();
+        let link = tempfile::Builder::new().prefix("pi-bash-").suffix(".log").tempfile_in(std::env::temp_dir()).unwrap();
+        std::fs::remove_file(link.path()).unwrap();
+        std::os::unix::fs::symlink(bash.path(), link.path()).unwrap();
         let mut writer = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
         for (entry, parent, text) in [("root", Value::Null, "ROOT"), ("a", json!("root"), "BRANCH A"), ("b", json!("root"), "BRANCH B")] {
             writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"system","content":"","sections":{"core":text},"timestamp":1}})).unwrap();
         }
         writeln!(writer, "{}", json!({"type":"message","id":"think","parentId":"b","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"fixture hidden reasoning"}]}})).unwrap();
+        writeln!(writer, "{}", json!({"type":"message","id":"media","parentId":"think","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"toolResult","toolCallId":"t1","content":[{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"},{"type":"image","data":"PGh0bWw+","mimeType":"image/png"}]}})).unwrap();
+        for (entry, parent, path) in [("bash1", "media", bash.path()), ("bash2", "bash1", large.path()), ("bash3", "bash2", link.path())] {
+            writeln!(writer, "{}", json!({"type":"message","id":entry,"parentId":parent,"timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"bashExecution","command":"fixture","output":"","exitCode":0,"fullOutputPath":path}})).unwrap();
+        }
         drop(writer);
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
@@ -4552,13 +4847,61 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let before = read();
         assert_eq!(before["data"]["state"]["systemPromptStatus"], "recorded", "{before}");
         assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
-        let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
+        let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.entryThinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
         assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
-        let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
+        let read_bash = |path: &Path| send(&state, json!({"v":1,"id":"bash","op":"agent.bashOutput","args":{"session":id,"path":path}}));
+        assert_eq!(read_bash(bash.path())["data"]["output"], "fixture bash output");
+        assert_eq!(read_bash(large.path())["error"]["code"], "too_large");
+        let big_download = send(&state, json!({"v":1,"id":"download","op":"agent.bashOutput","args":{"session":id,"path":large.path(),"download":true}}));
+        let big_handle = big_download["data"]["handle"].as_str().expect("large output grant");
+        assert_eq!(state.resources.clone_open_file(big_handle).unwrap().metadata().unwrap().len(), 5 * 1024 * 1024 + 1);
+        assert!(state.resources.revoke(big_handle));
+        for path in [link.path(), unreferenced.path()] {
+            let denied = send(&state, json!({"v":1,"id":"bad-download","op":"agent.bashOutput","args":{"session":id,"path":path,"download":true}}));
+            assert_eq!(denied["ok"], false, "{denied}");
+        }
+        assert_eq!(read_bash(link.path())["error"]["code"], "not_found");
+        assert_eq!(read_bash(unreferenced.path())["error"]["code"], "unauthorized_scope");
+        assert_eq!(read_bash(&root_path.join("not-allowed.log"))["error"]["code"], "invalid_args");
+        let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.entryThinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
         assert_eq!(missing["ok"], false, "{missing}");
+        let history = send(&state, json!({"v":1,"id":"history","op":"sessions.get","args":{"session":id,"deferMedia":true}}));
+        let messages = history["data"]["context"]["messages"].as_array().unwrap();
+        let tool_result = messages.iter().find(|message| message["role"] == "toolResult").unwrap();
+        assert_eq!(tool_result["content"][0]["source"], json!({"type":"session","sessionId":id,"entryId":"media","blockIndex":0,"media_type":"image/png"}));
+        let grant = send(&state, json!({"v":1,"id":"image","op":"sessions.entryToolResultImage","args":{"session":id,"entryId":"media","blockIndex":0}}));
+        let handle = grant["data"]["handle"].as_str().expect("resource handle");
+        match state.resources.read(handle, "", None) {
+            resource_protocol::ResourceResponse::Ok { bytes, mime, .. } => { assert_eq!(mime, "image/png"); assert_eq!(bytes, [137,80,78,71,13,10,26,10]); }
+            _ => panic!("image handle did not resolve"),
+        }
+        assert!(state.resources.revoke(handle));
+        for (entry, index) in [("media", 1), ("media", 99), ("think", 0)] {
+            let denied = send(&state, json!({"v":1,"id":"bad-image","op":"sessions.entryToolResultImage","args":{"session":id,"entryId":entry,"blockIndex":index}}));
+            assert_eq!(denied["ok"], false, "{denied}");
+        }
+        let output = root_path.join("image.bin");
+        let image = management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":0,"outputFile":output})).unwrap();
+        assert_eq!(image["mime"], "image/png");
+        assert_eq!(std::fs::read(&output).unwrap(), [137,80,78,71,13,10,26,10]);
+        assert!(management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":1,"outputFile":root_path.join("bad.bin")})).is_err());
+        assert!(management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"think","blockIndex":0,"outputFile":root_path.join("wrong-role.bin")})).is_err());
+        assert!(!root_path.join("bad.bin").exists());
         session.bridge_request("tree.navigate", Some(json!({"targetId":"a"})), Some(Duration::from_secs(30))).unwrap();
         let after = read();
         assert_eq!(after["data"]["state"]["systemPrompt"], "BRANCH A", "{after}");
+        let prompt_file = root_path.join("base-prompt");
+        std::fs::write(&prompt_file, "\u{feff}FIXTURE BASE").unwrap();
+        let (other_file, other_id) = session_host::create_session_file(&root_path.join("sessions"), &cwd).unwrap();
+        let mut other_config = config.clone();
+        other_config.shape = session_host::SessionSpawnShape::ChatOnly { prompt_file };
+        state.registry.start(&other_id, &other_file, &other_id, &cwd, &other_config).unwrap();
+        let foreign = send(&state, json!({"v":1,"id":"foreign","op":"sessions.entryToolResultImage","args":{"session":other_id,"entryId":"media","blockIndex":0}}));
+        assert_eq!(foreign["ok"], false, "foreign entry must not grant bytes: {foreign}");
+        let fallback = send(&state, json!({"v":1,"id":"base","op":"sessions.state","args":{"session":other_id}}));
+        assert_eq!(fallback["data"]["state"]["systemPromptStatus"], "configured", "{fallback}");
+        assert_eq!(fallback["data"]["state"]["systemPrompt"], "FIXTURE BASE");
+        state.registry.remove(&other_id, Duration::from_secs(5));
         state.registry.remove(&id, Duration::from_secs(5));
     }
 
@@ -5390,6 +5733,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(call("tasks.list", json!({}))["data"]["tasks"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn preview_resources_grant_read_revoke_roundtrip() {
         let state = state();
@@ -5397,8 +5741,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let png = dir.path().join("shot.png");
         std::fs::write(&png, vec![1u8; 300]).expect("write");
 
-        // Grant by host-side path decision; the handle is opaque.
-        state.propose_path(&png);
+        // The host authorizes the directory; the handle is opaque.
+        state.file_roots.lock().unwrap().add(dir.path());
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5846,8 +6190,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(read["error"]["code"], "unauthorized_scope");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resource_grants_only_accept_host_proposed_paths() {
+    fn resource_grants_require_host_authorized_roots() {
         let state = state();
         let dir = tempfile::tempdir().expect("tempdir");
         let png = dir.path().join("shot.png");
@@ -5860,9 +6205,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
         assert_eq!(denied["error"]["code"], "unauthorized_scope", "{denied}");
 
-        // Once the HOST proposed the path (the session index shape), the
-        // grant is a pure confirmation.
-        state.propose_path(&png);
+        // A host-authorized root permits its files, but never a symlink escape.
+        state.file_roots.lock().unwrap().add(dir.path());
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5874,6 +6218,29 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             json!({ "v": 1, "id": "g2", "op": "resources.read", "args": { "handle": handle } }),
         );
         assert_eq!(read["data"]["totalLen"], 8);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let escaped = send(&state, json!({ "v": 1, "id": "g3", "op": "resources.grantFile", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
+        assert_eq!(escaped["error"]["code"], "unauthorized_scope");
+        let preview_escape = send(&state, json!({ "v": 1, "id": "g-preview", "op": "resources.grantPreview", "args": { "path": dir.path().join("escape/secret").display().to_string() } }));
+        assert_eq!(preview_escape["error"]["code"], "unauthorized_scope");
+        let preview = send(&state, json!({ "v": 1, "id": "g-preview-ok", "op": "resources.grantPreview", "args": { "path": png.display().to_string() } }));
+        assert_eq!(preview["data"]["name"], "shot.png", "{preview}");
+        std::fs::remove_file(&png).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), &png).unwrap();
+        let pinned = send(&state, json!({ "v": 1, "id": "g4", "op": "resources.read", "args": { "handle": handle } }));
+        assert_eq!(pinned["data"]["totalLen"], 8, "grant retains original inode");
+    }
+
+    #[test]
+    fn reveal_directory_rejects_an_unapproved_root() {
+        let state = state();
+        let outside = tempfile::tempdir().unwrap();
+        let support = send(&state, json!({ "v": 1, "id": "support", "op": "files.revealSupport", "args": {} }));
+        assert_eq!(support["data"]["supported"], cfg!(unix));
+        let denied = send(&state, json!({ "v": 1, "id": "reveal", "op": "files.reveal", "args": { "cwd": outside.path() } }));
+        assert_eq!(denied["ok"], false);
     }
 
     #[test]
@@ -6077,7 +6444,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn pi_ipc_command_stays_the_async_gated_entry() {
         let source = include_str!("pi_ipc.rs");
         assert!(
-            source.contains("pub async fn pi_ipc(app: tauri::AppHandle, request: Value) -> Value"),
+            source.contains("pub async fn pi_ipc(app: tauri::AppHandle, window: tauri::WebviewWindow, request: Value) -> Value"),
             "pi_ipc must stay an async command (a sync command runs envelopes on the WebView's UI thread)"
         );
         assert!(
@@ -6354,8 +6721,10 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(project.join(".pi/mcp.json"), json!({"mcpServers": {"local": {"command": "node", "args": [fixture]}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         state.propose_path(&project);
+        let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
+        *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
-            executable, agent_dir: Some(agent),
+            executable, agent_dir: Some(agent.clone()),
             extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
         });
@@ -6363,8 +6732,52 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
         let listed = call("trust.status", json!({"cwd":cwd}));
         assert_eq!(listed["data"]["mcpServers"][0]["name"], "local", "{listed}");
+        let created = call("agent.create", json!({"cwd":cwd,"type":"ensure_session"}));
+        assert_eq!(created["ok"], true, "{created}");
+        let sid = created["data"]["sessionId"].as_str().unwrap().to_string();
+        let session = state.registry.get(&sid).unwrap();
+        let child_folder = project.join("child");
+        std::fs::create_dir_all(&child_folder).unwrap();
+        let child = call("agent.create", json!({"cwd":child_folder,"type":"ensure_session"}));
+        assert_eq!(child["ok"], true, "{child}");
+        let child_id = child["data"]["sessionId"].as_str().unwrap().to_string();
+        let child_session = state.registry.get(&child_id).unwrap();
+        let child_queued = child_session.composer_outbox.enqueue("descendant pending", None).unwrap();
+        let unrelated = dir.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        state.propose_path(&unrelated);
+        let other = call("agent.create", json!({"cwd":unrelated,"type":"ensure_session"}));
+        assert_eq!(other["ok"], true, "{other}");
+        let other_id = other["data"]["sessionId"].as_str().unwrap().to_string();
+        let other_session = state.registry.get(&other_id).unwrap();
+        let other_queued = other_session.composer_outbox.enqueue("unrelated pending", None).unwrap();
+        let queued = session.composer_outbox.enqueue("not delivered", None).unwrap();
+        let blocked = call("trust.set", json!({"cwd":cwd}));
+        assert_eq!(blocked["error"]["reason"], "session-busy", "{blocked}");
+        assert!(state.registry.get(&sid).is_some(), "preflight leaves all affected sessions open");
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
+        session.composer_outbox.take(&queued.id);
+        child_session.composer_outbox.take(&child_queued.id);
+        let dormant = call("agent.create", json!({"cwd":cwd,"type":"ensure_session"}));
+        assert_eq!(dormant["ok"], true, "{dormant}");
+        let dormant_id = dormant["data"]["sessionId"].as_str().unwrap().to_string();
+        let dormant_outbox = state.registry.composer_outbox_for(&dormant_id);
+        let dormant_queued = dormant_outbox.enqueue("pending after close", None).unwrap();
+        state.registry.remove(&dormant_id, Duration::from_secs(5));
+        let blocked = call("trust.set", json!({"cwd":cwd}));
+        assert_eq!(blocked["error"]["reason"], "session-busy", "{blocked}");
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
+        dormant_outbox.take(&dormant_queued.id);
         let trusted = call("trust.set", json!({"cwd":cwd}));
         assert_eq!(trusted["data"]["trusted"], true, "{trusted}");
+        assert!(state.registry.get(&sid).is_none(), "old session must actually exit");
+        assert!(state.registry.get(&child_id).is_none(), "inheriting descendant must exit");
+        assert!(state.registry.get(&other_id).is_some(), "an unrelated queued session must stay open");
+        other_session.composer_outbox.take(&other_queued.id);
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
+        let resumed = call("agent.command", json!({"session":sid,"type":"get_state"}));
+        assert_eq!(resumed["ok"], true, "{resumed}");
+        assert!(state.registry.get(&sid).is_some());
         let action = json!({"cwd":cwd,"action":"add","scope":"global","text":"node fixture.js","name":"fixture"});
         let added = call("mcp.configAction", action.clone());
         assert_eq!(added["data"]["added"]["name"], "fixture", "{added}");
@@ -6378,7 +6791,19 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let probe = call("mcp.test", json!({"cwd":cwd,"scope":"project","name":"local"}));
         assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
         assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        state.propose_path(&fresh);
+        let invalid = call("mcp.configAction", json!({"cwd":fresh,"action":"add","scope":"project","text":"","trustFolder":true}));
+        assert_eq!(invalid["error"]["reason"], "import-failed", "{invalid}");
+        assert!(!crate::trust_policy_fence::is_pending(&agent), "pre-write refusal releases the fence");
+        let added = call("mcp.configAction", json!({"cwd":fresh,"action":"add","scope":"project","text":"node fixture.js","name":"fresh","trustFolder":true}));
+        assert_eq!(added["data"]["added"]["name"], "fresh", "{added}");
+        assert_eq!(added["data"]["trustedFolder"], true, "{added}");
+        assert!(!crate::trust_policy_fence::is_pending(&agent));
         assert_eq!(state.management.scopes(), vec!["global".to_string()]);
+        state.registry.remove(&sid, Duration::from_secs(5));
+        state.registry.remove(&other_id, Duration::from_secs(5));
         state.management.shutdown_all(std::time::Duration::from_secs(5));
     }
 
