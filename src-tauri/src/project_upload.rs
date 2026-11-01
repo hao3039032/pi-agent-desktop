@@ -44,14 +44,25 @@ pub fn check(state: &IpcHostState, id: &str, args: &Value) -> Value {
 
 #[cfg(unix)]
 fn atomic_replace(directory: &std::fs::File, name: &str, input: &mut impl std::io::Read) -> std::io::Result<()> {
+    atomic_replace_os(directory, std::ffi::OsStr::new(name), input, None)
+}
+
+/// Stream to a sibling staging file and atomically replace without truncating
+/// a destination inode that may have other hard links.
+#[cfg(unix)]
+pub(crate) fn atomic_replace_os(directory: &std::fs::File, name: &std::ffi::OsStr, input: &mut impl std::io::Read, source_identity: Option<(u64, u64)>) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    let target = std::ffi::CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+    let target = std::ffi::CString::new(name.as_bytes()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
     let check_target = || -> std::io::Result<()> {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstatat(directory.as_raw_fd(), target.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
                 return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Destination is not a regular file"));
+            }
+            if source_identity == Some((stat.st_dev as u64, stat.st_ino as u64)) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Source and destination are the same file"));
             }
         } else {
             let error = std::io::Error::last_os_error();

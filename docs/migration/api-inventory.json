@@ -29,7 +29,7 @@
           "method": "GET",
           "op": "agent.bashOutput",
           "owner": "session-bridge",
-          "notes": "bashId-correlated tool output of the session child"
+          "notes": "session-referenced temp output; inline capped at 5 MiB, download pins a file resource for streaming native save"
         }
       ]
     },

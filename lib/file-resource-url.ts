@@ -14,6 +14,10 @@ export async function openFileResourceUrl(path: string, sessionId?: string | nul
   return { url: initialFileResourceUrl(path, sessionId, revision), release: () => {} };
 }
 
+export async function openSessionImageResourceUrl(sessionId: string, entryId: string, blockIndex: number): Promise<{ url: string; release: () => void }> {
+  return { url: `/api/sessions/${encodeURIComponent(sessionId)}/entries/${encodeURIComponent(entryId)}/tool-result-image?blockIndex=${blockIndex}`, release: () => {} };
+}
+
 export async function openFilePreviewUrl(path: string, sessionId?: string | null, revision?: number): Promise<{ url: string; release: () => void }> {
   return { url: initialFileResourceUrl(path, sessionId, revision, true), release: () => {} };
 }

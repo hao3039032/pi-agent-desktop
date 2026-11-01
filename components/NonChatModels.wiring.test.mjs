@@ -17,5 +17,7 @@ test("Settings › Models lists classifier and image models in their own entry",
 
 test("tool-result images can be saved, since pi never writes generated images to disk", () => {
   assert.match(messageView, /<ToolResultImages images=\{resultImages\}/);
-  assert.match(resultImages, /downloadUrlAsFile\(src, resultImageFileName\(imageMediaType\(image\), index\)\)/);
+  assert.match(resultImages, /resultImageFileName\(imageMediaType\(image\), index\)/);
+  assert.match(resultImages, /resource\?\.save\) await resource\.save\(name\)/);
+  assert.match(resultImages, /downloadUrlAsFile\(src, name\)/);
 });

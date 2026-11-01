@@ -236,6 +236,12 @@ export async function readFileResource(
   }
 }
 
+/** Resolve an image only from the named session entry; the host grants no file root. */
+export async function grantSessionToolResultImage(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
+  const data = await ensureClient().request<{ handle: string }>("sessions.entryToolResultImage", { session: sessionId, entryId, blockIndex }, { timeoutMs: 30_000 });
+  return data.handle;
+}
+
 /** Revoke preview resource handle over resources.revoke IPC. */
 export async function revokeFileResource(handle: string): Promise<boolean> {
   try {

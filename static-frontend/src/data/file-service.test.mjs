@@ -27,6 +27,7 @@ const {
   fetchRevealSupport,
   revealDirectory,
   grantFileResource,
+  grantSessionToolResultImage,
   readFileResource,
   revokeFileResource,
   bindFileService,
@@ -186,6 +187,15 @@ test("preview directory grant is scoped by the host", async () => {
   const mock = boundService(null);
   mock.on("resources.grantPreview", (args) => { assert.deepEqual(args, { path: "/proj/index.html" }); return { handle: "token", name: "index.html" }; });
   assert.deepEqual(await grantFilePreview("/proj/index.html"), { handle: "token", name: "index.html" });
+});
+
+test("session image grant sends only its session entry identity", async () => {
+  const mock = boundService(null);
+  mock.on("sessions.entryToolResultImage", (args) => {
+    assert.deepEqual(args, { session: "s1", entryId: "e1", blockIndex: 2 });
+    return { handle: "opaque" };
+  });
+  assert.equal(await grantSessionToolResultImage("s1", "e1", 2), "opaque");
 });
 
 test("resource protocol functions roundtrip through resources.* ops", async () => {
