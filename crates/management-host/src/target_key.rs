@@ -81,10 +81,18 @@ impl ManagementTargetKey {
     pub fn inspect(_agent_dir: &Path) -> Result<bool, String> { Err("safe management target key is unavailable on this platform".into()) }
 
     pub fn fingerprint(&self, canonical_key: &str) -> Result<String, String> {
-        if canonical_key.is_empty() || canonical_key.len() > 8192 { return Err("invalid MCP credential key".into()); }
+        self.fingerprint_with_domain(b"pi-web:mcp-credential-target:v1\0", canonical_key)
+    }
+
+    pub fn fingerprint_legacy(&self, legacy_key: &str) -> Result<String, String> {
+        self.fingerprint_with_domain(b"pi-web:mcp-credential-legacy:v1\0", legacy_key)
+    }
+
+    fn fingerprint_with_domain(&self, domain: &[u8], key: &str) -> Result<String, String> {
+        if key.is_empty() || key.len() > 8192 { return Err("invalid MCP credential key".into()); }
         let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.0).map_err(|_| "invalid management key")?;
-        mac.update(b"pi-web:mcp-credential-target:v1\0");
-        mac.update(canonical_key.as_bytes());
+        mac.update(domain);
+        mac.update(key.as_bytes());
         Ok(mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect())
     }
 }

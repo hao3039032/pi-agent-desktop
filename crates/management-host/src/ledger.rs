@@ -48,7 +48,7 @@ impl MutationDescriptor {
     }
     /// Only call with the nonce-bound target resolved from trusted MCP configuration.
     pub fn with_mcp_target(mut self, target: McpCredentialTarget) -> Result<Self, String> {
-        if !matches!(self.operation, "mcp.signInStart" | "mcp.configAction" | "mcp.test") { return Err("operation has no MCP credential target".into()); }
+        if !matches!(self.operation, "mcp.signInStart" | "mcp.signOutCooperative" | "mcp.configAction" | "mcp.test") { return Err("operation has no MCP credential target".into()); }
         self.mcp_target = Some(target);
         Ok(self)
     }
@@ -189,7 +189,7 @@ impl OperationLedger {
             if v["version"] != 1 || v["operationId"] != uuid.to_string() { return Err("invalid management ledger record".into()); }
             let operation = v["operation"].as_str().ok_or("invalid operation")?;
             let target = target_for(operation).ok_or("unknown ledger operation")?;
-            if v["target"] != target_name(target) || (mcp_target.is_some() && !matches!(operation, "mcp.signInStart" | "mcp.configAction" | "mcp.test"))
+            if v["target"] != target_name(target) || (mcp_target.is_some() && !matches!(operation, "mcp.signInStart" | "mcp.signOutCooperative" | "mcp.configAction" | "mcp.test"))
                 || (phase == LedgerPhase::Revoked && !matches!(operation, "mcp.signInStart" | "mcp.test")) { return Err("invalid ledger target".into()); }
             let scope = match v["scope"].as_str() { Some("global") => OperationScope::Global, Some(p) if p.starts_with('/') && p.len() <= 4096 => OperationScope::Project { path: p.to_string() }, _ => return Err("invalid ledger scope".into()) };
             let created_at_ms = v["createdAtMs"].as_u64().ok_or("invalid ledger timestamp")?;
@@ -200,6 +200,13 @@ impl OperationLedger {
 
     #[cfg(target_os = "linux")]
     pub(crate) fn begin(&self, descriptor: &MutationDescriptor) -> Result<String, String> {
+        self.begin_allowing(descriptor, &[])
+    }
+
+    /// `allowed` is derived under the owning host admission mutex from live,
+    /// guarded same-instance tasks; it is never an external authorization.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn begin_allowing(&self, descriptor: &MutationDescriptor, allowed: &[String]) -> Result<String, String> {
         use std::os::unix::fs::OpenOptionsExt;
         let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
         let operation = descriptor.operation;
@@ -207,10 +214,10 @@ impl OperationLedger {
         let records = self.read_records()?;
         // All current management configuration mutations share the global
         // physical coordination slot; conservatively fence any pending scope.
-        if records.iter().any(|(_, phase)| *phase == LedgerPhase::Pending) { return Err("management outcome unresolved; mutation not admitted".into()); }
+        if records.iter().any(|(record, phase)| *phase == LedgerPhase::Pending && !allowed.contains(&record.operation_id)) { return Err("management outcome unresolved; mutation not admitted".into()); }
         // Revocation evidence is retained; only ordinary successes are eligible
         // for pruning. Capacity exhaustion rejects rather than deleting evidence.
-        let retained = records.iter().filter(|(_, phase)| *phase == LedgerPhase::Revoked).count();
+        let retained = records.iter().filter(|(_, phase)| *phase != LedgerPhase::Succeeded).count();
         if retained >= MAX_PENDING { return Err("management ledger capacity reached".into()); }
         for (record, phase) in records {
             if phase == LedgerPhase::Succeeded {
@@ -234,6 +241,8 @@ impl OperationLedger {
     fn read_records(&self) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn begin(&self, _: &MutationDescriptor) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn begin_allowing(&self, _: &MutationDescriptor, _: &[String]) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn finish(&self, _: &str) -> Result<(), String> { Err("safe management ledger is unavailable on this platform".into()) }
     #[cfg(not(target_os = "linux"))]
@@ -284,7 +293,7 @@ fn operation_descriptor(op: &str) -> Option<(&'static str, OperationTarget)> {
         "models.setDefault" => "models.setDefault", "models.enabledSet" => "models.enabledSet", "models.refreshCatalog" => "models.refreshCatalog", "modelsConfig.put" => "modelsConfig.put", "terminal.settingsSet" => "terminal.settingsSet", "distro.configure" => "distro.configure", "distro.seed" => "distro.seed",
         "auth.apiKeyStore" => "auth.apiKeyStore", "auth.apiKeyDelete" => "auth.apiKeyDelete", "auth.logout" => "auth.logout", "auth.loginStart" => "auth.loginStart",
         "plugins.install" => "plugins.install", "plugins.remove" => "plugins.remove", "plugins.update" => "plugins.update", "plugins.setEnabled" => "plugins.setEnabled", "skills.install" => "skills.install", "skills.update" => "skills.update", "skills.setDisabled" => "skills.setDisabled",
-        "mcp.configAction" => "mcp.configAction", "mcp.signInStart" => "mcp.signInStart", "mcp.test" => "mcp.test", "trust.setFenced" => "trust.setFenced", "mcp.trustFolderAdd" => "mcp.trustFolderAdd",
+        "mcp.configAction" => "mcp.configAction", "mcp.signInStart" => "mcp.signInStart", "mcp.signOutCooperative" => "mcp.signOutCooperative", "mcp.test" => "mcp.test", "trust.setFenced" => "trust.setFenced", "mcp.trustFolderAdd" => "mcp.trustFolderAdd",
         _ => return None,
     };
     Some((name, target_for(name)?))
@@ -294,7 +303,7 @@ pub(crate) fn target_for(op: &str) -> Option<OperationTarget> {
         "models.setDefault" | "models.enabledSet" | "models.refreshCatalog" | "modelsConfig.put" | "terminal.settingsSet" | "distro.configure" | "distro.seed" => OperationTarget::Settings,
         "auth.apiKeyStore" | "auth.apiKeyDelete" | "auth.logout" | "auth.loginStart" => OperationTarget::Credentials,
         "plugins.install" | "plugins.remove" | "plugins.update" | "plugins.setEnabled" | "skills.install" | "skills.update" | "skills.setDisabled" => OperationTarget::Packages,
-        "mcp.configAction" | "mcp.signInStart" | "mcp.test" => OperationTarget::Mcp,
+        "mcp.configAction" | "mcp.signInStart" | "mcp.signOutCooperative" | "mcp.test" => OperationTarget::Mcp,
         "trust.setFenced" | "mcp.trustFolderAdd" => OperationTarget::Trust,
         _ => return None,
     })

@@ -37,6 +37,8 @@ fn target_fingerprint_matches_hmac_sha256_contract() {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let key = ManagementTargetKey::load_or_create(temp.path()).unwrap();
     assert_eq!(key.fingerprint("mcp__fixture|https://example.invalid").unwrap(), "38f3e0224a7ff8dd66089bb2439d9dff37f6fb0745196da8eca7ce2f8a019837");
+    assert_eq!(key.fingerprint_legacy("https://example.invalid").unwrap(), "5973622701b521f8d9bb67e7b2e8b3e9363855a69c0ad4d3147fe295c13845b0");
+    assert_ne!(key.fingerprint("https://example.invalid").unwrap(), key.fingerprint_legacy("https://example.invalid").unwrap());
 }
 
 #[test]
@@ -117,6 +119,11 @@ fn capacity_is_bounded_without_discarding_pending() {
 
 const CHILD: &str = r##"#!/usr/bin/python3
 import sys, json, base64, os
+old=None
+generation=0
+def emit(rid, nonce, result):
+    body={'rid':rid,'nonce':nonce,'ok':True,'result':result}
+    print(json.dumps({'type':'extension_ui_request','id':'notify','method':'notify','message':'PI_WEB_MGMT_V1 '+json.dumps(body)}),flush=True)
 for line in sys.stdin:
     r=json.loads(line)
     if r.get('type') != 'prompt': continue
@@ -124,6 +131,24 @@ for line in sys.stdin:
     rid=parts[1]
     data=json.loads(base64.urlsafe_b64decode(parts[2] + '='*((-len(parts[2]))%4)))
     root=os.environ['PI_CODING_AGENT_DIR']
+    mode=os.environ.get('MODE')
+    if mode in ('coop','coop_lost'):
+        op=data['op']; args=data['args']
+        print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
+        canonical='mcp__fixture|https://secret@example.invalid'; legacy='https://secret@example.invalid'; config='fixture-config'
+        if op == 'mcp.credentialTarget':
+            emit(rid,data['nonce'],{'schema':1,'admissionSchema':1,'canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation})
+        elif op == 'mcp.signInStart':
+            assert args['credentialAdmission'] == {'schema':1,'canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation}
+            old=(rid,data['nonce'])
+        elif op == 'mcp.signOutCooperative':
+            assert args['expectedCanonicalKey']==canonical and args['expectedLegacyKey']==legacy and args['expectedConfigKey']==config
+            generation += 1
+            if mode != 'coop_lost': emit(rid,data['nonce'],{'schema':1,'result':{'signedOut':{'removed':True}},'revocation':{'canonicalKey':canonical,'configKey':config,'generation':generation}})
+        elif op == 'auth.logout':
+            if old: emit(old[0],old[1],{'phase':'done'})
+            emit(rid,data['nonce'],{'success':True})
+        continue
     directory=os.path.join(root,'pi-web','management-operations')
     records=[open(os.path.join(directory, name)).read() for name in os.listdir(directory)]
     pending=[record for record in records if json.loads(record)['phase']=='pending']
@@ -217,6 +242,63 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
     let fresh = restarted.instance("global", &config).unwrap();
     assert!(fresh.reserve_mcp_cooperation(&target).is_err(), "restart cannot claim old task ownership");
     restarted.shutdown_all(Duration::from_secs(1));
+    host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn lost_cooperative_ack_never_revokes_or_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "coop_lost");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let context = serde_json::json!({"scope":"global","name":"fixture","agentDir":temp.path(),"allowedRoots":[]});
+    let first = instance.resolve_mcp_admission(context.clone()).unwrap();
+    instance.start_admitted_mcp("mcp.signInStart", first, Duration::from_secs(10)).unwrap();
+    let signout = instance.resolve_mcp_admission(context).unwrap();
+    let reservation = instance.reserve_mcp_cooperation(signout.target()).unwrap();
+    assert!(instance.cooperative_mcp_sign_out(signout, &reservation, Duration::from_millis(150)).is_err());
+    let pending = OperationLedger::inspect(temp.path()).unwrap();
+    assert_eq!(pending.len(), 2, "old writer and uncertain sign-out remain pending");
+    drop(reservation);
+    assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+    host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn fake_routed_cooperative_signout_revokes_only_guarded_writer() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "coop");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let context = serde_json::json!({"scope":"global","name":"fixture","agentDir":temp.path(),"allowedRoots":[]});
+    let first = instance.resolve_mcp_admission(context.clone()).unwrap();
+    let (old, joined) = instance.start_admitted_mcp("mcp.signInStart", first, Duration::from_secs(10)).unwrap();
+    assert!(!joined);
+    let again = instance.resolve_mcp_admission(context.clone()).unwrap();
+    let (same, joined) = instance.start_admitted_mcp("mcp.signInStart", again, Duration::from_secs(10)).unwrap();
+    assert!(joined);
+    assert_eq!(old, same);
+    let signout = instance.resolve_mcp_admission(context).unwrap();
+    let reservation = instance.reserve_mcp_cooperation(signout.target()).unwrap();
+    let result = instance.cooperative_mcp_sign_out(signout, &reservation, Duration::from_secs(5)).unwrap();
+    assert_eq!(result["signedOut"]["removed"], true);
+    assert!(OperationLedger::inspect(temp.path()).unwrap().is_empty());
+    assert!(OperationLedger::inspect_unresolved(temp.path()).unwrap(), "remote outcome remains unknown");
+    drop(reservation);
+    instance.management_call("auth.logout", serde_json::json!({}), Duration::from_secs(5)).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = instance.task_snapshot(&old).unwrap();
+        if snapshot.status == TaskStatus::Unknown { break; }
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(OperationLedger::inspect_unresolved(temp.path()).unwrap(), "late terminal reply cannot erase revocation evidence");
+    let dir = temp.path().join("pi-web/management-operations");
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let data = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(!data.contains("secret@example"));
+    }
     host.shutdown_all(Duration::from_secs(1));
 }
 

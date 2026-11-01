@@ -104,7 +104,7 @@ fn operation_policy(op: &str, session_writer: bool) -> Result<OperationPolicy, S
 }
 
 fn mutation_scope(op: &str, args: &Value) -> Result<ledger::OperationScope, String> {
-    if op == "trust.setFenced" || (matches!(op, "plugins.install" | "plugins.remove" | "plugins.update" | "skills.install" | "skills.update" | "mcp.configAction" | "mcp.signInStart" | "mcp.test")
+    if op == "trust.setFenced" || (matches!(op, "plugins.install" | "plugins.remove" | "plugins.update" | "skills.install" | "skills.update" | "mcp.configAction" | "mcp.signInStart" | "mcp.signOutCooperative" | "mcp.test")
         && args.get("scope").and_then(Value::as_str) == Some("project")) {
         let cwd = args.get("cwd").and_then(Value::as_str).ok_or("project mutation lacks a physical scope")?;
         let canonical = std::fs::canonicalize(cwd).map_err(|e| format!("cannot identify project mutation scope: {e}"))?;
@@ -131,6 +131,7 @@ fn confirmed_success(op: &str, value: &Value) -> bool {
         // Probe uses bounded Promise.race/close waits: an answered probe does
         // not prove an in-flight credential refresh can no longer write.
         "mcp.test" => false,
+        "mcp.signOutCooperative" => value.get("schema").and_then(Value::as_u64) == Some(1) && value.get("result").is_some() && value.get("revocation").is_some(),
         // These asynchronous flows encode failure/cancellation in successful
         // envelopes, so only their explicitly successful terminal phase counts.
         "mcp.signInStart" => value.get("phase").and_then(Value::as_str) == Some("done"),
@@ -156,6 +157,23 @@ pub enum TaskStatus { Running, Unknown, Succeeded, Failed, Cancelled }
 
 /// Instance-local evidence only: never authority to clear a restarted
 /// operation or to assert that unrelated children have stopped.
+/// Host-only preflight. Canonical/config values may be sensitive: this type
+/// intentionally has no Debug/Serialize implementation or public fields.
+pub struct McpCredentialAdmission {
+    instance_id: uuid::Uuid,
+    payload: Value,
+    canonical_key: String,
+    legacy_key: String,
+    config_key: String,
+    generation: u64,
+    target: ledger::McpCredentialTarget,
+    config_fingerprint: String,
+}
+
+impl McpCredentialAdmission {
+    pub fn target(&self) -> &ledger::McpCredentialTarget { &self.target }
+}
+
 pub struct VerifiedMcpRevocation {
     instance_id: uuid::Uuid,
     target_fingerprint: String,
@@ -219,6 +237,7 @@ pub struct McpCooperativeReservation {
     agent_dir: PathBuf,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     blockers: Vec<String>,
+    known_pending: Vec<String>,
     #[cfg(test)]
     fail_after: Option<usize>,
 }
@@ -243,7 +262,8 @@ impl McpCooperativeReservation {
             let state = self.state.try_lock().map_err(|_| "management instance busy")?;
             if state.closing || self.client.has_exited() || self.agent_dir_check.as_ref().is_some_and(|check| check(&self.agent_dir).is_err()) { return Err("management instance changed".into()); }
             let pending = ledger::OperationLedger::inspect(&self.agent_dir)?;
-            if pending.len() != self.blockers.len() || pending.iter().any(|record| !self.blockers.contains(&record.operation_id) || record.mcp_target.as_ref() != Some(&self.target)) {
+            if self.blockers.iter().any(|id| !pending.iter().any(|record| &record.operation_id == id && record.mcp_target.as_ref() == Some(&self.target)))
+                || pending.iter().any(|record| !self.known_pending.contains(&record.operation_id)) {
                 return Err("management pending evidence changed".into());
             }
             let mut tasks = Vec::new();
@@ -378,20 +398,92 @@ impl ManagementInstance {
         result
     }
 
+    /// Resolve a private credential identity from the fixed management child.
+    /// The returned admission stays bound to this instance and input payload.
+    pub fn resolve_mcp_admission(&self, payload: Value) -> Result<McpCredentialAdmission, String> {
+        let agent = self.agent_dir.to_str().ok_or("agent directory is not UTF-8")?;
+        if payload.get("agentDir").and_then(Value::as_str) != Some(agent) || !payload.get("allowedRoots").is_some_and(Value::is_array)
+            || payload.get("credentialAdmission").is_some() { return Err("invalid trusted MCP context".into()); }
+        let response = self.management_call_kind("mcp.credentialTarget", payload.clone(), Duration::from_secs(30), TaskKind::ReadOnly)?;
+        if response.get("schema").and_then(Value::as_u64) != Some(1) || response.get("admissionSchema").and_then(Value::as_u64) != Some(1) {
+            return Err("MCP credential admission capability unavailable".into());
+        }
+        let canonical = response.get("canonicalKey").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid MCP credential admission")?;
+        let legacy = response.get("legacyKey").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("MCP legacy credential identity unavailable")?;
+        let config = response.get("configKey").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid MCP credential admission")?;
+        let generation = response.get("generation").and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991).ok_or("invalid MCP credential admission")?;
+        let key = target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?;
+        let target = ledger::McpCredentialTarget::new(key.fingerprint(canonical)?, key.fingerprint_legacy(legacy)?)?;
+        let config_fingerprint = key.fingerprint(&format!("config:{config}"))?;
+        Ok(McpCredentialAdmission { instance_id: self.instance_id, payload, canonical_key: canonical.into(), legacy_key: legacy.into(), config_key: config.into(), generation, target, config_fingerprint })
+    }
+
+    /// Dispatch the same authorized context with the private guard contract.
+    pub fn start_admitted_mcp(&self, op: &str, mut admission: McpCredentialAdmission, deadline: Duration) -> Result<(String, bool), String> {
+        if admission.instance_id != self.instance_id || !matches!(op, "mcp.signInStart" | "mcp.test") { return Err("MCP admission instance mismatch".into()); }
+        admission.payload["credentialAdmission"] = json!({"schema":1,"canonicalKey":admission.canonical_key,"legacyKey":admission.legacy_key,"configKey":admission.config_key,"generation":admission.generation});
+        let guard = McpGuardAdmission { target: admission.target, generation: admission.generation, config_fingerprint: admission.config_fingerprint };
+        self.start_task_inner(op, admission.payload, deadline, TaskKind::Mutation, false, None, None, Some(guard), None)
+    }
+
+    /// Cooperative sign-out under an already acquired local reservation.
+    /// The preflight is repeated with the reservation held before dispatch;
+    /// only a routed ACK can transition the old local writers to revoked.
+    pub fn cooperative_mcp_sign_out(&self, first: McpCredentialAdmission, reservation: &McpCooperativeReservation, deadline: Duration) -> Result<Value, String> {
+        if first.instance_id != self.instance_id || first.target != reservation.target || reservation.instance_id != self.instance_id {
+            return Err("MCP cooperative identity mismatch".into());
+        }
+        let second = self.resolve_mcp_admission(first.payload.clone())?;
+        if second.instance_id != first.instance_id || second.target != first.target || second.config_fingerprint != first.config_fingerprint
+            || second.generation != first.generation || second.canonical_key != first.canonical_key || second.legacy_key != first.legacy_key {
+            return Err("MCP credential configuration changed".into());
+        }
+        let mut payload = first.payload;
+        payload["expectedCanonicalKey"] = json!(first.canonical_key);
+        payload["expectedLegacyKey"] = json!(first.legacy_key);
+        payload["expectedConfigKey"] = json!(first.config_key);
+        let (handle, _) = self.start_task_inner("mcp.signOutCooperative", payload, deadline, TaskKind::Mutation, false, None, None, None, Some(reservation))?;
+        let until = Instant::now() + deadline;
+        let result = loop {
+            let snapshot = self.task_snapshot(&handle)?;
+            match snapshot.status {
+                TaskStatus::Succeeded => break snapshot.result.ok_or("MCP cooperative result missing")?,
+                TaskStatus::Unknown | TaskStatus::Failed | TaskStatus::Cancelled => return Err("MCP cooperative outcome unknown".into()),
+                TaskStatus::Running => {},
+            }
+            if Instant::now() >= until { return Err("MCP cooperative outcome unknown".into()); }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let config = result.get("revocation").and_then(|r| r.get("configKey")).and_then(Value::as_str).ok_or("MCP cooperative acknowledgement missing")?;
+        let proof = self.verified_mcp_revocation(&handle, reservation.target.primary_digest(), config)?;
+        if !reservation.matches_revocation(&proof) { return Err("MCP cooperative acknowledgement mismatch".into()); }
+        let operation_id = {
+            let state = self.state.lock().map_err(|_| "management state unavailable")?;
+            let task = state.tasks.get(&handle).ok_or("MCP cooperative task missing")?.lock().map_err(|_| "management task unavailable")?;
+            task.ledger_operation_id.clone().ok_or("MCP cooperative evidence missing")?
+        };
+        ledger::OperationLedger::open(&self.agent_dir)?.finish(&operation_id)?;
+        reservation.persist_revocation(&proof)?;
+        let public_result = result.get("result").cloned().ok_or("MCP cooperative result missing")?;
+        // Do not retain the private key-bearing reply in a task snapshot.
+        if let Some(task) = self.state.lock().unwrap().tasks.get(&handle) { task.lock().unwrap().snapshot.result = None; }
+        Ok(public_result)
+    }
+
     /// Start a task. `kind` and `deadline` are trusted host policy, never frontend input.
     /// Operations must redact secrets before reporting a result or progress.
     pub fn start_task(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind) -> Result<String, String> {
-        self.start_task_inner(op, args, deadline, kind, false, None, None)
+        self.start_task_inner(op, args, deadline, kind, false, None, None, None, None).map(|(handle, _)| handle)
     }
 
     /// Reserve the same scope task capacity and unknown isolation used by ordinary tasks.
     pub fn start_serial_task(&self, op: &str, args: Value, deadline: Duration) -> Result<String, String> {
-        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, None)
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, None, None, None).map(|(handle, _)| handle)
     }
 
     /// Reserve this scope while executing in an existing cwd-scoped child.
     pub fn start_serial_task_on(&self, runner: Arc<ManagementInstance>, op: &str, args: Value, deadline: Duration) -> Result<String, String> {
-        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, Some(runner))
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, Some(runner), None, None).map(|(handle, _)| handle)
     }
 
     /// A killable child owned by one task; never reuse it for reads or other mutations.
@@ -402,16 +494,17 @@ impl ManagementInstance {
         #[cfg(windows)]
         { let _ = (op, args, deadline, config); return Err("exclusive management mutations are unsupported on Windows".into()); }
         #[cfg(unix)]
-        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, Some(config), None)
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, Some(config), None, None, None).map(|(handle, _)| handle)
     }
 
-    fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>) -> Result<String, String> {
+    fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>, admitted_mcp: Option<McpGuardAdmission>, cooperation: Option<&McpCooperativeReservation>) -> Result<(String, bool), String> {
         if deadline.is_zero() || deadline > Duration::from_secs(600) { return Err("invalid management task deadline".into()); }
         if let Some(check) = &self.agent_dir_check { check(&self.agent_dir)?; }
         if shared_runner.as_ref().is_some_and(|runner| runner.agent_dir != self.agent_dir || !Arc::ptr_eq(&runner.admission, &self.admission))
             || exclusive_config.as_ref().is_some_and(|config| config.agent_dir.as_ref() != Some(&self.agent_dir)) {
             return Err("management runner does not share the pinned host identity".into());
         }
+        if (op == "mcp.signOutCooperative") != cooperation.is_some() { return Err("MCP cooperative reservation is required".into()); }
         let policy = operation_policy(op, self.session_file_writer)?;
         if kind == TaskKind::ReadOnly && policy != OperationPolicy::ReadOnly {
             return Err("operation is not approved as read-only".into());
@@ -421,7 +514,11 @@ impl ManagementInstance {
         // RPC or task callbacks. Reservations block before any side effect.
         let _admission = if kind == TaskKind::Mutation {
             let admission = self.admission.try_lock().map_err(|_| "management admission busy")?;
-            if admission.reservation.is_some() { return Err("management cooperative reservation is active".into()); }
+            if let Some(reservation) = cooperation {
+                if !Arc::ptr_eq(&reservation.admission, &self.admission) || reservation.instance_id != self.instance_id || admission.reservation != Some(reservation.reservation_id) {
+                    return Err("MCP cooperative reservation is not active".into());
+                }
+            } else if admission.reservation.is_some() { return Err("management cooperative reservation is active".into()); }
             Some(admission)
         } else { None };
         let handle = format!("task-{}", uuid::Uuid::new_v4());
@@ -439,7 +536,7 @@ impl ManagementInstance {
             if serial_scope && state.tasks.values().any(|task| { let task = task.lock().unwrap(); task.serial_scope && task.finished_at.is_none() }) {
                 return Err("management configuration scope is busy".into());
             }
-            if kind == TaskKind::Mutation && state.tasks.values().any(|task| { let task = task.lock().unwrap(); !task.revoked && task.snapshot.status == TaskStatus::Unknown }) {
+            if kind == TaskKind::Mutation && admitted_mcp.is_none() && cooperation.is_none() && state.tasks.values().any(|task| { let task = task.lock().unwrap(); !task.revoked && task.snapshot.status == TaskStatus::Unknown }) {
                 return Err("management scope has an unknown outcome".into());
             }
             let evidence = if policy == OperationPolicy::PersistentMutation {
@@ -447,12 +544,41 @@ impl ManagementInstance {
                 // missing key beside existing evidence can never be regenerated.
                 let _key = target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?;
                 let ledger = ledger::OperationLedger::open(&self.agent_dir)?;
-                let descriptor = ledger::MutationDescriptor::new(op, mutation_scope(op, &args)?)?;
-                let id = ledger.begin(&descriptor)?;
+                let mut descriptor = ledger::MutationDescriptor::new(op, mutation_scope(op, &args)?)?;
+                let mut allowed = Vec::new();
+                if let Some(reservation) = cooperation {
+                    descriptor = descriptor.with_mcp_target(reservation.target.clone())?;
+                    allowed = reservation.known_pending.clone();
+                }
+                if let Some(guard) = &admitted_mcp {
+                    descriptor = descriptor.with_mcp_target(guard.target.clone())?;
+                    for pending in ledger.list_pending()? {
+                        let previous_target = pending.mcp_target.as_ref().ok_or("unidentified management outcome is unresolved")?;
+                        let (existing_handle, existing) = state.tasks.iter().find_map(|(handle, task)| {
+                            let task = task.try_lock().ok()?;
+                            if task.ledger_operation_id.as_deref() != Some(pending.operation_id.as_str()) || task.revoked || task.finished_at.is_some() { return None; }
+                            let existing = task.mcp_guard.as_ref()?;
+                            if task.mcp_target.as_ref() != Some(previous_target) || existing.target != *previous_target { return None; }
+                            Some((handle.clone(), (task.operation.clone(), task.snapshot.status, task.snapshot.cancel_requested, existing.config_fingerprint.clone(), existing.generation)))
+                        }).ok_or("management writer is not owned by this instance")?;
+                        if guard.target.conflicts(previous_target) {
+                            if op == "mcp.signInStart" && pending.operation == op && guard.target == *previous_target
+                                && existing.0 == op && existing.1 == TaskStatus::Running && !existing.2
+                                && existing.3 == guard.config_fingerprint && existing.4 == guard.generation {
+                                return Ok((existing_handle, true));
+                            }
+                            return Err("MCP credential target is busy".into());
+                        }
+                        if !matches!(pending.operation.as_str(), "mcp.signInStart" | "mcp.test") { return Err("unrelated management outcome is unresolved".into()); }
+                        allowed.push(pending.operation_id);
+                    }
+                }
+                let id = ledger.begin_allowing(&descriptor, &allowed)?;
                 {
                     let mut record = task.lock().unwrap();
                     record.ledger_operation_id = Some(id.clone());
                     record.mcp_target = descriptor.mcp_target().cloned();
+                    record.mcp_guard = admitted_mcp;
                 }
                 Some((ledger, id))
             } else { None };
@@ -463,6 +589,7 @@ impl ManagementInstance {
         drop(_admission);
         let instance = self.clone();
         let id = handle.clone();
+        let is_cooperative = cooperation.is_some();
         let operation = op.to_string();
         let worker_task = Arc::clone(&task);
         if let Err(error) = std::thread::Builder::new().name("mgmt-task".into()).spawn(move || {
@@ -518,10 +645,12 @@ impl ManagementInstance {
                             record.snapshot.error = Some("management outcome requires reconciliation".into());
                             drop(record); drop(activity); return;
                         }
-                        if let Err(error) = ledger.finish(&id) {
-                            record.snapshot.status = TaskStatus::Unknown;
-                            record.snapshot.error = Some(format!("management completion could not be persisted: {error}"));
-                            drop(record); drop(activity); return;
+                        if !is_cooperative {
+                            if let Err(error) = ledger.finish(&id) {
+                                record.snapshot.status = TaskStatus::Unknown;
+                                record.snapshot.error = Some(format!("management completion could not be persisted: {error}"));
+                                drop(record); drop(activity); return;
+                            }
                         }
                     }
                     record.snapshot.status = TaskStatus::Succeeded; record.snapshot.result = Some(value); record.finished_at = Some(Instant::now());
@@ -571,7 +700,7 @@ impl ManagementInstance {
             drop(record);
             let _ = self.cancel_task(&handle);
         }
-        Ok(handle)
+        Ok((handle, false))
     }
 
     pub fn exclusive_task_snapshot(&self, handle: &str, domain: &str) -> Result<TaskSnapshot, String> {
@@ -599,19 +728,24 @@ impl ManagementInstance {
         let pending = ledger::OperationLedger::inspect(&self.agent_dir)?;
         if pending.is_empty() { return Err("no MCP operation requires cooperation".into()); }
         let mut guard_context: Option<(String, u64)> = None;
+        let mut blockers = Vec::new();
         for record in &pending {
-            if !matches!(record.operation.as_str(), "mcp.signInStart" | "mcp.test") || record.mcp_target.as_ref() != Some(target) {
+            if !matches!(record.operation.as_str(), "mcp.signInStart" | "mcp.test") || record.mcp_target.is_none() {
                 return Err("unrelated or unidentified management outcome is unresolved".into());
             }
+            let record_target = record.mcp_target.as_ref().expect("checked");
             let guard = state.tasks.values().find_map(|task| {
                 let task = task.try_lock().ok()?;
                 if task.ledger_operation_id.as_deref() != Some(record.operation_id.as_str())
-                    || task.operation != record.operation || task.mcp_target.as_ref() != Some(target)
+                    || task.operation != record.operation || task.mcp_target.as_ref() != Some(record_target)
                     || task.finished_at.is_some() || !matches!(task.snapshot.status, TaskStatus::Running | TaskStatus::Unknown) { return None; }
                 let guard = task.mcp_guard.as_ref()?;
-                if guard.target != *target || guard.config_fingerprint.is_empty() || guard.generation > 9_007_199_254_740_991 { return None; }
+                if guard.target != *record_target || guard.config_fingerprint.is_empty() || guard.generation > 9_007_199_254_740_991 { return None; }
                 Some((guard.config_fingerprint.clone(), guard.generation))
             }).ok_or("MCP writer is not owned by this management instance")?;
+            if !target.conflicts(record_target) { continue; }
+            if target != record_target { return Err("MCP legacy credential alias is unresolved".into()); }
+            blockers.push(record.operation_id.clone());
             match &mut guard_context {
                 Some((config, generation)) if *config == guard.0 => *generation = (*generation).max(guard.1),
                 Some(_) => return Err("MCP writer configuration changed".into()),
@@ -623,7 +757,7 @@ impl ManagementInstance {
         admission.reservation = Some(reservation_id);
         Ok(McpCooperativeReservation { admission: Arc::clone(&self.admission), reservation_id, instance_id: self.instance_id, target: target.clone(), config_fingerprint, previous_generation,
             state: Arc::clone(&self.state), client: Arc::clone(&self.client), agent_dir: self.agent_dir.clone(), agent_dir_check: self.agent_dir_check.clone(),
-            blockers: pending.into_iter().map(|record| record.operation_id).collect(),
+            blockers, known_pending: pending.into_iter().map(|record| record.operation_id).collect(),
             #[cfg(test)]
             fail_after: None })
     }
