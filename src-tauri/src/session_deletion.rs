@@ -130,7 +130,9 @@ impl ScheduledReferences for crate::scheduled_session_index::ScheduledSessionInd
 }
 
 #[derive(Debug)]
-struct DeletePreflight { path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata, affected: Vec<DeleteMemberProof> }
+struct DeletePreflight { path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata, affected: Vec<DeleteMemberProof>, trash: Option<ChatFolderProof> }
+#[derive(Debug)]
+struct ChatFolderProof { path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata }
 #[derive(Debug)]
 struct DeleteMemberProof { id: String, path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata }
 struct ScannedMember { id: String, path: PathBuf, header: Value, parent: Option<PathBuf>, subagent_parent: Option<String>, file: std::fs::File, metadata: std::fs::Metadata }
@@ -147,9 +149,67 @@ fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> boo
 fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
+#[cfg(unix)]
+fn same_directory(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.is_dir() && right.is_dir() && left.dev() == right.dev() && left.ino() == right.ino()
+}
+#[cfg(not(unix))]
+fn same_directory(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool { false }
+
+fn same_existing_folder(left: &Path, right: &Path) -> Result<bool, (String, String)> {
+    if same_path(left, right) { return Ok(true); }
+    let left = left.canonicalize().map_err(|e| error("busy", format!("Cannot verify a session folder reference: {e}")))?;
+    let right = right.canonicalize().map_err(|e| error("busy", format!("Cannot verify a session folder reference: {e}")))?;
+    Ok(same_path(&left, &right))
+}
+
+fn open_chat_folder(path: &Path) -> Result<ChatFolderProof, (String, String)> {
+    let mut options = std::fs::OpenOptions::new(); options.read(true);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC); }
+    let file = options.open(path).map_err(|e| error("io", e))?;
+    let metadata = file.metadata().map_err(|e| error("io", e))?;
+    if !metadata.is_dir() { return Err(error("access_denied", "Chat folder is not a directory")); }
+    Ok(ChatFolderProof { path: path.to_path_buf(), file, metadata })
+}
+
+fn refuse_pending_writer_targets(agent: &Path) -> Result<(), (String, String)> {
+    let parent = agent.join("pi-web");
+    let path = parent.join("session-writer-fences");
+    for directory in [&parent, &path] {
+        match std::fs::symlink_metadata(directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(error("io", e)),
+            Ok(metadata) if metadata.file_type().is_dir() => {},
+            Ok(_) => return Err(error("busy", "Session writer fence directory is unsafe")),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let mut entries = {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path).map_err(|e| error("io", e))?;
+        std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())).map_err(|e| error("io", e))?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut entries = std::fs::read_dir(&path).map_err(|e| error("io", e))?;
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(error("busy", "An unresolved session writer may reference the chat folder")),
+        Some(Err(e)) => Err(error("io", e)),
+    }
+}
 
 pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
-    let _policy = state.policy_gate.try_read().map_err(|_| error("busy", "Session policy change is in progress"))?;
+    delete_with_policy_hook(state, args, || {})
+}
+
+fn delete_with_policy_hook(state: &IpcHostState, args: &Value, after_unlock: impl FnOnce()) -> Result<Value, (String, String)> {
+    delete_with_policy_hooks(state, args, after_unlock, || {})
+}
+
+fn delete_with_policy_hooks(state: &IpcHostState, args: &Value, after_unlock: impl FnOnce(), after_exclusive: impl FnOnce()) -> Result<Value, (String, String)> {
+    let policy = state.policy_gate.try_read().map_err(|_| error("busy", "Session policy change is in progress"))?;
     let agent = state.agent_dir();
     if crate::trust_policy_fence::is_pending(&agent) {
         return Err(error("busy", "Trust policy outcome is unresolved"));
@@ -160,7 +220,8 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
         return Err(error("invalid_args", "trashChatFolder must be a boolean"));
     }
     let mut preflight_proof = None;
-    if state.registry.get(id).is_some() {
+    let live = state.registry.get(id).is_some();
+    if live || args.get("trashChatFolder").and_then(Value::as_bool) == Some(true) {
         // Check every disk-side refusal before closing an idle child. The
         // actual deletion repeats all checks after the child really exits.
         {
@@ -177,12 +238,29 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
                 DeleteOutcome::Deleted(_) => return Err(error("io", "Unexpected deletion preflight result")),
             }
         }
-        state.registry.with_offline_session_writer(id, std::time::Duration::from_secs(5), || Ok::<_, (String, String)>(()))
-            .map_err(|failure| match failure {
-                session_host::SessionWriterError::Busy(message) => error("busy", message),
-                session_host::SessionWriterError::Operation(error) => error,
-            })?;
+        if live {
+            state.registry.with_offline_session_writer(id, std::time::Duration::from_secs(5), || Ok::<_, (String, String)>(()))
+                .map_err(|failure| match failure {
+                    session_host::SessionWriterError::Busy(message) => error("busy", message),
+                    session_host::SessionWriterError::Operation(error) => error,
+                })?;
+        }
     }
+    if preflight_proof.as_ref().is_some_and(|proof| proof.trash.is_some()) {
+        // Never upgrade a held read lock. The final complete disk/live scan is
+        // repeated under exclusive policy admission and the scheduler gate.
+        drop(policy);
+        after_unlock();
+        let _policy = state.policy_gate.try_write().map_err(|_| error("busy", "Session policy change is in progress"))?;
+        after_exclusive();
+        if crate::trust_policy_fence::is_pending(&agent) { return Err(error("busy", "Trust policy outcome is unresolved")); }
+        refuse_pending_writer_targets(&agent)?;
+        return delete_after_policy(state, args, &agent, preflight_proof.as_ref());
+    }
+    delete_after_policy(state, args, &agent, preflight_proof.as_ref())
+}
+
+fn delete_after_policy(state: &IpcHostState, args: &Value, agent: &Path, proof: Option<&DeletePreflight>) -> Result<Value, (String, String)> {
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
     crate::session_deletion_journal::recover_pending(state, &agent)?;
@@ -191,7 +269,7 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     }
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
-    match delete_with_index(state, args, &index, false, preflight_proof.as_ref())? {
+    match delete_with_index(state, args, &index, false, proof)? {
         DeleteOutcome::Deleted(result) => Ok(result),
         DeleteOutcome::Preflight(_) => Err(error("io", "Unexpected deletion result")),
     }
@@ -335,16 +413,66 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         }
         if !changed { break; }
     }
+    if let Some(cwd) = &target_cwd {
+        for session_id in state.registry.ids() {
+            if deleted.contains(&session_id) { continue; }
+            let session = state.registry.get(&session_id).ok_or_else(|| error("busy", "Cannot verify a live session"))?;
+            if !session.session_file.is_file() && same_existing_folder(&session.cwd, cwd)? {
+                return Err(error("busy", "An unpersisted live session may reference this session's workspace"));
+            }
+        }
+    }
+    let mut moving_chat = None;
     if trash_chat_folder {
-        if let Some(cwd) = target_cwd.filter(|cwd| crate::session_view::is_chat_folder_path(cwd, &state.agent_dir()) && cwd.exists()) {
-            let shared = session_cwds.iter().any(|(session_id, other)| !deleted.contains(session_id) && other.as_ref().is_some_and(|other| same_path(other, &cwd)));
-            if !shared {
-                return Err(error("not_supported", "Moving an unshared chat folder requires recoverable multi-file deletion."));
+        if let Some(cwd) = target_cwd.filter(|cwd| crate::session_view::is_chat_folder_path(cwd, &state.agent_dir())) {
+            let exists = match std::fs::symlink_metadata(&cwd) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(error("io", e)),
+            };
+            if exists {
+                let mut shared = false;
+                for (session_id, other) in &session_cwds {
+                    if deleted.contains(session_id) { continue; }
+                    let other = other.as_ref().ok_or_else(|| error("busy", "Cannot verify another session's working directory"))?;
+                    if same_existing_folder(other, &cwd)? { shared = true; break; }
+                }
+                if !shared {
+                    for session_id in state.registry.ids() {
+                        if deleted.contains(&session_id) { continue; }
+                        let session = state.registry.get(&session_id).ok_or_else(|| error("busy", "Cannot verify a live session's working directory"))?;
+                        if same_existing_folder(&session.cwd, &cwd)? { shared = true; break; }
+                    }
+                }
+                if shared {
+                    if proof.is_some_and(|proof| proof.trash.is_some()) {
+                        return Err(error("busy", "Another session now references the chat folder"));
+                    }
+                } else {
+                    let current = open_chat_folder(&cwd)?;
+                    if !preflight {
+                        let old = proof.and_then(|proof| proof.trash.as_ref()).ok_or_else(|| error("busy", "Chat folder requires exclusive policy admission"))?;
+                        if !same_path(&old.path, &current.path) || !same_directory(&old.metadata, &old.file.metadata().map_err(|e| error("io", e))?)
+                            || !same_directory(&old.metadata, &current.metadata) {
+                            return Err(error("busy", "Chat folder changed after deletion preflight"));
+                        }
+                    }
+                    moving_chat = Some(current);
+                }
+            } else if proof.is_some_and(|proof| proof.trash.is_some()) {
+                return Err(error("busy", "Chat folder disappeared after deletion preflight"));
             }
         }
     }
     let root_member = members.iter().find(|member| member.id == id).ok_or_else(|| error("busy", "Target session changed during scan"))?;
     let target_parent = root_member.parent.clone();
+    if let Some(parent) = &target_parent {
+        let resolved = parent.canonicalize().unwrap_or_else(|_| parent.clone());
+        if members.iter().filter(|member| deleted.contains(&member.id))
+            .any(|member| same_path(&member.path.canonicalize().unwrap_or_else(|_| member.path.clone()), &resolved)) {
+            return Err(error("not_supported", "Cannot reparent through a deleted session"));
+        }
+    }
     let parent_id = target_parent.as_ref().and_then(|parent| {
         let resolved = parent.canonicalize().unwrap_or_else(|_| parent.clone());
         path_ids.iter().find(|(path, _)| same_path(&path.canonicalize().unwrap_or_else(|_| path.clone()), &resolved)).map(|(_, id)| id.clone())
@@ -361,9 +489,10 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     if preflight {
         let affected = members.iter().map(|member| Ok(DeleteMemberProof { id: member.id.clone(), path: member.path.clone(),
             file: member.file.try_clone().map_err(|e| error("io", e))?, metadata: member.metadata.clone() })).collect::<Result<Vec<_>, (String, String)>>()?;
-        return Ok(DeleteOutcome::Preflight(DeletePreflight { path: canonical_target, file: target_handle, metadata: target_metadata, affected }));
+        return Ok(DeleteOutcome::Preflight(DeletePreflight { path: canonical_target, file: target_handle, metadata: target_metadata, affected, trash: moving_chat }));
     }
-    if members.len() == 1 {
+    let folder_trashed = moving_chat.is_some();
+    if members.len() == 1 && !folder_trashed {
         crate::session_deletion_journal::remove(&root, &state.agent_dir(), id, &canonical_target, &target_metadata)?;
     } else {
         let mut mutations = Vec::new();
@@ -384,9 +513,19 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
             if !path.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
             mutations.push(crate::session_deletion_journal::GroupMutation { session: member.id, path, handle: member.file, metadata: member.metadata, replacement_header, marker_parent });
         }
-        crate::session_deletion_journal::remove_group(&root, &state.agent_dir(), mutations)?;
+        let trash = match moving_chat {
+            Some(chat) => {
+                let trash = crate::session_deletion_journal::prepare_trash(&state.agent_dir(), &chat.path, state.deletion_prefers_fixture_trash())?;
+                if !same_directory(&chat.metadata, &chat.file.metadata().map_err(|e| error("io", e))?) || !same_directory(&chat.metadata, &trash.metadata) {
+                    return Err(error("busy", "Chat folder changed before Trash staging"));
+                }
+                Some(trash)
+            }
+            None => None,
+        };
+        crate::session_deletion_journal::remove_group(&root, &state.agent_dir(), mutations, trash)?;
     }
-    Ok(DeleteOutcome::Deleted(json!({"ok": true, "folderTrashed": false})))
+    Ok(DeleteOutcome::Deleted(json!({"ok": true, "folderTrashed": folder_trashed})))
 }
 
 #[cfg(test)]
@@ -411,6 +550,7 @@ mod tests {
         let state = IpcHostState::new();
         *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
         state.deletion_fork_writer_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+        state.deletion_use_app_trash.store(true, std::sync::atomic::Ordering::SeqCst);
         (dir, state, root)
     }
     fn session(root: &Path, id: &str, parent: Option<&Path>) -> PathBuf {
@@ -489,6 +629,16 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(state.registry.get("target").is_none());
         assert!(!target.exists());
         drop(live);
+    }
+    #[test]
+    fn deletion_refuses_a_parent_inside_its_own_deleted_subtree() {
+        let (_dir, state, root) = fixture();
+        let sub = session(&root, "sub", None);
+        let target = session(&root, "target", Some(&sub));
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&sub).unwrap(), "{}", json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target","parentSessionPath":target}})).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(target.exists() && sub.exists());
     }
     #[test]
     fn group_deletion_reparents_forks_and_removes_transitive_subagents() {
@@ -678,11 +828,194 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let chat = state.agent_dir().join("chats/chat-1");
         std::fs::create_dir_all(&chat).unwrap();
         std::fs::write(&child, format!("{}\n", json!({"type":"session","id":"child","cwd":chat,"parentSession":target}))).unwrap();
-        assert_eq!(delete(&state, &json!({"session":"child","trashChatFolder":true})).unwrap_err().0, "not_supported");
+        assert_eq!(delete(&state, &json!({"session":"child","trashChatFolder":true})).unwrap_err().0, "busy");
         assert!(child.exists());
         state.registry.composer_outbox_for("child").enqueue("queued", None).unwrap();
         assert_eq!(delete(&state, &json!({"session":"child"})).unwrap_err().0, "busy");
         assert!(child.exists());
+    }
+    #[test]
+    fn unshared_chat_folder_moves_to_fixture_trash_with_session() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let result = super::delete(&state, &json!({"session":"target","trashChatFolder":true})).unwrap();
+        assert_eq!(result["folderTrashed"], true);
+        assert!(!target.exists() && !chat.exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("chats-trash/chat-one/kept.txt")).unwrap(), "user data");
+    }
+    #[test]
+    fn deleted_chat_subagents_do_not_keep_an_unshared_folder() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+        let target = root.join("target.jsonl"); let sub = root.join("sub.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        std::fs::write(&sub, format!("{}\n{}\n", json!({"type":"session","id":"sub","cwd":chat}), json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target","parentSessionPath":target}}))).unwrap();
+        let result = super::delete(&state, &json!({"session":"target","trashChatFolder":true})).unwrap();
+        assert_eq!(result["folderTrashed"], true);
+        assert!(!target.exists() && !sub.exists() && !chat.exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("chats-trash/chat-one/kept.txt")).unwrap(), "user data");
+    }
+    #[test]
+    fn new_disk_chat_reference_between_policy_gates_refuses_the_move() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let other = root.join("new.jsonl");
+        let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
+            std::fs::write(&other, format!("{}\n", json!({"type":"session","id":"new","cwd":chat}))).unwrap();
+        }).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(target.exists() && other.exists() && chat.join("kept.txt").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn new_unflushed_live_chat_between_policy_gates_refuses_move() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let bridge = dir.path().join("bridge.mjs"); std::fs::write(&bridge, "// fixture").unwrap();
+        let script = r##"#!/usr/bin/env node
+const readline = require('node:readline'); const bridge = BRIDGE_PATH;
+readline.createInterface({input:process.stdin}).on('line', line => {
+  const r=JSON.parse(line); let data={};
+  if(r.type==='get_state') data={sessionId:'live',isStreaming:false,isCompacting:false,thinkingLevel:'off'};
+  if(r.type==='get_commands') data={commands:[{name:'pi-web:bridge',source:'extension',sourceInfo:{path:bridge}}]};
+  process.stdout.write(JSON.stringify({type:'response',id:r.id,command:r.type,success:true,data})+'\n');
+});
+"##.replace("BRIDGE_PATH", &serde_json::to_string(&bridge.to_string_lossy()).unwrap());
+        let executable = dir.path().join("mock-pi"); std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = session_host::SessionSpawnConfig {
+            executable:executable.to_string_lossy().into_owned(), agent_dir:Some(dir.path().to_path_buf()),
+            session_dir:Some(root.clone()), bridge_asset:bridge, artifacts_asset:None, chat_asset:None,
+            chat_asset_sha256:None, shape:session_host::SessionSpawnShape::Project { tool_args:None },
+            initial_model:None, thinking_level:None, extra_args:Vec::new(),
+        };
+        let livefile = root.join("transient.jsonl");
+        let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
+            std::fs::write(&livefile, format!("{}\n", json!({"type":"session","id":"live","cwd":chat}))).unwrap();
+            state.registry.start("live", &livefile, "live", &chat, &config).unwrap();
+            std::fs::remove_file(&livefile).unwrap();
+        }).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(target.exists() && chat.exists() && state.registry.get("live").is_some());
+        assert_eq!(super::delete(&state, &json!({"session":"target","trashChatFolder":false})).unwrap_err().0, "busy");
+        assert!(target.exists());
+        state.registry.remove("live", std::time::Duration::from_secs(2));
+    }
+    #[test]
+    fn replacement_chat_folder_between_policy_gates_is_never_moved() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("old"), "original").unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let old = dir.path().join("chats/moved-original");
+        let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
+            std::fs::rename(&chat, &old).unwrap(); std::fs::create_dir(&chat).unwrap(); std::fs::write(chat.join("new"), "new data").unwrap();
+        }).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(target.exists() && old.join("old").exists());
+        assert_eq!(std::fs::read_to_string(chat.join("new")).unwrap(), "new data");
+    }
+    #[test]
+    fn exclusive_policy_contention_does_not_wait_or_move_folder() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let held = std::cell::RefCell::new(None);
+        let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
+            *held.borrow_mut() = Some(state.policy_gate.try_read().unwrap());
+        }).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(target.exists() && chat.exists());
+    }
+    #[test]
+    fn exclusive_chat_move_blocks_create_and_fork_before_file_creation() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let result = delete_with_policy_hooks(&state, &json!({"session":"target","trashChatFolder":true}), || {}, || {
+            let created = crate::pi_ipc::create_session(&state, &json!({"cwd":chat,"type":"ensure_session"})).unwrap_err();
+            assert_eq!(created.0, "busy");
+            let fork = crate::session_actions::branch(&state, &json!({"session":"target","type":"fork","entryId":"entry"})).unwrap_err();
+            assert_eq!(fork.0, "busy");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        }).unwrap();
+        assert_eq!(result["folderTrashed"], true);
+        assert!(!target.exists() && !chat.exists());
+    }
+    #[test]
+    fn corrupt_unknown_writer_record_refuses_chat_folder_move() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
+            let fences = dir.path().join("pi-web/session-writer-fences"); std::fs::create_dir_all(&fences).unwrap();
+            std::fs::write(fences.join("broken.json"), "{broken").unwrap();
+        }).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(target.exists() && chat.exists());
+    }
+    #[test]
+    fn pending_writer_of_any_identity_refuses_chat_folder_move() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
+            crate::session_writer_fence::begin(dir.path(), "other", "op", "continue", &target, None).unwrap();
+        }).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(target.exists() && chat.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn chat_folder_reference_through_symlink_is_preserved() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let alias = dir.path().join("chat-alias"); std::os::unix::fs::symlink(&chat, &alias).unwrap();
+        let target = root.join("target.jsonl"); let other = root.join("other.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        std::fs::write(&other, format!("{}\n", json!({"type":"session","id":"other","cwd":alias}))).unwrap();
+        let result = super::delete(&state, &json!({"session":"target","trashChatFolder":true})).unwrap();
+        assert_eq!(result["folderTrashed"], false);
+        assert!(!target.exists() && other.exists() && chat.exists());
+    }
+    #[test]
+    fn unresolvable_other_cwd_blocks_folder_trash() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        let target = root.join("target.jsonl"); let other = root.join("other.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        std::fs::write(&other, format!("{}\n", json!({"type":"session","id":"other","cwd":dir.path().join("missing")}))).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target","trashChatFolder":true})).unwrap_err().0, "busy");
+        assert!(target.exists() && other.exists() && chat.exists());
+    }
+    #[test]
+    fn deleting_shared_chat_parent_reparents_fork_and_keeps_folder() {
+        let (dir, state, root) = fixture();
+        let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+        let target = root.join("target.jsonl"); let fork = root.join("fork.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
+        std::fs::write(&fork, format!("{}\n", json!({"type":"session","id":"fork","cwd":chat,"parentSession":target}))).unwrap();
+        let result = super::delete(&state, &json!({"session":"target","trashChatFolder":true})).unwrap();
+        assert_eq!(result["folderTrashed"], false);
+        assert!(!target.exists() && fork.exists() && chat.join("kept.txt").exists());
+        let header: Value = serde_json::from_str(std::fs::read_to_string(&fork).unwrap().lines().next().unwrap()).unwrap();
+        assert!(header.get("parentSession").is_none());
     }
     #[test]
     fn deleting_one_shared_chat_session_keeps_the_folder() {

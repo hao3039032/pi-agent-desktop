@@ -57,13 +57,24 @@ mod linux {
     }
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct GroupJournal { version: u8, items: Vec<GroupItem> }
+    struct GroupJournal { version: u8, items: Vec<GroupItem>, #[serde(default)] trash: Option<TrashJournal> }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TrashJournal { folder: String, original_path: String, device: u64, inode: u64, kind: String, root: String, destination: String, info: Option<String> }
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct FileVersion { device: u64, inode: u64, size: u64, mtime: i64, mtime_nsec: i64 }
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct GroupReady { replacements: Vec<Option<FileVersion>> }
+    struct GroupReady { replacements: Vec<Option<FileVersion>>, #[serde(default)] trash_info: Option<FileVersion> }
+
+    pub(crate) struct GroupTrash {
+        pub folder: std::path::PathBuf,
+        pub handle: File,
+        pub metadata: std::fs::Metadata,
+        pub kind: String,
+        pub root: std::path::PathBuf,
+    }
 
     pub(crate) struct GroupMutation {
         pub session: String,
@@ -172,7 +183,96 @@ mod linux {
     fn item_version(item: &GroupItem) -> FileVersion {
         FileVersion { device: item.device, inode: item.inode, size: item.size, mtime: item.mtime, mtime_nsec: item.mtime_nsec }
     }
-    fn verify_group(root: &Path, token: &str, group: &GroupJournal) -> Result<(), Failure> {
+    fn system_trash_path() -> Result<std::path::PathBuf, Failure> {
+        let base = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()).map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("PI_AGENT_HOME").filter(|value| !value.is_empty()).or_else(|| std::env::var_os("HOME")).map(|home| std::path::PathBuf::from(home).join(".local/share")))
+            .ok_or_else(|| fail("io", "Cannot resolve the system Trash directory"))?;
+        if !base.is_absolute() { return Err(fail("io", "System Trash path must be absolute")); }
+        Ok(base.join("Trash"))
+    }
+    fn expected_trash_root(agent: &Path, kind: &str) -> Result<std::path::PathBuf, Failure> {
+        match kind {
+            "system" => system_trash_path(),
+            "app" => Ok(agent.join("chats-trash")),
+            _ => Err(fail("io", "Invalid deletion Trash kind")),
+        }
+    }
+    fn uri_encode(path: &str) -> String {
+        let mut result = String::new();
+        for byte in path.bytes() {
+            if byte.is_ascii_alphanumeric() || b";/?:@&=+$,#-_.!~*'()".contains(&byte) { result.push(byte as char); }
+            else { result.push_str(&format!("%{byte:02X}")); }
+        }
+        result
+    }
+    fn verify_trash(agent: &Path, token: &str, trash: &TrashJournal) -> Result<(), Failure> {
+        if trash.folder.is_empty() || Path::new(&trash.folder).components().count() != 1
+            || !matches!(Path::new(&trash.folder).components().next(), Some(Component::Normal(_)))
+            || !(trash.destination == trash.folder || trash.destination == format!("{}-{token}", trash.folder)) {
+            return Err(fail("io", "Invalid deletion Trash path"));
+        }
+        let expected = expected_trash_root(agent, &trash.kind)?.canonicalize().map_err(io)?;
+        if expected != Path::new(&trash.root) { return Err(fail("io", "Deletion Trash root changed")); }
+        let chats = agent.join("chats").canonicalize().map_err(io)?;
+        let original = Path::new(&trash.original_path);
+        if !original.is_absolute() || original.file_name().and_then(|name| name.to_str()) != Some(trash.folder.as_str())
+            || original.parent().and_then(|parent| parent.canonicalize().ok()).as_deref() != Some(chats.as_path()) {
+            return Err(fail("io", "Invalid original chat folder path"));
+        }
+        if trash.kind == "system" {
+            let prefix = format!("[Trash Info]\nPath={}\nDeletionDate=", uri_encode(&trash.original_path));
+            let info = trash.info.as_deref().ok_or_else(|| fail("io", "Missing Trash information"))?;
+            let date = info.strip_prefix(&prefix).and_then(|s| s.strip_suffix('\n')).ok_or_else(|| fail("io", "Invalid Trash information"))?;
+            if date.len() != 19 || !date.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'-' | b':' | b'T')) { return Err(fail("io", "Invalid Trash deletion date")); }
+        } else if trash.info.is_some() { return Err(fail("io", "Unexpected application Trash information")); }
+        Ok(())
+    }
+    pub(crate) fn prepare_trash(agent: &Path, folder: &Path, prefer_app: bool) -> Result<GroupTrash, Failure> {
+        let chats_path = agent.join("chats").canonicalize().map_err(io)?;
+        let name = folder.file_name().and_then(|name| name.to_str()).ok_or_else(|| fail("io", "Invalid chat folder name"))?;
+        if folder.parent().and_then(|parent| parent.canonicalize().ok()).as_deref() != Some(chats_path.as_path()) {
+            return Err(fail("access_denied", "Chat folder is outside the chat root"));
+        }
+        let chats = open_dir_path(&chats_path)?;
+        let handle = open_directory(&chats, name)?;
+        let metadata = handle.metadata().map_err(io)?;
+        let candidates = if prefer_app { vec!["app"] } else { vec!["system", "app"] };
+        let mut last = None;
+        for kind in candidates {
+            let candidate = (|| {
+                let path = expected_trash_root(agent, kind)?;
+                std::fs::create_dir_all(&path).map_err(io)?;
+                let original_root = open_dir_path(&path)?;
+                if kind == "system" {
+                    for name in ["files", "info"] {
+                        if unsafe { libc::mkdirat(original_root.as_raw_fd(), c(name)?.as_ptr(), 0o700) } != 0 {
+                            let error = std::io::Error::last_os_error();
+                            if error.kind() != std::io::ErrorKind::AlreadyExists { return Err(io(error)); }
+                        }
+                        open_directory(&original_root, name)?;
+                    }
+                }
+                let root = path.canonicalize().map_err(io)?;
+                let canonical_root = open_dir_path(&root)?;
+                let original_meta = original_root.metadata().map_err(io)?;
+                let canonical_meta = canonical_root.metadata().map_err(io)?;
+                if original_meta.dev() != canonical_meta.dev() || original_meta.ino() != canonical_meta.ino() {
+                    return Err(fail("busy", "Trash root changed during authorization"));
+                }
+                let files = if kind == "system" { open_dir_path(&root.join("files"))? } else { canonical_root };
+                if files.metadata().map_err(io)?.dev() != metadata.dev() { return Err(fail("io", "Trash is on a different filesystem")); }
+                if kind == "system" { open_dir_path(&root.join("info"))?; }
+                Ok(GroupTrash { folder: folder.to_path_buf(), handle: handle.try_clone().map_err(io)?, metadata: metadata.clone(), kind: kind.to_string(), root })
+            })();
+            match candidate { Ok(trash) => return Ok(trash), Err(error) => last = Some(error) }
+        }
+        Err(last.unwrap_or_else(|| fail("io", "Cannot prepare Trash")))
+    }
+    fn trash_files(root: &Path, kind: &str) -> Result<File, Failure> {
+        if kind == "system" { open_dir_path(&root.join("files")) } else { open_dir_path(root) }
+    }
+    fn trash_info(root: &Path) -> Result<File, Failure> { open_dir_path(&root.join("info")) }
+    fn verify_group(agent: &Path, root: &Path, token: &str, group: &GroupJournal) -> Result<(), Failure> {
         use std::collections::HashSet;
         if !valid_token(token) || group.version != 2 || group.items.is_empty() { return Err(fail("io", "Invalid deletion group journal")); }
         let mut paths = HashSet::new(); let mut ids = HashSet::new();
@@ -189,6 +289,7 @@ mod linux {
             }
             parent_and_name(root, &item.source)?;
         }
+        if let Some(trash) = &group.trash { verify_trash(agent, token, trash)?; }
         Ok(())
     }
     fn make_replacement(stage: &File, item: &GroupItem) -> Result<FileVersion, Failure> {
@@ -228,11 +329,82 @@ mod linux {
         let value = stat(stage, "replacement")?.ok_or_else(|| fail("io", "Staged replacement disappeared"))?;
         Ok(version_from_stat(&value))
     }
+    fn matches_directory(value: &libc::stat, trash: &TrashJournal) -> bool {
+        value.st_mode & libc::S_IFMT == libc::S_IFDIR && value.st_dev as u64 == trash.device && value.st_ino as u64 == trash.inode
+    }
+    fn finish_trash(agent: &Path, token: &str, trash: &TrashJournal, ready: Option<&GroupReady>, committed: bool) -> Result<(), Failure> {
+        verify_trash(agent, token, trash)?;
+        let chats_path = agent.join("chats").canonicalize().map_err(io)?;
+        let chats = open_dir_path(&chats_path)?;
+        let staged_name = format!(".pi-deletion-{token}-chat");
+        let staged = stat(&chats, &staged_name)?;
+        if !committed {
+            if staged.is_some() {
+                rename_no_replace(&chats, &staged_name, &chats, &trash.folder)
+                    .map_err(|_| fail("busy", "Chat folder recovery cannot replace a new folder"))?;
+                chats.sync_all().map_err(io)?;
+            } else if !stat(&chats, &trash.folder)?.is_some_and(|value| matches_directory(&value, trash)) {
+                return Err(fail("busy", "Chat folder recovery cannot verify the original folder"));
+            }
+        }
+        let root = Path::new(&trash.root);
+        if trash.kind == "system" {
+            let info_root = trash_info(root)?;
+            let info_stage_name = format!(".pi-deletion-{token}-info");
+            let stage = match open_directory(&info_root, &info_stage_name) {
+                Ok(stage) => Some(stage),
+                Err(_) if stat(&info_root, &info_stage_name)?.is_none() => None,
+                Err(error) => return Err(error),
+            };
+            let info_name = format!("{}.trashinfo", trash.destination);
+            let info_text = trash.info.as_deref().ok_or_else(|| fail("io", "Missing Trash information"))?;
+            if let Some(stage) = stage {
+                if let Some(staged_info) = stat(&stage, "info")? {
+                    if committed {
+                        let expected = ready.and_then(|ready| ready.trash_info.as_ref()).ok_or_else(|| fail("io", "Missing Trash readiness"))?;
+                        if !matches_version(&staged_info, expected) { return Err(fail("busy", "Staged Trash information changed")); }
+                        rename_no_replace(&stage, "info", &info_root, &info_name)
+                            .map_err(|_| fail("busy", "Trash information destination already exists"))?;
+                        info_root.sync_all().map_err(io)?;
+                    } else {
+                        if read_file(&stage, "info")? != info_text.as_bytes() { return Err(fail("busy", "Staged Trash information changed")); }
+                        unlink(&stage, "info", 0)?;
+                    }
+                    stage.sync_all().map_err(io)?;
+                } else if committed {
+                    let expected = ready.and_then(|ready| ready.trash_info.as_ref()).ok_or_else(|| fail("io", "Missing Trash readiness"))?;
+                    if !stat(&info_root, &info_name)?.is_some_and(|value| matches_version(&value, expected)) {
+                        return Err(fail("busy", "Published Trash information changed"));
+                    }
+                }
+                unlink(&info_root, &info_stage_name, libc::AT_REMOVEDIR)?;
+                info_root.sync_all().map_err(io)?;
+            } else if committed {
+                let expected = ready.and_then(|ready| ready.trash_info.as_ref()).ok_or_else(|| fail("io", "Missing Trash readiness"))?;
+                if !stat(&info_root, &info_name)?.is_some_and(|value| matches_version(&value, expected)) {
+                    return Err(fail("busy", "Published Trash information changed"));
+                }
+            }
+        }
+        if committed {
+            let files = trash_files(root, &trash.kind)?;
+            if let Some(staged) = staged {
+                if !matches_directory(&staged, trash) { return Err(fail("busy", "Staged chat folder changed")); }
+                rename_no_replace(&chats, &staged_name, &files, &trash.destination)
+                    .map_err(|error| fail("busy", format!("Could not move chat folder to Trash: {}", error.1)))?;
+                chats.sync_all().map_err(io)?; files.sync_all().map_err(io)?;
+            } else if !stat(&files, &trash.destination)?.is_some_and(|value| matches_directory(&value, trash)) {
+                return Err(fail("busy", "Cannot verify the chat folder in Trash"));
+            }
+        }
+        Ok(())
+    }
+
     fn finish_group(agent: &Path, root: &Path, token: &str, group: &GroupJournal) -> Result<(), Failure> {
         finish_group_with_hook(agent, root, token, group, |_| Ok(()))
     }
     fn finish_group_with_hook(agent: &Path, root: &Path, token: &str, group: &GroupJournal, hook: impl Fn(&str) -> Result<(), Failure>) -> Result<(), Failure> {
-        verify_group(root, token, group)?;
+        verify_group(agent, root, token, group)?;
         let journal_root = journal_dir(agent)?;
         let transaction = open_directory(&journal_root, token)?;
         let committed = stat(&transaction, "commit")?.is_some();
@@ -244,7 +416,8 @@ mod linux {
         if ready.as_ref().is_some_and(|ready| ready.replacements.len() != group.items.len()) || (committed && ready.is_none()) {
             return Err(fail("io", "Invalid deletion group readiness"));
         }
-        if committed && group.items.iter().zip(&ready.as_ref().unwrap().replacements).any(|(item, replacement)| item.replacement_header.is_some() != replacement.is_some()) {
+        if ready.as_ref().is_some_and(|ready| group.items.iter().zip(&ready.replacements).any(|(item, replacement)| item.replacement_header.is_some() != replacement.is_some())
+            || group.trash.as_ref().is_some_and(|trash| trash.kind == "system") != ready.trash_info.is_some()) {
             return Err(fail("io", "Invalid group replacement readiness"));
         }
         for (index, item) in group.items.iter().enumerate() {
@@ -310,6 +483,8 @@ mod linux {
             }
             hook(&format!("applied:{index}"))?;
         }
+        if let Some(trash) = &group.trash { finish_trash(agent, token, trash, ready.as_ref(), committed)?; }
+        hook("trash-applied")?;
         let done = format!("{token}.done");
         rename_no_replace(&journal_root, token, &journal_root, &done)?;
         journal_root.sync_all().map_err(io)?;
@@ -437,11 +612,12 @@ mod linux {
                     }
                     Some(2) => {
                         let journal: GroupJournal = serde_json::from_value(value).map_err(io)?;
-                        verify_group(root, id, &journal)?;
+                        verify_group(&agent, root, id, &journal)?;
                         ids.extend(journal.items.iter().map(|item| item.session.clone()));
                         if has_ready {
                             let ready: GroupReady = serde_json::from_slice(&read_file(&transaction, "ready")?).map_err(io)?;
-                            if ready.replacements.len() != journal.items.len() || (has_commit && journal.items.iter().zip(&ready.replacements).any(|(item, replacement)| item.replacement_header.is_some() != replacement.is_some())) {
+                            if ready.replacements.len() != journal.items.len() || journal.items.iter().zip(&ready.replacements).any(|(item, replacement)| item.replacement_header.is_some() != replacement.is_some())
+                                || journal.trash.as_ref().is_some_and(|trash| trash.kind == "system") != ready.trash_info.is_some() {
                                 return Err(fail("io", "Invalid deletion group readiness"));
                             }
                         } else if has_commit { return Err(fail("io", "Missing deletion group readiness")); }
@@ -483,10 +659,10 @@ mod linux {
         })
     }
 
-    pub(crate) fn remove_group(root: &Path, agent: &Path, mutations: Vec<GroupMutation>) -> Result<(), Failure> {
-        remove_group_with_hook(root, agent, mutations, |_| Ok(()))
+    pub(crate) fn remove_group(root: &Path, agent: &Path, mutations: Vec<GroupMutation>, trash: Option<GroupTrash>) -> Result<(), Failure> {
+        remove_group_with_hook(root, agent, mutations, trash, |_| Ok(()))
     }
-    fn remove_group_with_hook(root: &Path, agent: &Path, mutations: Vec<GroupMutation>, hook: impl Fn(&str) -> Result<(), Failure>) -> Result<(), Failure> {
+    fn remove_group_with_hook(root: &Path, agent: &Path, mutations: Vec<GroupMutation>, trash: Option<GroupTrash>, hook: impl Fn(&str) -> Result<(), Failure>) -> Result<(), Failure> {
         let mut items = Vec::with_capacity(mutations.len());
         for mutation in &mutations {
             let current = mutation.handle.metadata().map_err(io)?;
@@ -501,8 +677,33 @@ mod linux {
         }
         let mut random = [0u8; 16]; getrandom::fill(&mut random).map_err(io)?;
         let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let group = GroupJournal { version: 2, items };
-        verify_group(root, &token, &group)?;
+        let trash_journal = if let Some(trash) = &trash {
+            let current = trash.handle.metadata().map_err(io)?;
+            if !current.is_dir() || current.dev() != trash.metadata.dev() || current.ino() != trash.metadata.ino() {
+                return Err(fail("busy", "Chat folder changed before Trash staging"));
+            }
+            let folder = trash.folder.file_name().and_then(|value| value.to_str()).ok_or_else(|| fail("io", "Invalid chat folder name"))?.to_string();
+            let chats = agent.join("chats").canonicalize().map_err(io)?;
+            if trash.folder.parent().and_then(|parent| parent.canonicalize().ok()).as_deref() != Some(chats.as_path()) { return Err(fail("access_denied", "Chat folder is outside the chat root")); }
+            let files = trash_files(&trash.root, &trash.kind)?;
+            let info = if trash.kind == "system" { Some(trash_info(&trash.root)?) } else { None };
+            let mut destination = folder.clone();
+            if stat(&files, &destination)?.is_some() || info.as_ref().is_some_and(|info| stat(info, &format!("{destination}.trashinfo")).map_or(true, |value| value.is_some())) {
+                destination = format!("{folder}-{token}");
+            }
+            if stat(&files, &destination)?.is_some() || info.as_ref().is_some_and(|info| stat(info, &format!("{destination}.trashinfo")).map_or(true, |value| value.is_some())) {
+                return Err(fail("busy", "Trash destination already exists"));
+            }
+            let info = if trash.kind == "system" {
+                let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(io)?.as_millis().min(i64::MAX as u128) as i64;
+                let date = crate::pi_ipc::ms_to_iso(ms);
+                Some(format!("[Trash Info]\nPath={}\nDeletionDate={}\n", uri_encode(&trash.folder.to_string_lossy()), &date[..19]))
+            } else { None };
+            Some(TrashJournal { folder, original_path: trash.folder.to_str().ok_or_else(|| fail("io", "Invalid chat folder path encoding"))?.to_string(), device: current.dev(), inode: current.ino(), kind: trash.kind.clone(),
+                root: trash.root.to_str().ok_or_else(|| fail("io", "Invalid Trash path encoding"))?.to_string(), destination, info })
+        } else { None };
+        let group = GroupJournal { version: 2, items, trash: trash_journal };
+        verify_group(agent, root, &token, &group)?;
         let bytes = serde_json::to_vec(&group).map_err(io)?;
         if bytes.len() > 4 * 1024 * 1024 { return Err(fail("io", "Deletion group journal exceeds its size budget")); }
         let journal_root = journal_dir(agent)?;
@@ -542,7 +743,40 @@ mod linux {
             }
             hook(&format!("isolated:{index}"))?;
         }
-        let ready = serde_json::to_vec(&GroupReady { replacements }).map_err(io)?;
+        let mut trash_info_version = None;
+        if let (Some(trash), Some(proof)) = (&group.trash, &trash) {
+            let staged = (|| {
+                let current = proof.handle.metadata().map_err(io)?;
+                if current.dev() != trash.device || current.ino() != trash.inode { return Err(fail("busy", "Chat folder changed before isolation")); }
+                let chats = open_dir_path(&agent.join("chats").canonicalize().map_err(io)?)?;
+                let stage_name = format!(".pi-deletion-{token}-chat");
+                rename_no_replace(&chats, &trash.folder, &chats, &stage_name)?;
+                chats.sync_all().map_err(io)?;
+                let isolated = stat(&chats, &stage_name)?.ok_or_else(|| fail("busy", "Isolated chat folder disappeared"))?;
+                if !matches_directory(&isolated, trash) { return Err(fail("busy", "Chat folder changed during isolation")); }
+                if trash.kind == "system" {
+                    let info = trash_info(Path::new(&trash.root))?;
+                    let stage_name = format!(".pi-deletion-{token}-info");
+                    if unsafe { libc::mkdirat(info.as_raw_fd(), c(&stage_name)?.as_ptr(), 0o700) } != 0 { return Err(io(std::io::Error::last_os_error())); }
+                    info.sync_all().map_err(io)?;
+                    let stage = open_directory(&info, &stage_name)?;
+                    create_file(&stage, "info", trash.info.as_ref().ok_or_else(|| fail("io", "Missing Trash information"))?.as_bytes())?;
+                    stage.sync_all().map_err(io)?;
+                    let value = stat(&stage, "info")?.ok_or_else(|| fail("io", "Trash information disappeared"))?;
+                    Ok(Some(version_from_stat(&value)))
+                } else { Ok(None) }
+            })();
+            match staged {
+                Ok(version) => trash_info_version = version,
+                Err(error) => {
+                    // A failed OS Trash attempt remains journaled; it must not
+                    // be mistaken for a successful move or silently discarded.
+                    return Err(fail("busy", format!("{}; chat Trash transaction remains pending", error.1)));
+                }
+            }
+            hook("chat-isolated")?;
+        }
+        let ready = serde_json::to_vec(&GroupReady { replacements, trash_info: trash_info_version }).map_err(io)?;
         create_file(&transaction, "ready", &ready)?;
         transaction.sync_all().map_err(io)?;
         hook("ready")?;
@@ -626,7 +860,7 @@ mod linux {
         fn group_commit_and_rollback_are_recoverable_at_key_phases() {
             for phase in ["prepared", "isolated:0", "isolated:1", "isolated:2", "ready", "committed", "applied:0", "applied:1", "applied:2"] {
                 let (dir, state, root, mutations) = group_fixture();
-                assert!(remove_group_with_hook(&root, dir.path(), mutations, |at| if at == phase { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+                assert!(remove_group_with_hook(&root, dir.path(), mutations, None, |at| if at == phase { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
                 let _policy = state.policy_gate.try_read().unwrap();
                 let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
                 recover(&state, &root).unwrap();
@@ -655,7 +889,7 @@ mod linux {
                 }
                 let _guard = task_scheduler::transaction_lock::TransactionLock::acquire(&agent).unwrap();
                 let phase = std::env::var("PI_TEST_GROUP_CRASH_PHASE").unwrap();
-                let _ = remove_group_with_hook(&root, &agent, mutations, |at| {
+                let _ = remove_group_with_hook(&root, &agent, mutations, None, |at| {
                     if at == phase { std::process::exit(73); }
                     Ok(())
                 });
@@ -680,9 +914,155 @@ mod linux {
             }
         }
         #[test]
+        fn chat_folder_moves_with_group_and_restores_before_commit() {
+            for phase in ["isolated:1", "chat-isolated", "ready", "committed", "applied:1", "trash-applied"] {
+                let (dir, state, root, mutations) = group_fixture();
+                let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+                std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+                let trash = prepare_trash(dir.path(), &chat, true).unwrap();
+                assert!(remove_group_with_hook(&root, dir.path(), mutations, Some(trash), |at| if at == phase { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+                let _policy = state.policy_gate.try_read().unwrap();
+                let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+                recover(&state, &root).unwrap();
+                let committed = matches!(phase, "committed" | "applied:1" | "trash-applied");
+                assert_eq!(chat.exists(), !committed, "{phase}");
+                let contents = if committed { dir.path().join("chats-trash/chat-one/kept.txt") } else { chat.join("kept.txt") };
+                assert_eq!(std::fs::read_to_string(contents).unwrap(), "user data");
+                recover(&state, &root).unwrap();
+            }
+        }
+        #[test]
+        fn chat_group_process_crash_recovers_only_under_fixture_exclusivity() {
+            if let Ok(agent) = std::env::var("PI_TEST_CHAT_CRASH_AGENT") {
+                let agent = std::path::PathBuf::from(agent); let root = agent.join("sessions");
+                let path = root.join("p/root.jsonl"); let handle = File::open(&path).unwrap(); let metadata = handle.metadata().unwrap();
+                let mutation = GroupMutation { session:"root".into(), path, handle, metadata, replacement_header:None, marker_parent:None };
+                let chat = agent.join("chats/chat-one"); let trash = prepare_trash(&agent, &chat, true).unwrap();
+                let _guard = task_scheduler::transaction_lock::TransactionLock::acquire(&agent).unwrap();
+                let phase = std::env::var("PI_TEST_CHAT_CRASH_PHASE").unwrap();
+                let _ = remove_group_with_hook(&root, &agent, vec![mutation], Some(trash), |at| {
+                    if at == phase { std::process::exit(73); } Ok(())
+                });
+                panic!("chat fixture phase not reached");
+            }
+            for phase in ["chat-isolated", "committed", "trash-applied"] {
+                let (dir, state, root, mutations) = group_fixture(); drop(mutations);
+                let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+                std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "session_deletion_journal::linux::tests::chat_group_process_crash_recovers_only_under_fixture_exclusivity"])
+                    .env("PI_TEST_CHAT_CRASH_AGENT", dir.path()).env("PI_TEST_CHAT_CRASH_PHASE", phase).status().unwrap();
+                assert_eq!(status.code(), Some(73));
+                let gate = dir.path().join("scheduled-tasks/transaction.lock"); assert!(gate.is_dir());
+                std::fs::remove_file(gate.join("owner")).unwrap(); std::fs::remove_dir(&gate).unwrap();
+                let _policy = state.policy_gate.try_read().unwrap();
+                let _exclusive = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+                recover(&state, &root).unwrap();
+                let committed = phase != "chat-isolated";
+                assert_eq!(chat.exists(), !committed);
+                let contents = if committed { dir.path().join("chats-trash/chat-one/kept.txt") } else { chat.join("kept.txt") };
+                assert_eq!(std::fs::read_to_string(contents).unwrap(), "user data");
+            }
+        }
+        #[test]
+        fn isolated_system_trash_moves_folder_and_preserves_evidence_on_failure() {
+            if let Ok(agent) = std::env::var("PI_TEST_GROUP_TRASH_AGENT") {
+                let agent = std::path::PathBuf::from(agent); let root = agent.join("sessions");
+                let path = root.join("p/root.jsonl");
+                let handle = File::open(&path).unwrap(); let metadata = handle.metadata().unwrap();
+                let mutation = GroupMutation { session:"root".into(), path, handle, metadata, replacement_header:None, marker_parent:None };
+                let chat = agent.join("chats/chat-one");
+                let trash = prepare_trash(&agent, &chat, false).unwrap();
+                assert_eq!(trash.kind, "system");
+                let data_home = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+                let mode = std::env::var("PI_TEST_GROUP_TRASH_COLLISION").unwrap();
+                let result = remove_group_with_hook(&root, &agent, vec![mutation], Some(trash), |phase| {
+                    if mode == "1" && phase == "committed" { std::fs::write(data_home.join("Trash/files/chat-one"), "new user file").unwrap(); }
+                    if mode == "stagefail" && phase == "isolated:0" { std::fs::remove_dir(data_home.join("Trash/info")).unwrap(); }
+                    Ok(())
+                });
+                if mode == "stagefail" {
+                    assert_eq!(result.unwrap_err().0, "busy");
+                    assert!(crate::session_deletion_journal::has_pending(&agent).unwrap());
+                    std::fs::create_dir(data_home.join("Trash/info")).unwrap();
+                    let state = crate::pi_ipc::IpcHostState::new(); *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+                    state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _policy = state.policy_gate.try_read().unwrap();
+                    let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent).unwrap();
+                    recover(&state, &root).unwrap();
+                    assert_eq!(std::fs::read_to_string(chat.join("kept.txt")).unwrap(), "user data");
+                } else if mode == "1" {
+                    assert_eq!(result.unwrap_err().0, "busy");
+                    assert_eq!(std::fs::read_to_string(data_home.join("Trash/files/chat-one")).unwrap(), "new user file");
+                    assert!(crate::session_deletion_journal::has_pending(&agent).unwrap());
+                    std::fs::remove_file(data_home.join("Trash/files/chat-one")).unwrap();
+                    let state = crate::pi_ipc::IpcHostState::new(); *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+                    state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _policy = state.policy_gate.try_read().unwrap();
+                    let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent).unwrap();
+                    recover(&state, &root).unwrap();
+                    assert_eq!(std::fs::read_to_string(data_home.join("Trash/files/chat-one/kept.txt")).unwrap(), "user data");
+                } else {
+                    result.unwrap();
+                    assert_eq!(std::fs::read_to_string(data_home.join("Trash/files/chat-one/kept.txt")).unwrap(), "user data");
+                    let info = std::fs::read_to_string(data_home.join("Trash/info/chat-one.trashinfo")).unwrap();
+                    assert!(info.contains("[Trash Info]\nPath=") && info.contains("DeletionDate="));
+                }
+                return;
+            }
+            for mode in ["0", "1", "stagefail"] {
+                let (dir, _state, _root, mutations) = group_fixture(); drop(mutations);
+                let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+                std::fs::write(chat.join("kept.txt"), "user data").unwrap();
+                let data_home = dir.path().join("xdg"); std::fs::create_dir(&data_home).unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "session_deletion_journal::linux::tests::isolated_system_trash_moves_folder_and_preserves_evidence_on_failure"])
+                    .env("PI_TEST_GROUP_TRASH_AGENT", dir.path()).env("XDG_DATA_HOME", &data_home)
+                    .env("PI_TEST_GROUP_TRASH_COLLISION", mode).output().unwrap();
+                assert!(output.status.success(), "{} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+        }
+        #[test]
+        fn committed_chat_move_preserves_a_new_source_folder() {
+            let (dir, _state, root, mutations) = group_fixture();
+            let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+            std::fs::write(chat.join("old"), "original").unwrap();
+            let trash = prepare_trash(dir.path(), &chat, true).unwrap();
+            remove_group_with_hook(&root, dir.path(), mutations, Some(trash), |phase| {
+                if phase == "chat-isolated" { std::fs::create_dir(&chat).unwrap(); std::fs::write(chat.join("new"), "new data").unwrap(); }
+                Ok(())
+            }).unwrap();
+            assert_eq!(std::fs::read_to_string(chat.join("new")).unwrap(), "new data");
+            assert_eq!(std::fs::read_to_string(dir.path().join("chats-trash/chat-one/old")).unwrap(), "original");
+        }
+        #[test]
+        fn application_trash_root_symlink_is_refused() {
+            let (dir, _state, _root, _mutations) = group_fixture();
+            let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("chats-trash")).unwrap();
+            assert!(prepare_trash(dir.path(), &chat, true).is_err());
+            assert!(chat.exists());
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+        #[test]
+        fn chat_recovery_never_replaces_a_new_folder() {
+            let (dir, state, root, mutations) = group_fixture();
+            let chat = dir.path().join("chats/chat-one"); std::fs::create_dir_all(&chat).unwrap();
+            std::fs::write(chat.join("old"), "original").unwrap();
+            let trash = prepare_trash(dir.path(), &chat, true).unwrap();
+            assert!(remove_group_with_hook(&root, dir.path(), mutations, Some(trash), |at| if at == "chat-isolated" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            std::fs::create_dir(&chat).unwrap(); std::fs::write(chat.join("new"), "new data").unwrap();
+            let _policy = state.policy_gate.try_read().unwrap();
+            let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+            assert_eq!(recover(&state, &root).unwrap_err().0, "busy");
+            assert_eq!(std::fs::read_to_string(chat.join("new")).unwrap(), "new data");
+            assert!(crate::session_deletion_journal::has_pending(dir.path()).unwrap());
+        }
+        #[test]
         fn group_recovery_never_overwrites_a_new_source() {
             let (dir, state, root, mutations) = group_fixture();
-            assert!(remove_group_with_hook(&root, dir.path(), mutations, |at| if at == "isolated:0" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            assert!(remove_group_with_hook(&root, dir.path(), mutations, None, |at| if at == "isolated:0" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
             let target = root.join("p/root.jsonl"); std::fs::write(&target, "new user file").unwrap();
             let _policy = state.policy_gate.try_read().unwrap();
             let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
@@ -692,7 +1072,7 @@ mod linux {
         #[test]
         fn committed_group_refuses_to_overwrite_new_child_file() {
             let (dir, state, root, mutations) = group_fixture();
-            assert!(remove_group_with_hook(&root, dir.path(), mutations, |at| if at == "committed" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            assert!(remove_group_with_hook(&root, dir.path(), mutations, None, |at| if at == "committed" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
             let fork = root.join("p/fork.jsonl"); std::fs::write(&fork, "new user file").unwrap();
             let _policy = state.policy_gate.try_read().unwrap();
             let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
@@ -913,8 +1293,16 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{recover, remove, remove_group, GroupMutation};
+pub(crate) use linux::{prepare_trash, recover, remove, remove_group, GroupMutation};
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct GroupTrash {
+    pub folder: std::path::PathBuf,
+    pub handle: std::fs::File,
+    pub metadata: std::fs::Metadata,
+    pub kind: String,
+    pub root: std::path::PathBuf,
+}
 #[cfg(not(target_os = "linux"))]
 pub(crate) struct GroupMutation {
     pub session: String,
@@ -925,7 +1313,11 @@ pub(crate) struct GroupMutation {
     pub marker_parent: Option<(String, String)>,
 }
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn remove_group(_root: &std::path::Path, _agent: &std::path::Path, _mutations: Vec<GroupMutation>) -> Result<(), (String, String)> {
+pub(crate) fn prepare_trash(_agent: &std::path::Path, _folder: &std::path::Path, _prefer_app: bool) -> Result<GroupTrash, (String, String)> {
+    Err(("not_supported".into(), "Safe chat Trash is unavailable on this platform.".into()))
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn remove_group(_root: &std::path::Path, _agent: &std::path::Path, _mutations: Vec<GroupMutation>, _trash: Option<GroupTrash>) -> Result<(), (String, String)> {
     Err(("not_supported".into(), "Safe session deletion is unavailable on this platform.".into()))
 }
 

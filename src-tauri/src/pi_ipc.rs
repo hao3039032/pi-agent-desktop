@@ -38,6 +38,8 @@ pub struct IpcHostState {
     pub(crate) deletion_recovery_exclusive: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) deletion_fork_writer_exclusive: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) deletion_use_app_trash: std::sync::atomic::AtomicBool,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -138,6 +140,13 @@ impl IpcHostState {
         { false }
     }
 
+    pub(crate) fn deletion_prefers_fixture_trash(&self) -> bool {
+        #[cfg(test)]
+        { return self.deletion_use_app_trash.load(std::sync::atomic::Ordering::SeqCst); }
+        #[cfg(not(test))]
+        { false }
+    }
+
     pub(crate) fn chat_unlock_permitted(&self) -> bool {
         self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
     }
@@ -173,6 +182,8 @@ impl IpcHostState {
             deletion_recovery_exclusive: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             deletion_fork_writer_exclusive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            deletion_use_app_trash: std::sync::atomic::AtomicBool::new(false),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
