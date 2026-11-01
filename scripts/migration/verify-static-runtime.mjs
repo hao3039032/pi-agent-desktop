@@ -3,7 +3,7 @@
 // checkout or home visible. This is not native WebView/package acceptance.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,10 @@ if (process.argv[2] !== "--inside") {
     if (result.status !== 0) throw new Error(`isolated runtime probe failed: ${result.signal ?? result.status}`);
   } finally { rmSync(scratch, { recursive: true, force: true }); }
 } else {
+  writeFileSync("/work/session.jsonl", [
+    JSON.stringify({ type: "session", version: 3, id: "fixture-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/work" }),
+    JSON.stringify({ type: "message", id: "a1", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "isolated fixture", timestamp: 1767225601000 } }),
+  ].join("\n") + "\n");
   const child = spawn("/bundle/pi/pi", ["--mode", "rpc", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", "/bundle/server/lib/pi-rpc/assets/pi-web-management.mjs"], { stdio: ["pipe", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", (data) => { stderr = (stderr + data).slice(-16000); });
@@ -59,7 +63,13 @@ if (process.argv[2] !== "--inside") {
     assert.match(cron.result.runs[0], /T05:17:00\.000Z$/);
     const search = await call("session.search", { query: "fixture", sessions: [] });
     assert.equal(search.ok, true, JSON.stringify(search));
-    console.log("Isolated bundled pi: management extension, cron and projection RPC passed; no checkout mounted.");
+    const header = await call("session.readHeader", { file: "/work/session.jsonl" });
+    assert.equal(header.ok, true, JSON.stringify(header));
+    assert.equal(header.result.header.id, "fixture-session");
+    const context = await call("session.readContext", { file: "/work/session.jsonl" });
+    assert.equal(context.ok, true, JSON.stringify(context));
+    assert.match(JSON.stringify(context.result.context), /isolated fixture/);
+    console.log("Isolated bundled pi: management, cron, SDK identity-guarded session projection RPC passed; no checkout mounted.");
   } finally {
     child.stdin.end();
     await Promise.race([new Promise((r) => child.once("exit", r)), new Promise((r) => setTimeout(r, 3000))]);

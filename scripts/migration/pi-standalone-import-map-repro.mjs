@@ -9,7 +9,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { verifyBundle } from "./static-bundle-manifest.mjs";
 
-if (process.platform !== "linux" || process.argv.length !== 3) throw new Error("usage: node pi-standalone-import-map-repro.mjs <staged-resource-dir>");
+if (process.platform !== "linux" || ![3, 4].includes(process.argv.length) || (process.argv[3] && process.argv[3] !== "--sdk-identity")) throw new Error("usage: node pi-standalone-import-map-repro.mjs <staged-resource-dir> [--sdk-identity]");
+const identity = process.argv[3] === "--sdk-identity";
 const bundle = resolve(process.argv[2]);
 verifyBundle(bundle, JSON.parse(readFileSync(join(bundle, "bundle-manifest.json"), "utf8")));
 const scratch = mkdtempSync(join(tmpdir(), "pi-import-map-"));
@@ -23,7 +24,9 @@ try {
   writeFileSync(join(pkg, "test.js"), 'import x from "#internal"; export default x;\n');
   writeFileSync(join(scratch, "test.mjs"), 'import x from "p"; export default x;\n');
   writeFileSync(join(scratch, "missing.mjs"), 'import "pi-static-missing-package-fixture-47c2";\n');
-  writeFileSync(join(scratch, "probe.mjs"), `export default function(pi) { pi.registerCommand("probe", { handler: async () => {
+  writeFileSync(join(scratch, "probe.mjs"), `${identity ? 'import { SessionManager, ModelRegistry } from "@earendil-works/pi-coding-agent";' : ""}
+  export default function(pi) { pi.registerCommand("probe", { handler: async (_, ctx) => {
+    ${identity ? 'console.error("SDK_IDENTITY", ctx.sessionManager instanceof SessionManager, ctx.modelRegistry instanceof ModelRegistry);' : ""}
     for (const p of ["/work/test.mjs", "/work/node_modules/p/test.js", "/work/missing.mjs"]) {
       try { console.error("PROBE_OK", p, (await import(p)).default); }
       catch (e) { console.error("PROBE_FAIL", p, String(e)); }
@@ -43,13 +46,15 @@ try {
     const deadline = Date.now() + 30000;
     while (!stdout.includes('"disposition":"handled"') && pi.exitCode === null && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
     assert.match(stdout, /"disposition":"handled"/, stderr);
+    if (identity) assert.match(stderr, /SDK_IDENTITY true true/);
     assert.match(stderr, /PROBE_OK \/work\/test\.mjs 42/);
-    assert.match(stderr, /PROBE_FAIL \/work\/node_modules\/p\/test\.js .*Cannot find package '#internal'/);
+    if (identity) assert.match(stderr, /PROBE_OK \/work\/node_modules\/p\/test\.js 43/);
+    else assert.match(stderr, /PROBE_FAIL \/work\/node_modules\/p\/test\.js .*Cannot find package '#internal'/);
     assert.match(stderr, /PROBE_FAIL \/work\/missing\.mjs .*Cannot find package 'pi-static-missing-package-fixture-47c2'/);
   } finally {
     pi.stdin.end();
     await Promise.race([exited, new Promise((r) => setTimeout(r, 3000))]);
     if (pi.exitCode === null) { pi.kill("SIGKILL"); await exited; }
   }
-  console.log("Reproduced: bundled Node resolves package imports; official standalone pi cannot resolve #internal in the same filesystem. No checkout or user home mounted.");
+  console.log(identity ? "Static SDK imports match live session manager and model registry constructors; package imports resolve through this extension." : "Reproduced: bundled Node resolves package imports; official standalone pi cannot resolve #internal in the same filesystem. No checkout or user home mounted.");
 } finally { rmSync(scratch, { recursive: true, force: true }); }

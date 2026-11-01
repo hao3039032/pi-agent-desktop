@@ -32,6 +32,7 @@ const ROOT = resolve(HERE, "../..");
 // The exported surface the management extension consumes. Keep in step with
 // the ops in lib/pi-rpc/assets/pi-web-management.mjs.
 const ENTRY = `
+export { SessionManager as projectionSessionManager } from "@earendil-works/pi-coding-agent";
 export {
   buildSessionContext,
   sliceActiveBranch,
@@ -132,7 +133,7 @@ export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, ca
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
 
 /** Bundle the projection entry; returns the output contents. */
-export async function bundleProjectionModules({ packaged = false } = {}) {
+export async function bundleProjectionModules() {
   const result = await build({
     stdin: {
       contents: ENTRY,
@@ -141,18 +142,13 @@ export async function bundleProjectionModules({ packaged = false } = {}) {
       sourcefile: "management-projection-entry.ts",
     },
     bundle: true,
-    // In the packaged tree the SDK entry is next to this generated module.
-    // The standalone pi loader does not resolve the bare specifier there.
-    plugins: packaged ? [{ name: "packaged-sdk-entry", setup(build) {
-      build.onResolve({ filter: /^@earendil-works\/pi-coding-agent$/ }, () => ({
-        path: "./node_modules/@earendil-works/pi-coding-agent/dist/index.js", external: true,
-      }));
-    } }] : [],
+    // The extension loader resolves the SDK's public specifier to its own
+    // virtual module in the compiled pi; never bundle a second SDK graph.
     format: "esm",
     platform: "node",
     target: "node20",
     // MCP internals and the public SDK must resolve from the same managed tree.
-    external: packaged ? ["jiti"] : ["jiti", "@earendil-works/pi-coding-agent"],
+    external: ["jiti", "@earendil-works/pi-coding-agent"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph
@@ -170,8 +166,8 @@ export async function bundleProjectionModules({ packaged = false } = {}) {
 }
 
 /** Build into a directory (creates it). Returns the written path. */
-export async function buildProjectionInto(outDir, options) {
-  const contents = await bundleProjectionModules(options);
+export async function buildProjectionInto(outDir) {
+  const contents = await bundleProjectionModules();
   await mkdir(outDir, { recursive: true });
   const target = resolve(outDir, PROJECTION_MODULE_NAME);
   await writeFile(target, contents, "utf8");
