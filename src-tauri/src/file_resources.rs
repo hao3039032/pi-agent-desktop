@@ -355,9 +355,43 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
     )
 }
 
-#[cfg(not(unix))]
-pub fn handle_files_index(_state: &IpcHostState, id: &str, _args: &Value) -> Value {
-    protocol_error(id, "not_supported", "Secure file indexing is unavailable on this platform")
+#[cfg(windows)]
+pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value {
+    let cwd = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or(""));
+    if !cwd.is_absolute() { return protocol_error(id, "invalid_args", "cwd must be an absolute path"); }
+    let handle = match state.file_roots.lock().unwrap().open_directory(cwd) {
+        Ok(handle) => handle, Err(error) => return protocol_error(id, "unauthorized_scope", &error.to_string()),
+    };
+    let mut queue = std::collections::VecDeque::from([(handle, String::new(), 0usize)]);
+    let mut files = Vec::new();
+    while let Some((directory, relative, depth)) = queue.pop_front() {
+        let entries = match crate::file_access::file_handle_windows::entries(&directory) {
+            Ok(entries) => entries, Err(error) => return protocol_error(id, "io", &error.to_string()),
+        };
+        for (name, is_dir, reparse) in entries {
+            let Some(name) = name.to_str() else { return protocol_error(id, "io", "Directory contains a non-Unicode name") };
+            if is_hidden_outside_git(name) || reparse { continue; }
+            let child = if relative.is_empty() { name.to_owned() } else { format!("{relative}/{name}") };
+            if is_dir && depth < MAX_WALK_DEPTH {
+                match crate::file_access::file_handle_windows::open_child(&directory, std::ffi::OsStr::new(name), true) {
+                    Ok(dir) => queue.push_back((dir, child, depth + 1)),
+                    Err(error) => return protocol_error(id, "io", &error.to_string()),
+                }
+            } else if !is_dir {
+                files.push(child);
+                if files.len() >= WALK_HARD_CAP { break; }
+            }
+        }
+        if files.len() >= WALK_HARD_CAP { break; }
+    }
+    if let Some(query) = args.get("q").and_then(Value::as_str).filter(|q| !q.is_empty()) {
+        if query.len() > MAX_QUERY_LENGTH { return protocol_error(id, "invalid_args", "query is too long"); }
+        let limit = args.get("limit").and_then(Value::as_u64).map(|n| (n as usize).clamp(1, MAX_MATCH_LIMIT)).unwrap_or(DEFAULT_MATCH_LIMIT);
+        return protocol_ok(id, json!({ "matches": filter_file_entries(&derive_entries_from_files(&files), query, limit), "truncated": true }));
+    }
+    files.truncate(MAX_FILES);
+    // Git visibility cannot yet be evaluated through a pinned Windows cwd.
+    protocol_ok(id, json!({ "files": files, "truncated": true }))
 }
 
 // ---------------------------------------------------------------------------

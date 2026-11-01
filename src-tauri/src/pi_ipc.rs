@@ -331,10 +331,7 @@ impl IpcHostState {
     }
 
     pub(crate) fn reauthorize_selected_path(&self, path: &Path) -> std::io::Result<()> {
-        #[cfg(unix)]
         self.file_roots.lock().unwrap().reauthorize(path)?;
-        #[cfg(windows)]
-        self.file_roots.lock().unwrap().add(path)?;
         self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
         Ok(())
     }
@@ -2409,7 +2406,11 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 } else { None }
             };
             #[cfg(windows)]
-            let opened: Option<Result<std::fs::File, std::io::Error>> = None;
+            let opened = {
+                let roots = state.file_roots.lock().unwrap();
+                let target = Path::new(path);
+                if roots.is_path_allowed(target) { Some(roots.open_file(target)) } else { None }
+            };
             match opened {
                 Some(Ok(file)) => match state.resources.grant_open_file(file, Path::new(path), Duration::from_secs(600)) {
                     Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
@@ -2421,7 +2422,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "resources.grantPreview" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 let roots = state.file_roots.lock().unwrap();
                 let (directory, name) = match roots.open_preview_directory(Path::new(path)) {
@@ -2433,7 +2434,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
                 }
             }
-            #[cfg(windows)]
+            #[cfg(not(any(unix, windows)))]
             { let _ = path; protocol_error(&id, "unauthorized_scope", "preview resources are unavailable on this platform") }
         }
         "resources.metadata" => {
@@ -2593,11 +2594,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             };
             #[cfg(windows)]
             let outcome: Option<Result<Vec<u8>, std::io::Error>> = {
-                // Fail-closed until the handle-based implementation ships:
-                // the naive read re-opens by path and re-introduces the
-                // check→open race the Unix side closed.
-                let _ = &target;
-                None
+                use std::io::Read;
+                let roots = state.file_roots.lock().unwrap();
+                Some(roots.open_file(&target).and_then(|mut file| { let mut bytes = Vec::new(); file.read_to_end(&mut bytes)?; Ok(bytes) }))
             };
             match outcome {
                 None => protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots"),
@@ -2612,7 +2611,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     protocol_error(&id, "not_found", "no such file")
                 }
                 #[cfg(windows)]
-                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                Some(Err(error)) => protocol_error(&id, if error.kind() == std::io::ErrorKind::PermissionDenied { "unauthorized_scope" } else { "io" }, &error.to_string()),
                 #[cfg(unix)]
                 Some(Err(error)) => protocol_error(
                     &id,
@@ -4957,7 +4956,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             let result = send(&state, json!({"v":1,"id":"denied","op":op,"args":{"cwd":outside}}));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
         }
-        state.propose_path(&chat);
+        state.propose_path(&chat).expect("fixture root");
         for op in ["git.status", "worktrees.list", "worktrees.fetch"] {
             let result = send(&state, json!({"v":1,"id":"chat","op":op,"args":{"cwd":chat}}));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
@@ -5201,7 +5200,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&folder).expect("folder");
         std::fs::create_dir_all(dir.path().join("elsewhere")).expect("elsewhere");
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
-        state.propose_path(&folder);
+        state.propose_path(&folder).expect("fixture root");
 
         let dotted = format!(
             "{}/../chats/20260101-120000-abcd",
@@ -5226,7 +5225,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("project");
         std::fs::create_dir_all(&target).expect("target");
-        state.propose_path(&target);
+        state.propose_path(&target).expect("fixture root");
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv1", "op": "cwd.validate", "args": { "cwd": target.to_string_lossy() } }),
@@ -5797,7 +5796,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(&png, vec![1u8; 300]).expect("write");
 
         // The host authorizes the directory; the handle is opaque.
-        state.file_roots.lock().unwrap().add(dir.path());
+        state.file_roots.lock().unwrap().add(dir.path()).expect("fixture root");
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5874,7 +5873,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
 
         // The HOST grants the project root (the sessions.list path); reads
         // inside pass, outside stays refused even with traversal tricks.
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let read = send(
             &state,
             json!({ "v": 1, "id": "f3", "op": "files.read", "args": { "path": project.join("a.txt").display().to_string() } }),
@@ -5933,7 +5932,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // project/leak → outside/created-by-attack.txt (dangling: the victim
         // does not exist yet).
         std::os::unix::fs::symlink(&victim, project.join("leak")).expect("leak");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let evil = send(
             &state,
@@ -5968,7 +5967,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&project).expect("proj");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let roots = state.file_roots.lock().unwrap();
         let target = project.join("swapme.txt");
@@ -6002,7 +6001,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&sub).expect("sub");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let roots = state.file_roots.lock().unwrap();
         let target = sub.join("file.txt");
@@ -6040,7 +6039,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::fs::write(outside.join("secret.txt"), b"s").expect("secret");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
         let (resolved, root) = crate::file_access::resolved_read_target_with_root(&roots, &sub)
             .expect("the honest directory authorizes");
@@ -6075,7 +6074,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(project.join("doc.txt"), b"inside").expect("doc");
         let secret = dir.path().join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").expect("secret");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
         let (resolved, root) = crate::file_access::resolved_read_target_with_root(
             &roots,
@@ -6115,7 +6114,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&b).expect("b");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
 
         // Authorization passes on the honest layout — and SNAPSHOT the
@@ -6180,7 +6179,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).expect("proj");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let write = |name: &str, data: &str| {
             send(
                 &state,
@@ -6221,7 +6220,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // new-path rule authorizes through the resolved parent, so the
         // resolved link target's parent (outside) fails containment.
         std::os::unix::fs::symlink(&outside, project.join("leak")).expect("leak");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let evil = send(
             &state,
@@ -6261,7 +6260,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(denied["error"]["code"], "unauthorized_scope", "{denied}");
 
         // A host-authorized root permits its files, but never a symlink escape.
-        state.file_roots.lock().unwrap().add(dir.path());
+        state.file_roots.lock().unwrap().add(dir.path()).expect("fixture root");
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -6311,7 +6310,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
         assert_eq!(bare["error"]["code"], "invalid_args", "{bare}");
         // An allowed cwd: fine.
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let inside = send(
             &state,
             json!({ "v": 1, "id": "tc2", "op": "terminal.create", "args": { "id": "t-b", "cwd": project.display().to_string() } }),
@@ -6332,7 +6331,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let legacy = agent.join("chat-workspace/nested");
         std::fs::create_dir_all(&chat).unwrap();
         std::fs::create_dir_all(&legacy).unwrap();
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         for (i, path) in [agent.join("chats"), chat, legacy].iter().enumerate() {
             let result = send(&state, json!({ "v": 1, "id": format!("chat-{i}"), "op": "terminal.create", "args": { "id": format!("chat-{i}"), "cwd": path } }));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
@@ -6385,7 +6384,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.management_config.lock().unwrap() = None;
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path()).expect("dir");
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         let response = send(
             &state,
             json!({ "v": 1, "id": "m1", "op": "models.list", "args": { "cwd": dir.path().to_string_lossy() } }),
@@ -6461,7 +6460,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             extensions: vec![],
             env: vec![],
         });
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let slow = tauri::async_runtime::spawn(dispatch_envelope_gated(
             Arc::clone(&state),
@@ -6548,7 +6547,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn skills_ops_validate_cwd_and_toggle_payload_before_management() {
         let state = state();
         let dir = tempfile::tempdir().expect("tempdir");
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         *state.management_config.lock().unwrap() = None;
         let cwd = dir.path().to_string_lossy();
         for args in [
@@ -6586,7 +6585,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("PI_AGENT_HOME".into(), dir.path().display().to_string())],
         });
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let cwd = project.to_string_lossy();
         let first = send(&state, json!({"v": 1, "id": "first", "op": "plugins.list", "args": {"cwd": cwd}}));
         assert_eq!(first["ok"], true, "{first}");
@@ -6628,7 +6627,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("FIXTURE_MARKER".into(), marker.display().to_string())],
         });
-        state.propose_path(&project); state.propose_path(&other);
+        state.propose_path(&project).expect("fixture root"); state.propose_path(&other).expect("fixture root");
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
         let first = call("plugins.install.start", json!({"cwd":project,"source":package,"scope":"global"}));
         assert_eq!(first["ok"], true, "{first}");
@@ -6690,7 +6689,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
         let state = state();
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig { executable, agent_dir: Some(agent), extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()], env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("FIXTURE_MARKER".into(), marker.display().to_string())] });
-        state.propose_path(&project); state.propose_path(&other);
+        state.propose_path(&project).expect("fixture root"); state.propose_path(&other).expect("fixture root");
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let started = call("plugins.install.start", json!({"cwd": project, "source":"npm:fixture", "scope":"global"}));
@@ -6766,7 +6765,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
                 ("XDG_STATE_HOME".into(), String::new()),
             ],
         });
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let cwd = project.to_string_lossy();
         let search = send(&state, json!({ "v": 1, "id": "search", "op": "skills.search", "args": { "cwd": cwd, "query": "demo" } }));
         assert_eq!(search["ok"], true, "{search}");
@@ -6807,7 +6806,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let fixture = std::path::Path::new("../lib/__fixtures__/mcp-env-server.mjs").canonicalize().unwrap();
         std::fs::write(project.join(".pi/mcp.json"), json!({"mcpServers": {"local": {"command": "node", "args": [fixture]}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
@@ -6832,7 +6831,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let child_queued = child_session.composer_outbox.enqueue("descendant pending", None).unwrap();
         let unrelated = dir.path().join("unrelated");
         std::fs::create_dir_all(&unrelated).unwrap();
-        state.propose_path(&unrelated);
+        state.propose_path(&unrelated).expect("fixture root");
         let other = call("agent.create", json!({"cwd":unrelated,"type":"ensure_session"}));
         assert_eq!(other["ok"], true, "{other}");
         let other_id = other["data"]["sessionId"].as_str().unwrap().to_string();
@@ -6880,7 +6879,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
         let fresh = dir.path().join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
-        state.propose_path(&fresh);
+        state.propose_path(&fresh).expect("fixture root");
         let invalid = call("mcp.configAction", json!({"cwd":fresh,"action":"add","scope":"project","text":"","trustFolder":true}));
         assert_eq!(invalid["error"]["reason"], "import-failed", "{invalid}");
         assert!(!crate::trust_policy_fence::is_pending(&agent), "pre-write refusal releases the fence");
@@ -7059,7 +7058,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         )
         .expect("models.json");
         // The project must sit inside the allowed roots (the cwd gate).
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         // 1. models.list: the /api/models contract for the project cwd.
         let listed = send(
@@ -7120,7 +7119,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.management_config.lock().unwrap() = None;
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path()).expect("dir");
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         let cwd = dir.path().to_string_lossy().into_owned();
 
         // The op enum is closed: an unknown value never reaches an instance.
@@ -7494,7 +7493,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             r#"{"enabledModels":["ghost-provider/ghost-model"]}"#,
         )
         .expect("settings.json");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         // 1. The read: the exact EnabledModelsView through the cwd gate and
         //    the cwd-SCOPED instance.
@@ -7569,7 +7568,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn terminal_roundtrip_over_the_dispatch_table() {
         let state = state();
         let dir = tempfile::tempdir().unwrap();
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         let cwd = dir.path().to_str().unwrap();
         let create = send(
             &state,
@@ -9654,7 +9653,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
         assert_eq!(refused["error"]["code"], "unauthorized_scope");
 
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "l1", "op": "files.list", "args": { "path": project.display().to_string() } }),
@@ -9708,7 +9707,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(git(&["add", "."]).status.success());
         assert!(git(&["commit", "-qm", "init"]).status.success());
 
-        state.propose_path(&repo);
+        state.propose_path(&repo).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "gl1", "op": "files.list", "args": { "path": repo.display().to_string() } }),
@@ -9740,7 +9739,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&other).expect("other");
         let link = project.join("linked");
         std::os::unix::fs::symlink(&outside, &link).expect("linked");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let send_allow = |id: &str, target: &std::path::Path| {
             send(
                 &state,
@@ -9805,7 +9804,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, project.join("linked")).expect("linked");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "sl1", "op": "files.list", "args": { "path": project.display().to_string() } }),

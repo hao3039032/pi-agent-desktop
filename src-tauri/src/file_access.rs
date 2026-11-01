@@ -25,7 +25,7 @@ use file_directory_unix::{directory_entries, directory_entry_info, git_directory
 mod pinned_root_unix;
 #[cfg(windows)]
 #[path = "file_handle_windows.rs"]
-mod file_handle_windows;
+pub(crate) mod file_handle_windows;
 
 /// The allowed-root set (normalized, forward-slash, trailing-slash-free).
 #[derive(Debug, Default, Clone)]
@@ -34,6 +34,8 @@ pub struct AllowedRoots {
     resolved_roots: BTreeMap<String, PathBuf>,
     #[cfg(unix)]
     pinned_roots: BTreeMap<String, pinned_root_unix::PinnedRoot>,
+    #[cfg(windows)]
+    pinned_roots: BTreeMap<String, file_handle_windows::PinnedRoot>,
 }
 
 impl AllowedRoots {
@@ -65,17 +67,43 @@ impl AllowedRoots {
             self.pinned_roots.insert(normalized.clone(), pinned);
         }
         #[cfg(windows)]
-        { self.resolved_roots.insert(normalized.clone(), std::fs::canonicalize(root)?); }
+        {
+            for known in &self.roots {
+                if is_within(&normalized, known) && self.unchanged_root(known).is_none() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "previously authorized root was replaced or removed"));
+                }
+            }
+            if let Some((_, existing)) = self.pinned_roots.iter().find(|(key, _)| file_handle_windows::same_text(key, &normalized)) {
+                existing.admit()?;
+                return Ok(());
+            }
+            if self.roots.iter().any(|key| file_handle_windows::same_text(key, &normalized)) {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "previously missing root requires explicit selection"));
+            }
+            let pinned = file_handle_windows::PinnedRoot::open(root)?;
+            pinned.admit()?;
+            self.resolved_roots.insert(normalized.clone(), pinned.path().to_path_buf());
+            self.pinned_roots.insert(normalized.clone(), pinned);
+        }
         self.roots.insert(normalized);
         Ok(())
     }
 
     /// Only a fresh host-native selection may replace a prior grant.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn reauthorize(&mut self, root: &Path) -> std::io::Result<()> {
         let normalized = normalize_root(root).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root must be absolute"))?;
+        #[cfg(unix)]
         let pinned = pinned_root_unix::PinnedRoot::open(root)?;
+        #[cfg(windows)]
+        let pinned = file_handle_windows::PinnedRoot::open(root)?;
         pinned.admit()?;
+        #[cfg(windows)]
+        if let Some(old) = self.roots.iter().find(|key| file_handle_windows::same_text(key, &normalized)).cloned() {
+            self.roots.remove(&old);
+            self.resolved_roots.remove(&old);
+            self.pinned_roots.remove(&old);
+        }
         let canonical = pinned.path().to_path_buf();
         self.resolved_roots.insert(normalized.clone(), canonical);
         self.pinned_roots.insert(normalized.clone(), pinned);
@@ -85,15 +113,21 @@ impl AllowedRoots {
 
     /// Record a missing historical cwd for status only, without a grant.
     pub fn add_missing(&mut self, root: &Path) {
-        if let Some(normalized) = normalize_root(root) { self.roots.insert(normalized); }
+        if let Some(normalized) = normalize_root(root) {
+            #[cfg(windows)]
+            if self.roots.iter().any(|known| file_handle_windows::same_text(known, &normalized)) { return; }
+            self.roots.insert(normalized);
+        }
     }
 
     fn unchanged_root(&self, root: &str) -> Option<PathBuf> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.pinned_roots.get(root)?.admit().ok()?;
         let original = self.resolved_roots.get(root)?;
-        let current = std::fs::canonicalize(root).ok()?;
-        (current == *original).then_some(current)
+        #[cfg(windows)]
+        { Some(original.clone()) }
+        #[cfg(not(windows))]
+        { let current = std::fs::canonicalize(root).ok()?; (current == *original).then_some(current) }
     }
 
     /// The `~/pi-cwd` and `~/pi-cwd-YYYYMMDD` scan roots (the legacy
@@ -138,9 +172,9 @@ impl AllowedRoots {
     /// inside a root that ALSO resolves to the same spelling — a symlink or
     /// junction pointing outside the roots is refused.
     pub fn is_existing_path_allowed(&self, target: &Path) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         { self.open_directory(target).is_ok() || self.open_file(target).is_ok() }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         { self.is_existing_path_allowed_at(target, true) }
     }
 
@@ -187,6 +221,12 @@ impl AllowedRoots {
 
     #[cfg(unix)]
     fn admit_resolved(&self, target: &Path) -> std::io::Result<(PathBuf, PathBuf, std::fs::File)> {
+        let normalized = normalize_absolute(target).ok_or(std::io::ErrorKind::InvalidInput)?;
+        for known in &self.roots {
+            if is_within(&normalized, known) && self.unchanged_root(known).is_none() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "authorized root was replaced or removed"));
+            }
+        }
         let (resolved, root) = resolved_read_target_with_root(self, target)
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside authorized roots"))?;
         for (key, pinned) in &self.pinned_roots {
@@ -217,6 +257,41 @@ impl AllowedRoots {
         let _file = open_file_relative(&handle, relative)?;
         let directory = walk_directory(&handle, relative.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?;
         Ok((directory, name))
+    }
+
+    #[cfg(windows)]
+    fn open_windows_target(&self, target: &Path, directory: bool) -> std::io::Result<std::fs::File> {
+        if has_parent_segment(target) { return Err(std::io::ErrorKind::PermissionDenied.into()); }
+        let normalized = normalize_absolute(target).ok_or(std::io::ErrorKind::InvalidInput)?;
+        for known in &self.roots {
+            if is_within(&normalized, known) && self.unchanged_root(known).is_none() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "authorized root was replaced or removed"));
+            }
+        }
+        let (root, pinned) = self.pinned_roots.iter().filter(|(root, _)| is_within(&normalized, root))
+            .max_by_key(|(root, _)| root.split('/').count()).ok_or(std::io::ErrorKind::PermissionDenied)?;
+        let mut current = pinned.admit()?;
+        let root_parts = root.split('/').count();
+        let parts: Vec<&str> = normalized.split('/').skip(root_parts).collect();
+        if parts.is_empty() { return if directory { Ok(current) } else { Err(std::io::ErrorKind::InvalidInput.into()) }; }
+        for (index, part) in parts.iter().enumerate() {
+            current = file_handle_windows::open_child(&current, std::ffi::OsStr::new(part), directory || index + 1 < parts.len())?;
+        }
+        Ok(current)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_directory(&self, target: &Path) -> std::io::Result<std::fs::File> { self.open_windows_target(target, true) }
+    #[cfg(windows)]
+    pub(crate) fn open_file(&self, target: &Path) -> std::io::Result<std::fs::File> { self.open_windows_target(target, false) }
+    #[cfg(windows)]
+    pub(crate) fn open_preview_directory(&self, target: &Path) -> std::io::Result<(std::fs::File, String)> {
+        if has_parent_segment(target) { return Err(std::io::ErrorKind::PermissionDenied.into()); }
+        let parent = target.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+        let name = target.file_name().and_then(|name| name.to_str()).ok_or(std::io::ErrorKind::InvalidInput)?;
+        let directory = self.open_directory(parent)?;
+        let _file = file_handle_windows::open_child(&directory, std::ffi::OsStr::new(name), false)?;
+        Ok((directory, name.to_owned()))
     }
 
     /// Open an already-authorized directory without following swapped path
@@ -493,17 +568,19 @@ fn normalize_absolute(path: &Path) -> Option<String> {
     if !path.is_absolute() {
         return None;
     }
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
     let mut parts: Vec<String> = Vec::new();
     for component in path.components() {
         match component {
             Component::RootDir => {}
             Component::Prefix(prefix) => {
                 // Windows drive/UNC prefix: keep its spelling (e.g. "C:").
-                let text = prefix.as_os_str().to_string_lossy().replace('\\', "/");
+                let text = prefix.as_os_str().to_str()?.replace('\\', "/");
                 parts.push(text);
             }
             Component::Normal(part) => {
-                let text = part.to_string_lossy().to_string();
+                let text = part.to_str()?.to_string();
                 if text == ".." {
                     // Lexical climb: never below a root.
                     parts.pop();
@@ -531,10 +608,17 @@ fn normalize_absolute(path: &Path) -> Option<String> {
 
 /// Containment: `candidate` equals or is below `root` (both normalized).
 fn is_within(candidate: &str, root: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let mut parts = candidate.split('/');
+        return root.split('/').all(|part| parts.next().is_some_and(|candidate| file_handle_windows::same_text(candidate, part)));
+    }
+    #[cfg(not(windows))]
     if candidate == root {
         return true;
     }
-    candidate.starts_with(root) && candidate.as_bytes().get(root.len()) == Some(&b'/')
+    #[cfg(not(windows))]
+    { candidate.starts_with(root) && candidate.as_bytes().get(root.len()) == Some(&b'/') }
 }
 
 /// MIME by extension for file serving (scriptless defaults, the same map
@@ -608,6 +692,27 @@ mod tests {
         write_through_allowed_parent(&roots, &root.join("value"), b"new").unwrap();
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
         assert_eq!(std::fs::read(root.join("value")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_nested_root_cannot_fall_back_to_parent_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("value"), b"old").unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        roots.add(&child).unwrap();
+        std::fs::rename(&child, root.join("old")).unwrap();
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("value"), b"replacement").unwrap();
+        assert!(roots.open_file(&child.join("value")).is_err());
+        assert!(write_through_allowed_parent(&roots, &child.join("value"), b"changed").is_err());
+        assert_eq!(std::fs::read(child.join("value")).unwrap(), b"replacement");
+        roots.reauthorize(&child).unwrap();
+        assert!(roots.open_file(&child.join("value")).is_ok());
     }
 
     #[cfg(unix)]
@@ -824,8 +929,16 @@ pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<List
 }
 
 #[cfg(windows)]
-pub fn list_directory(_roots: &AllowedRoots, _directory: &Path) -> Result<Vec<ListedEntry>, String> {
-    Err("listing is not supported on this platform until the handle-based implementation ships".to_string())
+pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<ListedEntry>, String> {
+    let handle = roots.open_directory(directory).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for (name, is_dir, reparse) in file_handle_windows::entries(&handle).map_err(|e| e.to_string())? {
+        let name = name.to_str().ok_or("Directory contains a non-Unicode name")?.to_owned();
+        if is_hidden_outside_git(&name) { continue; }
+        entries.push(ListedEntry { name, is_dir: is_dir && !reparse, size: 0, modified: String::new(), outside_link_target: None, outside_link_encloses: false });
+    }
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
+    Ok(entries)
 }
 
 #[cfg(unix)]

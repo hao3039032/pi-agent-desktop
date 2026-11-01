@@ -454,7 +454,7 @@ mod tests {
         std::fs::write(cwd.join("marker"), "SAFE_PROJECT_MARKER\n").unwrap();
         std::fs::write(chat.join("work/marker"), "CHAT_MARKER\n").unwrap();
         let mut roots = AllowedRoots::new();
-        roots.add(dir.path());
+        roots.add(dir.path()).expect("fixture root");
         let authorized = authorize_cwd(&roots, &agent, cwd.to_str().unwrap()).unwrap();
         let normal_handle = pin_cwd(&roots, &agent, &authorized).unwrap();
         let normal_host = pty_host::PtyHost::new();
@@ -549,7 +549,7 @@ mod tests {
             std::fs::create_dir_all(path).unwrap();
         }
         let mut roots = AllowedRoots::new();
-        roots.add(dir.path());
+        roots.add(dir.path()).expect("fixture root");
         assert!(authorize_cwd(&roots, &agent, project.to_str().unwrap()).is_ok());
         for path in [agent.join("chats"), chat, legacy] {
             assert_eq!(
