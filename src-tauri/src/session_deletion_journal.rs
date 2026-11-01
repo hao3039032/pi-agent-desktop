@@ -292,16 +292,47 @@ mod linux {
         if let Some(trash) = &group.trash { verify_trash(agent, token, trash)?; }
         Ok(())
     }
+    fn copy_xattrs(input: &File, output: &File) -> Result<(), Failure> {
+        let count = unsafe { libc::flistxattr(input.as_raw_fd(), std::ptr::null_mut(), 0) };
+        if count < 0 { return Err(io(std::io::Error::last_os_error())); }
+        if count as usize > 1024 * 1024 { return Err(fail("io", "Session extended attributes exceed the rewrite budget")); }
+        let mut names = vec![0u8; count as usize];
+        if count > 0 {
+            let read = unsafe { libc::flistxattr(input.as_raw_fd(), names.as_mut_ptr().cast(), names.len()) };
+            if read != count { return Err(fail("busy", "Session extended attributes changed during rewrite")); }
+        }
+        let mut total = names.len();
+        for name in names.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
+            let name = CString::new(name).map_err(io)?;
+            let length = unsafe { libc::fgetxattr(input.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            if length < 0 { return Err(io(std::io::Error::last_os_error())); }
+            total = total.saturating_add(length as usize);
+            if total > 4 * 1024 * 1024 { return Err(fail("io", "Session extended attributes exceed the rewrite budget")); }
+            let mut value = vec![0u8; length as usize];
+            let read = unsafe { libc::fgetxattr(input.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            if read != length { return Err(fail("busy", "Session extended attributes changed during rewrite")); }
+            if unsafe { libc::fsetxattr(output.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) } != 0 {
+                return Err(io(std::io::Error::last_os_error()));
+            }
+        }
+        Ok(())
+    }
     fn make_replacement(stage: &File, item: &GroupItem) -> Result<FileVersion, Failure> {
         use std::io::BufRead;
         let fd = unsafe { libc::openat(stage.as_raw_fd(), c("original")?.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
         if fd < 0 { return Err(io(std::io::Error::last_os_error())); }
         let input = unsafe { File::from_raw_fd(fd) };
-        let mode = input.metadata().map_err(io)?.mode() & 0o777;
+        let original_metadata = input.metadata().map_err(io)?;
+        let mode = original_metadata.mode() & 0o7777;
         let fd = unsafe { libc::openat(stage.as_raw_fd(), c("replacement")?.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode) };
         if fd < 0 { return Err(io(std::io::Error::last_os_error())); }
         let mut output = unsafe { File::from_raw_fd(fd) };
+        if unsafe { libc::fchown(output.as_raw_fd(), original_metadata.uid(), original_metadata.gid()) } != 0 {
+            return Err(io(std::io::Error::last_os_error()));
+        }
         if unsafe { libc::fchmod(output.as_raw_fd(), mode) } != 0 { return Err(io(std::io::Error::last_os_error())); }
+        copy_xattrs(&input, &output)?;
+        if output.metadata().map_err(io)?.mode() & 0o7777 != mode { return Err(fail("io", "Cannot preserve session permissions")); }
         let mut reader = std::io::BufReader::new(input);
         let mut line = Vec::new(); reader.by_ref().take(65537).read_until(b'\n', &mut line).map_err(io)?;
         if line.is_empty() || line.len() > 65536 { return Err(fail("io", "Invalid session header while staging rewrite")); }
@@ -325,6 +356,12 @@ mod linux {
             }
         }
         std::io::copy(&mut reader, &mut output).map_err(io)?;
+        let after = reader.get_ref().metadata().map_err(io)?;
+        if after.dev() != original_metadata.dev() || after.ino() != original_metadata.ino() || after.len() != original_metadata.len()
+            || after.mtime() != original_metadata.mtime() || after.mtime_nsec() != original_metadata.mtime_nsec()
+            || after.ctime() != original_metadata.ctime() || after.ctime_nsec() != original_metadata.ctime_nsec() {
+            return Err(fail("busy", "Session changed during staged rewrite"));
+        }
         output.sync_all().map_err(io)?;
         let value = stat(stage, "replacement")?.ok_or_else(|| fail("io", "Staged replacement disappeared"))?;
         Ok(version_from_stat(&value))
@@ -667,7 +704,8 @@ mod linux {
         for mutation in &mutations {
             let current = mutation.handle.metadata().map_err(io)?;
             if current.dev() != mutation.metadata.dev() || current.ino() != mutation.metadata.ino() || current.len() != mutation.metadata.len()
-                || current.mtime() != mutation.metadata.mtime() || current.mtime_nsec() != mutation.metadata.mtime_nsec() {
+                || current.mtime() != mutation.metadata.mtime() || current.mtime_nsec() != mutation.metadata.mtime_nsec()
+                || current.ctime() != mutation.metadata.ctime() || current.ctime_nsec() != mutation.metadata.ctime_nsec() {
                 return Err(fail("busy", "Session changed before group staging"));
             }
             let source = mutation.path.strip_prefix(root).map_err(io)?.to_str().ok_or_else(|| fail("io", "Invalid session path encoding"))?.to_string();

@@ -144,6 +144,7 @@ fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> boo
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino() && left.len() == right.len()
         && left.mtime() == right.mtime() && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime() && left.ctime_nsec() == right.ctime_nsec()
 }
 #[cfg(not(unix))]
 fn same_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
@@ -646,6 +647,13 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let grandparent = session(&root, "grandparent", None);
         let target = session(&root, "target", Some(&grandparent));
         let fork = session(&root, "fork", Some(&target));
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&fork, std::fs::Permissions::from_mode(0o640)).unwrap(); }
+        #[cfg(target_os = "linux")] {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(fork.as_os_str().as_bytes()).unwrap();
+            let name = std::ffi::CString::new("user.pi-fixture").unwrap();
+            assert_eq!(unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"fixture".as_ptr().cast(), 7, 0) }, 0);
+        }
         let sub1 = session(&root, "sub1", None);
         let sub2 = session(&root, "sub2", None);
         use std::io::Write;
@@ -665,6 +673,16 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert_eq!(marker["data"]["parentSessionId"], "grandparent");
         assert_eq!(marker["data"]["parentSessionPath"], grandparent.to_string_lossy().as_ref());
         assert!(lines.next().unwrap().contains("keep"));
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; assert_eq!(std::fs::metadata(&fork).unwrap().permissions().mode() & 0o777, 0o640); }
+        #[cfg(target_os = "linux")] {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(fork.as_os_str().as_bytes()).unwrap();
+            let name = std::ffi::CString::new("user.pi-fixture").unwrap();
+            let mut value = [0u8; 16];
+            let count = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            assert_eq!(count, 7);
+            assert_eq!(&value[..7], b"fixture");
+        }
     }
     #[test]
     fn affected_set_includes_transitive_subagents_and_direct_forks() {
