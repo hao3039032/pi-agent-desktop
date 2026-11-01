@@ -85,6 +85,7 @@
 - **取消契约（`agent.unsubscribeEvents`，Terra P2-2）**：宿主置停标志并**唤醒**等待中的 relay 线程（不等待 30 s 探测）：静默取消后线程即刻结束、注册项回收。取消时刻之后最多再投递**一帧**（已在发送中的在途帧；多帧重放在每帧之间重查停止标志）。客户端收到取消 ACK 后不得假设存在后续帧，也不得依赖“取消后无帧”做同步。
 - 取消：前端 drop 订阅、页面刷新（WebView 重载）、窗口销毁均释放订阅；宿主侧以 `subscriptionId` 注销（`agent.unsubscribeEvents`），无泄漏。
 - `agent.subscribeEvents` 的第一帧 `kind:"snapshot"` 的 payload 是宿主快照 `{epoch, settledEpoch, state}`，**不是 AgentEvent**；前端适配层把它翻译成连接层等待的 `connected` AgentEvent（`lib/agent-event-stream.ts` 的首个 data 事件语义），后续 `kind:"event"` 帧的 payload 才是真实事件记录。
+- `tasks.subscribeEvents` 的宿主 relay 最多 32 条（计入线程退出），每订阅 ingress 最多 256 帧、1 MiB，单事件 JSON 最多 64 KiB。每次仅发一帧，前端投递后以 `tasks.ackEvents {subscriptionId, epoch, seq}` 确认；15 秒未确认、溢出或发送失败时结束 relay，尽力发 `reset`。`tasks.unsubscribe` 唤醒等待并释放。前端检测断序、不同订阅/epoch 或 reset 后清除增量状态、刷新 `tasks.list` 并重连；不得把通知丢失解释为任务终止。预算不包括上游事件产生、Tauri 反序列化前或 WebView 内部队列。
 - 消费确认与有界队列：工具中间输出可合并（coalesce）；最终消息、错误、UI 确认（extension dialog 请求/回复）不可静默丢弃。隐藏窗口不订阅时，宿主只为仍在运行的对象保留状态，不为无人消费的流无限堆积。
 - 会话事件内容沿用 pi RPC 事件记录（`agent_start`、`message_*`、`agent_settled`、`extension_ui_request`…），包一层 envelope；扩展 UI 请求经 `agent.respondUi` 回传，语义与 `crates/pi-host` 的 UI 子协议一致（到达序重放、超时/溢出取消而非同意）。
 

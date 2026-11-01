@@ -132,19 +132,20 @@ struct EventRelayHandle {
 }
 
 #[derive(Default)]
-struct SessionRelayAck {
+pub(crate) struct SessionRelayAck {
     state: Mutex<(u64, u64)>, // sent, acknowledged
     wake: std::sync::Condvar,
 }
 impl SessionRelayAck {
-    fn acknowledge(&self, seq: u64) -> bool {
+    pub(crate) fn acknowledge(&self, seq: u64) -> bool {
         let Ok(mut state) = self.state.lock() else { return false };
         if seq == 0 || seq > state.0 { return false; }
         state.1 = state.1.max(seq);
         self.wake.notify_all();
         true
     }
-    fn forward(&self, channel: &Channel<Value>, frame: Value, seq: u64, stop: &std::sync::atomic::AtomicBool, timeout: Duration) -> bool {
+    pub(crate) fn wake(&self) { self.wake.notify_all(); }
+    pub(crate) fn forward(&self, channel: &Channel<Value>, frame: Value, seq: u64, stop: &std::sync::atomic::AtomicBool, timeout: Duration) -> bool {
         {
             let Ok(mut state) = self.state.lock() else { return false };
             state.0 = seq;
@@ -1743,6 +1744,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "tasks.ackEvents" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            if state.scheduled_events.acknowledge(subscription, epoch, seq) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid scheduled stream acknowledgement") }
+        }
         "agent.ackEvents" => {
             let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
             let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
@@ -2793,7 +2801,7 @@ pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -
     let id = envelope_id(&request);
     let op = request.get("op").and_then(Value::as_str);
     let control = matches!(op,
-        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
+        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "tasks.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
              "agent.interrupt" | "auth.loginCancel" | "mcp.signInCancel" |
              "plugins.mutation.cancel" | "plugins.install.cancel" | "skills.mutation.cancel"))
         || (op == Some("agent.command") && matches!(request.pointer("/args/type").and_then(Value::as_str),
@@ -5794,6 +5802,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             Ok(())
         });
         let subscription = state.scheduled_events.subscribe(channel).unwrap();
+        let snapshot: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert!(state.scheduled_events.acknowledge(&subscription, 1, snapshot["seq"].as_u64().unwrap()));
         let started = send(&state, json!({ "v": 1, "id": "run", "op": "tasks.run", "args": { "id": task_id } }));
         assert_eq!(started["ok"], true, "{started}");
         let run = &started["data"]["run"];
@@ -5810,6 +5820,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let mut types = Vec::new();
         while types.len() < 4 {
             let frame: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+            assert!(state.scheduled_events.acknowledge(&subscription, 1, frame["seq"].as_u64().unwrap()));
             if let Some(kind) = frame["payload"]["type"].as_str() { types.push(kind.to_string()); }
         }
         assert!(types.iter().any(|kind| kind == "run_started"));
@@ -6684,6 +6695,20 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(!ack.forward(&silent, json!({"seq":2}), 2, &stop, Duration::from_millis(10)), "lost ACK closes the window");
         stop.store(true, Ordering::SeqCst);
         assert!(!ack.forward(&silent, json!({"seq":3}), 3, &stop, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn scheduled_channel_ack_through_dispatch_checks_epoch() {
+        let state = state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body| { let _ = tx.send(body); Ok(()) });
+        let subscription = state.scheduled_events.subscribe(channel).unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let request = |epoch, seq| json!({"v":1,"id":"ack","op":"tasks.ackEvents","args":{"subscriptionId":subscription,"epoch":epoch,"seq":seq}});
+        assert_eq!(send(&state, request(2, 1))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request(1, 2))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request(1, 1))["ok"], true);
+        state.scheduled_events.unsubscribe(&subscription);
     }
 
     #[test]

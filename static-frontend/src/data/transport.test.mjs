@@ -297,6 +297,37 @@ test("session frames are acknowledged after delivery even before subscribe ACK; 
   }
 });
 
+test("scheduled Channel frames ACK with epoch after delivery and unsubscribe", async () => {
+  let callback;
+  const calls = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 42; }, unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_subscribe_scheduled") {
+        callback({ index: 0, message: { subscriptionId: "tasks-1", epoch: 1, seq: 1, kind: "snapshot", payload: {} } });
+        return Promise.resolve({ subscriptionId: "tasks-1", epoch: 1 });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    let delivered = false;
+    const close = detectTransport().transport.subscribe("tasks.subscribeEvents", undefined, () => { delivered = true; }, () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "tasks.ackEvents"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(delivered);
+    assert.deepEqual(calls.find((call) => call.args?.request?.op === "tasks.ackEvents").args.request.args, { subscriptionId: "tasks-1", epoch: 1, seq: 1 });
+    close();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(calls.some((call) => call.args?.request?.op === "tasks.unsubscribe"));
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
+});
+
 // --- the subscribe ACK contract (a refused stream must reach onError) ------
 
 test("a protocol-error subscribe ACK becomes an onError, never a silent wait", async () => {
