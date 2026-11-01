@@ -83,6 +83,7 @@ pub struct IpcHostState {
     pub(crate) native_drops: crate::native_drop::NativeDrops,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
+    file_roots_init_error: Option<String>,
     /// Authorized save destinations (bound via native dialog selections).
     pub authorized_save_destinations: Mutex<HashMap<String, std::time::Instant>>,
     /// Per-cwd cache for files.index.
@@ -96,6 +97,7 @@ pub struct IpcHostState {
     pub projects: crate::session_view::ProjectResolver,
     /// Private exported HTML directories, removed on eviction or host exit.
     pub(crate) session_exports: Mutex<std::collections::VecDeque<tempfile::TempDir>>,
+    pub(crate) title_tasks: Mutex<HashMap<String, Option<Arc<Mutex<crate::session_title::TitleTask>>>>>,
     /// The catalogue's version counter (`invalidateSessionListCache` +
     /// `getSessionListVersion`): bumped by every host-visible mutation that
     /// changes the list a client holds (a create, a rename). Clients compare
@@ -105,10 +107,13 @@ pub struct IpcHostState {
     chat_unlock_policy: ChatUnlockPolicy,
     #[cfg(test)]
     pub(crate) session_writer_timeout: Mutex<Duration>,
+    #[cfg(test)]
+    pub(crate) title_rename_timeout: Mutex<Duration>,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
     dispatch_gate: Arc<tokio::sync::Semaphore>,
+    dispatch_control_gate: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -169,7 +174,7 @@ impl IpcHostState {
         let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
         let fence_agent_dir = Arc::clone(&task_agent_dir);
         let admitted_agent_dir = Mutex::new(None::<PathBuf>);
-        let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
+        let checker: session_host::SessionFenceChecker = Arc::new(move |id, owner| {
             let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
                 .clone().ok_or_else(|| "Agent directory unavailable".to_string())?;
             let mut admitted = admitted_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?;
@@ -180,8 +185,13 @@ impl IpcHostState {
             if crate::trust_policy_fence::is_pending(&agent) {
                 return Err("Trust policy outcome is unresolved; session admission is blocked".into());
             }
-            crate::session_writer_fence::assert_session_writable(&agent, id)
+            match owner {
+                Some(operation_id) => crate::session_writer_fence::assert_owned_title_fence(&agent, id, operation_id),
+                None => crate::session_writer_fence::assert_session_writable(&agent, id),
+            }
         });
+        let mut initial_roots = crate::file_access::AllowedRoots::new();
+        let file_roots_init_error = std::env::var_os("HOME").and_then(|home| initial_roots.add_default_cwd_roots(Path::new(&home)).err().map(|e| e.to_string()));
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
@@ -201,6 +211,9 @@ impl IpcHostState {
             terminals,
             #[cfg(test)]
             terminal_test_shell: Mutex::new(None),
+            title_tasks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            title_rename_timeout: Mutex::new(Duration::from_secs(30)),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
@@ -212,15 +225,8 @@ impl IpcHostState {
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             native_drops: crate::native_drop::NativeDrops::default(),
-            file_roots: {
-                let mut roots = crate::file_access::AllowedRoots::new();
-                // The legacy default-cwd layouts stay browsable across
-                // restarts (the /api/files scan behavior).
-                if let Some(home) = std::env::var_os("HOME") {
-                    roots.add_default_cwd_roots(Path::new(&home));
-                }
-                Mutex::new(roots)
-            },
+            file_roots: Mutex::new(initial_roots),
+            file_roots_init_error,
             authorized_save_destinations: Mutex::new(HashMap::new()),
             file_index_cache: Mutex::new(HashMap::new()),
             proposed_paths: Mutex::new(BTreeSet::new()),
@@ -228,6 +234,7 @@ impl IpcHostState {
             session_exports: Mutex::new(std::collections::VecDeque::new()),
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
+            dispatch_control_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_CONTROL)),
             chat_unlock_policy: ChatUnlockPolicy::Denied,
             #[cfg(test)]
             session_writer_timeout: Mutex::new(Duration::from_secs(60)),
@@ -312,12 +319,24 @@ impl IpcHostState {
     /// the index scan). Such paths become grantable resources and, for
     /// directories, browsable file roots — the /api/files semantics where
     /// roots derive from session data, never from a client-supplied path.
-    pub fn propose_path(&self, path: &Path) {
-        let text = path.to_string_lossy().into_owned();
-        self.proposed_paths.lock().unwrap().insert(text.clone());
-        if path.is_dir() {
-            self.file_roots.lock().unwrap().add(path);
+    pub fn propose_path(&self, path: &Path) -> std::io::Result<()> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => self.file_roots.lock().unwrap().add(path)?,
+            Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "workspace is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.file_roots.lock().unwrap().add_missing(path),
+            Err(error) => return Err(error),
         }
+        self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
+        Ok(())
+    }
+
+    pub(crate) fn reauthorize_selected_path(&self, path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        self.file_roots.lock().unwrap().reauthorize(path)?;
+        #[cfg(windows)]
+        self.file_roots.lock().unwrap().add(path)?;
+        self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
+        Ok(())
     }
 
     /// Whether the host itself proposed this exact path.
@@ -327,21 +346,17 @@ impl IpcHostState {
 
     /// Recover a persisted workspace from the host's session headers even if
     /// cwd validation races the first sidebar scan. Frontend paths alone grant nothing.
-    fn discover_session_cwd(&self, cwd: &Path) {
-        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return; }
+    fn discover_session_cwd(&self, cwd: &Path) -> std::io::Result<()> {
+        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return Ok(()); }
         let index = session_host::scan_sessions(&self.agent_dir());
         if index.projects.keys().any(|known| Path::new(known) == cwd) {
             let agent_dir = self.agent_dir();
             let is_chat = crate::session_view::is_chat_workspace_path(cwd, &agent_dir);
             let in_chat = crate::worktrees::is_chat_area(cwd, &agent_dir);
-            if cwd.exists() && is_chat != in_chat { return; }
-            self.propose_path(cwd);
-            if !cwd.exists() {
-                // A deleted session cwd is still a known lexical root for the
-                // read-only missing status; it cannot authorize existing files.
-                self.file_roots.lock().unwrap().add(cwd);
-            }
+            if cwd.exists() && is_chat != in_chat { return Ok(()); }
+            self.propose_path(cwd)?;
         }
+        Ok(())
     }
 
     /// The agent dir this host runs against (sessions.list, the task store).
@@ -1063,6 +1078,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
     let Some(op) = envelope.get("op").and_then(Value::as_str) else {
         return protocol_error(&id, "invalid_args", "the request has no op");
     };
+    if let Some(error) = &state.file_roots_init_error { return protocol_error(&id, "io", error); }
     let args = envelope.get("args").cloned().unwrap_or(json!({}));
     if !args.is_object() {
         return protocol_error(&id, "invalid_args", "args must be an object");
@@ -1078,6 +1094,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 "protocol": IPC_PROTOCOL_VERSION,
             }),
         ),
+        // Read-only diagnosis only: never grants recovery or removes markers.
+        "desktop.recoveryStatus" => protocol_ok(&id, json!(crate::host_lifecycle::recovery_status(&state.agent_dir()))),
         // The transition-version state mirror (plan §七): the static app
         // READS the mirror the legacy version wrote, before React mounts.
         // The mirror lives under the host's agent dir; a missing or corrupt
@@ -1223,7 +1241,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             // The /api/files semantics: session cwds (and the chat roots)
             // become browsable roots, derived host-side.
             for (cwd, _) in index.projects.iter() {
-                state.propose_path(Path::new(cwd));
+                if let Err(error) = state.propose_path(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             }
             let mut data = session_host::history::index_json(&index);
             if let Some(object) = data.as_object_mut() {
@@ -1326,7 +1344,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             // Host-derived roots stay in step with the catalogue's cwds.
             for value in sessions.iter() {
                 if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
-                    state.propose_path(Path::new(cwd));
+                    if let Err(error) = state.propose_path(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                 }
             }
             // The hidden chat root (ensureChatWorkspace; the sidebar's new-chat
@@ -1336,7 +1354,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 .unwrap_or_else(|_| {
                     crate::session_view::chat_workspace_dir(&agent_dir).display().to_string()
                 });
-            state.propose_path(Path::new(&chat_root));
+            if let Err(error) = state.propose_path(Path::new(&chat_root)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             protocol_ok(
                 &id,
                 json!({
@@ -1353,7 +1371,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
-        "sessions.autoName" => protocol_error(&id, "not_supported", "Automatic session naming is unavailable until the live provider's request semantics can be preserved."),
+        "sessions.autoName" => match crate::session_title::start(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.autoNameStatus" => match crate::session_title::status(state, &args) {
+            Ok(data) => { if data.get("title").is_some() { bump_session_list_version(state); } protocol_ok(&id, data) },
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.autoNameCancel" => match crate::session_title::cancel(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "agent.command" if args.get("type").and_then(Value::as_str) == Some("abort_branch_summary") => {
             protocol_error(&id, "not_supported", "Branch summaries are unavailable in the desktop session host.")
         }
@@ -1503,7 +1532,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // gets proposed for browsing.
         "cwd.status" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else { return protocol_error(&id, "invalid_args", "An absolute cwd is required"); };
-            state.discover_session_cwd(Path::new(cwd));
+            if let Err(error) = state.discover_session_cwd(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             match crate::workspace_status::status(&state.file_roots.lock().unwrap(), cwd) {
                 Ok(result) => protocol_ok(&id, result),
                 Err((code, message)) => protocol_error(&id, code, message),
@@ -1519,7 +1548,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let agent_dir = state.agent_dir();
             match crate::session_view::ensure_chat_workspace(&agent_dir) {
                 Ok(cwd) => {
-                    state.propose_path(&cwd);
+                    if let Err(error) = state.propose_path(&cwd) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     protocol_ok(&id, json!({ "cwd": cwd.display().to_string() }))
                 }
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
@@ -1536,7 +1565,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 .join(format!("{year:04}{month:02}{day:02}"));
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
-                    state.propose_path(&dir);
+                    if let Err(error) = state.propose_path(&dir) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     protocol_ok(&id, json!({ "cwd": dir.display().to_string() }))
                 }
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
@@ -2366,20 +2395,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(unix)]
             let opened = {
                 let target_path = Path::new(path);
-                let scoped = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, target_path)
-                };
-                let scoped = if scoped.is_some() { scoped } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
+                let roots = state.file_roots.lock().unwrap();
+                if roots.is_path_allowed(target_path) {
+                    Some(roots.open_file(target_path))
+                } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
                     if target_path.is_absolute() && !target_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                         match session_file_referenced(state, session, path) {
-                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| (resolved, PathBuf::from("/"))),
+                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| crate::file_access::open_file_beneath_root(Path::new("/"), &resolved)),
                             Ok(false) => None,
                             Err((code, message)) => return protocol_error(&id, &code, &message),
                         }
                     } else { None }
-                } else { None };
-                scoped.map(|(target, root)| crate::file_access::open_file_beneath_root(&root, &target))
+                } else { None }
             };
             #[cfg(windows)]
             let opened: Option<Result<std::fs::File, std::io::Error>> = None;
@@ -2388,7 +2415,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
                     Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
                 },
-                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                Some(Err(error)) => protocol_error(&id, if error.kind() == std::io::ErrorKind::PermissionDenied { "unauthorized_scope" } else { "io" }, &error.to_string()),
                 None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
         }
@@ -2396,16 +2423,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             #[cfg(unix)]
             {
-                let scoped = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, Path::new(path))
-                };
-                let Some((target, root)) = scoped else { return protocol_error(&id, "unauthorized_scope", "preview path is outside authorized roots"); };
-                let Some(parent) = target.parent() else { return protocol_error(&id, "invalid_args", "invalid preview path"); };
-                let Some(name) = target.file_name().and_then(|name| name.to_str()) else { return protocol_error(&id, "invalid_args", "invalid preview filename"); };
-                if crate::file_access::open_file_beneath_root(&root, &target).is_err() { return protocol_error(&id, "unauthorized_scope", "preview file cannot be opened safely"); }
-                let directory = match crate::file_access::open_directory_beneath_root(&root, parent) {
-                    Ok(directory) => directory,
+                let roots = state.file_roots.lock().unwrap();
+                let (directory, name) = match roots.open_preview_directory(Path::new(path)) {
+                    Ok(result) => result,
                     Err(error) => return protocol_error(&id, "unauthorized_scope", &error.to_string()),
                 };
                 match state.resources.grant_open_directory(directory, Duration::from_secs(600)) {
@@ -2506,7 +2526,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             match crate::worktrees::execute(op, &cwd, &args, &project) {
                 Ok((data, grants)) => {
                     for path in grants {
-                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) { state.propose_path(&path); }
+                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) {
+                            if let Err(error) = state.propose_path(&path) { return protocol_error(&id, "unauthorized_scope", &format!("Worktree operation completed, but its root could not be authorized: {error}")); }
+                        }
                     }
                     if matches!(op, "worktrees.create" | "worktrees.switch" | "worktrees.delete") { state.projects.invalidate(); }
                     protocol_ok(&id, data)
@@ -2559,7 +2581,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     if !already_allowed {
                         // The operator explicitly chose to browse the target:
                         // a host-side root grant (propose_path records it).
-                        state.propose_path(std::path::Path::new(&target));
+                        if let Err(error) = state.propose_path(std::path::Path::new(&target)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     }
                     protocol_ok(
                         &id,
@@ -2584,8 +2606,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(unix)]
             let outcome = {
                 let roots = state.file_roots.lock().unwrap();
-                crate::file_access::resolved_read_target_with_root(&roots, &target)
-                    .map(|(resolved, root)| crate::file_access::read_beneath_root(&root, &resolved))
+                use std::io::Read;
+                Some(roots.open_file(&target).and_then(|mut file| { let mut bytes = Vec::new(); file.read_to_end(&mut bytes)?; Ok(bytes) }))
             };
             #[cfg(windows)]
             let outcome: Option<Result<Vec<u8>, std::io::Error>> = {
@@ -2655,15 +2677,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let path = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
             #[cfg(unix)]
             {
-                let resolved = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, path)
-                };
-                let Some((target, root)) = resolved else { return protocol_error(&id, "unauthorized_scope", "access-denied") };
-                if crate::file_access::open_directory_beneath_root(&root, &target).is_err() {
-                    return protocol_error(&id, "unauthorized_scope", "not-a-directory");
-                }
-                match crate::open_path_with_default_app(&target) {
+                let roots = state.file_roots.lock().unwrap();
+                if roots.open_directory(path).is_err() { return protocol_error(&id, "unauthorized_scope", "not-a-directory"); }
+                match crate::open_path_with_default_app(path) {
                     Ok(()) => protocol_ok(&id, json!({ "opened": true })),
                     Err(error) => protocol_error(&id, "io", &error),
                 }
@@ -2698,9 +2714,12 @@ fn envelope_id(raw: &Value) -> String {
 /// The concurrency cap for envelope dispatches through the async entry:
 /// headroom for the page's bursts (state probes beside a slow management
 /// op) while a flooding page cannot grow the blocking pool unbounded.
-/// Excess requests QUEUE on the gate — backpressure the frontend already
-/// handles, since every invoke is an awaited request/response.
+/// Excess requests are rejected before dispatch; there is no host-side
+/// semaphore wait queue. This does not bound Tauri/WebView's own buffers.
 pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
+/// Separate capacity for stream cleanup/terminal ACK so slow operations do
+/// not prevent relays from being released. This lane is bounded too.
+pub const IPC_MAX_CONCURRENT_CONTROL: usize = 4;
 
 /// The product dispatch path the async `pi_ipc` command AND the static-UI
 /// acceptance harness share — one gate, one blocking pool, the same caps.
@@ -2723,10 +2742,15 @@ pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
 /// blocks process exit.
 pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -> Value {
     let id = envelope_id(&request);
-    let gate = Arc::clone(&state.dispatch_gate);
-    let permit = match gate.acquire_owned().await {
+    let control = matches!(request.get("op").and_then(Value::as_str),
+        Some("agent.unsubscribeEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe"));
+    let gate = Arc::clone(if control { &state.dispatch_control_gate } else { &state.dispatch_gate });
+    let permit = match gate.try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => {
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            return protocol_error_value(&id, json!({"code":"busy", "message":"dispatch capacity exhausted; request was not executed", "reason":"dispatch_not_admitted", "retryable":true}));
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
             return protocol_error(&id, "host_error", "the dispatch gate is closed");
         }
     };
@@ -2834,10 +2858,15 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
         let mut payload = args.clone();
         payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
         payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+        payload["hostedOAuth"] = json!(true);
         let handle = match instance.start_task("mcp.signInStart", payload, Duration::from_secs(600), management_host::TaskKind::Mutation) {
             Ok(handle) => handle,
             Err(error) => return protocol_error(id, "io", &error),
         };
+        if let Err(error) = crate::mcp_oauth_callback::start(instance.clone(), handle.clone()) {
+            let _ = instance.cancel_task(&handle);
+            return protocol_error(id, "io", &format!("Could not start callback monitor: {error}"));
+        }
         {
             let mut handles = state.mcp_signin_tasks.lock().unwrap();
             handles.retain(|handle| instance.task_snapshot(handle).is_ok());
@@ -2908,6 +2937,7 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
 }
 
 fn mcp_signin_flow_response(id: &str, handle: &str, mut flow: Value) -> Value {
+    if let Some(object) = flow.as_object_mut() { object.remove("_hostCallback"); }
     if flow.get("mcpRefusal").is_some() { return mcp_management_response(id, flow); }
     if !flow.is_object() || flow.get("phase").and_then(Value::as_str).is_none() {
         return protocol_error(id, "io", "Invalid MCP sign-in response");
@@ -3943,7 +3973,7 @@ pub(crate) fn create_session(
     )
     .map_err(|message| invalid(&message, command_type.as_deref()))?;
 
-    state.discover_session_cwd(&requested_cwd);
+    state.discover_session_cwd(&requested_cwd).map_err(|e| ("unauthorized_scope".to_string(), e.to_string(), None))?;
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
     if chat_workspace && !chat_root && (!state.is_proposed(&requested_cwd.to_string_lossy())
@@ -4023,7 +4053,7 @@ pub(crate) fn create_session(
     let (session_file, session_id) = session_host::create_session_file(&session_dir, &session_cwd)
         .map_err(|error| ("io".to_string(), error.to_string(), None))?;
     // A brand-new cwd is immediately browsable (allowFileRoot's contract).
-    state.propose_path(&session_cwd);
+    state.propose_path(&session_cwd).map_err(|e| ("unauthorized_scope".to_string(), format!("Session file created, but workspace authorization failed: {e}"), None))?;
 
     // 4. Spawn through the shared plan (kind, pin, prompts, model).
     let base = state
@@ -4411,7 +4441,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
     let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
-    state.discover_session_cwd(&cwd);
+    state.discover_session_cwd(&cwd).map_err(|e| ("unauthorized_scope".to_string(), e.to_string()))?;
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
         if !crate::session_view::is_chat_root_path(&cwd, &agent_dir)
@@ -5250,6 +5280,22 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(response["data"]["host"], "tauri");
         assert_eq!(response["data"]["protocol"], 1);
         assert_eq!(response["data"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn recovery_status_is_read_only_and_uses_host_agent_directory() {
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        std::fs::create_dir(dir.path().join("pi-web")).unwrap();
+        let marker = dir.path().join("pi-web/trust-policy-pending.json");
+        std::fs::write(&marker, b"unknown").unwrap();
+        let response = send(&state, json!({"v": 1, "id": "recovery", "op": "desktop.recoveryStatus", "args": {"agentDir": other.path()}}));
+        assert_eq!(response["data"]["trustPolicy"], "pending");
+        assert_eq!(response["data"]["sessionWriters"], "clear");
+        assert_eq!(response["data"]["deletionJournal"], "clear");
+        assert_eq!(std::fs::read(marker).unwrap(), b"unknown");
     }
 
     #[test]
@@ -6462,6 +6508,38 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(slow["error"]["code"], "io", "{slow}");
     }
 
+    #[test]
+    fn dispatch_saturation_rejects_before_execution_and_recovers() {
+        let state = Arc::new(state());
+        let permits: Vec<_> = (0..IPC_MAX_CONCURRENT_DISPATCH)
+            .map(|_| Arc::clone(&state.dispatch_gate).try_acquire_owned().unwrap())
+            .collect();
+        for n in 0..1000 {
+            let response = tauri::async_runtime::block_on(dispatch_envelope_gated(
+                Arc::clone(&state), json!({"v":1,"id":format!("flood-{n}"),"op":"desktop.identity"}),
+            ));
+            assert_eq!(response["error"]["reason"], "dispatch_not_admitted");
+            assert_eq!(response["error"]["retryable"], true);
+        }
+        let control = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"cleanup","op":"tasks.unsubscribe","args":{"subscriptionId":"missing"}}),
+        ));
+        assert_eq!(control["ok"], true, "cleanup has reserved capacity: {control}");
+        let control_permits: Vec<_> = (0..IPC_MAX_CONCURRENT_CONTROL)
+            .map(|_| Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap())
+            .collect();
+        let control = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"control-full","op":"tasks.unsubscribe"}),
+        ));
+        assert_eq!(control["error"]["reason"], "dispatch_not_admitted");
+        drop(control_permits);
+        drop(permits);
+        let response = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            state, json!({"v":1,"id":"after","op":"desktop.identity"}),
+        ));
+        assert_eq!(response["ok"], true, "{response}");
+    }
+
     /// The async `pi_ipc` command is the product boundary. This pins the
     /// delegation (a cheap tripwire, NOT the only evidence — the behavioral
     /// test above and the static-UI acceptance run are): a revert to a sync
@@ -6856,7 +6934,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&managed).unwrap();
         symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
-        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"cancel":{"url":url},"signout":{"url":url}}}).to_string()).unwrap();
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"signout":{"url":url},"exit":{"url":url}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable, agent_dir: Some(agent.clone()),
@@ -6881,12 +6959,39 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let redirect = String::from_utf8(result.stdout).unwrap();
         let invalid = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":"http://localhost/?code=x&state=wrong"}));
         assert_eq!(invalid["error"]["reason"], "redirect-state-mismatch", "{invalid}");
-        let submitted = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":redirect.trim()}));
-        assert_eq!(submitted["ok"], true, "{submitted}");
+        assert!(waiting["data"].get("_hostCallback").is_none());
+        let wrong = Command::new("node").arg("-e").arg("let u=new URL(process.argv[1]);u.searchParams.set('state','wrong');fetch(u).then(r=>{if(r.status!==400)throw Error(String(r.status))})").arg(redirect.trim()).output().unwrap();
+        assert!(wrong.status.success(), "{}", String::from_utf8_lossy(&wrong.stderr));
+        let callback = Command::new("node").arg("-e").arg("fetch(process.argv[1]).then(async r=>{if(!r.ok)throw Error(String(r.status)); console.log(await r.text())})").arg(redirect.trim()).output().unwrap();
+        assert!(callback.status.success(), "{}", String::from_utf8_lossy(&callback.stderr));
         loop {
             let status = call("mcp.signInStatus", json!({"flowId":handle}));
             assert_eq!(status["ok"], true, "{status}");
             if status["data"]["phase"] == "done" { assert_eq!(status["data"]["result"]["state"], "connected", "{status}"); break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let callback_url = url::Url::parse(redirect.trim()).unwrap();
+        let address: std::net::SocketAddr = ([127, 0, 0, 1], callback_url.port().unwrap()).into();
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
+            assert!(std::time::Instant::now() < close_deadline, "completed callback listener remained open");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let manual_start = call("mcp.signInStart", json!({"scope":"global","name":"manual"}));
+        let manual_handle = manual_start["data"]["flowId"].as_str().unwrap();
+        let manual_page = loop {
+            let status = call("mcp.signInStatus", json!({"flowId":manual_handle}));
+            if status["data"]["phase"] == "authorize" { break status["data"]["authorizationUrl"].as_str().unwrap().to_owned(); }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let manual_redirect = Command::new("node").arg("-e").arg("fetch(process.argv[1],{redirect:'manual'}).then(r=>console.log(r.headers.get('location')))").arg(manual_page).output().unwrap();
+        let submitted = call("mcp.signInSubmit", json!({"flowId":manual_handle,"redirectUrl":String::from_utf8(manual_redirect.stdout).unwrap().trim()}));
+        assert_eq!(submitted["ok"], true, "{submitted}");
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":manual_handle}));
+            if status["data"]["phase"] == "done" { assert_eq!(status["data"]["result"]["state"], "connected"); break; }
             assert!(std::time::Instant::now() < deadline, "{status}");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -6911,6 +7016,23 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             if status["data"]["phase"] == "cancelled" { break; }
             assert!(std::time::Instant::now() < deadline, "{status}");
             std::thread::sleep(Duration::from_millis(50));
+        }
+        let exit = call("mcp.signInStart", json!({"scope":"global","name":"exit"}));
+        let exit_handle = exit["data"]["flowId"].as_str().unwrap();
+        let exit_redirect = loop {
+            let status = call("mcp.signInStatus", json!({"flowId":exit_handle}));
+            if status["data"]["phase"] == "authorize" { break status["data"]["redirectUrl"].as_str().unwrap().to_owned(); }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let exit_address: std::net::SocketAddr = ([127, 0, 0, 1], url::Url::parse(&exit_redirect).unwrap().port().unwrap()).into();
+        let config = state.management_config.lock().unwrap().clone().unwrap();
+        let instance = state.management.instance("global", &config).unwrap();
+        instance.force_stop(Duration::from_secs(5)).unwrap();
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::net::TcpStream::connect_timeout(&exit_address, Duration::from_millis(50)).is_ok() {
+            assert!(std::time::Instant::now() < close_deadline, "callback listener survived child shutdown");
+            std::thread::sleep(Duration::from_millis(20));
         }
         state.management.shutdown_all(Duration::from_secs(5));
     }

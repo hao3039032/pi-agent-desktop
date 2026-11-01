@@ -116,7 +116,7 @@ fn text_file(roots: &AllowedRoots, path: &Path) -> Option<String> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.is_file() || meta.len() > 256 * 1024 { return None; }
     #[cfg(unix)]
-    let bytes = { let (resolved, root) = crate::file_access::resolved_read_target_with_root(roots, path)?; crate::file_access::read_beneath_root(&root, &resolved).ok()? };
+    let bytes = { use std::io::Read; let mut file = roots.open_file(path).ok()?; let mut bytes = Vec::new(); file.read_to_end(&mut bytes).ok()?; bytes };
     #[cfg(not(unix))]
     let bytes: Vec<u8> = { let _ = roots; return None; };
     if bytes.len() > 256 * 1024 || bytes.contains(&0) { return None; }

@@ -193,7 +193,7 @@ impl RunningSignal {
     }
 }
 
-pub type SessionFenceChecker = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+pub type SessionFenceChecker = Arc<dyn Fn(&str, Option<&str>) -> Result<(), String> + Send + Sync>;
 
 pub struct Session {
     fence_checker: SessionFenceChecker,
@@ -237,6 +237,12 @@ pub struct Session {
     running_signal: Arc<RunningSignal>,
 }
 
+/// Exclusive activity permit, bound to the Session which created it.
+pub struct SessionActivityGuard<'a> {
+    owner: &'a Session,
+    _guard: std::sync::RwLockWriteGuard<'a, ()>,
+}
+
 struct SessionState {
     lease_until: Instant,
     started_at: Instant,
@@ -261,7 +267,7 @@ impl Session {
         } else { None };
         if matches!(command, "abort" | "abort_bash") { self.cancel_ui(); }
         if _admission.is_some() {
-            (self.fence_checker)(&self.id).map_err(pi_host::PiRpcError::invalid)?;
+            (self.fence_checker)(&self.id, None).map_err(pi_host::PiRpcError::invalid)?;
         }
         let result = self.client.command(command, data, timeout);
         self.touch();
@@ -269,10 +275,10 @@ impl Session {
     }
 
     /// Hold across branch validation and mutation so admissions cannot race it.
-    pub fn try_branch_activity(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, &'static str> {
+    pub fn try_branch_activity(&self) -> Result<SessionActivityGuard<'_>, &'static str> {
         let guard = self.activity_gate.try_write().map_err(|_| "session is busy")?;
-        (self.fence_checker)(&self.id).map_err(|_| "session has an unresolved writer outcome")?;
-        Ok(guard)
+        (self.fence_checker)(&self.id, None).map_err(|_| "session has an unresolved writer outcome")?;
+        Ok(SessionActivityGuard { owner: self, _guard: guard })
     }
 
     /// Whether the child transport is closing or has exited.
@@ -304,25 +310,41 @@ impl Session {
         let _admission = if op == "subagents.steer" {
             Some(self.activity_gate.try_read().map_err(|_| refusal("session branch operation is in progress".into()))?)
         } else { None };
-        if _admission.is_some() { (self.fence_checker)(&self.id).map_err(refusal)?; }
+        if _admission.is_some() { (self.fence_checker)(&self.id, None).map_err(refusal)?; }
         self.bridge.request(op, args, timeout)
     }
 
     /// Issue a branch mutation while the caller holds this session's activity
     /// guard. This avoids reacquiring the guard in composite host operations.
     pub fn bridge_request_with_activity(
-        &self, _guard: &std::sync::RwLockWriteGuard<'_, ()>, op: &str,
+        &self, guard: &SessionActivityGuard<'_>, op: &str,
         args: Option<Value>, timeout: Option<Duration>,
     ) -> Result<Value, pi_host::bridge::BridgeError> {
-        if !matches!(op, "tree.navigate" | "session.rename") {
+        if !std::ptr::eq(guard.owner, self) || !matches!(op, "tree.navigate" | "session.rename") {
             return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
                 op: op.to_string(), message: "invalid guarded branch operation".into(), code: Some("invalid_args".into()),
             }));
         }
-        (self.fence_checker)(&self.id).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+        (self.fence_checker)(&self.id, None).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
             op: op.to_string(), message, code: Some("busy".into()),
         }))?;
         self.bridge.request(op, args, timeout)
+    }
+
+    /// The activity owner may dispatch only its own persistently fenced title rename.
+    pub fn title_rename_with_owned_fence(
+        &self, guard: &SessionActivityGuard<'_>, operation_id: &str,
+        task_id: &str, name: &str, timeout: Option<Duration>,
+    ) -> Result<Value, pi_host::bridge::BridgeError> {
+        if !std::ptr::eq(guard.owner, self) {
+            return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+                op: "title.rename".into(), message: "activity guard belongs to another session".into(), code: Some("fence_refused".into()),
+            }));
+        }
+        (self.fence_checker)(&self.id, Some(operation_id)).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+            op: "title.rename".into(), message, code: Some("fence_refused".into()),
+        }))?;
+        self.bridge.request("title.rename", Some(json!({"id":task_id, "name": name})), timeout)
     }
 
     /// The exact custom base passed at spawn, not the composed run prompt.
@@ -790,7 +812,7 @@ impl Default for SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
-        Self::with_fence_checker(Arc::new(|_| Err("session fence checker is not configured".into())))
+        Self::with_fence_checker(Arc::new(|_, _| Err("session fence checker is not configured".into())))
     }
 
     pub fn with_fence_checker(fence_checker: SessionFenceChecker) -> Self {
@@ -839,7 +861,7 @@ impl SessionRegistry {
     ) -> Result<T, SessionWriterError<E>> {
         let lock = self.start_lock_for(id);
         let _start = lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))?;
-        (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+        (self.fence_checker)(id, None).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         // Include exited entries: their in-flight delivery can still restore an
         // unknown message to the persistent outbox after the process exits.
         let session = self.sessions.lock().unwrap().get(id).cloned();
@@ -912,7 +934,7 @@ impl SessionRegistry {
             });
         }
         for (id, session) in ids.iter().zip(&sessions) {
-            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+            (self.fence_checker)(id, None).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
             if self.composer_outbox_for(id).has_pending_or_in_flight()
                 || session.as_ref().is_some_and(|session| session.run_state().is_running()) {
                 return Err(SessionWriterError::Busy("session is running or has pending messages"));
@@ -938,7 +960,7 @@ impl SessionRegistry {
             starts.push(lock.try_lock().map_err(|_| SessionWriterError::Busy("session writer is busy"))?);
         }
         for id in &ids {
-            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+            (self.fence_checker)(id, None).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         }
         operation().map_err(SessionWriterError::Operation)
     }
@@ -995,7 +1017,7 @@ impl SessionRegistry {
         let _policy = self.policy_gate.try_read().map_err(|_| SessionHostError::Spawn("session policy change is in progress".to_string()))?;
         let lock = self.start_lock_for(id);
         let _guard = lock.lock().unwrap();
-        (self.fence_checker)(id).map_err(SessionHostError::Spawn)?;
+        (self.fence_checker)(id, None).map_err(SessionHostError::Spawn)?;
         // Won the lock: re-check (another caller may have finished spawning).
         if let Some(existing) = self.get(id) {
             if existing.is_idle_expired() {
@@ -2087,13 +2109,13 @@ mod dispatch_tests {
     struct SessionRegistry;
     impl SessionRegistry {
         fn new() -> super::SessionRegistry {
-            super::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+            super::SessionRegistry::with_fence_checker(Arc::new(|_, _| Ok(())))
         }
     }
 
     #[test]
     fn snapshot_and_multi_writer_gates_refuse_busy_and_pending_without_waiting() {
-        let registry = super::SessionRegistry::with_fence_checker(Arc::new(|id| {
+        let registry = super::SessionRegistry::with_fence_checker(Arc::new(|id, _| {
             if id == "fenced" { Err("unknown".into()) } else { Ok(()) }
         }));
         let lock = registry.start_lock_for("held");
@@ -2106,7 +2128,7 @@ mod dispatch_tests {
 
     #[test]
     fn session_fence_refuses_offline_writers_and_starts() {
-        let checker: SessionFenceChecker = Arc::new(|id| {
+        let checker: SessionFenceChecker = Arc::new(|id, _owner| {
             if id == "blocked" { Err("unknown writer outcome".into()) } else { Ok(()) }
         });
         let registry = super::SessionRegistry::with_fence_checker(checker);

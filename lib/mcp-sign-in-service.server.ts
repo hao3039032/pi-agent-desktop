@@ -1,6 +1,9 @@
 import { isMcpDisabledByOperator } from "./builtin-extensions";
 import { isMcpEntryRefusal, mcpProjectTrustRefusal, readConnectableMcpBody } from "./mcp-entry-request";
 import { McpServiceError } from "./mcp-service.server";
+import { McpCredentialAdmissionError } from "./mcp-sign-out";
+import { signInMcpWithHostedCallback, type McpHostedCallbackFactory } from "./mcp-oauth-hosted.server";
+export { McpOAuthBroker } from "./mcp-oauth-broker.server";
 import {
   cancelMcpSignIn,
   createMcpSignInDeps,
@@ -12,7 +15,7 @@ import {
 } from "./mcp-sign-in";
 
 /** Start against a disk entry checked with the host's authorized roots. */
-export async function startManagedMcpSignIn(options: { body: unknown; agentDir: string; allowedRoots: Set<string> }) {
+export async function startManagedMcpSignIn(options: { body: unknown; agentDir: string; allowedRoots: Set<string>; callbackFactory?: McpHostedCallbackFactory; credentialAdmission?: unknown }) {
   const entry = await readConnectableMcpBody(options.body, options);
   if (isMcpEntryRefusal(entry)) {
     const { error, reason, ...params } = entry.body;
@@ -23,8 +26,18 @@ export async function startManagedMcpSignIn(options: { body: unknown; agentDir: 
   if (url === undefined) throw new McpServiceError(409, "sign-in-not-oauth", `MCP server "${name}" does not use OAuth: only an HTTP server without an Authorization header does`, { name });
   const mayConnect = () => !isMcpDisabledByOperator()
     && (scope !== "project" || !project || mcpProjectTrustRefusal(project.cwd, agentDir) === undefined);
-  const { flow, joined } = startMcpSignIn({ scope, name, sourcePath, configKey, config, cwd, url, mayConnect }, createMcpSignInDeps(internals));
-  return { ...flow, ...(joined ? { joined: true as const } : {}) };
+  const deps = createMcpSignInDeps(internals);
+  if (options.callbackFactory) {
+    const factory = options.callbackFactory;
+    deps.signIn = (request, signal, onTokenRequest) => signInMcpWithHostedCallback(request, factory, signal, onTokenRequest);
+  }
+  try {
+    const { flow, joined } = startMcpSignIn({ scope, name, sourcePath, configKey, config, cwd, url, mayConnect }, deps, { credentialAdmission: options.credentialAdmission });
+    return { ...flow, ...(joined ? { joined: true as const } : {}) };
+  } catch (error) {
+    if (error instanceof McpCredentialAdmissionError) throw new McpServiceError(409, "invalid-request", error.message);
+    throw error;
+  }
 }
 
 const UNKNOWN = "No sign-in has that id: it ended over a minute ago, or Pi Web restarted";

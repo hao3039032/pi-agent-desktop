@@ -2528,6 +2528,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oauth-loopback"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "sha2",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2963,6 +2971,7 @@ dependencies = [
  "ksni",
  "libc",
  "management-host",
+ "oauth-loopback",
  "objc2",
  "objc2-foundation",
  "pi-host",

@@ -882,6 +882,8 @@ export const zhCNLocale: LocalePlugin = {
     "mcp.signIn.done.needsAuthAfter": "已登录，但 Pi Web 再次连接时，服务器仍要求登录。",
     "mcp.signIn.done.notConnected": "已登录。按“测试连接”查看服务器提供的内容。",
     "mcp.signIn.cancelled": "已取消登录。",
+    "mcp.signIn.remoteOutcomeUnknown": "认证请求可能仍在处理，远端或本地凭据可能发生变化；请稍后检查连接和登录状态。",
+
     "mcp.signIn.expired": "登录没有在 5 分钟内完成，因此 Pi Web 停止了等待。",
     "mcp.signIn.failed.connect-failed": "服务器没有连接成功，也没有要求登录，因此没有可登录的内容。上方的“连接”说明了原因。",
     "mcp.signIn.failed.queue-timed-out": "另一个会执行 shell 命令的服务器的测试没有及时完成，因此登录没有开始。请重试。",

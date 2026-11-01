@@ -93,7 +93,7 @@ fn ipc_worktree_mutations_refuse_unpinned_git_metadata() {
     let repo = temp.path().join("repo"); std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init"]); git(&repo, &["config", "user.email", "fixture@example.invalid"]); git(&repo, &["config", "user.name", "Fixture"]);
     std::fs::write(repo.join("file"), "original\n").unwrap(); git(&repo, &["add", "file"]); git(&repo, &["commit", "-m", "initial"]);
-    let state = crate::pi_ipc::IpcHostState::new(); state.propose_path(&repo);
+    let state = crate::pi_ipc::IpcHostState::new(); state.propose_path(&repo).expect("fixture root");
     let call = |op: &str, args: Value| crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
     let created = call("worktrees.create", json!({"cwd":repo,"branch":"new"})); assert_eq!(created["ok"], true, "{created}");
     let path = PathBuf::from(created["data"]["path"].as_str().unwrap());
