@@ -12,7 +12,7 @@ fn accept_selection(state: &IpcHostState, selected: Option<PathBuf>) -> Result<O
         return Err("Chat folders cannot be selected as projects".into());
     }
     std::fs::read_dir(&canonical).map_err(|e| e.to_string())?;
-    state.propose_path(&canonical);
+    state.reauthorize_selected_path(&canonical).map_err(|e| e.to_string())?;
     Ok(Some(canonical.to_string_lossy().into_owned()))
 }
 
@@ -82,6 +82,38 @@ mod tests {
         *state.task_agent_dir.lock().unwrap() = Some(agent);
         let missing = crate::pi_ipc::dispatch_envelope(&state, serde_json::json!({"v":1,"id":"test","op":"cwd.status","args":{"cwd":project}}));
         assert_eq!(missing["data"]["availability"], "missing", "{missing}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_requires_native_reselection_and_old_resource_stays_pinned() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let old = tmp.path().join("old");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("value"), b"old").unwrap();
+        let state = IpcHostState::new();
+        accept_selection(&state, Some(project.clone())).unwrap();
+        let mut pinned = state.file_roots.lock().unwrap().open_file(&project.join("value")).unwrap();
+        std::fs::rename(&project, &old).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("value"), b"new").unwrap();
+        assert!(state.propose_path(&project).is_err());
+        let request = |op: &str, args: serde_json::Value| crate::pi_ipc::dispatch_envelope(&state, serde_json::json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let path = project.join("value");
+        assert_eq!(request("files.read", serde_json::json!({"path":path}))["ok"], false);
+        assert_eq!(request("files.write", serde_json::json!({"path":path,"data":"YXR0YWNr"}))["ok"], false);
+        assert!(state.file_roots.lock().unwrap().open_file(&project.join("value")).is_err());
+        assert!(crate::file_access::write_through_allowed_parent(&state.file_roots.lock().unwrap(), &project.join("value"), b"attack").is_err());
+        assert_eq!(std::fs::read(project.join("value")).unwrap(), b"new");
+        assert_eq!(std::fs::read(old.join("value")).unwrap(), b"old");
+        let mut content = String::new();
+        pinned.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "old");
+        accept_selection(&state, Some(project.clone())).unwrap();
+        assert_eq!(request("files.read", serde_json::json!({"path":path}))["ok"], true);
+        assert!(state.file_roots.lock().unwrap().open_file(&project.join("value")).is_ok());
     }
 
     #[cfg(unix)]

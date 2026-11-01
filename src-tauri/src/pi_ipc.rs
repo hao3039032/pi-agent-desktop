@@ -83,6 +83,7 @@ pub struct IpcHostState {
     pub(crate) native_drops: crate::native_drop::NativeDrops,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
+    file_roots_init_error: Option<String>,
     /// Authorized save destinations (bound via native dialog selections).
     pub authorized_save_destinations: Mutex<HashMap<String, std::time::Instant>>,
     /// Per-cwd cache for files.index.
@@ -183,6 +184,8 @@ impl IpcHostState {
             }
             crate::session_writer_fence::assert_session_writable(&agent, id)
         });
+        let mut initial_roots = crate::file_access::AllowedRoots::new();
+        let file_roots_init_error = std::env::var_os("HOME").and_then(|home| initial_roots.add_default_cwd_roots(Path::new(&home)).err().map(|e| e.to_string()));
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
@@ -213,15 +216,8 @@ impl IpcHostState {
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             native_drops: crate::native_drop::NativeDrops::default(),
-            file_roots: {
-                let mut roots = crate::file_access::AllowedRoots::new();
-                // The legacy default-cwd layouts stay browsable across
-                // restarts (the /api/files scan behavior).
-                if let Some(home) = std::env::var_os("HOME") {
-                    roots.add_default_cwd_roots(Path::new(&home));
-                }
-                Mutex::new(roots)
-            },
+            file_roots: Mutex::new(initial_roots),
+            file_roots_init_error,
             authorized_save_destinations: Mutex::new(HashMap::new()),
             file_index_cache: Mutex::new(HashMap::new()),
             proposed_paths: Mutex::new(BTreeSet::new()),
@@ -314,12 +310,24 @@ impl IpcHostState {
     /// the index scan). Such paths become grantable resources and, for
     /// directories, browsable file roots — the /api/files semantics where
     /// roots derive from session data, never from a client-supplied path.
-    pub fn propose_path(&self, path: &Path) {
-        let text = path.to_string_lossy().into_owned();
-        self.proposed_paths.lock().unwrap().insert(text.clone());
-        if path.is_dir() {
-            self.file_roots.lock().unwrap().add(path);
+    pub fn propose_path(&self, path: &Path) -> std::io::Result<()> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => self.file_roots.lock().unwrap().add(path)?,
+            Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "workspace is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.file_roots.lock().unwrap().add_missing(path),
+            Err(error) => return Err(error),
         }
+        self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
+        Ok(())
+    }
+
+    pub(crate) fn reauthorize_selected_path(&self, path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        self.file_roots.lock().unwrap().reauthorize(path)?;
+        #[cfg(windows)]
+        self.file_roots.lock().unwrap().add(path)?;
+        self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
+        Ok(())
     }
 
     /// Whether the host itself proposed this exact path.
@@ -329,21 +337,17 @@ impl IpcHostState {
 
     /// Recover a persisted workspace from the host's session headers even if
     /// cwd validation races the first sidebar scan. Frontend paths alone grant nothing.
-    fn discover_session_cwd(&self, cwd: &Path) {
-        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return; }
+    fn discover_session_cwd(&self, cwd: &Path) -> std::io::Result<()> {
+        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return Ok(()); }
         let index = session_host::scan_sessions(&self.agent_dir());
         if index.projects.keys().any(|known| Path::new(known) == cwd) {
             let agent_dir = self.agent_dir();
             let is_chat = crate::session_view::is_chat_workspace_path(cwd, &agent_dir);
             let in_chat = crate::worktrees::is_chat_area(cwd, &agent_dir);
-            if cwd.exists() && is_chat != in_chat { return; }
-            self.propose_path(cwd);
-            if !cwd.exists() {
-                // A deleted session cwd is still a known lexical root for the
-                // read-only missing status; it cannot authorize existing files.
-                self.file_roots.lock().unwrap().add(cwd);
-            }
+            if cwd.exists() && is_chat != in_chat { return Ok(()); }
+            self.propose_path(cwd)?;
         }
+        Ok(())
     }
 
     /// The agent dir this host runs against (sessions.list, the task store).
@@ -1065,6 +1069,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
     let Some(op) = envelope.get("op").and_then(Value::as_str) else {
         return protocol_error(&id, "invalid_args", "the request has no op");
     };
+    if let Some(error) = &state.file_roots_init_error { return protocol_error(&id, "io", error); }
     let args = envelope.get("args").cloned().unwrap_or(json!({}));
     if !args.is_object() {
         return protocol_error(&id, "invalid_args", "args must be an object");
@@ -1227,7 +1232,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             // The /api/files semantics: session cwds (and the chat roots)
             // become browsable roots, derived host-side.
             for (cwd, _) in index.projects.iter() {
-                state.propose_path(Path::new(cwd));
+                if let Err(error) = state.propose_path(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             }
             let mut data = session_host::history::index_json(&index);
             if let Some(object) = data.as_object_mut() {
@@ -1330,7 +1335,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             // Host-derived roots stay in step with the catalogue's cwds.
             for value in sessions.iter() {
                 if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
-                    state.propose_path(Path::new(cwd));
+                    if let Err(error) = state.propose_path(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                 }
             }
             // The hidden chat root (ensureChatWorkspace; the sidebar's new-chat
@@ -1340,7 +1345,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 .unwrap_or_else(|_| {
                     crate::session_view::chat_workspace_dir(&agent_dir).display().to_string()
                 });
-            state.propose_path(Path::new(&chat_root));
+            if let Err(error) = state.propose_path(Path::new(&chat_root)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             protocol_ok(
                 &id,
                 json!({
@@ -1507,7 +1512,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // gets proposed for browsing.
         "cwd.status" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else { return protocol_error(&id, "invalid_args", "An absolute cwd is required"); };
-            state.discover_session_cwd(Path::new(cwd));
+            if let Err(error) = state.discover_session_cwd(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             match crate::workspace_status::status(&state.file_roots.lock().unwrap(), cwd) {
                 Ok(result) => protocol_ok(&id, result),
                 Err((code, message)) => protocol_error(&id, code, message),
@@ -1523,7 +1528,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let agent_dir = state.agent_dir();
             match crate::session_view::ensure_chat_workspace(&agent_dir) {
                 Ok(cwd) => {
-                    state.propose_path(&cwd);
+                    if let Err(error) = state.propose_path(&cwd) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     protocol_ok(&id, json!({ "cwd": cwd.display().to_string() }))
                 }
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
@@ -1540,7 +1545,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 .join(format!("{year:04}{month:02}{day:02}"));
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
-                    state.propose_path(&dir);
+                    if let Err(error) = state.propose_path(&dir) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     protocol_ok(&id, json!({ "cwd": dir.display().to_string() }))
                 }
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
@@ -2370,20 +2375,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(unix)]
             let opened = {
                 let target_path = Path::new(path);
-                let scoped = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, target_path)
-                };
-                let scoped = if scoped.is_some() { scoped } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
+                let roots = state.file_roots.lock().unwrap();
+                if roots.is_path_allowed(target_path) {
+                    Some(roots.open_file(target_path))
+                } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
                     if target_path.is_absolute() && !target_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                         match session_file_referenced(state, session, path) {
-                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| (resolved, PathBuf::from("/"))),
+                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| crate::file_access::open_file_beneath_root(Path::new("/"), &resolved)),
                             Ok(false) => None,
                             Err((code, message)) => return protocol_error(&id, &code, &message),
                         }
                     } else { None }
-                } else { None };
-                scoped.map(|(target, root)| crate::file_access::open_file_beneath_root(&root, &target))
+                } else { None }
             };
             #[cfg(windows)]
             let opened: Option<Result<std::fs::File, std::io::Error>> = None;
@@ -2392,7 +2395,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
                     Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
                 },
-                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                Some(Err(error)) => protocol_error(&id, if error.kind() == std::io::ErrorKind::PermissionDenied { "unauthorized_scope" } else { "io" }, &error.to_string()),
                 None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
         }
@@ -2400,16 +2403,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
             #[cfg(unix)]
             {
-                let scoped = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, Path::new(path))
-                };
-                let Some((target, root)) = scoped else { return protocol_error(&id, "unauthorized_scope", "preview path is outside authorized roots"); };
-                let Some(parent) = target.parent() else { return protocol_error(&id, "invalid_args", "invalid preview path"); };
-                let Some(name) = target.file_name().and_then(|name| name.to_str()) else { return protocol_error(&id, "invalid_args", "invalid preview filename"); };
-                if crate::file_access::open_file_beneath_root(&root, &target).is_err() { return protocol_error(&id, "unauthorized_scope", "preview file cannot be opened safely"); }
-                let directory = match crate::file_access::open_directory_beneath_root(&root, parent) {
-                    Ok(directory) => directory,
+                let roots = state.file_roots.lock().unwrap();
+                let (directory, name) = match roots.open_preview_directory(Path::new(path)) {
+                    Ok(result) => result,
                     Err(error) => return protocol_error(&id, "unauthorized_scope", &error.to_string()),
                 };
                 match state.resources.grant_open_directory(directory, Duration::from_secs(600)) {
@@ -2492,7 +2488,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             match crate::worktrees::execute(op, &cwd, &args, &project) {
                 Ok((data, grants)) => {
                     for path in grants {
-                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) { state.propose_path(&path); }
+                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) {
+                            if let Err(error) = state.propose_path(&path) { return protocol_error(&id, "unauthorized_scope", &format!("Worktree operation completed, but its root could not be authorized: {error}")); }
+                        }
                     }
                     if matches!(op, "worktrees.create" | "worktrees.switch" | "worktrees.delete") { state.projects.invalidate(); }
                     protocol_ok(&id, data)
@@ -2545,7 +2543,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     if !already_allowed {
                         // The operator explicitly chose to browse the target:
                         // a host-side root grant (propose_path records it).
-                        state.propose_path(std::path::Path::new(&target));
+                        if let Err(error) = state.propose_path(std::path::Path::new(&target)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     }
                     protocol_ok(
                         &id,
@@ -2570,8 +2568,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(unix)]
             let outcome = {
                 let roots = state.file_roots.lock().unwrap();
-                crate::file_access::resolved_read_target_with_root(&roots, &target)
-                    .map(|(resolved, root)| crate::file_access::read_beneath_root(&root, &resolved))
+                use std::io::Read;
+                Some(roots.open_file(&target).and_then(|mut file| { let mut bytes = Vec::new(); file.read_to_end(&mut bytes)?; Ok(bytes) }))
             };
             #[cfg(windows)]
             let outcome: Option<Result<Vec<u8>, std::io::Error>> = {
@@ -2641,15 +2639,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let path = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
             #[cfg(unix)]
             {
-                let resolved = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, path)
-                };
-                let Some((target, root)) = resolved else { return protocol_error(&id, "unauthorized_scope", "access-denied") };
-                if crate::file_access::open_directory_beneath_root(&root, &target).is_err() {
-                    return protocol_error(&id, "unauthorized_scope", "not-a-directory");
-                }
-                match crate::open_path_with_default_app(&target) {
+                let roots = state.file_roots.lock().unwrap();
+                if roots.open_directory(path).is_err() { return protocol_error(&id, "unauthorized_scope", "not-a-directory"); }
+                match crate::open_path_with_default_app(path) {
                     Ok(()) => protocol_ok(&id, json!({ "opened": true })),
                     Err(error) => protocol_error(&id, "io", &error),
                 }
@@ -3943,7 +3935,7 @@ pub(crate) fn create_session(
     )
     .map_err(|message| invalid(&message, command_type.as_deref()))?;
 
-    state.discover_session_cwd(&requested_cwd);
+    state.discover_session_cwd(&requested_cwd).map_err(|e| ("unauthorized_scope".to_string(), e.to_string(), None))?;
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
     if chat_workspace && !chat_root && (!state.is_proposed(&requested_cwd.to_string_lossy())
@@ -4023,7 +4015,7 @@ pub(crate) fn create_session(
     let (session_file, session_id) = session_host::create_session_file(&session_dir, &session_cwd)
         .map_err(|error| ("io".to_string(), error.to_string(), None))?;
     // A brand-new cwd is immediately browsable (allowFileRoot's contract).
-    state.propose_path(&session_cwd);
+    state.propose_path(&session_cwd).map_err(|e| ("unauthorized_scope".to_string(), format!("Session file created, but workspace authorization failed: {e}"), None))?;
 
     // 4. Spawn through the shared plan (kind, pin, prompts, model).
     let base = state
@@ -4411,7 +4403,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
     let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
-    state.discover_session_cwd(&cwd);
+    state.discover_session_cwd(&cwd).map_err(|e| ("unauthorized_scope".to_string(), e.to_string()))?;
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
         if !crate::session_view::is_chat_root_path(&cwd, &agent_dir)
