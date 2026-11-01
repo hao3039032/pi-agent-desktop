@@ -51,6 +51,35 @@ test("scheduled gaps invalidate the stream and refresh authoritative state", asy
   off();
 });
 
+test("scheduled quiet heartbeats keep the stream alive; silent death refreshes and reconnects", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let loads = 0;
+  let closes = 0;
+  const callbacks = [];
+  const transport = {
+    send(request) { loads++; return Promise.resolve({ v: 1, id: request.id, ok: true, data: { tasks: [] } }); },
+    subscribe(_op, _args, onMessage) { callbacks.push(onMessage); return () => { closes++; }; },
+  };
+  bindScheduledTasksStore(new IpcClient(transport));
+  const release = retainScheduledTaskStream();
+  callbacks[0]({ subscriptionId: "tasks-1", epoch: 1, seq: 1, kind: "snapshot", payload: {} });
+  t.mock.timers.tick(44_000);
+  callbacks[0]({ subscriptionId: "tasks-1", epoch: 1, seq: 2, kind: "heartbeat", payload: null });
+  t.mock.timers.tick(44_000);
+  assert.equal(callbacks.length, 1);
+  assert.equal(loads, 1, "heartbeats do not refetch or disconnect an active stream");
+  t.mock.timers.tick(1_001);
+  assert.equal(loads, 2, "a missing heartbeat triggers authoritative refresh");
+  t.mock.timers.tick(3_000);
+  assert.equal(callbacks.length, 2);
+  assert.equal(closes, 1);
+  callbacks[0]({ subscriptionId: "tasks-1", epoch: 1, seq: 3, kind: "event", payload: { type: "run_started", taskId: "stale" } });
+  callbacks[1]({ subscriptionId: "tasks-2", epoch: 1, seq: 1, kind: "snapshot", payload: {} });
+  await Promise.resolve();
+  release();
+  assert.equal(closes, 2);
+});
+
 test("scheduled event subscribers receive real host events and detach", () => {
   const transport = new MockTransport().on("tasks.subscribeEvents", () => ({})).on("tasks.list", () => ({ tasks: [] }));
   bindScheduledTasksStore(new IpcClient(transport));

@@ -120,6 +120,63 @@ test("a stream error resubscribes after 1.5s (the SSE reconnect contract)", asyn
   dispose();
 });
 
+test("running gaps and silent death resnapshot without accepting old generations", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const callbacks = [];
+  let closes = 0;
+  const transport = {
+    send: () => Promise.resolve({}),
+    subscribe(_op, _args, onMessage) { callbacks.push(onMessage); return () => { closes++; }; },
+  };
+  bindSessionListService(new IpcClient(transport));
+  const seen = [];
+  let resets = 0;
+  const dispose = subscribeRunningSessions((frame) => seen.push(frame), () => { resets++; });
+  const frame = (id, seq, kind = "event", extra = {}) => ({ subscriptionId: id, epoch: 1, seq, kind, payload: { type: "running", runningSessionIds: [id], sessionListVersion: 1, ...extra } });
+  callbacks[0](frame("run-a", 1, "snapshot"));
+  t.mock.timers.tick(44_000);
+  callbacks[0](frame("run-a", 2));
+  t.mock.timers.tick(44_000);
+  assert.equal(resets, 0, "quiet observations extend the liveness deadline");
+  callbacks[0](frame("run-a", 4));
+  assert.equal(resets, 1, "a sequence gap requests authoritative refresh");
+  callbacks[0](frame("run-a", 3));
+  t.mock.timers.tick(1_500);
+  assert.equal(closes, 1);
+  callbacks[1](frame("run-b", 1, "snapshot"));
+  callbacks[0](frame("run-a", 4));
+  callbacks[1](frame("run-b", 2, "event", { resync: true }));
+  assert.equal(resets, 2, "ring overflow explicitly refreshes the catalogue");
+  t.mock.timers.tick(45_001);
+  assert.equal(resets, 3, "a silently dead Channel requests refresh");
+  t.mock.timers.tick(1_500);
+  assert.equal(callbacks.length, 3);
+  assert.deepEqual(seen.map((value) => value.runningSessionIds[0]), ["run-a", "run-a", "run-b", "run-b"]);
+  dispose();
+  assert.equal(closes, 3);
+});
+
+test("running wrong epoch or reset invalidates before delivering stale state", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let callback;
+  const transport = { send: () => Promise.resolve({}), subscribe(_op, _args, onMessage) { callback = onMessage; return () => {}; } };
+  bindSessionListService(new IpcClient(transport));
+  const seen = [];
+  let resets = 0;
+  const dispose = subscribeRunningSessions((frame) => seen.push(frame), () => { resets++; });
+  const payload = { type: "running", runningSessionIds: [], sessionListVersion: 1 };
+  callback({ subscriptionId: "run-a", epoch: 1, seq: 1, kind: "snapshot", payload });
+  callback({ subscriptionId: "run-a", epoch: 2, seq: 2, kind: "event", payload });
+  callback({ subscriptionId: "run-a", epoch: 1, seq: 2, kind: "event", payload });
+  assert.equal(resets, 1);
+  assert.equal(seen.length, 1);
+  t.mock.timers.tick(1_500);
+  callback({ subscriptionId: "run-b", epoch: 1, seq: 1, kind: "snapshot", payload });
+  callback({ subscriptionId: "run-b", epoch: 1, seq: 2, kind: "reset", payload: {} });
+  assert.equal(resets, 2);
+  dispose();
+});
+
 test("the disposer ends the subscription", () => {
   const { transport, state } = runningStreamTransport([]);
   bindSessionListService(new IpcClient(transport));

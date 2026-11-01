@@ -648,6 +648,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         // server cache instead of forcing a fresh scan.
         void loadSessions();
       }
+    }, () => {
+      sseAuthoritativeRef.current = false;
+      void loadSessions();
     });
     return () => dispose();
   }, [loadSessions]);

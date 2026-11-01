@@ -84,12 +84,19 @@ pub struct RunningTransition {
 struct RunningSignalState {
     epoch: u64,
     next_seq: u64,
+    dropped_through: u64,
+    ring_bytes: usize,
     ring: std::collections::VecDeque<RunningTransition>,
 }
 
 /// How many transitions the replay ring keeps (bounded memory; beyond it
 /// consumers get a gap and re-derive from a full snapshot).
 const RUNNING_TRANSITION_RING: usize = 512;
+const RUNNING_TRANSITION_BYTES: usize = 1024 * 1024;
+
+fn running_transition_bytes(session: &str) -> usize {
+    std::mem::size_of::<RunningTransition>().saturating_add(session.len())
+}
 
 impl Default for RunningSignal {
     fn default() -> Self {
@@ -97,6 +104,8 @@ impl Default for RunningSignal {
             state: std::sync::Mutex::new(RunningSignalState {
                 epoch: 0,
                 next_seq: 0,
+                dropped_through: 0,
+                ring_bytes: 0,
                 ring: std::collections::VecDeque::new(),
             }),
             cv: std::sync::Condvar::new(),
@@ -121,13 +130,19 @@ impl RunningSignal {
         state.epoch += 1;
         state.next_seq += 1;
         let seq = state.next_seq;
-        state.ring.push_back(RunningTransition {
-            seq,
-            session: session.to_string(),
-            running,
-        });
-        while state.ring.len() > RUNNING_TRANSITION_RING {
-            state.ring.pop_front();
+        let size = running_transition_bytes(session);
+        if size > RUNNING_TRANSITION_BYTES {
+            state.ring.clear();
+            state.ring_bytes = 0;
+            state.dropped_through = seq;
+        } else {
+            while state.ring.len() >= RUNNING_TRANSITION_RING || state.ring_bytes + size > RUNNING_TRANSITION_BYTES {
+                let dropped = state.ring.pop_front().expect("the ring has an entry to evict");
+                state.ring_bytes -= running_transition_bytes(&dropped.session);
+                state.dropped_through = dropped.seq;
+            }
+            state.ring.push_back(RunningTransition { seq, session: session.to_string(), running });
+            state.ring_bytes += size;
         }
         drop(state);
         self.cv.notify_all();
@@ -160,12 +175,7 @@ impl RunningSignal {
     /// missed and must fall back to a full re-derivation (a resync).
     pub fn changes_since(&self, seen_seq: u64) -> (Vec<RunningTransition>, bool) {
         let state = self.state.lock().unwrap();
-        let Some(oldest) = state.ring.front() else {
-            // Empty = nothing was EVER recorded (overflow never empties
-            // the ring) — nothing to replay, no gap possible.
-            return (Vec::new(), false);
-        };
-        if oldest.seq > seen_seq + 1 {
+        if seen_seq < state.dropped_through {
             return (Vec::new(), true);
         }
         (
@@ -2113,6 +2123,24 @@ mod running_signal_tests {
         assert!(gap, "a cursor at the start lost the dropped head");
         let (_, gap) = signal.changes_since(600 - RUNNING_TRANSITION_RING as u64 - 1);
         assert!(gap, "a cursor one entry before the surviving head lost that entry");
+    }
+
+    #[test]
+    fn byte_budget_evicts_and_oversized_entry_marks_a_gap_even_when_empty() {
+        let signal = RunningSignal::default();
+        let large = "x".repeat(RUNNING_TRANSITION_BYTES / 2);
+        signal.notify_transition(&large, true);
+        signal.notify_transition(&large, false);
+        assert!(signal.changes_since(0).1);
+        assert!(!signal.changes_since(1).1);
+        assert!(signal.state.lock().unwrap().ring_bytes <= RUNNING_TRANSITION_BYTES);
+        signal.notify_transition(&"y".repeat(RUNNING_TRANSITION_BYTES), true);
+        assert!(signal.state.lock().unwrap().ring.is_empty());
+        assert!(signal.changes_since(2).1);
+        assert!(!signal.changes_since(3).1);
+        signal.notify_transition("small", true);
+        assert!(signal.changes_since(2).1);
+        assert_eq!(signal.changes_since(3).0[0].session, "small");
     }
 
     /// Nothing recorded: no transitions, no gap, and a baseline cursor of 0.

@@ -48,6 +48,7 @@ pub struct IpcHostState {
     /// Live event-stream relays by subscription id (unsubscribe detaches).
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
     session_relay_gate: Arc<tokio::sync::Semaphore>,
+    running_relay_gate: Arc<tokio::sync::Semaphore>,
     /// The provider-auth domain's login-stream relays (the same release
     /// contract: unsubscribe cancels the flow host-side). Kept in the
     /// domain's own map so the shared one stays untouched.
@@ -226,6 +227,7 @@ impl IpcHostState {
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             session_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_SESSION_RELAYS)),
+            running_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_RUNNING_RELAYS)),
             login_relays: Arc::new(Default::default()),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
@@ -818,7 +820,19 @@ fn derive_running_snapshot(registry: &SessionRegistry, version: &AtomicU64) -> R
 /// channel frees (Terra P2-1), never swallowed as "the net set did not
 /// change". A burst that overflows the ring (512 unseen transitions) is
 /// answered with ONE forced resync frame instead of a replay.
-const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(30);
+const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(10);
+const IPC_MAX_RUNNING_RELAYS: usize = 32;
+const RUNNING_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+struct RunningFrameSize(usize);
+impl std::io::Write for RunningFrameSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).filter(|n| *n <= RUNNING_MAX_FRAME_BYTES)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "running frame too large"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
 
 /// Drops of this guard are the relay thread's LAST act (every exit path):
 /// the alive count in `IpcHostState::running_relay_threads` therefore
@@ -850,18 +864,28 @@ pub fn pi_ipc_subscribe_running(
 }
 
 fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after: Duration) -> Value {
-    let subscription_id = format!(
-        "run-{}",
-        state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1
-    );
+    subscribe_running_with_timeout(state, on_frame, probe_after, Duration::from_secs(15))
+}
+
+fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>, probe_after: Duration, ack_timeout: Duration) -> Value {
+    let permit = match Arc::clone(&state.running_relay_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"running stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
+    };
+    let mut nonce = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut nonce) {
+        return protocol_error("?", "io", &format!("running subscription identity unavailable: {error}"));
+    }
+    let subscription_id = format!("run-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ack = Arc::new(SessionRelayAck::default());
     state.event_relays.lock().unwrap().insert(
         subscription_id.clone(),
         EventRelayHandle {
             stop: Arc::clone(&stop),
             subscriber_id: 0,
             session_id: String::new(),
-            ack: None,
+            ack: Some(Arc::clone(&ack)),
         },
     );
     let registry = Arc::clone(&state.registry);
@@ -878,6 +902,21 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
         .spawn(move || {
             let subscription_id = subscription_for_relay;
             let _alive = RunningRelayAlive(relays_alive);
+            let _permit = permit;
+            // Preflight the set before constructing the JSON frame; the
+            // fixed envelope is substantially smaller than this reserve.
+            let fits = |running: &Vec<String>| serde_json::to_writer(&mut RunningFrameSize(512), running).is_ok();
+            let reset = |seq| {
+                if !stop.load(Ordering::SeqCst) {
+                    let _ = on_frame.send(stream_frame(&subscription_id, 1, seq, "reset", json!({"reason":"relay_gap"})));
+                }
+            };
+            let forward = |seq, frame: Value| {
+                let within_limit = serde_json::to_writer(&mut RunningFrameSize(0), &frame).is_ok();
+                if within_limit && ack.forward(&on_frame, frame, seq, &stop, ack_timeout) { return true; }
+                reset(seq + 1);
+                false
+            };
             let detach = || {
                 relays_for_thread.lock().unwrap().remove(&subscription_id);
             };
@@ -943,6 +982,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                                 version: version_counter.load(Ordering::SeqCst),
                             };
                             seq += 1;
+                            if !fits(&observation.running) {
+                                reset(seq);
+                                detach();
+                                return;
+                            }
                             let frame = stream_frame(
                                 &subscription_id,
                                 // The host process is this stream's epoch: a
@@ -960,7 +1004,7 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                             );
                             last_sent = Some(observation);
                             last_sent_at = std::time::Instant::now();
-                            if on_frame.send(frame).is_err() {
+                            if !forward(seq, frame) {
                                 detach();
                                 return;
                             }
@@ -982,6 +1026,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                     last_sent_at = std::time::Instant::now();
                     seq += 1;
                     let kind = if seq == 1 { "snapshot" } else { "event" };
+                    if !fits(&snapshot.running) {
+                        reset(seq);
+                        detach();
+                        return;
+                    }
                     let frame = stream_frame(
                         &subscription_id,
                         1,
@@ -991,10 +1040,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                             "type": "running",
                             "runningSessionIds": snapshot.running,
                             "sessionListVersion": snapshot.version,
+                            "resync": force_resync,
                         }),
                     );
-                    if on_frame.send(frame).is_err() {
-                        // The Channel died (page reload, window closed):
+                    if !forward(seq, frame) {
+                        // The Channel died or the ACK window expired:
                         // end the relay and free its registry entry.
                         detach();
                         return;
@@ -1744,6 +1794,16 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "agent.ackRunning" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let ack = state.event_relays.lock().unwrap().get(subscription)
+                .filter(|handle| handle.session_id.is_empty() && subscription.starts_with("run-"))
+                .and_then(|handle| handle.ack.clone());
+            if epoch == 1 && ack.is_some_and(|ack| ack.acknowledge(seq)) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid running stream acknowledgement") }
+        }
         "tasks.ackEvents" => {
             let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
             let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
@@ -1754,7 +1814,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         "agent.ackEvents" => {
             let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
             let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
-            let ack = state.event_relays.lock().unwrap().get(subscription).and_then(|handle| handle.ack.clone());
+            let ack = state.event_relays.lock().unwrap().get(subscription).filter(|handle| !handle.session_id.is_empty()).and_then(|handle| handle.ack.clone());
             if ack.is_some_and(|ack| ack.acknowledge(seq)) { protocol_ok(&id, json!({"acknowledged":seq})) }
             else { protocol_error(&id, "invalid_args", "invalid session stream acknowledgement") }
         }
@@ -1779,7 +1839,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                             session.unsubscribe(handle.subscriber_id);
                         }
                         // WAKE the running-set relay's waiter (Terra P2-2): it
-                        // sleeps on the registry's running signal with a 30 s
+                        // sleeps on the registry's running signal with a 10 s
                         // probe — without this bump a quiet unsubscribe leaves
                         // the relay thread (and its liveness count) alive until
                         // the probe. The bump is wake-only: no transition is
@@ -2801,7 +2861,7 @@ pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -
     let id = envelope_id(&request);
     let op = request.get("op").and_then(Value::as_str);
     let control = matches!(op,
-        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "tasks.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
+        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "agent.ackRunning" | "tasks.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
              "agent.interrupt" | "auth.loginCancel" | "mcp.signInCancel" |
              "plugins.mutation.cancel" | "plugins.install.cancel" | "skills.mutation.cancel"))
         || (op == Some("agent.command") && matches!(request.pointer("/args/type").and_then(Value::as_str),
@@ -8183,12 +8243,16 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     }
     /// A Channel that records every frame it is sent (the relay's own
     /// serialization path: InvokeResponseBody::Json).
-    fn recording_channel() -> (Channel<Value>, Arc<Mutex<Vec<Value>>>) {
+    fn recording_channel(state: &IpcHostState) -> (Channel<Value>, Arc<Mutex<Vec<Value>>>) {
+        let relays = Arc::clone(&state.event_relays);
         let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&frames);
         let channel = Channel::new(move |message| {
             if let tauri::ipc::InvokeResponseBody::Json(text) = message {
                 if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                    if let (Some(id), Some(seq)) = (frame["subscriptionId"].as_str(), frame["seq"].as_u64()) {
+                        if let Some(ack) = relays.lock().unwrap().get(id).and_then(|handle| handle.ack.clone()) { ack.acknowledge(seq); }
+                    }
                     sink.lock().unwrap().push(frame);
                 }
             }
@@ -8217,9 +8281,74 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     }
 
     #[test]
+    fn running_ack_window_isolated_and_rejects_invalid_generation() {
+        let state = state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slow = Channel::new(move |body| { let _ = tx.send(body); Ok(()) });
+        let slow_id = subscribe_running(&state, slow, Duration::from_secs(60))["subscriptionId"].as_str().unwrap().to_string();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (fast, frames) = recording_channel(&state);
+        let fast_id = subscribe_running(&state, fast, Duration::from_secs(60))["subscriptionId"].as_str().unwrap().to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(2)));
+        let request = |id: &str, epoch, seq| json!({"v":1,"id":"ack","op":"agent.ackRunning","args":{"subscriptionId":id,"epoch":epoch,"seq":seq}});
+        assert_eq!(send(&state, request(&slow_id, 2, 1))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request(&slow_id, 1, 2))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request("run-old-generation", 1, 1))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, json!({"v":1,"id":"old","op":"agent.ackEvents","args":{"subscriptionId":slow_id,"seq":1}}))["error"]["code"], "invalid_args");
+        bump_session_list_version(&state);
+        assert!(wait_for_frames(&frames, 2, Duration::from_secs(2)), "slow subscription cannot block the fast one");
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err(), "no second unacknowledged frame");
+        assert_eq!(send(&state, request(&slow_id, 1, 1))["ok"], true);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        unsubscribe_running(&state, &slow_id);
+        unsubscribe_running(&state, &fast_id);
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn running_relay_admission_and_ack_timeout_release() {
+        let state = state();
+        let mut ids = Vec::new();
+        for _ in 0..IPC_MAX_RUNNING_RELAYS {
+            let reply = subscribe_running(&state, Channel::new(|_| Ok(())), Duration::from_secs(60));
+            ids.push(reply["subscriptionId"].as_str().unwrap().to_string());
+        }
+        let refused = subscribe_running(&state, Channel::new(|_| Ok(())), Duration::from_secs(60));
+        assert_eq!(refused["error"]["reason"], "stream_not_admitted");
+        for id in ids { unsubscribe_running(&state, &id); }
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body| { let _ = tx.send(body); Ok(()) });
+        let reply = subscribe_running_with_timeout(&state, channel, Duration::from_secs(60), Duration::from_millis(30));
+        assert!(reply["subscriptionId"].is_string());
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reset = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let tauri::ipc::InvokeResponseBody::Json(text) = reset else { panic!("expected JSON") };
+        let reset: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(reset["kind"], "reset");
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+        assert_eq!(state.running_relay_gate.available_permits(), IPC_MAX_RUNNING_RELAYS);
+    }
+
+    #[test]
+    fn running_oversized_transition_forces_resync_without_sending_payload() {
+        let state = state();
+        let (channel, frames) = recording_channel(&state);
+        let reply = subscribe_running(&state, channel, Duration::from_secs(60));
+        let id = reply["subscriptionId"].as_str().unwrap();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(2)));
+        state.registry.running_signal().notify_transition(&"x".repeat(RUNNING_MAX_FRAME_BYTES), true);
+        assert!(wait_for_frames(&frames, 2, Duration::from_secs(2)));
+        assert_eq!(frames.lock().unwrap()[1]["payload"]["resync"], true);
+        assert!(serde_json::to_writer(&mut RunningFrameSize(512), &vec!["x".repeat(RUNNING_MAX_FRAME_BYTES)]).is_err());
+        unsubscribe_running(&state, id);
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+    }
+
+    #[test]
     fn subscribe_running_first_frame_is_the_observation_at_subscribe_time() {
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(
@@ -8246,7 +8375,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn subscribe_running_emits_one_frame_per_change_and_nothing_between() {
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8284,7 +8413,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // (a page reload never unsubscribes): without it the relay would
         // sleep forever holding its registry entry.
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_millis(1_200));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8309,10 +8438,16 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // (the WebView went away between two frames).
         let sends = Arc::new(Mutex::new(0usize));
         let counter = Arc::clone(&sends);
-        let channel = Channel::new(move |_| {
+        let relays = Arc::clone(&state.event_relays);
+        let channel = Channel::new(move |body| {
             let mut count = counter.lock().unwrap();
             *count += 1;
             if *count == 1 {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let id = frame["subscriptionId"].as_str().unwrap();
+                    if let Some(ack) = relays.lock().unwrap().get(id).and_then(|handle| handle.ack.clone()) { ack.acknowledge(1); }
+                }
                 Ok(())
             } else {
                 Err(tauri::Error::Io(std::io::Error::new(
@@ -8343,7 +8478,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn subscribe_running_unsubscribe_ends_the_relay_and_frees_the_entry() {
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8382,7 +8517,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
     }
 
-    fn gated_channel(block_at: u64) -> GatedChannel {
+    fn gated_channel(state: &IpcHostState, block_at: u64) -> GatedChannel {
+        let relays = Arc::clone(&state.event_relays);
         let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let sends_entered = Arc::new(AtomicU64::new(0));
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -8400,6 +8536,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             }
             if let tauri::ipc::InvokeResponseBody::Json(text) = message {
                 if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                    if let (Some(id), Some(seq)) = (frame["subscriptionId"].as_str(), frame["seq"].as_u64()) {
+                        if let Some(ack) = relays.lock().unwrap().get(id).and_then(|handle| handle.ack.clone()) { ack.acknowledge(seq); }
+                    }
                     sink.lock().unwrap().push(frame);
                 }
             }
@@ -8455,7 +8594,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn a_short_run_that_settled_while_a_send_was_blocked_is_replayed() {
         let state = state();
-        let gated = gated_channel(1);
+        let gated = gated_channel(&state, 1);
         let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         // The relay is now deterministically stuck INSIDE its first send.
@@ -8510,7 +8649,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn a_ring_gap_forces_one_resync_frame_instead_of_replaying_the_burst() {
         let state = state();
-        let gated = gated_channel(1);
+        let gated = gated_channel(&state, 1);
         let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(gated.wait_sends(1, Duration::from_secs(5)));
@@ -8540,6 +8679,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             "the resync frame is the current net observation (the fabricated sessions never existed): {:?}",
             frames[1]
         );
+        assert_eq!(frames[1]["payload"]["resync"], true);
         drop(frames);
         let done = unsubscribe_running(&state, &subscription_id);
         assert_eq!(done["ok"], true, "{done}");
@@ -8555,7 +8695,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn unsubscribing_a_quiet_running_relay_ends_its_thread_at_once() {
         let state = state();
         let baseline = state.running_relay_threads.load(Ordering::SeqCst);
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8582,7 +8722,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn unsubscribing_with_replay_pending_delivers_at_most_one_more_frame() {
         let state = state();
-        let gated = gated_channel(2);
+        let gated = gated_channel(&state, 2);
         let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         // Frame 1 (the initial snapshot) passes the gate untouched.
@@ -9707,7 +9847,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         sorted_expected.sort();
 
         // Subscribe: the first frame lists both ids sorted.
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         let mut both_running = false;
@@ -9860,7 +10000,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(created["ok"], true, "{created}");
         let session_id = created["data"]["sessionId"].as_str().expect("id").to_string();
 
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         // A 60 s probe: within the test window ONLY the running signal can
         // deliver a frame — this is exactly what the test asserts.
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));

@@ -74,7 +74,7 @@ export interface IpcStreamMessage<T = unknown> {
   epoch: number;
   /** Monotonic per subscription, starting at 1. */
   seq: number;
-  kind: "snapshot" | "event" | "reset";
+  kind: "snapshot" | "event" | "reset" | "heartbeat";
   payload: T;
 }
 

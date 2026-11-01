@@ -92,17 +92,25 @@ function connectScheduledStream(): void {
     let streamId: string | null = null;
     let epoch = 0;
     let seq = 0;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
     const invalidate = () => {
       if (!active) return;
       active = false;
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
       streamError = "Scheduled task event stream interrupted; reconnecting";
       setState({ error: streamError, runningTaskIds: new Set() });
       void refreshScheduledTasks();
       scheduleStreamReconnect();
     };
+    const armWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(invalidate, 45_000);
+    };
+    armWatchdog();
     const dispose = clientForTasks().subscribe<ScheduledTaskEvent>("tasks.subscribeEvents", undefined, (frame) => {
       if (!active) return;
-      if (frame.kind === "reset" || typeof frame.subscriptionId !== "string" || !frame.subscriptionId
+      if ((frame.kind !== "snapshot" && frame.kind !== "event" && frame.kind !== "heartbeat") || typeof frame.subscriptionId !== "string" || !frame.subscriptionId
           || !Number.isSafeInteger(frame.seq) || !Number.isSafeInteger(frame.epoch) || frame.epoch < 1
           || (seq === 0 ? frame.kind !== "snapshot" || frame.seq !== 1
             : frame.kind === "snapshot" || frame.subscriptionId !== streamId || frame.epoch !== epoch || frame.seq !== seq + 1)) {
@@ -112,6 +120,7 @@ function connectScheduledStream(): void {
       streamId = frame.subscriptionId;
       epoch = frame.epoch;
       seq = frame.seq;
+      armWatchdog();
       if (frame.kind === "snapshot") {
         streamError = null;
         setState({ error: null });
@@ -133,7 +142,7 @@ function connectScheduledStream(): void {
       for (const handler of eventHandlers) handler(event);
       void refreshScheduledTasks();
     }, (error) => { if (active) { invalidate(); streamError = error.message; setState({ error: streamError }); } });
-    stopStream = () => { active = false; dispose(); };
+    stopStream = () => { active = false; if (watchdog) clearTimeout(watchdog); watchdog = null; dispose(); };
 }
 
 function scheduleStreamReconnect(): void {
