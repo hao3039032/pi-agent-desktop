@@ -14,6 +14,19 @@ pub struct TrackedShutdown {
     pub management: Option<management_host::ManagementShutdownReport>,
 }
 
+fn publish_report<T>(
+    tracked: &Mutex<TrackedShutdown>, name: &str, result: T,
+    outcome: Result<(), String>, store: impl FnOnce(&mut TrackedShutdown, T),
+) -> Result<(), String> {
+    match tracked.try_lock() {
+        Ok(mut report) => { store(&mut report, result); outcome }
+        Err(_) => Err(format!("{name} report publication unavailable or busy; {}", match outcome {
+            Ok(()) => "callback completed but report was not published".to_string(),
+            Err(error) => format!("callback reported: {error}"),
+        })),
+    }
+}
+
 pub struct IsolatedStaticHost {
     pub state: Arc<IpcHostState>,
     lifecycle: HostLifecycle,
@@ -44,32 +57,32 @@ impl IsolatedStaticHost {
             let result = host.shutdown_scheduler_until(deadline);
             let stopped = result.stopped;
             let unknown = result.active_unknown.clone();
-            report.lock().map_err(|_| "scheduler report lock poisoned")?.scheduler = Some(result);
-            if stopped { Ok(()) } else { Err(format!("scheduler unknown: {}", unknown.join(", "))) }
+            let outcome = if stopped { Ok(()) } else { Err(format!("scheduler unknown: {}", unknown.join(", "))) };
+            publish_report(&report, "scheduler", result, outcome, |report, value| report.scheduler = Some(value))
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
         lifecycle.register_until(ShutdownStage::SessionChild, "session-writers", move |deadline| {
             let result = host.session_writers.shutdown_until(deadline);
             let unknown = result.unknown.clone();
-            report.lock().map_err(|_| "writer report lock poisoned")?.session_writers = Some(result);
-            if unknown.is_empty() { Ok(()) } else { Err(format!("session writer unknown: {}", unknown.join(", "))) }
+            let outcome = if unknown.is_empty() { Ok(()) } else { Err(format!("session writer unknown: {}", unknown.join(", "))) };
+            publish_report(&report, "writer", result, outcome, |report, value| report.session_writers = Some(value))
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
         lifecycle.register_until(ShutdownStage::SessionChild, "session-leaders", move |deadline| {
             let result = host.registry.shutdown_until(deadline);
             let unknown = result.unknown.clone();
-            report.lock().map_err(|_| "session report lock poisoned")?.sessions = Some(result);
-            if unknown.is_empty() { Ok(()) } else { Err(format!("session unknown: {}", unknown.join(", "))) }
+            let outcome = if unknown.is_empty() { Ok(()) } else { Err(format!("session unknown: {}", unknown.join(", "))) };
+            publish_report(&report, "session", result, outcome, |report, value| report.sessions = Some(value))
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
         lifecycle.register_until(ShutdownStage::Management, "management-leaders", move |deadline| {
             let result = host.management.shutdown_until(deadline);
             let unknown = result.unknown.clone();
-            report.lock().map_err(|_| "management report lock poisoned")?.management = Some(result);
-            if unknown.is_empty() { Ok(()) } else { Err(format!("management unknown: {}", unknown.join(", "))) }
+            let outcome = if unknown.is_empty() { Ok(()) } else { Err(format!("management unknown: {}", unknown.join(", "))) };
+            publish_report(&report, "management", result, outcome, |report, value| report.management = Some(value))
         })?;
         Ok(Self { state, lifecycle, tracked })
     }
@@ -80,11 +93,13 @@ impl IsolatedStaticHost {
     /// repeat session diagnostics; they are not additive process counts. PTYs,
     /// detached descendants and unregistered writers remain uncovered.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), Vec<ShutdownFailure>> {
+        // Admission is fenced before the lifecycle state lock can be contended.
+        self.state.begin_static_shutdown();
         self.lifecycle.shutdown_until(deadline)
     }
 
     pub fn tracked(&self) -> Result<std::sync::MutexGuard<'_, TrackedShutdown>, String> {
-        self.tracked.lock().map_err(|_| "shutdown report lock poisoned".into())
+        self.tracked.try_lock().map_err(|_| "shutdown report unavailable or busy".into())
     }
 }
 

@@ -415,7 +415,15 @@ fn main() {
                 HostCall::Shutdown if isolated_host.is_some() => {
                     let host = isolated_host.as_ref().unwrap();
                     let result = host.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                    let report = host.tracked().expect("shutdown report");
+                    let report = match host.tracked() {
+                        Ok(report) => report,
+                        Err(error) => {
+                            let _ = reply.send(json!({ "harness": "shutdown", "ok": false,
+                                "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
+                                "reportError": error }));
+                            continue;
+                        }
+                    };
                     json!({
                         "harness": "shutdown", "ok": result.is_ok(),
                         "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),

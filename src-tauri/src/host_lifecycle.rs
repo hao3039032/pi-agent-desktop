@@ -1,7 +1,8 @@
 //! Static bootstrap lifecycle. Cooperative ownership is not writer proof and
 //! never authorizes deletion, journal replay, seed, or scheduler startup.
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use crate::host_ownership::{HostOwnership, OwnershipMode};
 
@@ -68,6 +69,8 @@ pub struct HostLifecycle {
     _ownership: HostOwnership,
     agent: PathBuf,
     inner: Mutex<Inner>,
+    closing: AtomicBool,
+    completed: OnceLock<LifecycleState>,
 }
 
 impl HostLifecycle {
@@ -75,7 +78,7 @@ impl HostLifecycle {
         let agent = agent.canonicalize().map_err(|e| format!("Cannot resolve agent directory: {e}"))?;
         let ownership = HostOwnership::acquire(&agent, OwnershipMode::Runtime)
             .map_err(|e| format!("Cannot acquire cooperative host ownership: {e}"))?;
-        Ok(Self { _ownership: ownership, agent, inner: Mutex::new(Inner { state: LifecycleState::Running, services: Vec::new() }) })
+        Ok(Self { _ownership: ownership, agent, inner: Mutex::new(Inner { state: LifecycleState::Running, services: Vec::new() }), closing: AtomicBool::new(false), completed: OnceLock::new() })
     }
 
     pub fn recovery_status(&self) -> RecoveryStatus { recovery_status(&self.agent) }
@@ -96,8 +99,9 @@ impl HostLifecycle {
     /// lifecycle cannot bound an arbitrary callback that ignores it.
     pub fn register_until<F>(&self, stage: ShutdownStage, name: impl Into<String>, shutdown: F) -> Result<(), String>
     where F: FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static {
+        if self.closing.load(Ordering::SeqCst) { return Err("Host is shutting down".into()); }
         let mut inner = self.inner.lock().map_err(|_| "Lifecycle lock poisoned")?;
-        if inner.state != LifecycleState::Running { return Err("Host is shutting down".into()); }
+        if self.closing.load(Ordering::SeqCst) || inner.state != LifecycleState::Running { return Err("Host is shutting down".into()); }
         let name = name.into();
         if name.is_empty() || inner.services.iter().any(|service| service.name == name) {
             return Err("Invalid or duplicate lifecycle service name".into());
@@ -107,8 +111,9 @@ impl HostLifecycle {
     }
 
     pub fn state(&self) -> LifecycleState {
-        self.inner.lock().map(|inner| inner.state.clone()).unwrap_or_else(|_| LifecycleState::Failed(vec![ShutdownFailure {
-            stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into(),
+        if let Some(state) = self.completed.get() { return state.clone(); }
+        self.inner.try_lock().map(|inner| inner.state.clone()).unwrap_or_else(|_| LifecycleState::Failed(vec![ShutdownFailure {
+            stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; outcome unknown".into(),
         }]))
     }
 
@@ -118,11 +123,22 @@ impl HostLifecycle {
         self.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(35))
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_inner_for_test(&self, ready: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) {
+        let _guard = self.inner.lock().unwrap();
+        let _ = ready.send(());
+        let _ = release.recv();
+    }
+
     /// All callbacks receive the same absolute deadline, including callbacks
     /// after an earlier phase consumed the remaining time.
     pub fn shutdown_until(&self, deadline: std::time::Instant) -> Result<(), Vec<ShutdownFailure>> {
+        self.closing.store(true, Ordering::SeqCst);
+        if let Some(state) = self.completed.get() {
+            return match state { LifecycleState::Stopped => Ok(()), LifecycleState::Failed(failures) => Err(failures.clone()), _ => unreachable!() };
+        }
         let mut services = {
-            let mut inner = self.inner.lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into() }])?;
+            let mut inner = self.inner.try_lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; callbacks not claimed".into() }])?;
             match &inner.state {
                 LifecycleState::Stopped => return Ok(()),
                 LifecycleState::Failed(failures) => return Err(failures.clone()),
@@ -139,8 +155,14 @@ impl HostLifecycle {
             let error = match result { Ok(Ok(())) => continue, Ok(Err(error)) => error, Err(_) => "Shutdown callback panicked; outcome unknown".into() };
             failures.push(ShutdownFailure { stage: service.stage, name: service.name, error });
         }
-        let mut inner = self.inner.lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into() }])?;
-        inner.state = if failures.is_empty() { LifecycleState::Stopped } else { LifecycleState::Failed(failures.clone()) };
+        match self.inner.try_lock() {
+            Ok(mut inner) => {
+                inner.state = if failures.is_empty() { LifecycleState::Stopped } else { LifecycleState::Failed(failures.clone()) };
+            }
+            Err(_) => failures.push(ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle result publication unavailable or busy; state unknown".into() }),
+        }
+        let final_state = if failures.is_empty() { LifecycleState::Stopped } else { LifecycleState::Failed(failures.clone()) };
+        let _ = self.completed.set(final_state);
         if failures.is_empty() { Ok(()) } else { Err(failures) }
     }
 }
