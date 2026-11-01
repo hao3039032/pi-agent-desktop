@@ -28,7 +28,7 @@ export async function startManagedMcpSignIn(options: { body: unknown; agentDir: 
   const deps = createMcpSignInDeps(internals);
   if (options.callbackFactory) {
     const factory = options.callbackFactory;
-    deps.signIn = (request, signal) => signInMcpWithHostedCallback(request, factory, signal);
+    deps.signIn = (request, signal, onTokenRequest) => signInMcpWithHostedCallback(request, factory, signal, onTokenRequest);
   }
   const { flow, joined } = startMcpSignIn({ scope, name, sourcePath, configKey, config, cwd, url, mayConnect }, deps);
   return { ...flow, ...(joined ? { joined: true as const } : {}) };

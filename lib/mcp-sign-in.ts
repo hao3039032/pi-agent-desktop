@@ -149,7 +149,7 @@ export interface McpSignInDeps {
   /** The connection's store must call `guard` before each write (`guardedCredentialStore()`). */
   open(target: McpSignInTarget, guard: McpSignInWriteGuard): McpSignInConnection;
   /** The SDK's `signInMcpServer()`. */
-  signIn(options: McpSignInOptions, signal: AbortSignal): Promise<void>;
+  signIn(options: McpSignInOptions, signal: AbortSignal, onTokenRequest: (inFlight: boolean) => void): Promise<void>;
   /** The server's part of `mcp-auth.json`, from the SDK's credential store, by its name and URL. */
   store(name: string, url: string): McpOAuthStateStore;
   /** Whether `error` is the SDK's McpSignInCancelledError: the prompt was answered with "". */
@@ -274,6 +274,8 @@ interface Flow {
   /** Answers the SDK's prompt, while it waits. */
   prompt?: (value: string | undefined) => void;
   sawPage: boolean;
+  tokenRequestInFlight?: boolean;
+  warning?: "remote-outcome-unknown";
   completion?: Promise<void>;
   alreadySignedIn?: true;
   refreshed?: true;
@@ -322,6 +324,7 @@ function setPhase(flow: Flow, phase: McpSignInPhase): void {
 function end(flow: Flow, phase: McpSignInPhase, extra: Partial<Pick<Flow, "alreadySignedIn" | "refreshed" | "result" | "failure" | "error">> = {}): void {
   if (isEnded(flow)) return;
   Object.assign(flow, extra);
+  if ((phase === "cancelled" || phase === "expired") && flow.tokenRequestInFlight) flow.warning = "remote-outcome-unknown";
   flow.phase = phase;
   clearTimeout(flow.expiry);
   flow.controller.abort();
@@ -352,6 +355,7 @@ function describeFlow(flow: Flow): McpSignInFlowInfo {
     ...(flow.refreshed ? { refreshed: true as const } : {}),
     ...(flow.result ? { result: flow.result } : {}),
     ...(flow.failure ? { failure: flow.failure } : {}),
+    ...(flow.warning ? { warning: flow.warning } : {}),
     ...(flow.error !== undefined ? { error: flow.error } : {}),
   };
 }
@@ -496,7 +500,7 @@ async function runFlow(flow: Flow, deps: McpSignInDeps): Promise<void> {
           showAuthorizationUrl: (url) => showAuthorizationUrl(flow, url),
           promptForRedirectUrl: (signal) => askForRedirect(flow, signal),
         },
-      }, flow.controller.signal);
+      }, flow.controller.signal, (inFlight) => { flow.tokenRequestInFlight = inFlight; });
     } catch (error) {
       if (isEnded(flow)) return;
       if (deps.isCancelled(error) || error instanceof McpSignedOutError) end(flow, "cancelled");

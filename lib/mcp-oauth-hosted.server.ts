@@ -53,6 +53,7 @@ export async function signInMcpWithHostedCallback(
   options: McpSignInOptions,
   startCallback: McpHostedCallbackFactory,
   signal: AbortSignal,
+  onTokenRequest: (inFlight: boolean) => void = () => {},
 ): Promise<void> {
   const { serverUrl, store, settings, challenge, prompt } = options;
   if (signal.aborted) throw new Error("Sign-in cancelled");
@@ -84,25 +85,69 @@ export async function signInMcpWithHostedCallback(
       await store.save(next);
     }
     let authorizationUrl: URL | undefined;
+    let tokenOutcomeUnknown = false;
     const provider = new McpOAuthProvider({
       serverUrl, redirectUrl,
       clientMetadata: { client_name: settings.clientName ?? "pi" },
       clientMetadataDocument: cimd ? (metadata) => metadataDocument(serverUrl, redirectUrl, metadata) : undefined,
-      clientId: settings.clientId, clientSecret: settings.clientSecret, store,
+      clientId: settings.clientId, clientSecret: settings.clientSecret,
+      store: {
+        load: () => store.load(),
+        save: (value) => {
+          if (tokenOutcomeUnknown) throw new Error("OAuth token request outcome is unknown");
+          return store.save(value);
+        },
+      },
       onRedirect: (url) => { authorizationUrl = url; },
     });
     const stepUp = challenge?.error === "insufficient_scope";
     const scope = [...new Set([settings.scope, stepUp ? stepUpScope(stored?.tokens?.scope, challenge?.scope) : challenge?.scope]
       .flatMap((value) => value?.split(/\s+/).filter(Boolean) ?? []))].join(" ") || undefined;
-    const timedFetch: typeof fetch = (input, init) => {
-      const timeout = AbortSignal.timeout(15_000);
-      return fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+    // User cancellation does not abort an in-flight token request. The 15s
+    // request deadline still does: the remote server may already have issued
+    // tokens or rotated a refresh token, so its outcome is then unknown.
+    const authorize = async (extra: { skipRefresh?: boolean; authorizationCode?: string; iss?: string }) => {
+      const deadline = new AbortController();
+      let tokenTimedOut = false;
+      const timedFetch: typeof fetch = async (input, init) => {
+        const timeout = AbortSignal.timeout(15_000);
+        const grant = init?.body instanceof URLSearchParams ? init.body.get("grant_type") : undefined;
+        const isTokenRequest = grant === "authorization_code" || grant === "refresh_token";
+        const onTimeout = () => { tokenTimedOut = true; tokenOutcomeUnknown = true; deadline.abort(); };
+        if (isTokenRequest) {
+          onTokenRequest(true);
+          timeout.addEventListener("abort", onTimeout, { once: true });
+        }
+        try {
+          const response = await fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+          if (isTokenRequest) {
+            // pi-mcp reads the token response with text(); keep the deadline
+            // active through body consumption, but not through later storage.
+            const text = response.text.bind(response);
+            response.text = async () => {
+              try { return await text(); }
+              finally { timeout.removeEventListener("abort", onTimeout); }
+            };
+          }
+          return response;
+        } catch (error) {
+          timeout.removeEventListener("abort", onTimeout);
+          throw error;
+        }
+      };
+      try {
+        const result = await authorizeMcp(provider, { serverUrl, fetch: timedFetch, signal: deadline.signal,
+          resourceMetadataUrl: challenge?.resourceMetadataUrl, authorizationServerMetadataUrl: settings.authServerMetadataUrl, scope, ...extra });
+        if (tokenTimedOut) throw new Error("token request timed out");
+        return result;
+      } catch (error) {
+        if (tokenTimedOut) throw new Error("OAuth token request timed out; local sign-in stopped. The server may have issued tokens or rotated the refresh token; the remote outcome is unknown.");
+        throw error;
+      } finally {
+        onTokenRequest(false);
+      }
     };
-    // Like the existing sign-in path, do not abort an in-flight refresh or
-    // token exchange: the server may already have rotated its credentials.
-    const flow = { serverUrl, fetch: timedFetch, resourceMetadataUrl: challenge?.resourceMetadataUrl,
-      authorizationServerMetadataUrl: settings.authServerMetadataUrl, scope };
-    if (await authorizeMcp(provider, { ...flow, skipRefresh: stepUp }) === "AUTHORIZED") return;
+    if (await authorize({ skipRefresh: stepUp }) === "AUTHORIZED") return;
     if (signal.aborted) throw new Error("Sign-in cancelled");
     if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
     const state = await provider.state();
@@ -116,6 +161,6 @@ export async function signInMcpWithHostedCallback(
     try { response = await Promise.race([browser, manual]); }
     finally { controller.abort(); browser.catch(() => {}); manual.catch(() => {}); }
     if (signal.aborted) throw new Error("Sign-in cancelled");
-    await authorizeMcp(provider, { ...flow, authorizationCode: response.code, iss: response.iss });
+    await authorize({ authorizationCode: response.code, iss: response.iss });
   } finally { callback.close(); }
 }
