@@ -8,7 +8,7 @@ use std::time::Duration;
 
 fn error(code: &str, message: impl ToString) -> (String, String) { (code.into(), message.to_string()) }
 
-fn random_id() -> Result<String, (String, String)> {
+pub(crate) fn random_id() -> Result<String, (String, String)> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| error("io", e))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -33,7 +33,7 @@ fn source(state: &IpcHostState, id: &str) -> Result<session_host::SessionSummary
 }
 
 #[cfg(unix)]
-fn writer_config(state: &IpcHostState) -> Result<management_host::ManagementSpawnConfig, (String, String)> {
+pub(crate) fn writer_config(state: &IpcHostState) -> Result<management_host::ManagementSpawnConfig, (String, String)> {
     let mut config = state.management_config.lock().unwrap().clone().ok_or_else(|| error("management_unavailable", "Management runtime unavailable"))?;
     let agent = state.agent_dir();
     if config.agent_dir.as_deref().is_some_and(|configured| configured != agent) || config.extensions.len() != 1 {
@@ -54,7 +54,7 @@ fn writer_config(state: &IpcHostState) -> Result<management_host::ManagementSpaw
 /// these operations do not spawn subprocesses or external commands. Their pi
 /// process has a private process group. This proof is not valid for other ops.
 #[cfg(unix)]
-fn run_writer(state: &IpcHostState, op: &str, args: Value) -> Result<Value, (String, String)> {
+pub(crate) fn run_writer(state: &IpcHostState, op: &str, args: Value) -> Result<Value, (String, String)> {
     let config = writer_config(state).map_err(|e| error("outcome_unknown", format!("Session writer outcome unknown; do not retry: {}", e.1)))?;
     let writer = management_host::spawn_session_file_writer(&config).map_err(|e| error("outcome_unknown", e))?;
     let pid = writer.pid();
@@ -77,7 +77,7 @@ fn run_writer(state: &IpcHostState, op: &str, args: Value) -> Result<Value, (Str
 }
 
 #[cfg(not(unix))]
-fn run_writer(_state: &IpcHostState, _op: &str, _args: Value) -> Result<Value, (String, String)> {
+pub(crate) fn run_writer(_state: &IpcHostState, _op: &str, _args: Value) -> Result<Value, (String, String)> {
     Err(error("not_supported", "Session file mutations are not supported on this platform"))
 }
 
