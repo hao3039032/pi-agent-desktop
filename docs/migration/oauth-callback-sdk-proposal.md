@@ -91,5 +91,42 @@ MCP has a separate SDK entry point: `pi-coding-agent/dist/extensions/mcp/oauth.j
 an approved repository adapter can reuse those protocol primitives while Rust
 owns the listener. It must retain the SDK entry point's registration reuse,
 CIMD issuer/mix-up defense, configured callback and port policy, refresh,
-request timeout, scope, credential-store and cancellation behavior. No such
-adapter is claimed by this document.
+request timeout, scope, credential-store and cancellation behavior. The
+repository now contains an experimental hosted-callback adapter; its separate
+Rust callback and end-to-end integration still require acceptance.
+
+## MCP management: public capability gap
+
+The official standalone pi 1.4.0 extension loader exposes the public
+`@earendil-works/pi-coding-agent` SDK as a virtual module. The existing
+management MCP implementation instead loads coding-agent internals from the
+staged disk tree. A genuine standalone isolated probe finds that the disk
+`createMcpExtension` is not the same function as the virtual public SDK export;
+the existing second-copy identity guard correctly refuses MCP Test. Removing
+that guard would mix unrelated SDK class graphs. The public
+`@earendil-works/pi-mcp` entry exports protocol clients and transports, and
+`@earendil-works/pi-mcp/oauth` exports the OAuth engine and an in-memory store,
+but these alone do not expose the coding-agent configuration validator/loader,
+config-value resolution and shell-command semantics, or its persistent
+credential store and locking. A stdio-only adapter or a memory credential store
+cannot satisfy the existing management Test, OAuth refresh and sign-out rules.
+
+Proposed upstream addition: expose, through the *same virtual public SDK entry*,
+a supported MCP management factory or individually documented public exports
+for configuration loading/validation, config-value resolution, the actual
+persistent credential store, connection and transport creation. It must keep
+the SDK's version and storage-lock semantics, allow the existing per-operation
+sign-out guard around every credential write, and preserve the class identity of
+all SDK-created transport and connection objects. Alternatively a fully public
+pi-mcp management factory may own the whole separate protocol graph, provided
+it exposes these same services and exchanges only plain data or documented
+callbacks with the CLI SDK. No SDK source patch or new distribution is
+approved by this proposal.
+
+Required acceptance: a fixed genuine release and isolated, relocated bundle;
+a real fake-MCP Test with config/trust and sanitized stdio, `!command` queue,
+redaction, deadlines and close; and fake OAuth refresh racing sign-out against
+the real guarded persistent store. Confirm no second coding-agent graph and
+no fallback to checkout, global npm or a local pi install. The local protocol
+fixture with an in-memory store and a fake callback proves neither that
+persistent-store contract nor Rust-owned callback integration.

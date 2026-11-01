@@ -33,6 +33,8 @@ const ROOT = resolve(HERE, "../..");
 // the ops in lib/pi-rpc/assets/pi-web-management.mjs.
 const ENTRY = `
 export { SessionManager as projectionSessionManager } from "@earendil-works/pi-coding-agent";
+export { McpOAuthProvider as projectionMcpOAuthProvider, MemoryOAuthStateStore as projectionMemoryOAuthStateStore } from "@earendil-works/pi-mcp/oauth";
+export { signInMcpWithHostedCallback } from "${ROOT}/lib/mcp-oauth-hosted.server.ts";
 export {
   buildSessionContext,
   sliceActiveBranch,
