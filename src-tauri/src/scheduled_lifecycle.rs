@@ -16,7 +16,7 @@ struct Tracking {
     release_failed: bool,
 }
 #[derive(Clone)]
-struct RunState { session: Option<String>, unresolved: bool }
+struct RunState { session: Option<String>, unresolved: bool, detail: Option<String> }
 pub(crate) struct ScheduledRunGuard { lifecycle: Arc<ScheduledLifecycle>, id: String, claimed: bool, resolved: bool }
 
 impl ScheduledLifecycle {
@@ -28,13 +28,13 @@ impl ScheduledLifecycle {
         if entries.releasing || entries.release_failed { return Err("scheduler lease release in progress or unresolved"); }
         if entries.runs.contains_key(id) { return Err("duplicate scheduled run id"); }
         if entries.runs.len() >= 128 { return Err("scheduled run tracking capacity reached"); }
-        entries.runs.insert(id.to_string(), RunState { session: None, unresolved: false });
+        entries.runs.insert(id.to_string(), RunState { session: None, unresolved: false, detail: None });
         Ok(ScheduledRunGuard { lifecycle: Arc::clone(self), id: id.to_string(), claimed: false, resolved: false })
     }
-    pub(crate) fn snapshot(&self) -> Result<Vec<(String, Option<String>, bool)>, &'static str> {
+    pub(crate) fn snapshot(&self) -> Result<Vec<(String, Option<String>, bool, Option<String>)>, &'static str> {
         self.entries.try_lock().map(|entries| {
-            let mut snapshot: Vec<_> = entries.runs.iter().map(|(id, state)| (id.clone(), state.session.clone(), state.unresolved)).collect();
-            if entries.releasing || entries.release_failed { snapshot.push(("scheduler lease release".into(), None, entries.release_failed)); }
+            let mut snapshot: Vec<_> = entries.runs.iter().map(|(id, state)| (id.clone(), state.session.clone(), state.unresolved, state.detail.clone())).collect();
+            if entries.releasing || entries.release_failed { snapshot.push(("scheduler lease release".into(), None, entries.release_failed, None)); }
             snapshot
         }).map_err(|_| "scheduled run tracking unavailable or busy")
     }
@@ -78,6 +78,13 @@ impl ScheduledRunGuard {
     }
     pub(crate) fn claimed(&mut self) { self.claimed = true; }
     pub(crate) fn resolved(&mut self) { self.resolved = true; }
+    pub(crate) fn record_outcome(&self, ledger_written: bool, prompt: String, writer: String) {
+        if let Ok(mut entries) = self.lifecycle.entries.lock() {
+            if let Some(state) = entries.runs.get_mut(&self.id) {
+                state.detail = Some(format!("ledger={}, prompt={prompt}, writer={writer}", if ledger_written { "written" } else { "unknown" }));
+            }
+        }
+    }
 }
 impl Drop for ScheduledRunGuard {
     fn drop(&mut self) {
@@ -114,7 +121,7 @@ mod tests {
         let lifecycle = ScheduledLifecycle::default();
         lifecycle.defer_pause_release(dir.path().to_path_buf());
         assert!(lifecycle.prepare_start().is_err());
-        assert_eq!(lifecycle.snapshot().unwrap(), vec![("scheduler lease release".into(), None, true)]);
+        assert_eq!(lifecycle.snapshot().unwrap(), vec![("scheduler lease release".into(), None, true, None)]);
     }
 
     #[test]
@@ -127,7 +134,7 @@ mod tests {
         lifecycle.begin_shutdown();
         drop(lock);
         drop(guard);
-        assert_eq!(lifecycle.snapshot().unwrap(), vec![("run".into(), None, true)]);
+        assert_eq!(lifecycle.snapshot().unwrap(), vec![("run".into(), None, true, None)]);
         assert!(lifecycle.admit("late").is_err());
     }
 }

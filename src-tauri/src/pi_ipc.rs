@@ -333,7 +333,7 @@ impl IpcHostState {
                 if !lifecycle_free { unknown.push("scheduler lifecycle busy".into()); }
                 if !timer_stopped { unknown.push("scheduler timer still running or unavailable".into()); }
                 match active {
-                    Ok(entries) => unknown.extend(entries.into_iter().map(|(id, session, unresolved)| format!("{id}: {}{}", if unresolved { "scheduled outcome unresolved" } else { "scheduled run or start in flight" }, session.map(|id| format!(" (session {id})")).unwrap_or_default()))),
+                    Ok(entries) => unknown.extend(entries.into_iter().map(|(id, session, unresolved, detail)| format!("{id}: {}{}{}", if unresolved { "scheduled outcome unresolved" } else { "scheduled run or start in flight" }, session.map(|id| format!(" (session {id})")).unwrap_or_default(), detail.map(|value| format!("; {value}")).unwrap_or_default()))),
                     Err(error) => unknown.push(error.into()),
                 }
                 break;

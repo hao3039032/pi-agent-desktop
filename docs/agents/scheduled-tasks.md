@@ -68,6 +68,16 @@ claim retains it. Restart cancels a deferred release, or refuses while a
 release is in progress or unresolved. This changes release timing during an
 active run to avoid dropping its lease under final shutdown.
 
+A successful write of a `failed`, `aborted`, or `succeeded` run record does not
+prove the submitted prompt ended or the controlled child stopped writing. The
+shutdown report keeps ledger, prompt attribution, and writer state separate.
+The installed RPC does not correlate `agent_settled` to a specific request;
+even an apparently normal terminal event therefore remains uncorrelated. Such
+runs retain their tracking and lease, and can eventually exhaust the 128-entry
+admission cap. This is a known functional gate, not normal-run compatibility:
+closing it requires the proposed SDK-correlated prompt lifecycle (and separate
+proof of controlled-writer termination), not fabricated terminal attribution.
+
 ## Client
 - `hooks/useScheduledTasks.ts`: one store shared by the sidebar badge and the page, fed by
   `lib/scheduled-tasks/shared-stream.ts` (one stream per browser, led by one tab; see the ADR). Events

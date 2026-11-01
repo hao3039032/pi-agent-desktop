@@ -59,12 +59,14 @@ struct Config {
     session_id: String,
     commands: serde_json::Value,
     prompt_hold: bool,
+    prompt_drop_ack: bool,
     prompt_hold_past_eof: bool,
     stay_after_eof: bool,
     prompt_events: Vec<serde_json::Value>,
     prompt_disposition: String,
     assert_busy_after_prompt: bool,
     prompt_log: Option<std::path::PathBuf>,
+    abort_log: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Config {
@@ -72,12 +74,14 @@ fn parse_args() -> Config {
         session_id: "mock-session-id".into(),
         commands: serde_json::json!({ "commands": [] }),
         prompt_hold: false,
+        prompt_drop_ack: false,
         prompt_hold_past_eof: false,
         stay_after_eof: false,
         prompt_events: Vec::new(),
         prompt_disposition: "started".into(),
         assert_busy_after_prompt: false,
         prompt_log: None,
+        abort_log: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -95,6 +99,7 @@ fn parse_args() -> Config {
                 }
             }
             "--mock-prompt-hold" => config.prompt_hold = true,
+            "--mock-prompt-drop-ack" => config.prompt_drop_ack = true,
             "--mock-assert-busy-after-prompt" => config.assert_busy_after_prompt = true,
             "--mock-stay-after-eof" => config.stay_after_eof = true,
             "--mock-prompt-hold-past-eof" => {
@@ -118,6 +123,11 @@ fn parse_args() -> Config {
             "--mock-prompt-log" => {
                 if let Some(value) = args.next() {
                     config.prompt_log = Some(std::path::PathBuf::from(value));
+                }
+            }
+            "--mock-abort-log" => {
+                if let Some(value) = args.next() {
+                    config.abort_log = Some(std::path::PathBuf::from(value));
                 }
             }
             _ => {}
@@ -177,6 +187,12 @@ fn main() {
                             if parts.len() == 3 {
                                 if let Ok(payload) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[2]) {
                                     if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                        if payload["op"] == "meta.scheduled-run" {
+                                            respond(&mut out, &id, "prompt", serde_json::json!({"disposition":"handled"}));
+                                            let envelope = serde_json::json!({"sid":config.session_id,"rid":parts[1],"nonce":payload["nonce"],"ok":true,"result":{"entry":"scheduled-run"}});
+                                            emit(&mut out, serde_json::json!({"type":"extension_ui_request","id":"fixture-notify","method":"notify","message":format!("PI_WEB_BRIDGE_V1 {envelope}")}));
+                                            continue;
+                                        }
                                         if payload["op"] == "tree.assertIdle" {
                                             respond(&mut out, &id, "prompt", serde_json::json!({"disposition":"handled"}));
                                             let envelope = if config.assert_busy_after_prompt && prompt_admitted {
@@ -208,6 +224,7 @@ fn main() {
                                 let _ = writeln!(file, "{message}");
                             }
                         }
+                        if config.prompt_drop_ack { continue; }
                         if config.prompt_hold {
                             // Hold the delivery mid-flight until the test
                             // releases it (answering get_state probes read
@@ -292,6 +309,9 @@ fn main() {
                         }));
                     }
                     _ => {
+                        if type_ == "abort" {
+                            if let Some(path) = &config.abort_log { let _ = std::fs::write(path, "abort rejected"); }
+                        }
                         // An unknown command is an explicit failure, not a
                         // hang: the handshake's error paths stay observable.
                         let record = serde_json::json!({

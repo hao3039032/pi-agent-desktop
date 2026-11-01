@@ -44,7 +44,7 @@ pub fn tick(state: &Arc<IpcHostState>, now_ms: i64) -> Result<bool, String> {
     let mut active = state.scheduled_active.lock().unwrap().clone();
     // A failed ledger/setup path can leave a claimed run unresolved even
     // after its worker unwound. Do not reinterpret it as an orphan.
-    active.extend(state.scheduled_lifecycle.snapshot()?.into_iter().map(|(id, _, _)| id));
+    active.extend(state.scheduled_lifecycle.snapshot()?.into_iter().map(|(id, _, _, _)| id));
     for task in &tasks {
         let Some(task_id) = task["id"].as_str() else { continue };
         if repo.runs(task_id)?.iter().any(|run| orphaned(run, pid, &active)) {
@@ -171,9 +171,9 @@ impl SchedulerLoop {
     pub fn begin_shutdown(&self) { let _ = self.stop.send(()); }
 
     /// Wait only until the caller's shared deadline. A timed-out worker stays
-    /// owned here and retains its lease until it actually leaves the tick.
-    /// Success covers only the timer thread: it does not drain scheduled runs
-    /// or prove host shutdown. The existing loop releases its lease on exit.
+    /// owned here. Success covers only the timer thread, not its runs or host
+    /// shutdown; final shutdown retains the lease and ordinary pause defers
+    /// release until tracked runs resolve.
     pub fn shutdown_until(&mut self, deadline: std::time::Instant) -> bool {
         self.begin_shutdown();
         loop {
@@ -194,7 +194,8 @@ impl SchedulerLoop {
     }
 }
 // Never turn a deadline failure into an unbounded join during unwinding/drop.
-// The thread owns its state and releases its lease only on its actual exit.
+// The detached thread owns its state; lease disposition follows the loop's
+// final-shutdown versus ordinary-pause rules, not Drop.
 impl Drop for SchedulerLoop { fn drop(&mut self) { self.begin_shutdown(); } }
 
 #[cfg(test)]
