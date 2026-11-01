@@ -13,6 +13,7 @@
  */
 
 import { IpcClient, IpcFailure, type IpcTransport } from "../ipc/client.ts";
+import { notifyCleanupWarning } from "./cleanup-warning.ts";
 
 export class AgentCommandError extends Error {
   constructor(
@@ -102,7 +103,7 @@ export async function sendAgentCommand<T = unknown>(
     signal.addEventListener("abort", onAbort, { once: true });
   });
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       hostOp !== undefined
         ? ensureClient().request<T>(
             hostOp,
@@ -120,6 +121,8 @@ export async function sendAgentCommand<T = unknown>(
           ),
       abort,
     ]);
+    notifyCleanupWarning(result);
+    return result;
   } catch (caught) {
     if (caught instanceof AgentCommandError) throw caught;
     if (caught instanceof IpcFailure) throw toAgentCommandError(caught);

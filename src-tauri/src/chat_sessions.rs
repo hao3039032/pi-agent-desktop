@@ -145,14 +145,15 @@ pub(crate) fn set_access(state: &IpcHostState, args: &Value) -> Result<Value, (S
             || session_host::spawn_plan::read_chat_unlocked(&summary.file) != unlocked {
             return Err(error("outcome_unknown", "Access change could not be verified; do not retry"));
         }
-        crate::session_writer_fence::finish(&agent, id, &operation).map_err(|e| error("partial_success", format!("Chat access was saved, but its completion record could not be cleared; do not retry: {e}")))?;
+        let cleanup = crate::session_writer_fence::finish_known(&agent, id, &operation, crate::session_writer_fence::FenceOutcome::Applied).err();
         writer.complete();
-        Ok(())
+        Ok(cleanup)
     });
     match result {
         Err(session_host::SessionWriterError::Busy(message)) => return Err(error("busy", message)),
         Err(session_host::SessionWriterError::Operation(error)) => return Err(error),
-        Ok(()) => {}
+        Ok(Some(cleanup)) => return Ok(json!({"success":true,"data":{"sessionId":id,"recreated":false,"unlocked":unlocked},"cleanupWarning":format!("Chat access was saved, but fence cleanup is uncertain; do not repeat the change: {cleanup}")})),
+        Ok(None) => {}
     }
     drop(_policy);
     crate::pi_ipc::dispatch_with_resume(state, "agent.command", &json!({"session": id, "type": "get_state"}))
@@ -190,10 +191,11 @@ pub(crate) fn continue_in_project(state: &IpcHostState, args: &Value) -> Result<
             || digest(&summary.file).map_err(|e| error("outcome_unknown", format!("Copy source could not be verified; do not retry: {}", e.1)))? != before {
             return Err(error("outcome_unknown", "Copy identity could not be verified; do not retry"));
         }
-        crate::session_writer_fence::finish(&agent, &target_id, &operation).map_err(|e| error("partial_success", format!("Project copy was created, but its completion record could not be cleared; do not retry: {e}")))?;
-        crate::session_writer_fence::finish(&agent, id, &operation).map_err(|e| error("partial_success", format!("Project copy was created, but its completion record could not be cleared; do not retry: {e}")))?;
+        let target_cleanup = crate::session_writer_fence::finish_known(&agent, &target_id, &operation, crate::session_writer_fence::FenceOutcome::Applied).err();
+        let source_cleanup = crate::session_writer_fence::finish_known(&agent, id, &operation, crate::session_writer_fence::FenceOutcome::Applied).err();
         writer.complete();
-        Ok(json!({"sessionId":target_id,"path":copied,"cwd":cwd,"chatFolder":if crate::session_view::is_chat_folder_path(Path::new(&summary.cwd), &agent) { Some(summary.cwd) } else { None }}))
+        let warning = target_cleanup.or(source_cleanup).map(|e| format!("Project copy was created, but fence cleanup is uncertain; do not repeat the copy: {e}"));
+        Ok(json!({"sessionId":target_id,"path":copied,"cwd":cwd,"chatFolder":if crate::session_view::is_chat_folder_path(Path::new(&summary.cwd), &agent) { Some(summary.cwd) } else { None },"cleanupWarning":warning}))
     });
     match result {
         Ok(value) => Ok(value),

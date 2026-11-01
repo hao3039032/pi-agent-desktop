@@ -49,7 +49,7 @@ impl SessionWriterLifecycle {
                             })),
                         }
                     }
-                    if report.unknown.is_empty() || Instant::now() >= deadline || entries.values().any(|state| matches!(state, WriterState::Unknown)) { return report; }
+                    if !entries.values().any(|state| matches!(state, WriterState::Preparing | WriterState::Started)) || Instant::now() >= deadline { return report; }
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => return SessionWriterShutdownReport { unknown: vec!["session writer registry poisoned".into()], ..Default::default() },
                 Err(std::sync::TryLockError::WouldBlock) => {},
@@ -105,6 +105,20 @@ mod tests {
         guard.before_spawn().unwrap();
         drop(guard);
         assert!(host.shutdown_until(Instant::now()).unknown[0].contains("unresolved"));
+    }
+    #[test]
+    fn shutdown_waits_for_active_writer_even_when_another_is_unknown() {
+        let host = Arc::new(SessionWriterLifecycle::default());
+        let mut unknown = host.admit("unknown").unwrap(); unknown.before_spawn().unwrap(); drop(unknown);
+        let mut active = host.admit("active").unwrap(); active.before_spawn().unwrap();
+        let wait = host.clone();
+        let join = std::thread::spawn(move || wait.shutdown_until(Instant::now() + Duration::from_secs(1)));
+        while !host.closing.load(Ordering::SeqCst) { std::thread::yield_now(); }
+        active.complete();
+        let report = join.join().unwrap();
+        assert_eq!(report.exited, vec!["active"]);
+        assert_eq!(report.unknown.len(), 1);
+        assert!(report.unknown[0].contains("unknown"));
     }
     #[test]
     fn completed_writer_releases_admission() {

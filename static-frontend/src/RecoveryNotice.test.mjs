@@ -11,9 +11,10 @@ const { RecoveryNoticeContent } = await jiti.import("./RecoveryNotice.tsx");
 const render = (status, error = false) => renderToStaticMarkup(React.createElement(RecoveryNoticeContent, { locale: "en", status, error, onRefresh() {} }));
 
 test("notice reports each unresolved category and offers only a read-only check", () => {
-  const html = render({ trustPolicy: "pending", sessionWriters: "uninspectable", deletionJournal: "clear" });
+  const html = render({ trustPolicy: "pending", sessionWriters: "uninspectable", sessionWriterCleanup: "pending", deletionJournal: "clear" });
   assert.match(html, /Trust policy: pending/);
   assert.match(html, /Session writer: cannot inspect/);
+  assert.match(html, /Known session outcome: cleanup: pending/);
   assert.doesNotMatch(html, /Session deletion:/);
   assert.match(html, /Do not retry uncertain changes/);
   assert.match(html, /Check again/);
@@ -21,6 +22,6 @@ test("notice reports each unresolved category and offers only a read-only check"
 });
 
 test("clear status hides notice but unavailable status is visible", () => {
-  assert.equal(render({ trustPolicy: "clear", sessionWriters: "clear", deletionJournal: "clear" }), "");
+  assert.equal(render({ trustPolicy: "clear", sessionWriters: "clear", sessionWriterCleanup: "clear", deletionJournal: "clear" }), "");
   assert.match(render(null, true), /Recovery status could not be checked/);
 });

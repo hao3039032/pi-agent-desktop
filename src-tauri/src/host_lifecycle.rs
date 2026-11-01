@@ -14,26 +14,14 @@ pub enum PendingState { Clear, Pending, Uninspectable }
 pub struct RecoveryStatus {
     pub trust_policy: PendingState,
     pub session_writers: PendingState,
+    pub session_writer_cleanup: PendingState,
     pub deletion_journal: PendingState,
 }
 
 impl RecoveryStatus {
     pub fn is_clear(&self) -> bool {
         self.trust_policy == PendingState::Clear && self.session_writers == PendingState::Clear
-            && self.deletion_journal == PendingState::Clear
-    }
-}
-
-fn directory_pending(path: &Path) -> PendingState {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingState::Clear,
-        Err(_) => PendingState::Uninspectable,
-        Ok(meta) if !meta.file_type().is_dir() => PendingState::Uninspectable,
-        Ok(_) => match std::fs::read_dir(path).and_then(|mut entries| entries.next().transpose()) {
-            Ok(None) => PendingState::Clear,
-            Ok(Some(_)) => PendingState::Pending,
-            Err(_) => PendingState::Uninspectable,
-        },
+            && self.session_writer_cleanup == PendingState::Clear && self.deletion_journal == PendingState::Clear
     }
 }
 
@@ -52,13 +40,13 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
             Err(_) => PendingState::Uninspectable,
         }
     };
-    let writers = if base_safe { directory_pending(&base.join("session-writer-fences")) } else { PendingState::Uninspectable };
+    let (writers, writer_cleanup) = if base_safe { crate::session_writer_fence::diagnostic(agent) } else { (PendingState::Uninspectable, PendingState::Uninspectable) };
     let journal = match crate::session_deletion_journal::has_pending(agent) {
         Ok(true) => PendingState::Pending,
         Ok(false) => PendingState::Clear,
         Err(_) => PendingState::Uninspectable,
     };
-    RecoveryStatus { trust_policy: trust, session_writers: writers, deletion_journal: journal }
+    RecoveryStatus { trust_policy: trust, session_writers: writers, session_writer_cleanup: writer_cleanup, deletion_journal: journal }
 }
 
 /// Ordered shutdown phases. Register each actual service/controlled child
@@ -193,7 +181,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("session-deletion-journal")).unwrap();
         std::fs::write(dir.path().join("session-deletion-journal/pending"), "journal").unwrap();
         let status = host.require_clean_start().unwrap_err();
-        assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, deletion_journal: PendingState::Pending });
+        assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, session_writer_cleanup: PendingState::Clear, deletion_journal: PendingState::Pending });
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "unresolved");
     }
 
