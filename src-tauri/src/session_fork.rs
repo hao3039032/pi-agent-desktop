@@ -196,11 +196,13 @@ pub(crate) fn copy(state: &IpcHostState, id: &str, kind: &str, args: &Value) -> 
             || source_digest(&prepared.source).map_err(|e| error("outcome_unknown", e.1))? != prepared.source_digest {
             return Err(error("outcome_unknown", "Source changed during fork; do not retry"));
         }
-        crate::session_writer_fence::finish(&agent, &prepared.target, &prepared.operation).map_err(|e| error("partial_success", format!("Fork completed but target fence remains; do not retry: {e}")))?;
-        crate::session_writer_fence::finish(&agent, id, &prepared.operation).map_err(|e| error("partial_success", format!("Fork completed but source fence remains; do not retry: {e}")))?;
+        let outcome = if prepared.cancelled { crate::session_writer_fence::FenceOutcome::NotApplied } else { crate::session_writer_fence::FenceOutcome::Applied };
+        let target_cleanup = crate::session_writer_fence::finish_known(&agent, &prepared.target, &prepared.operation, outcome).err();
+        let source_cleanup = crate::session_writer_fence::finish_known(&agent, id, &prepared.operation, outcome).err();
         prepared.writer.complete();
-        std::fs::remove_dir_all(&prepared.staging).map_err(|e| error("partial_success", format!("Fork completed but staging cleanup failed; do not retry: {e}")))?;
-        Ok(if prepared.cancelled { json!({"cancelled":true}) } else { json!({"cancelled":false,"newSessionId":prepared.target}) })
+        let staging_cleanup = std::fs::remove_dir_all(&prepared.staging).err().map(|e| e.to_string());
+        let cleanup_warning = target_cleanup.or(source_cleanup).or(staging_cleanup).map(|e| format!("Fork outcome is known, but cleanup is uncertain; do not repeat the operation: {e}"));
+        Ok(if prepared.cancelled { json!({"cancelled":true,"cleanupWarning":cleanup_warning}) } else { json!({"cancelled":false,"newSessionId":prepared.target,"cleanupWarning":cleanup_warning}) })
     });
     match result {
         Ok(value) => Ok(value),

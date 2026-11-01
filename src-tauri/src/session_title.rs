@@ -119,14 +119,14 @@ pub(crate) fn status(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
         let renamed = session.title_rename_with_owned_fence(&guard, &operation_id, task_id, title, Some(timeout));
         match renamed {
             Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
-                crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id)
-                    .map_err(|e| err("outcome_unknown", format!("Title was renamed but its fence remains; do not retry: {e}")))?;
-                Ok(json!({"title":title,"usage":response["result"]["usage"]}))
+                let cleanup = crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id, crate::session_writer_fence::FenceOutcome::Applied).err();
+                let warning = cleanup.map(|e| format!("Title was renamed; fence cleanup is uncertain. Do not repeat the rename: {e}"));
+                Ok(json!({"title":title,"usage":response["result"]["usage"],"cleanupWarning":warning}))
             }
             Err(pi_host::bridge::BridgeError::Op(ref error)) if matches!(error.code.as_deref(), Some("rename_not_applied" | "title_stale")) => {
-                crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id)
-                    .map_err(|e| err("outcome_unknown", format!("Rename was refused but its fence remains; do not retry: {e}")))?;
-                Err(err(if error.code.as_deref() == Some("title_stale") { "stale" } else { "busy" }, &error.message))
+                let cleanup = crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id, crate::session_writer_fence::FenceOutcome::NotApplied).err();
+                let message = if let Some(cleanup) = cleanup { format!("{}; rename was not applied, but fence cleanup is uncertain: {cleanup}", error.message) } else { error.message.clone() };
+                Err(err(if error.code.as_deref() == Some("title_stale") { "stale" } else { "busy" }, message))
             }
             other => Err(err("outcome_unknown", format!("Title rename outcome is unknown; its writer fence remains and retry is blocked: {other:?}"))),
         }

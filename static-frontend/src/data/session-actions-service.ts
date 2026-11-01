@@ -1,4 +1,5 @@
 import { IpcClient, IpcFailure } from "../ipc/client.ts";
+import { notifyCleanupWarning } from "./cleanup-warning.ts";
 
 let client: IpcClient | null = null;
 export function bindSessionActionsService(bound: IpcClient): void { client = bound; }
@@ -16,7 +17,7 @@ export async function autoNameSession(sessionId: string, signal?: AbortSignal): 
       // A status request can perform the rename. Await its answer even after
       // cancellation: abandoning it could misreport a completed rename.
       const result = await client.request<{ status?: string; title?: string }>("sessions.autoNameStatus", { session: sessionId, task }, { timeoutMs: 100_000 });
-      if (result.title) return result;
+      if (result.title) { notifyCleanupWarning(result); return result; }
       if (result.status !== "running") throw new Error("Invalid title task status");
       await new Promise<void>((resolve) => setTimeout(resolve, 250));
     }
