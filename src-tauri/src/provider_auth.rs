@@ -1070,6 +1070,35 @@ export default function(pi) {
         managed
     }
 
+    /// Build only the local projection; link read-only dependencies instead
+    /// of copying the installed SDK closure. This is not standalone evidence.
+    fn local_managed_tree(dir: &std::path::Path) -> std::path::PathBuf {
+        let managed = dir.join("managed").join("node_modules");
+        std::fs::create_dir_all(&managed).unwrap();
+        let output = std::process::Command::new("node")
+            .arg("../scripts/migration/build-management-modules.mjs")
+            .arg("--out").arg(&managed).output().expect("projection builder runs");
+        assert!(output.status.success(), "projection failed: {}", String::from_utf8_lossy(&output.stderr));
+        let projection = std::fs::metadata(managed.join("pi-web-session-projection.mjs")).unwrap().len();
+        let title = std::fs::metadata(managed.join("pi-web-session-title.mjs")).unwrap().len();
+        assert!(projection + title < 100 * 1024 * 1024, "fixture projection exceeds source budget");
+        let dependencies = std::path::Path::new("../node_modules").canonicalize().unwrap();
+        for name in ["@earendil-works", "jiti"] {
+            let source = dependencies.join(name);
+            let destination = managed.join(name);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(source, destination).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_dir(source, destination).unwrap();
+        }
+        managed
+    }
+
+    struct StopFixtureManagement<'a>(&'a crate::pi_ipc::IpcHostState);
+    impl Drop for StopFixtureManagement<'_> {
+        fn drop(&mut self) { self.0.management.shutdown_all(Duration::from_secs(2)); }
+    }
+
     /// The fixture auth.json (never a real account, never a real secret).
     fn write_fixture_auth(agent_dir: &std::path::Path, key: &str) {
         std::fs::create_dir_all(agent_dir.join("sessions")).expect("sessions dir");
@@ -1240,12 +1269,64 @@ export default function(pi) {
         let _ = instance.cancel_task(&task_handle);
     }
 
-    /// A running OAuth login task can accept input via submit_task_input even when
-    /// another mutation in the same management scope has an Unknown outcome (which
-    /// blocks ordinary new mutations like auth.apiKeyStore). Also verifies that
-    /// wrong handle, bad/repeated token, and submission after cancel all reject.
+    fn assert_real_login_unknown(executable: &str, managed: &std::path::Path, source: &str, cancel: bool) {
+        let state = crate::pi_ipc::IpcHostState::new();
+        let dir = tempfile::tempdir().unwrap();
+        let _cleanup = StopFixtureManagement(&state);
+        let agent = dir.path().join("agent");
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        write_fixture_auth(&agent, "fake-fixture-key");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::write(agent.join("extensions/fixture.js"), source).unwrap();
+        let config = management_host::ManagementSpawnConfig {
+            executable: executable.to_string(), agent_dir: Some(agent.clone()),
+            extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("PI_OFFLINE".into(), "1".into())],
+        };
+        *state.management_config.lock().unwrap() = Some(config.clone());
+        let instance = state.management.instance("global", &config).unwrap();
+        let task = instance.start_task("auth.loginStart", json!({"flowId":"isolated-flow","provider":"fixture-oauth"}),
+            LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        let token = loop {
+            let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":"isolated-flow"}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
+            if let Some(token) = poll["events"].as_array().and_then(|events| events.iter().find_map(|e| e["event"]["token"].as_str())) { break token.to_string(); }
+            let snapshot = instance.task_snapshot(&task).unwrap();
+            assert_eq!(snapshot.status, management_host::TaskStatus::Running, "fake login did not start: {:?}", snapshot.error);
+            assert!(std::time::Instant::now() < until, "isolated fake prompt missing");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if cancel {
+            instance.cancel_task(&task).unwrap();
+            assert!(instance.submit_task_input(&task, json!({"provider":"fixture-oauth", "token":token, "code":"fixture"})).is_err(),
+                "a cancellation request must close input before outcome is known");
+        } else {
+            let result = instance.submit_task_input(&task, json!({"provider":"fixture-oauth", "token":token, "code":"fake-rejection-2026"})).unwrap();
+            assert_eq!(result["status"], "accepted");
+        }
+        while instance.task_snapshot(&task).unwrap().status == management_host::TaskStatus::Running {
+            assert!(std::time::Instant::now() < until, "fake login outcome did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(instance.task_snapshot(&task).unwrap().status, management_host::TaskStatus::Unknown,
+            "failed/cancelled interaction does not prove the writer stopped");
+        assert!(instance.submit_task_input(&task, json!({"provider":"fixture-oauth", "token":token, "code":"fixture"})).is_err());
+        assert!(instance.start_task("auth.loginStart", json!({"flowId":"blocked","provider":"fixture-oauth"}),
+            LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation).is_err());
+        assert!(instance.start_task("auth.apiKeyStore", json!({"provider":"openai","apiKey":"sk-new"}),
+            LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation).is_err());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::read_to_string(agent.join("provider-starts")).unwrap(), "start\n");
+        let ledger = agent.join("pi-web/management-operations");
+        let records: Vec<_> = std::fs::read_dir(ledger).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect();
+        assert!(records.iter().any(|record| record.contains("\"phase\":\"pending\"")));
+        assert!(records.iter().all(|record| !record.contains("fake-rejection-2026") && !record.contains(&token)));
+    }
+
+    /// Real local pi: pending/unknown credential ledgers block new mutations,
+    /// while task-bound input remains available to the original running login.
     #[test]
-    fn login_input_bypasses_scope_mutation_isolation_and_enforces_task_guards() {
+    fn login_input_respects_pending_ledger_and_task_guards() {
         let Some(executable) = std::env::var("PI_CLI_BIN")
             .ok()
             .filter(|value| !value.is_empty())
@@ -1255,20 +1336,23 @@ export default function(pi) {
         };
         let state = crate::pi_ipc::IpcHostState::new();
         let dir = tempfile::tempdir().expect("tempdir");
+        let _cleanup = StopFixtureManagement(&state);
         let agent_dir = dir.path().join("agent");
-        let managed = stage_managed_tree(dir.path());
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = local_managed_tree(dir.path());
         write_fixture_auth(&agent_dir, "sk-test-key-scope");
         std::fs::create_dir_all(agent_dir.join("extensions")).unwrap();
         std::fs::write(agent_dir.join("extensions/fixture.js"), r#"
+import { appendFileSync } from 'node:fs';
 export default function(pi) {
-  for (const id of ['fixture-oauth', 'fixture-stuck']) pi.registerProvider({
+  for (const id of ['fixture-oauth']) pi.registerProvider({
     id, name: id, auth: { oauth: {
       name: id,
       login: async (interaction) => {
-        if (id === 'fixture-stuck') return await new Promise(() => {});
+        appendFileSync(process.env.PI_CODING_AGENT_DIR + '/provider-starts', 'start\n');
         interaction.notify({ type: 'auth_url', url: 'https://example.invalid/?state=fixture', instructions: 'Fixture' });
         const code = await interaction.prompt({ type: 'manual_code', message: 'Fixture code' });
-        if (code === 'bad') throw new Error('Fixture rejected');
+        if (code.startsWith('fake-rejection-')) throw new Error('Fixture rejected');
         return { type: 'oauth', access: 'fixture-access', refresh: 'fixture-refresh', expires: Date.now() + 3600000 };
       },
       refresh: async () => ({ access: 'fixture-access', refresh: 'fixture-refresh', expires: Date.now() + 3600000 }),
@@ -1278,7 +1362,7 @@ export default function(pi) {
 }
 "#).unwrap();
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
-            executable,
+            executable: executable.clone(),
             agent_dir: Some(agent_dir.clone()),
             extensions: vec![
                 std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs")
@@ -1293,6 +1377,7 @@ export default function(pi) {
 
         let config = state.management_config.lock().unwrap().clone().unwrap();
         let instance = state.management.instance("global", &config).unwrap();
+        let fixture_source = std::fs::read_to_string(agent_dir.join("extensions/fixture.js")).unwrap();
 
         // 1. Start a real OAuth login task using the isolated fixture provider:
         let login_task = instance
@@ -1342,61 +1427,44 @@ export default function(pi) {
         state.login_relays.relays.lock().unwrap().get_mut("sub-input-1").unwrap().tokens.insert(token.clone());
         let invalid = instance.submit_task_input(&login_task, json!({"provider":"fixture-oauth", "token":"wrong", "code":"fixture"})).unwrap();
         assert_eq!(invalid["status"], "no_pending");
+        let wrong_provider = instance.submit_task_input(&login_task, json!({"provider":"wrong-provider", "token":token, "code":"fixture"})).unwrap();
+        assert_eq!(wrong_provider["status"], "provider_mismatch");
         assert!(instance.submit_task_input(&login_task, json!({"data":"x".repeat(4096)})).is_err());
         let other = state.management.instance("other", &config).unwrap();
         assert!(other.submit_task_input(&login_task, json!({})).is_err());
 
-        // Two further fixture flows exercise provider error and cooperative cancel.
-        for (flow, answer) in [("flow-error", Some("bad")), ("flow-cancel", None)] {
-            let handle = instance.start_task("auth.loginStart", json!({"flowId":flow, "provider":"fixture-oauth"}), LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation).unwrap();
-            let until = std::time::Instant::now() + Duration::from_secs(10);
-            let prompt_token = loop {
-                let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":flow}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
-                if let Some(token) = poll["events"].as_array().unwrap().iter().find_map(|e| e["event"]["token"].as_str()) { break token.to_string(); }
-                assert!(std::time::Instant::now() < until, "fixture prompt missing");
-                std::thread::sleep(Duration::from_millis(20));
-            };
-            if let Some(code) = answer {
-                assert_eq!(instance.submit_task_input(&handle, json!({"provider":"fixture-oauth", "token":prompt_token, "code":code})).unwrap()["status"], "accepted");
-            } else {
-                instance.cancel_task(&handle).unwrap();
-            }
-            while instance.task_snapshot(&handle).unwrap().status == management_host::TaskStatus::Running && std::time::Instant::now() < until { std::thread::sleep(Duration::from_millis(20)); }
-            assert_eq!(instance.task_snapshot(&handle).unwrap().status, if answer.is_some() { management_host::TaskStatus::Failed } else { management_host::TaskStatus::Cancelled });
-            assert!(instance.submit_task_input(&handle, json!({"provider":"fixture-oauth", "token":prompt_token, "code":"fixture"})).is_err());
-        }
-
-        // 2. Introduce an Unknown-outcome mutation task in the SAME management scope:
-        // A bounded synchronous call expires while its fixture login is still running.
-        let timeout_error = instance.management_call(
-            "auth.loginStart",
-            json!({ "flowId": "flow-timeout-fake", "provider": "fixture-stuck" }),
-            Duration::from_millis(1),
-        ).unwrap_err();
-        let unknown_task = timeout_error.split("(task ").nth(1).unwrap().trim_end_matches(')').to_string();
-        assert_eq!(
-            instance.task_snapshot(&unknown_task).unwrap().status,
-            management_host::TaskStatus::Unknown,
-            "the scope now has an Unknown outcome"
-        );
-
-        // 3. Verify that ordinary new mutations are blocked by the Unknown task in the scope:
+        // The pending ledger blocks a second credential mutation before it
+        // enters the provider, while this task can still accept bound input.
         let blocked_mutation = instance.start_task(
-            "auth.apiKeyStore",
-            json!({ "provider": "openai", "apiKey": "sk-new" }),
+            "auth.loginStart",
+            json!({ "flowId": "blocked-flow", "provider": "fixture-oauth" }),
             Duration::from_secs(60),
             management_host::TaskKind::Mutation,
         );
-        assert!(blocked_mutation.is_err(), "ordinary mutations are blocked by scope write isolation");
-        assert_eq!(blocked_mutation.unwrap_err(), "management scope has an unknown outcome");
+        assert!(blocked_mutation.is_err(), "pending ledger must block another login");
+        assert!(instance.start_task("auth.apiKeyStore", json!({ "provider": "openai", "apiKey": "sk-new" }),
+            Duration::from_secs(60), management_host::TaskKind::Mutation).is_err());
+        let pending_records: Vec<_> = std::fs::read_dir(agent_dir.join("pi-web/management-operations")).unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap()).collect();
+        assert!(pending_records.iter().any(|record| record.contains("\"phase\":\"pending\"")));
+        assert_eq!(read_auth(&agent_dir)["openai"]["key"], "sk-test-key-scope");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::read_to_string(agent_dir.join("provider-starts")).unwrap(), "start\n");
         let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":"flow-input-test-1"}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
         assert!(poll["events"].as_array().unwrap().iter().any(|event| event["event"]["url"].as_str() == Some("https://example.invalid/?state=fixture")));
 
-        // Input is delivered through the same dispatch used by the WebView, despite unknown isolation.
+        // Input is delivered through the same dispatch used by the WebView,
+        // despite the original task's pending ledger.
         let input_res = dispatch(&state, "auth.loginManualCode", "input", &json!({"provider":"fixture-oauth", "token":token, "code":"fixture-code"})).unwrap();
         assert_eq!(input_res["ok"], true, "{input_res}");
         let repeated = dispatch(&state, "auth.loginManualCode", "repeat", &json!({"provider":"fixture-oauth", "token":token, "code":"fixture-code"})).unwrap();
         assert_eq!(repeated["ok"], false);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while instance.task_snapshot(&login_task).unwrap().status == management_host::TaskStatus::Running {
+            assert!(std::time::Instant::now() < until, "fake provider success did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(instance.task_snapshot(&login_task).unwrap().status, management_host::TaskStatus::Succeeded);
 
         // 5. Wrong handle is rejected:
         let wrong_handle_res = instance.submit_task_input(
@@ -1405,18 +1473,6 @@ export default function(pi) {
         );
         assert!(wrong_handle_res.is_err());
         assert_eq!(wrong_handle_res.unwrap_err(), "management task not found");
-
-        // 6. Unknown/terminal target task is rejected:
-        let unknown_target_res = instance.submit_task_input(
-            &unknown_task,
-            json!({ "provider": "anthropic", "token": "t", "code": "c" }),
-        );
-        assert!(unknown_target_res.is_err());
-        let unknown_err = unknown_target_res.unwrap_err();
-        assert!(
-            unknown_err.contains("terminal") || unknown_err.contains("not running"),
-            "unknown_err: {unknown_err}"
-        );
 
         // 7. Verify subsequent input is rejected after completion or cancellation:
         let _ = instance.cancel_task(&login_task);
@@ -1430,6 +1486,9 @@ export default function(pi) {
             err.contains("cancel requested") || err.contains("not running") || err.contains("terminal"),
             "err: {err}"
         );
+        state.management.shutdown_all(Duration::from_secs(2));
+        assert_real_login_unknown(&executable, &managed, &fixture_source, false);
+        assert_real_login_unknown(&executable, &managed, &fixture_source, true);
     }
 
     /// A custom models.json provider stays out of the API-key list even with
