@@ -338,7 +338,7 @@ test("provider login Channel ACKs snapshots and heartbeats and detach does not c
       calls.push({ command, args });
       if (command === "pi_ipc_login_stream") {
         callback({ index: 0, message: { subscriptionId: "login-1", epoch: 1, seq: 1, kind: "snapshot", payload: { flowId: "f", taskHandle: "t" } } });
-        return Promise.resolve({ subscriptionId: "login-1" });
+        return Promise.resolve({ subscriptionId: "login-1", flowId: "f", taskHandle: "t" });
       }
       return Promise.resolve({ ok: true });
     },

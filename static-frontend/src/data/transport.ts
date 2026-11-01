@@ -138,6 +138,7 @@ class HostBridgeTransport implements IpcTransport {
     args: Record<string, unknown> | undefined,
     onMessage: (message: IpcStreamMessage) => void,
     onError: (error: IpcError) => void,
+    onSubscribe?: (metadata: { subscriptionId: string; flowId: string; taskHandle: string }) => void,
   ): () => void {
     const invoke = tauriHostInvoke();
     if (invoke === null) {
@@ -149,6 +150,42 @@ class HostBridgeTransport implements IpcTransport {
     let boundedAckInFlight = false;
     let pendingBoundedAck: { subscriptionId: string; epoch: number; seq: number } | null = null;
     let loginLiveness: ReturnType<typeof setTimeout> | undefined;
+    type LoginBinding = { subscriptionId: string; flowId: string; taskHandle: string };
+    let loginBinding: LoginBinding | undefined;
+    let loginSnapshot: LoginBinding | undefined;
+    let pendingLoginFrame: IpcStreamMessage | undefined;
+    let loginSeq = 0;
+    let loginInvalid = false;
+    const boundedId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 512;
+    const matchesRequested = (binding: LoginBinding) =>
+      (args?.flowId == null && args?.taskHandle == null) || (args?.flowId === binding.flowId && args?.taskHandle === binding.taskHandle);
+    const sameBinding = (a: LoginBinding, b: LoginBinding) => a.subscriptionId === b.subscriptionId && a.flowId === b.flowId && a.taskHandle === b.taskHandle;
+    const validInteraction = (event: unknown): boolean => {
+      if (!isRecord(event)) return false;
+      if (event.type === "auth") return boundedId(event.token) && typeof event.url === "string" && (event.instructions === null || typeof event.instructions === "string");
+      if (event.type === "device_code") return typeof event.userCode === "string" && typeof event.verificationUri === "string";
+      if (event.type === "prompt_request") return boundedId(event.token) && typeof event.message === "string" && (event.placeholder === null || typeof event.placeholder === "string");
+      if (event.type === "select_request") return boundedId(event.token) && typeof event.message === "string" && Array.isArray(event.options)
+        && event.options.every((option: unknown) => isRecord(option) && typeof option.id === "string" && typeof option.label === "string");
+      return false;
+    };
+    const validLoginPayload = (kind: unknown, payload: unknown) => {
+      if (kind === "heartbeat") return payload === null;
+      if (!isRecord(payload)) return false;
+      if (kind === "reset") return Array.isArray(payload.events) && payload.events.length <= 16
+        && new TextEncoder().encode(JSON.stringify(payload)).byteLength <= 60 * 1024 && payload.events.every(validInteraction);
+      if (kind === "event") return validInteraction(payload) || ((payload.type === "progress" || payload.type === "error") && typeof payload.message === "string");
+      if (kind === "terminal") return payload.type === "success" || payload.type === "cancelled" || (payload.type === "error" && typeof payload.message === "string");
+      return kind === "unknown" && payload.type === "error" && typeof payload.message === "string";
+    };
+    const failLogin = () => {
+      if (closed) return;
+      closed = true;
+      clearTimeout(loginLiveness);
+      pendingBoundedAck = null;
+      void subscription?.unsubscribe();
+      onError({ code: "io", message: "Login observation invalid; outcome unknown", retryable: false });
+    };
     const armLoginLiveness = () => {
       if (op !== "auth.loginStream") return;
       clearTimeout(loginLiveness);
@@ -173,9 +210,24 @@ class HostBridgeTransport implements IpcTransport {
     // race the invoke's own response); the disposer works even mid-open.
     void (async () => {
       try {
-        const handle = await tauriHostChannel((message) => {
+        const deliver = (message: unknown) => {
           if (closed) return;
-          armLoginLiveness();
+          if (op === "auth.loginStream") {
+            if (!isRecord(message) || !boundedId(message.subscriptionId) || message.epoch !== 1
+              || !Number.isSafeInteger(message.seq) || message.seq !== loginSeq + 1) { failLogin(); return; }
+            if (loginSeq === 0) {
+              if (pendingLoginFrame) { failLogin(); return; }
+              const payload = message.payload;
+              if (message.kind !== "snapshot" || !isRecord(payload) || !boundedId(payload.flowId) || !boundedId(payload.taskHandle)) { failLogin(); return; }
+              const binding = { subscriptionId: message.subscriptionId, flowId: payload.flowId, taskHandle: payload.taskHandle };
+              if (!matchesRequested(binding) || (loginBinding && !sameBinding(binding, loginBinding))) { loginInvalid = true; failLogin(); return; }
+              loginSnapshot = binding;
+              if (!loginBinding) { pendingLoginFrame = message as unknown as IpcStreamMessage; return; }
+            } else if (!loginSnapshot || message.subscriptionId !== loginSnapshot.subscriptionId
+              || !validLoginPayload(message.kind, message.payload)) { failLogin(); return; }
+            loginSeq = message.seq as number;
+            armLoginLiveness();
+          }
           onMessage(message as IpcStreamMessage);
           if (!closed && (op === "agent.subscribeEvents" || op === "tasks.subscribeEvents" || op === "agent.subscribeRunning" || op === "auth.loginStream") && isRecord(message)
               && typeof message.subscriptionId === "string" && Number.isSafeInteger(message.seq)
@@ -189,7 +241,8 @@ class HostBridgeTransport implements IpcTransport {
               flushBoundedAck();
             }
           }
-        });
+        };
+        const handle = await tauriHostChannel(deliver);
         if (closed) {
           handle.stopLocalDelivery();
           return;
@@ -225,6 +278,21 @@ class HostBridgeTransport implements IpcTransport {
                 : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
         armLoginLiveness();
         const ack = await invoke(command, payload);
+        if (op === "auth.loginStream" && isRecord(ack) && ack.ok !== false) {
+          if (!boundedId(ack.subscriptionId) || !boundedId(ack.flowId) || !boundedId(ack.taskHandle)) {
+            failLogin();
+          } else {
+            const binding = { subscriptionId: ack.subscriptionId, flowId: ack.flowId, taskHandle: ack.taskHandle };
+            if (!matchesRequested(binding) || (loginSnapshot && !sameBinding(binding, loginSnapshot))) {
+              loginInvalid = true;
+              failLogin();
+            } else {
+              loginBinding = binding;
+              if (!loginInvalid) onSubscribe?.(binding);
+              if (!closed && pendingLoginFrame) { const pending = pendingLoginFrame; pendingLoginFrame = undefined; deliver(pending); }
+            }
+          }
+        }
         if (closed) {
           handle.stopLocalDelivery();
           const parsed = parseSubscribeAck(ack);
@@ -243,7 +311,6 @@ class HostBridgeTransport implements IpcTransport {
           return;
         }
         const subscriptionId = parsed.subscriptionId;
-        armLoginLiveness();
         subscription = {
           stopLocalDelivery: () => handle.stopLocalDelivery(),
           unsubscribe: async () => {

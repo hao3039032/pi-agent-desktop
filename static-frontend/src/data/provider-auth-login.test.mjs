@@ -49,10 +49,11 @@ test("subscribeOAuthLogin opens auth.loginStream and receives frames", async () 
     (err) => errors.push(err),
   );
 
+  mock.emit({ subscriptionId: "sub-1", epoch: 1, seq: 1, kind: "snapshot", payload: { flowId: "f", taskHandle: "t" } });
   mock.emit({
     subscriptionId: "sub-1",
     epoch: 1,
-    seq: 1,
+    seq: 2,
     kind: "event",
     payload: {
       type: "auth",
@@ -71,8 +72,8 @@ test("subscribeOAuthLogin opens auth.loginStream and receives frames", async () 
   mock.emit({
     subscriptionId: "sub-1",
     epoch: 1,
-    seq: 2,
-    kind: "event",
+    seq: 3,
+    kind: "terminal",
     payload: { type: "success" },
   });
 
@@ -100,11 +101,13 @@ test("reconnect binds the original task after observation loss and clears only o
   dispose();
   dispose = subscribeOAuthLogin("fixture-reconnect", (event) => events.push(event), () => {});
   assert.deepEqual(subscriptions[1].args, { provider: "fixture-reconnect", flowId: "flow-1", taskHandle: "task-1" });
-  subscriptions[1].onMessage({ subscriptionId: "two", epoch: 1, seq: 1, kind: "unknown", payload: { type: "error", message: "outcome unknown" } });
+  subscriptions[1].onMessage({ subscriptionId: "two", epoch: 1, seq: 1, kind: "snapshot", payload: { flowId: "flow-1", taskHandle: "task-1" } });
+  subscriptions[1].onMessage({ subscriptionId: "two", epoch: 1, seq: 2, kind: "unknown", payload: { type: "error", message: "outcome unknown" } });
   dispose();
   dispose = subscribeOAuthLogin("fixture-reconnect", (event) => events.push(event), () => {});
   assert.equal(subscriptions[2].args.taskHandle, "task-1");
-  subscriptions[2].onMessage({ subscriptionId: "three", epoch: 1, seq: 1, kind: "terminal", payload: { type: "success" } });
+  subscriptions[2].onMessage({ subscriptionId: "three", epoch: 1, seq: 1, kind: "snapshot", payload: { flowId: "flow-1", taskHandle: "task-1" } });
+  subscriptions[2].onMessage({ subscriptionId: "three", epoch: 1, seq: 2, kind: "terminal", payload: { type: "success" } });
   dispose();
   dispose = subscribeOAuthLogin("fixture-reconnect", () => {}, () => {});
   assert.deepEqual(subscriptions[3].args, { provider: "fixture-reconnect" });
@@ -118,7 +121,7 @@ test("bind failure preserves the started task for reconnect", () => {
     subscribe: (_op, args, onMessage, onError) => { subscriptions.push({ args, onMessage, onError }); return () => {}; },
   }));
   const dispose = subscribeOAuthLogin("fixture-bind-error", () => {}, () => {});
-  subscriptions[0].onError({ code: "io", message: "observer unavailable", retryable: false, details: { flowId: "f-bind", taskHandle: "t-bind" } });
+  subscriptions[0].onError({ code: "io", message: "observer unavailable", retryable: false, details: { subscriptionId: "s-bind", flowId: "f-bind", taskHandle: "t-bind" } });
   dispose();
   const reconnect = subscribeOAuthLogin("fixture-bind-error", () => {}, () => {});
   assert.deepEqual(subscriptions[1].args, { provider: "fixture-bind-error", flowId: "f-bind", taskHandle: "t-bind" });
@@ -143,18 +146,18 @@ test("explicit cancel targets the original task while ordinary detach does not",
 });
 
 test("early explicit cancel waits for task identity before detaching", async () => {
-  let deliver;
+  let acknowledge;
   let detached = false;
   const requests = [];
   bindProviderAuthLogin(new IpcClient({
     send: async (request) => { requests.push(request); return { v: 1, id: request.id, ok: true, data: {} }; },
-    subscribe: (_op, _args, onMessage) => { deliver = onMessage; return () => { detached = true; }; },
+    subscribe: (_op, _args, _onMessage, _onError, onSubscribe) => { acknowledge = onSubscribe; return () => { detached = true; }; },
   }));
   const dispose = subscribeOAuthLogin("fixture-early-cancel", () => {}, () => {});
   dispose.cancel();
   dispose();
   assert.equal(detached, false);
-  deliver({ subscriptionId: "s", epoch: 1, seq: 1, kind: "snapshot", payload: { flowId: "f-early", taskHandle: "t-early" } });
+  acknowledge({ subscriptionId: "s", flowId: "f-early", taskHandle: "t-early" });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(detached, true);
   assert.deepEqual(requests[0].args, { taskHandle: "t-early" });

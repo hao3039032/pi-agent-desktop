@@ -83,6 +83,10 @@ interface LoginFlow {
   events: QueuedLoginEvent[];
   eventBytes: number;
   truncatedThrough: number;
+  interactions: QueuedLoginEvent[];
+  deviceCodeExpiresAt: number | null;
+  interactionUnavailable: boolean;
+  cancelRequested: boolean;
   done: boolean;
   /** One manual-code handshake at a time, reused across auth_url events. */
   pendingManual: { pending: PendingPrompt; answer: Promise<string> } | undefined;
@@ -102,6 +106,21 @@ function enqueue(flow: LoginFlow, event: OAuthLoginEvent): void {
   if (flow.done) return;
   flow.seq += 1;
   const queued = { seq: flow.seq, event };
+  if (["auth", "device_code", "prompt_request", "select_request"].includes(event.type)) {
+    flow.deviceCodeExpiresAt = event.type === "device_code" && typeof event.expiresInSeconds === "number" && Number.isFinite(event.expiresInSeconds)
+      ? Date.now() + Math.max(0, event.expiresInSeconds) * 1000 : null;
+    const live = new Set([...flow.liveTokens].filter((pending) => !pending.settled).map((pending) => pending.token));
+    flow.interactions = flow.interactions.filter(({ event: old }) => {
+      if ("token" in old && !live.has(old.token)) return false;
+      if (event.type === "device_code" || old.type === "device_code") return false;
+      return !(old.type === event.type && "token" in old && "token" in event && old.token === event.token);
+    });
+    flow.interactions.push(queued);
+    if (flow.interactions.length > 16 || Buffer.byteLength(JSON.stringify(flow.interactions)) > MAX_EVENT_BYTES) {
+      flow.interactions = [];
+      flow.interactionUnavailable = true;
+    }
+  }
   const size = Buffer.byteLength(JSON.stringify(queued));
   if (size > MAX_EVENT_BYTES) {
     flow.truncatedThrough = flow.seq;
@@ -129,13 +148,8 @@ function finishFlow(flow: LoginFlow, terminal: OAuthLoginEvent): void {
     flow.inputCleaner = undefined;
   }
   for (const pending of flow.liveTokens) {
-    if (!pending.settled) {
-      pending.settled = true;
-      tokens.delete(pending.token);
-      pending.reject(new Error("Login cancelled"));
-    }
+    if (!pending.settled) pending.reject(new Error("Login cancelled"));
   }
-  flow.liveTokens.clear();
 }
 
 /** The old route's createClientInputRequest: mint a token + its promise. */
@@ -156,12 +170,14 @@ function mintPrompt(flow: LoginFlow): { pending: PendingPrompt; answer: Promise<
       if (pending.settled) return;
       pending.settled = true;
       tokens.delete(token);
+      flow.liveTokens.delete(pending);
       settle(value);
     },
     reject: (error) => {
       if (pending.settled) return;
       pending.settled = true;
       tokens.delete(token);
+      flow.liveTokens.delete(pending);
       fail(error);
     },
     settled: false,
@@ -245,6 +261,10 @@ export async function startLoginFlow(
     events: [],
     eventBytes: 0,
     truncatedThrough: 0,
+    interactions: [],
+    deviceCodeExpiresAt: null,
+    interactionUnavailable: false,
+    cancelRequested: false,
     done: false,
     pendingManual: undefined,
     liveTokens: new Set(),
@@ -303,10 +323,15 @@ export async function startLoginFlow(
   };
 
   const promise = (async () => {
+    let providerStarted = false;
+    let verifiedSuccess = false;
     try {
+      if (flow.done) throw new Error("Login cancelled");
+      providerStarted = true;
       await modelRuntime.login(provider, "oauth", {
         signal: flow.abort.signal,
         prompt: async (prompt: AuthPrompt) => {
+          if (flow.done) throw new Error("Login cancelled");
           const manual = prompt.type === "manual_code";
           const minted = manual ? getManualInputRequest() : mintPrompt(flow);
           if (prompt.type === "select") {
@@ -332,6 +357,7 @@ export async function startLoginFlow(
           return minted.answer;
         },
         notify: (event: AuthEvent) => {
+          if (flow.done) return;
           if (event.type === "auth_url") {
             const authEvt: OAuthLoginEvent = {
               type: "auth",
@@ -361,6 +387,7 @@ export async function startLoginFlow(
         },
       }, oauthLoginOptions());
 
+      verifiedSuccess = true;
       invalidateModelsCache();
       finishFlow(flow, { type: "success" });
       opContext?.progress?.(desensitizeProgress({ type: "success" }, provider));
@@ -377,7 +404,9 @@ export async function startLoginFlow(
       }
       throw new Error("Login failed");
     } finally {
-      retireFlow(flowId, flow);
+      // Models.login races its provider promise against AbortSignal. An abort
+      // rejection therefore does not prove that provider work has unwound.
+      if (!flow.cancelRequested || !providerStarted || verifiedSuccess) retireFlow(flowId, flow);
     }
   })();
 
@@ -396,12 +425,17 @@ export async function startLoginFlow(
 export function pollLoginFlow(
   flowId: string,
   since: number,
-): { events: QueuedLoginEvent[]; lastSeq: number; done: boolean; missing?: boolean; truncated?: boolean } {
+): { events: QueuedLoginEvent[]; lastSeq: number; done: boolean; missing?: boolean; truncated?: boolean; currentInteraction?: OAuthLoginEvent[] | null } {
   const flow = flows.get(flowId) ?? finishedFlows.get(flowId);
   if (!flow) return { events: [], lastSeq: since, done: true, missing: true };
   flow.lastPolled = Date.now();
   const events = flow.events.filter((queued) => queued.seq > since);
-  return { events, lastSeq: flow.seq, done: flow.done, truncated: since < flow.truncatedThrough };
+  const truncated = since < flow.truncatedThrough;
+  const live = new Set([...flow.liveTokens].filter((pending) => !pending.settled).map((pending) => pending.token));
+  const currentInteraction = flow.done || flow.interactionUnavailable || (flow.deviceCodeExpiresAt !== null && Date.now() >= flow.deviceCodeExpiresAt) ? null : flow.interactions
+    .filter(({ event }) => !("token" in event) || live.has(event.token))
+    .map(({ event }) => event);
+  return { events, lastSeq: flow.seq, done: flow.done, truncated, ...(truncated ? { currentInteraction } : {}) };
 }
 
 /**
@@ -427,8 +461,8 @@ export function submitLoginCode(
 export function cancelLoginFlow(flowId: string): boolean {
   const flow = flows.get(flowId);
   if (!flow) return false;
-  // Retire only in the login promise's finally: aborting interaction does
-  // not prove the credential writer has unwound or released its slot.
+  // An aborted SDK login may return before its provider promise unwinds.
+  flow.cancelRequested = true;
   finishFlow(flow, { type: "cancelled" });
   return true;
 }

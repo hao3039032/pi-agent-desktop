@@ -95,6 +95,36 @@ impl std::io::Write for FrameSize {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
+fn recovery_interactions(snapshot: &Value) -> Option<(Vec<Value>, std::collections::HashSet<String>, u64)> {
+    let events = snapshot.get("currentInteraction")?.as_array()?;
+    let last = snapshot.get("lastSeq")?.as_u64()?;
+    if events.len() > 16 { return None; }
+    let payload = json!({ "events": events });
+    let mut counter = FrameSize(4 * 1024);
+    if serde_json::to_writer(&mut counter, &payload).is_err() { return None; }
+    let mut tokens = std::collections::HashSet::new();
+    for event in events {
+        match event.get("type")?.as_str()? {
+            "auth" | "prompt_request" | "select_request" => {
+                let token = event.get("token")?.as_str()?;
+                if token.is_empty() || token.len() > 512 { return None; }
+                let shape_ok = match event["type"].as_str()? {
+                    "auth" => event.get("url").is_some_and(Value::is_string) && event.get("instructions").is_some_and(|v| v.is_null() || v.is_string()),
+                    "prompt_request" => event.get("message").is_some_and(Value::is_string) && event.get("placeholder").is_some_and(|v| v.is_null() || v.is_string()),
+                    "select_request" => event.get("message").is_some_and(Value::is_string) && event.get("options").and_then(Value::as_array)
+                        .is_some_and(|options| options.iter().all(|option| option.get("id").is_some_and(Value::is_string) && option.get("label").is_some_and(Value::is_string))),
+                    _ => false,
+                };
+                if !shape_ok { return None; }
+                tokens.insert(token.to_string());
+            }
+            "device_code" if event.get("userCode").is_some_and(Value::is_string) && event.get("verificationUri").is_some_and(Value::is_string) => {}
+            _ => return None,
+        }
+    }
+    Some((events.clone(), tokens, last))
+}
+
 struct RelaySlot(Arc<AtomicUsize>);
 impl Drop for RelaySlot {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
@@ -459,14 +489,20 @@ fn reserve_login_relay(
                     Ok(poll_snapshot) => {
                         failures = 0;
                         if poll_snapshot.get("missing").and_then(Value::as_bool) == Some(true)
-                            && snapshot.status == management_host::TaskStatus::Running {
+                            && snapshot.status == management_host::TaskStatus::Running && snapshot.progress.is_some() {
                             let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": "Login observation lost; outcome unknown" }));
                             break;
                         }
                         if poll_snapshot.get("truncated").and_then(Value::as_bool) == Some(true)
                             && snapshot.status == management_host::TaskStatus::Running {
-                            let _ = send(&mut frame_seq, "reset", json!({ "type": "error", "message": "Login history truncated; outcome unknown" }));
-                            break;
+                            let Some((events, tokens, last)) = recovery_interactions(&poll_snapshot) else {
+                                let _ = send(&mut frame_seq, "unknown", json!({ "type": "error", "message": "Login recovery unavailable; outcome unknown" }));
+                                break;
+                            };
+                            if let Some(relay) = relays.relays.lock().unwrap().get_mut(&subscription_id) { relay.tokens = tokens; }
+                            if !send(&mut frame_seq, "reset", json!({ "events": events })) { break; }
+                            since = last;
+                            continue;
                         }
                         if let Some(events) = poll_snapshot.get("events").and_then(Value::as_array) {
                             for queued in events {
@@ -644,7 +680,7 @@ fn open_login_stream(
     }
     if sender.send((flow_id.clone(), task_handle.clone(), instance)).is_err() {
         let mut error = crate::pi_ipc::protocol_error("?", "io", "login observer could not bind; task outcome is independent");
-        error["error"]["details"] = json!({ "flowId": flow_id, "taskHandle": task_handle });
+        error["error"]["details"] = json!({ "subscriptionId": subscription_id, "flowId": flow_id, "taskHandle": task_handle });
         return error;
     }
     json!({ "subscriptionId": subscription_id, "flowId": flow_id, "taskHandle": task_handle })
@@ -800,6 +836,148 @@ for line in sys.stdin:
         assert!(unknown["payload"]["message"].as_str().unwrap().contains("unknown"));
         assert!(state.login_relays.acknowledge(sub3, 1, 3));
         state.management.shutdown_all(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_login_snapshot_rebinds_live_token_and_resumes_after_cursor() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("recovery-child.py");
+        std::fs::write(&child, r##"#!/usr/bin/python3
+import sys,json,base64
+used=False
+def emit(rid,nonce,result):
+    body={'rid':rid,'nonce':nonce,'ok':True,'result':result}
+    print(json.dumps({'type':'extension_ui_request','id':'notify','method':'notify','message':'PI_WEB_MGMT_V1 '+json.dumps(body)}),flush=True)
+for line in sys.stdin:
+    r=json.loads(line)
+    if r.get('type')!='prompt': continue
+    p=r['message'].split(' '); rid=p[1]
+    d=json.loads(base64.urlsafe_b64decode(p[2]+'='*((-len(p[2]))%4)))
+    print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
+    if d['op']=='auth.loginPoll':
+        if d['args']['since']==0:
+            emit(rid,d['nonce'],{'truncated':True,'lastSeq':520,'events':[],'currentInteraction':[{'type':'prompt_request','message':'Enter fake code','placeholder':None,'token':'fixture-live'}]})
+        else:
+            emit(rid,d['nonce'],{'truncated':False,'lastSeq':521,'events':[{'seq':521,'event':{'type':'progress','message':'Signing in'}}] if d['args']['since']==520 else []})
+    elif d['op']=='__input':
+        token=d['args']['data']['token']; ok=token=='fixture-live' and not used
+        if ok: used=True
+        emit(rid,d['nonce'],{'status':'accepted' if ok else 'no_pending','message':'No pending login for token'})
+"##).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(IpcHostState::new());
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: child.to_string_lossy().into_owned(), agent_dir: Some(dir.path().to_path_buf()), extensions: vec![], env: vec![],
+        });
+        let (tx, rx) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let opened = open_login_stream(&state, "fixture".into(), None, None, channel);
+        let id = opened["subscriptionId"].as_str().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap()["kind"], "snapshot");
+        assert!(state.login_relays.acknowledge(id, 1, 1));
+        let recovered = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(recovered["kind"], "reset");
+        assert_eq!(recovered["payload"]["events"][0]["token"], "fixture-live");
+        assert!(state.login_relays.acknowledge(id, 1, 2));
+        let progress = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(progress["payload"]["type"], "progress");
+        assert!(state.login_relays.acknowledge(id, 1, 3));
+        let submit = |token| dispatch(&state, "auth.loginManualCode", "input", &json!({"provider":"fixture","token":token,"code":"fake-code"})).unwrap();
+        assert_eq!(submit("fixture-live")["ok"], true);
+        assert_eq!(submit("fixture-live")["error"]["code"], "not_found");
+        assert_eq!(submit("fixture-old")["error"]["code"], "not_found");
+        assert!(unsubscribe_login_stream(&state, id));
+        state.management.shutdown_all(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_node_login_snapshot_reaches_channel_and_accepts_fake_code() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::write(agent.join("extensions/fake-provider.js"), r#"
+export default function(pi) {
+  pi.registerProvider({ id: 'relay-fake', name: 'Relay fake', auth: { oauth: {
+    name: 'Fake', login: async (interaction) => {
+      interaction.notify({type:'auth_url', url:'https://example.invalid/authorize', instructions:'fixture'});
+      for (let i=0; i<520; i++) interaction.notify({type:'progress', message:'fixture'});
+      const code = await interaction.prompt({type:'manual_code', message:'Fake code'});
+      if (code !== 'fake-code') throw new Error('fake refusal');
+      return {type:'oauth', access:'fake-access', refresh:'fake-refresh', expires:4102444800000};
+    }, refresh: async () => ({access:'fake-access',refresh:'fake-refresh',expires:4102444800000}),
+    toAuth: async (credential) => ({apiKey:credential.access})
+  } }, getModels: () => [{id:'fake',name:'Fake'}], models: [{id:'fake',name:'Fake'}] });
+}
+"#).unwrap();
+        let state = Arc::new(IpcHostState::new());
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: std::path::Path::new("../lib/__fixtures__/provider-login-relay-child.mjs").canonicalize().unwrap().to_string_lossy().into_owned(),
+            agent_dir: Some(agent), extensions: vec![], env: vec![("PI_OFFLINE".into(), "1".into())],
+        });
+        let mut client = Command::new("node")
+            .arg("../static-frontend/src/data/provider-login-client-child.mjs")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut client_in = client.stdin.take().unwrap();
+        let client_out = BufReader::new(client.stdout.take().unwrap());
+        let (client_tx, client_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in client_out.lines() {
+                let Ok(line) = line else { break };
+                if client_tx.send(line).is_err() { break; }
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let opened = open_login_stream(&state, "relay-fake".into(), None, None, channel);
+        let id = opened["subscriptionId"].as_str().unwrap();
+        let first = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(first["kind"], "snapshot");
+        writeln!(client_in, "{first}").unwrap();
+        client_in.flush().unwrap();
+        assert!(state.login_relays.acknowledge(id, 1, 1));
+        let recovered = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(recovered["kind"], "reset", "{recovered}");
+        writeln!(client_in, "{recovered}").unwrap();
+        client_in.flush().unwrap();
+        let mut token = None;
+        for _ in recovered["payload"]["events"].as_array().unwrap() {
+            let line = match client_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(line) => line,
+                Err(error) => { let _ = client.kill(); let _ = client.wait(); panic!("fake client did not receive recovery: {error}"); }
+            };
+            let event: Value = serde_json::from_str(&line).unwrap();
+            if event["type"] == "prompt_request" { token = event["token"].as_str().map(str::to_string); }
+        }
+        let token = token.expect("static login service rendered the recovered prompt");
+        assert!(state.login_relays.acknowledge(id, 1, 2));
+        let submitted = dispatch(&state, "auth.loginManualCode", "submit", &json!({"provider":"relay-fake", "token":token, "code":"fake-code"})).unwrap();
+        assert_eq!(submitted["ok"], true, "{submitted}");
+        let terminal = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(terminal["kind"], "terminal", "{terminal}");
+        assert_eq!(terminal["payload"]["type"], "success");
+        assert!(state.login_relays.acknowledge(id, 1, 3));
+        drop(client_in);
+        assert!(client.wait().unwrap().success());
+        reader.join().unwrap();
+        state.management.shutdown_all(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn recovery_rejects_noninteractive_and_oversized_payloads() {
+        let good = json!({"lastSeq":7,"currentInteraction":[{"type":"auth","token":"live","url":"https://example.invalid","instructions":null}]});
+        assert!(recovery_interactions(&good).is_some());
+        assert!(recovery_interactions(&json!({"lastSeq":7,"currentInteraction":[{"type":"success"}]})).is_none());
+        assert!(recovery_interactions(&json!({"lastSeq":7,"currentInteraction":[{"type":"auth","token":"live","url":"x".repeat(70_000)}]})).is_none());
+        assert!(recovery_interactions(&json!({"lastSeq":7,"currentInteraction":null})).is_none());
     }
 
     #[test]

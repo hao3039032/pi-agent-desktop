@@ -27,12 +27,14 @@ import {
 export interface IpcTransport {
   /** Send one request envelope; resolves with the raw response value. */
   send(request: IpcRequest, timeoutMs: number): Promise<unknown>;
-  /** Open one subscription stream; returns a disposer. */
+  /** Open one subscription stream; returns a disposer. For auth.loginStream,
+   * onSubscribe carries the real host ACK and may arrive after disposal. */
   subscribe(
     op: string,
     args: Record<string, unknown> | undefined,
     onMessage: (message: IpcStreamMessage) => void,
     onError: (error: IpcError) => void,
+    onSubscribe?: (metadata: { subscriptionId: string; flowId: string; taskHandle: string }) => void,
   ): () => void;
 }
 
@@ -100,8 +102,9 @@ export class IpcClient {
     args: Record<string, unknown> | undefined,
     onMessage: (message: IpcStreamMessage<T>) => void,
     onError: (error: IpcError) => void,
+    onSubscribe?: (metadata: { subscriptionId: string; flowId: string; taskHandle: string }) => void,
   ): () => void {
-    return this.transport.subscribe(op, args, onMessage as (message: IpcStreamMessage) => void, onError);
+    return this.transport.subscribe(op, args, onMessage as (message: IpcStreamMessage) => void, onError, onSubscribe);
   }
 }
 
