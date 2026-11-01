@@ -61,6 +61,8 @@ mod session_deletion_journal;
 mod terminal_host;
 mod host_ownership;
 pub mod host_lifecycle;
+#[cfg(any(test, feature = "harness"))]
+pub mod static_host;
 pub mod recovery_evidence;
 mod scheduler_host;
 mod scheduler_tick;

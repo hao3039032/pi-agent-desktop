@@ -35,6 +35,7 @@ cpSync(frontend, join(out, "frontend"), { recursive: true, dereference: false })
 cpSync(join(root, "lib/pi-rpc/assets"), join(out, "server/lib/pi-rpc/assets"), { recursive: true, dereference: false });
 await stageManagedTree(join(out, "managed/node_modules"));
 unlinkSync(join(out, "managed/node_modules/pi-web-session-projection.mjs"));
+unlinkSync(join(out, "managed/node_modules/pi-web-session-title.mjs"));
 await buildProjectionInto(join(out, "managed"));
 // npm's installation-time .bin link is not a module dependency. In this
 // checkout cpSync preserves it as an absolute link into the build machine.

@@ -13,10 +13,14 @@ test("manifest checks all files, mutations, additions and links", () => {
     put("pi/pi-distribution.json", JSON.stringify({ complete: true, binary: "pi", files: ["pi"] }));
     put("node/node", "node");
     put("managed/pi-web-session-projection.mjs", "projection");
+    put("managed/pi-web-session-title.mjs", "title");
     put("server/lib/pi-rpc/assets/pi-web-management.mjs", "extension");
     put("frontend/index.html", "page");
     const manifest = { version: 1, files: bundleFiles(root) };
     verifyBundle(root, manifest);
+    rmSync(join(root, "managed/pi-web-session-title.mjs"));
+    assert.throws(() => verifyBundle(root, manifest), /differ/);
+    put("managed/pi-web-session-title.mjs", "title");
     put("frontend/index.html", "changed");
     assert.throws(() => verifyBundle(root, manifest), /differ/);
     put("frontend/index.html", "page");

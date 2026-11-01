@@ -26,7 +26,7 @@ export function verifyBundle(root, manifest) {
   if (manifest?.version !== 1 || !Array.isArray(manifest.files)) throw new Error("invalid bundle manifest");
   const actual = bundleFiles(root);
   if (JSON.stringify(actual) !== JSON.stringify(manifest.files)) throw new Error("bundle files differ from manifest");
-  for (const path of ["pi/pi-distribution.json", "managed/pi-web-session-projection.mjs", "server/lib/pi-rpc/assets/pi-web-management.mjs", "frontend/index.html"]) {
+  for (const path of ["pi/pi-distribution.json", "managed/pi-web-session-projection.mjs", "managed/pi-web-session-title.mjs", "server/lib/pi-rpc/assets/pi-web-management.mjs", "frontend/index.html"]) {
     if (!actual.some((file) => file.path === path)) throw new Error(`bundle missing ${path}`);
   }
   if (!actual.some((file) => file.path === "node/node" || file.path === "node/node.exe")) throw new Error("bundle missing node runtime");

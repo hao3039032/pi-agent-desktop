@@ -241,6 +241,27 @@ impl IpcHostState {
         }
     }
 
+    /// Close both IPC lanes and fence tracked child starts before draining
+    /// already-admitted calls. This does not prove detached writers stopped.
+    pub(crate) fn begin_static_shutdown(&self) {
+        self.dispatch_gate.close();
+        self.dispatch_control_gate.close();
+        self.registry.begin_shutdown();
+        self.management.begin_shutdown();
+    }
+
+    pub(crate) fn drain_static_ipc_until(&self, deadline: std::time::Instant) -> Result<(), String> {
+        loop {
+            let ordinary = IPC_MAX_CONCURRENT_DISPATCH - self.dispatch_gate.available_permits();
+            let control = IPC_MAX_CONCURRENT_CONTROL - self.dispatch_control_gate.available_permits();
+            if ordinary == 0 && control == 0 { return Ok(()); }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("IPC operations still in flight: {ordinary} ordinary, {control} control"));
+            }
+            std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));
+        }
+    }
+
     /// Authorize a destination for desktop.saveFile (e.g. from dialog selection).
     pub fn authorize_save_destination(&self, path: &Path, ttl: Duration) {
         let normalized = path.to_string_lossy().replace('\\', "/");
@@ -616,6 +637,7 @@ pub(crate) fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &s
 
 #[tauri::command]
 pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event: Channel<Value>) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     match state.scheduled_events.subscribe(on_event) {
         Ok(subscription_id) => json!({ "subscriptionId": subscription_id, "epoch": 1 }),
         Err(error) => protocol_error("?", "io", &error),
@@ -634,6 +656,7 @@ pub fn pi_ipc_subscribe_events(
     session: String,
     on_event: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     let Some(session_handle) = state.registry.get(&session) else {
         return protocol_error("?", "not_found", &format!("no running session {session}"));
     };
@@ -786,6 +809,7 @@ pub fn pi_ipc_subscribe_running(
     state: State<'_, Arc<IpcHostState>>,
     on_frame: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     subscribe_running(&state, on_frame, RUNNING_CHANNEL_PROBE)
 }
 
@@ -974,6 +998,7 @@ pub fn pi_ipc_subscribe_terminal(
     cursor: u64,
     on_output: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     let subscription_id = format!("term-{}", state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1);
     match state.terminal_streams.subscribe(&id, subscription_id.clone(), cursor, move |frame| on_output.send(frame).is_ok()) {
         Ok(()) => json!({ "subscriptionId": subscription_id }),
@@ -6484,6 +6509,23 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let slow = tauri::async_runtime::block_on(slow).expect("the slow dispatch joins");
         assert_eq!(slow["ok"], false, "the stub child exits: models.list answers its real failure");
         assert_eq!(slow["error"]["code"], "io", "{slow}");
+    }
+
+    #[test]
+    fn static_shutdown_drains_both_ipc_lanes_and_refuses_new_work() {
+        let state = Arc::new(state());
+        let ordinary = Arc::clone(&state.dispatch_gate).try_acquire_owned().unwrap();
+        let control = Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap();
+        state.begin_static_shutdown();
+        let error = state.drain_static_ipc_until(std::time::Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert!(error.contains("1 ordinary, 1 control"), "{error}");
+        let denied = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"after-close","op":"desktop.identity"}),
+        ));
+        assert_ne!(denied["ok"], true);
+        drop(ordinary);
+        drop(control);
+        state.drain_static_ipc_until(std::time::Instant::now() + Duration::from_secs(1)).unwrap();
     }
 
     #[test]
