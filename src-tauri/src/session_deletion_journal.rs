@@ -1205,7 +1205,9 @@ mod linux {
             let (dir, state, root, source) = fixture();
             let metadata = std::fs::metadata(&source).unwrap();
             assert!(remove_with_hook(&root, dir.path(), "a", &source, &metadata, |at| if at == "isolated" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
-            crate::session_writer_fence::begin(dir.path(), "a", "op", "chat", &source, None).unwrap();
+            let fence_source = dir.path().join("fence-source.jsonl");
+            std::fs::write(&fence_source, "fixture").unwrap();
+            crate::session_writer_fence::begin(dir.path(), "a", "op", "chat", &fence_source, None, None).unwrap();
             let _policy = state.policy_gate.try_read().unwrap();
             let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
             assert_eq!(recover(&state, &root).unwrap_err().0, "busy");

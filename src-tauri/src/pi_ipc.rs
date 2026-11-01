@@ -37,7 +37,7 @@ pub struct IpcHostState {
     #[cfg(test)]
     pub(crate) deletion_recovery_exclusive: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    pub(crate) deletion_fork_writer_exclusive: std::sync::atomic::AtomicBool,
+    pub(crate) deletion_write_exclusive: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) deletion_use_app_trash: std::sync::atomic::AtomicBool,
     /// The spawn base is resolved at host startup (the packaged pi
@@ -136,9 +136,13 @@ impl IpcHostState {
         { false }
     }
 
-    pub(crate) fn deletion_fork_writer_proven_stopped(&self) -> bool {
+    /// No production path grants destructive-write exclusivity yet. M5 must
+    /// prove exclusion of old/new external writers and retain that proof from
+    /// preflight through child shutdown, final admission and journal completion.
+    /// This is separate from the permission to recover an existing journal.
+    pub(crate) fn destructive_session_deletion_permitted(&self) -> bool {
         #[cfg(test)]
-        { return self.deletion_fork_writer_exclusive.load(std::sync::atomic::Ordering::SeqCst); }
+        { return self.deletion_write_exclusive.load(std::sync::atomic::Ordering::SeqCst); }
         #[cfg(not(test))]
         { false }
     }
@@ -184,7 +188,7 @@ impl IpcHostState {
             #[cfg(test)]
             deletion_recovery_exclusive: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            deletion_fork_writer_exclusive: std::sync::atomic::AtomicBool::new(false),
+            deletion_write_exclusive: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             deletion_use_app_trash: std::sync::atomic::AtomicBool::new(false),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
@@ -1353,6 +1357,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "sessions.delete" => match crate::session_deletion::delete(state, &args) {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
+            Err((code, message)) if code == crate::session_deletion::EXCLUSIVE_MAINTENANCE_REQUIRED => protocol_error_value(&id, json!({
+                "code":"busy", "reason":code, "message":message, "retryable":false,
+            })),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
         "sessions.export" => match crate::session_actions::export(state, &args) {

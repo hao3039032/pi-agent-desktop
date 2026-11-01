@@ -305,7 +305,7 @@ mod tests {
         let policy = state.policy_gate.try_write().unwrap();
         assert_eq!(snapshot(&state).err().unwrap().0, "busy");
         drop(policy);
-        crate::session_writer_fence::begin(dir.path(), "a", "op", "chat", &file, None).unwrap();
+        crate::session_writer_fence::begin(dir.path(), "a", "op", "chat", &file, None, None).unwrap();
         assert_eq!(snapshot(&state).err().unwrap().0, "busy");
         for op in ["sessions.index", "sessions.list"] {
             let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"test","op":op,"args":{}}));

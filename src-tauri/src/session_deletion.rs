@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use crate::pi_ipc::IpcHostState;
 
+pub(crate) const EXCLUSIVE_MAINTENANCE_REQUIRED: &str = "session_deletion_exclusive_maintenance_required";
 fn error(code: &str, message: impl ToString) -> (String, String) { (code.into(), message.to_string()) }
 
 fn files_in(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), (String, String)> {
@@ -229,8 +230,8 @@ fn delete_with_policy_hooks(state: &IpcHostState, args: &Value, after_unlock: im
             let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
                 .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
             crate::session_deletion_journal::recover_pending(state, &agent)?;
-            if !state.deletion_fork_writer_proven_stopped() {
-                return Err(error("busy", "Session deletion is blocked until prior fork or clone writers are confirmed stopped"));
+            if !state.destructive_session_deletion_permitted() {
+                return Err(error(EXCLUSIVE_MAINTENANCE_REQUIRED, "Session deletion requires exclusive maintenance; the host cannot yet exclude old or external writers"));
             }
             let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
                 .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
@@ -265,8 +266,8 @@ fn delete_after_policy(state: &IpcHostState, args: &Value, agent: &Path, proof: 
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
     crate::session_deletion_journal::recover_pending(state, &agent)?;
-    if !state.deletion_fork_writer_proven_stopped() {
-        return Err(error("busy", "Session deletion is blocked until prior fork or clone writers are confirmed stopped"));
+    if !state.destructive_session_deletion_permitted() {
+        return Err(error(EXCLUSIVE_MAINTENANCE_REQUIRED, "Session deletion requires exclusive maintenance; the host cannot yet exclude old or external writers"));
     }
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
@@ -550,7 +551,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let state = IpcHostState::new();
         *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
-        state.deletion_fork_writer_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+        state.deletion_write_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
         state.deletion_use_app_trash.store(true, std::sync::atomic::Ordering::SeqCst);
         (dir, state, root)
     }
@@ -700,9 +701,77 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert_eq!(affected_session_ids(&state, "target").unwrap().ids, vec!["fork", "sub1", "sub2", "target"]);
         let args = json!({"session":"target"});
         assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["sub2".into()]), false, None).unwrap_err().0, "not_supported");
-        crate::session_writer_fence::begin(dir.path(), "fork", "op", "chat", &fork, None).unwrap();
+        crate::session_writer_fence::begin(dir.path(), "fork", "op", "chat", &fork, None, None).unwrap();
         assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
         assert!(target.exists() && fork.exists() && sub1.exists() && sub2.exists() && unrelated.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires isolated PI_CLI_BIN and the real management fixture"]
+    fn real_fork_then_group_delete_reparents_without_losing_history() {
+        use crate::pi_ipc::SpawnBase;
+        let executable = std::env::var("PI_CLI_BIN").expect("PI_CLI_BIN is required");
+        let (dir, state, root) = fixture();
+        let cwd = dir.path().join("project"); std::fs::create_dir_all(&cwd).unwrap();
+        let source = root.join("source.jsonl");
+        let rows = [
+            json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00.000Z","cwd":cwd}),
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"fixture question"}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"fixture answer"}]}}),
+        ];
+        std::fs::write(&source, rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        std::fs::write(dir.path().join("models.json"), json!({"providers":{"fixture":{"baseUrl":"http://127.0.0.1:9","apiKey":"fixture","api":"openai-completions","models":[{"id":"local","name":"Local","reasoning":false,"input":["text"],"contextWindow":200000,"maxTokens":4096,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}).to_string()).unwrap();
+        std::fs::write(dir.path().join("settings.json"), r#"{"defaultProvider":"fixture","defaultModel":"local"}"#).unwrap();
+        let managed = dir.path().join("managed"); std::fs::create_dir_all(managed.join("@earendil-works")).unwrap();
+        std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works/pi-coding-agent").canonicalize().unwrap(), managed.join("@earendil-works/pi-coding-agent")).unwrap();
+        std::os::unix::fs::symlink(Path::new("../node_modules").canonicalize().unwrap(), managed.join("node_modules")).unwrap();
+        let build = std::process::Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).output().unwrap();
+        assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
+        *state.spawn_base.lock().unwrap() = Some(SpawnBase { executable:executable.clone(), bridge_asset:Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap(), artifacts_asset:None, chat_asset:None });
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig { executable, agent_dir:Some(dir.path().to_path_buf()),
+            extensions:vec![Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()], env:vec![("PI_WEB_MANAGED_MODULES".into(), managed.to_string_lossy().into_owned())] });
+        let fork = crate::session_actions::branch(&state, &json!({"session":"source","type":"fork_branch","entryId":"a1"})).unwrap();
+        let fork_id = fork["newSessionId"].as_str().unwrap();
+        let fork_file = session_host::history::find_session_by_id(dir.path(), fork_id).unwrap().file;
+        assert!(state.registry.get("source").is_some());
+        assert_eq!(super::delete(&state, &json!({"session":"source"})).unwrap()["ok"], true);
+        assert!(!source.exists());
+        let content = std::fs::read_to_string(&fork_file).unwrap();
+        let header: Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(header.get("parentSession").is_none());
+        assert!(content.contains("fixture answer"));
+    }
+    #[test]
+    fn group_delete_does_not_race_a_fenced_fork_writer() {
+        let (dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let fork = session(&root, "fork", Some(&target));
+        let staging = dir.path().join("pi-web/fork-staging/fixture");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let state_ref = &state; let agent = dir.path(); let source = &fork; let target_dir = &root; let staging = &staging;
+            let writer = scope.spawn(move || state_ref.registry.with_idle_session_writer("fork", |_| {
+                crate::session_writer_fence::begin_fork(agent, "fork", "op", "fork-source", source, target_dir, "future", staging).unwrap();
+                crate::session_writer_fence::begin_fork(agent, "future", "op", "fork-target", source, target_dir, "future", staging).unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                crate::session_writer_fence::finish(agent, "future", "op").unwrap();
+                crate::session_writer_fence::finish(agent, "fork", "op").unwrap();
+                Ok::<_, ()>(())
+            }));
+            ready_rx.recv().unwrap();
+            assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "busy");
+            assert!(target.exists() && fork.exists());
+            assert!(crate::session_writer_fence::fence_path(dir.path(), "fork").exists());
+            assert!(crate::session_writer_fence::fence_path(dir.path(), "future").exists());
+            release_tx.send(()).unwrap();
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
+        assert!(!target.exists() && fork.exists());
+        let header: Value = serde_json::from_str(std::fs::read_to_string(fork).unwrap().lines().next().unwrap()).unwrap();
+        assert!(header.get("parentSession").is_none());
     }
     #[test]
     fn affected_discovery_keeps_identity_when_a_child_is_replaced() {
@@ -749,13 +818,17 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(std::fs::read_to_string(&target).unwrap().contains("new"));
     }
     #[test]
-    fn unknown_prior_fork_writer_blocks_deletion_before_side_effects() {
+    fn unproven_exclusive_maintenance_blocks_deletion_before_side_effects() {
         let (_dir, state, root) = fixture();
         let target = session(&root, "target", None);
-        state.deletion_fork_writer_exclusive.store(false, std::sync::atomic::Ordering::SeqCst);
+        state.deletion_write_exclusive.store(false, std::sync::atomic::Ordering::SeqCst);
         let result = super::delete(&state, &json!({"session":"target"})).unwrap_err();
-        assert_eq!(result.0, "busy");
-        assert!(result.1.contains("fork or clone writers"));
+        assert_eq!(result.0, EXCLUSIVE_MAINTENANCE_REQUIRED);
+        assert!(result.1.contains("exclusive maintenance"));
+        let response = crate::pi_ipc::dispatch_envelope(&state, json!({"v":1,"id":"delete","op":"sessions.delete","args":{"session":"target"}}));
+        assert_eq!(response["error"]["code"], "busy");
+        assert_eq!(response["error"]["reason"], EXCLUSIVE_MAINTENANCE_REQUIRED);
+        assert_eq!(response["error"]["retryable"], false);
         assert!(target.exists());
         assert!(!crate::session_deletion_journal::has_pending(&state.agent_dir()).unwrap());
     }
@@ -771,7 +844,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let writer = lock.lock().unwrap();
         assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
         drop(writer);
-        crate::session_writer_fence::begin(dir.path(), "target", "op", "chat", &target, None).unwrap();
+        crate::session_writer_fence::begin(dir.path(), "target", "op", "chat", &target, None, None).unwrap();
         assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
         assert!(target.exists());
         crate::session_writer_fence::finish(dir.path(), "target", "op").unwrap();
@@ -993,10 +1066,14 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let target = root.join("target.jsonl");
         std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target","cwd":chat}))).unwrap();
         let result = delete_with_policy_hook(&state, &json!({"session":"target","trashChatFolder":true}), || {
-            crate::session_writer_fence::begin(dir.path(), "other", "op", "continue", &target, None).unwrap();
+            let staging = dir.path().join("pi-web/fork-staging/fixture");
+            crate::session_writer_fence::begin_fork(dir.path(), "other", "op", "fork-source", &target, &root, "future", &staging).unwrap();
+            crate::session_writer_fence::begin_fork(dir.path(), "future", "op", "fork-target", &target, &root, "future", &staging).unwrap();
         }).unwrap_err();
         assert_eq!(result.0, "busy");
         assert!(target.exists() && chat.exists());
+        assert!(crate::session_writer_fence::fence_path(dir.path(), "other").exists());
+        assert!(crate::session_writer_fence::fence_path(dir.path(), "future").exists());
     }
     #[cfg(unix)]
     #[test]
