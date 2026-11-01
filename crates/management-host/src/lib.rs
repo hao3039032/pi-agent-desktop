@@ -91,7 +91,7 @@ fn operation_policy(op: &str, session_writer: bool) -> Result<OperationPolicy, S
         "session.readThinking" | "session.recordedSystemPrompt" | "session.authorizeBashOutput" |
         "chat.systemPrompt" | "session.chatOnlyPrompt" | "models.list" | "models.enabledGet" |
         "modelsConfig.get" | "models.nonchat" | "skills.list" | "plugins.list" |
-        "auth.providers" | "auth.loginPoll" | "mcp.configGet" | "mcp.credentialTarget" | "trust.projectListing" | "trust.projectStatus" |
+        "auth.providers" | "auth.loginPoll" | "mcp.configGet" | "mcp.credentialTarget" | "mcp.probeTarget" | "trust.projectListing" | "trust.projectStatus" |
         "terminal.settingsGet" | "terminal.resolveShell" | "distro.status" | "docx.extractText" | "docx.renderHtml" |
         "tasks.validateCreate" | "tasks.validateUpdate" | "tasks.nextRun" | "tasks.decideSlot" | "tasks.previewCron" => Ok(ReadOnly),
         // These can call a network service or write an explicitly temporary
@@ -174,6 +174,14 @@ impl McpCredentialAdmission {
     pub fn target(&self) -> &ledger::McpCredentialTarget { &self.target }
 }
 
+pub struct McpProbeAdmission {
+    instance_id: uuid::Uuid,
+    payload: Value,
+    kind: &'static str,
+    config_key: String,
+    credential: Option<McpCredentialAdmission>,
+}
+
 pub struct VerifiedMcpRevocation {
     instance_id: uuid::Uuid,
     target_fingerprint: String,
@@ -195,6 +203,7 @@ struct TaskRecord {
     snapshot: TaskSnapshot,
     finished_at: Option<Instant>,
     serial_scope: bool,
+    blocks_mutations: bool,
     exclusive: bool,
     operation: String,
     ledger_operation_id: Option<String>,
@@ -420,12 +429,50 @@ impl ManagementInstance {
         Ok(McpCredentialAdmission { instance_id: self.instance_id, payload, canonical_key: canonical.into(), legacy_key: legacy.into(), config_key: config.into(), generation, target, config_fingerprint })
     }
 
+    /// Resolve a no-I/O probe classification from the fixed management child.
+    pub fn resolve_mcp_probe(&self, payload: Value) -> Result<McpProbeAdmission, String> {
+        let agent = self.agent_dir.to_str().ok_or("agent directory is not UTF-8")?;
+        if payload.get("agentDir").and_then(Value::as_str) != Some(agent) || !payload.get("allowedRoots").is_some_and(Value::is_array)
+            || payload.get("probeAdmission").is_some() { return Err("invalid trusted MCP context".into()); }
+        let response = self.management_call_kind("mcp.probeTarget", payload.clone(), Duration::from_secs(30), TaskKind::ReadOnly)?;
+        if response.get("schema").and_then(Value::as_u64) != Some(1) || response.get("probeAdmissionSchema").and_then(Value::as_u64) != Some(1) { return Err("MCP probe admission capability unavailable".into()); }
+        let config = response.get("configKey").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid MCP probe admission")?.to_string();
+        let kind = match response.get("kind").and_then(Value::as_str) {
+            Some("mcp-oauth") => "mcp-oauth", Some("http-no-mcp-oauth") => "http-no-mcp-oauth",
+            Some("broad") => return Err("MCP probe has a broad unverified side-effect scope".into()),
+            _ => return Err("invalid MCP probe admission".into()),
+        };
+        let credential = if kind == "mcp-oauth" {
+            let canonical = response.get("canonicalKey").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid MCP probe identity")?;
+            let legacy = response.get("legacyKey").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or("invalid MCP probe identity")?;
+            let generation = response.get("generation").and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991).ok_or("invalid MCP probe identity")?;
+            let key = target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?;
+            Some(McpCredentialAdmission { instance_id: self.instance_id, payload: payload.clone(), canonical_key: canonical.into(), legacy_key: legacy.into(), config_key: config.clone(), generation,
+                target: ledger::McpCredentialTarget::new(key.fingerprint(canonical)?, key.fingerprint_legacy(legacy)?)?, config_fingerprint: key.fingerprint(&format!("config:{config}"))? })
+        } else { None };
+        Ok(McpProbeAdmission { instance_id: self.instance_id, payload, kind, config_key: config, credential })
+    }
+
+    pub fn start_mcp_probe(&self, mut admission: McpProbeAdmission, deadline: Duration) -> Result<String, String> {
+        if admission.instance_id != self.instance_id { return Err("MCP probe admission instance mismatch".into()); }
+        let mut contract = json!({"schema":1,"kind":admission.kind,"configKey":admission.config_key});
+        let guard = if let Some(credential) = admission.credential {
+            contract["canonicalKey"] = json!(credential.canonical_key);
+            contract["legacyKey"] = json!(credential.legacy_key);
+            contract["generation"] = json!(credential.generation);
+            Some(McpGuardAdmission { target: credential.target, generation: credential.generation, config_fingerprint: credential.config_fingerprint })
+        } else { None };
+        admission.payload["probeAdmission"] = contract;
+        let expected = Some((admission.config_key, admission.kind == "http-no-mcp-oauth"));
+        self.start_task_inner("mcp.test", admission.payload, deadline, TaskKind::Mutation, false, None, None, guard, None, expected).map(|(handle, _)| handle)
+    }
+
     /// Dispatch the same authorized context with the private guard contract.
     pub fn start_admitted_mcp(&self, op: &str, mut admission: McpCredentialAdmission, deadline: Duration) -> Result<(String, bool), String> {
         if admission.instance_id != self.instance_id || !matches!(op, "mcp.signInStart" | "mcp.test") { return Err("MCP admission instance mismatch".into()); }
         admission.payload["credentialAdmission"] = json!({"schema":1,"canonicalKey":admission.canonical_key,"legacyKey":admission.legacy_key,"configKey":admission.config_key,"generation":admission.generation});
         let guard = McpGuardAdmission { target: admission.target, generation: admission.generation, config_fingerprint: admission.config_fingerprint };
-        self.start_task_inner(op, admission.payload, deadline, TaskKind::Mutation, false, None, None, Some(guard), None)
+        self.start_task_inner(op, admission.payload, deadline, TaskKind::Mutation, false, None, None, Some(guard), None, None)
     }
 
     /// Cooperative sign-out under an already acquired local reservation.
@@ -444,7 +491,7 @@ impl ManagementInstance {
         payload["expectedCanonicalKey"] = json!(first.canonical_key);
         payload["expectedLegacyKey"] = json!(first.legacy_key);
         payload["expectedConfigKey"] = json!(first.config_key);
-        let (handle, _) = self.start_task_inner("mcp.signOutCooperative", payload, deadline, TaskKind::Mutation, false, None, None, None, Some(reservation))?;
+        let (handle, _) = self.start_task_inner("mcp.signOutCooperative", payload, deadline, TaskKind::Mutation, false, None, None, None, Some(reservation), None)?;
         let until = Instant::now() + deadline;
         let result = loop {
             let snapshot = self.task_snapshot(&handle)?;
@@ -475,17 +522,17 @@ impl ManagementInstance {
     /// Start a task. `kind` and `deadline` are trusted host policy, never frontend input.
     /// Operations must redact secrets before reporting a result or progress.
     pub fn start_task(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind) -> Result<String, String> {
-        self.start_task_inner(op, args, deadline, kind, false, None, None, None, None).map(|(handle, _)| handle)
+        self.start_task_inner(op, args, deadline, kind, false, None, None, None, None, None).map(|(handle, _)| handle)
     }
 
     /// Reserve the same scope task capacity and unknown isolation used by ordinary tasks.
     pub fn start_serial_task(&self, op: &str, args: Value, deadline: Duration) -> Result<String, String> {
-        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, None, None, None).map(|(handle, _)| handle)
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, None, None, None, None).map(|(handle, _)| handle)
     }
 
     /// Reserve this scope while executing in an existing cwd-scoped child.
     pub fn start_serial_task_on(&self, runner: Arc<ManagementInstance>, op: &str, args: Value, deadline: Duration) -> Result<String, String> {
-        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, Some(runner), None, None).map(|(handle, _)| handle)
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, None, Some(runner), None, None, None).map(|(handle, _)| handle)
     }
 
     /// A killable child owned by one task; never reuse it for reads or other mutations.
@@ -496,10 +543,10 @@ impl ManagementInstance {
         #[cfg(windows)]
         { let _ = (op, args, deadline, config); return Err("exclusive management mutations are unsupported on Windows".into()); }
         #[cfg(unix)]
-        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, Some(config), None, None, None).map(|(handle, _)| handle)
+        self.start_task_inner(op, args, deadline, TaskKind::Mutation, true, Some(config), None, None, None, None).map(|(handle, _)| handle)
     }
 
-    fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>, admitted_mcp: Option<McpGuardAdmission>, cooperation: Option<&McpCooperativeReservation>) -> Result<(String, bool), String> {
+    fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>, admitted_mcp: Option<McpGuardAdmission>, cooperation: Option<&McpCooperativeReservation>, probe_expected: Option<(String, bool)>) -> Result<(String, bool), String> {
         if deadline.is_zero() || deadline > Duration::from_secs(600) { return Err("invalid management task deadline".into()); }
         if let Some(check) = &self.agent_dir_check { check(&self.agent_dir)?; }
         if shared_runner.as_ref().is_some_and(|runner| runner.agent_dir != self.agent_dir || !Arc::ptr_eq(&runner.admission, &self.admission))
@@ -507,7 +554,8 @@ impl ManagementInstance {
             return Err("management runner does not share the pinned host identity".into());
         }
         if (op == "mcp.signOutCooperative") != cooperation.is_some() { return Err("MCP cooperative reservation is required".into()); }
-        let policy = operation_policy(op, self.session_file_writer)?;
+        let mut policy = operation_policy(op, self.session_file_writer)?;
+        if op == "mcp.test" && probe_expected.as_ref().is_some_and(|(_, no_oauth)| *no_oauth) { policy = OperationPolicy::Ephemeral; }
         if kind == TaskKind::ReadOnly && policy != OperationPolicy::ReadOnly {
             return Err("operation is not approved as read-only".into());
         }
@@ -526,7 +574,7 @@ impl ManagementInstance {
         let handle = format!("task-{}", uuid::Uuid::new_v4());
         let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
             status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
-        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None }));
+        }, finished_at: None, serial_scope, blocks_mutations: kind == TaskKind::Mutation, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None }));
         let (activity, evidence) = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
@@ -538,7 +586,7 @@ impl ManagementInstance {
             if serial_scope && state.tasks.values().any(|task| { let task = task.lock().unwrap(); task.serial_scope && task.finished_at.is_none() }) {
                 return Err("management configuration scope is busy".into());
             }
-            if kind == TaskKind::Mutation && admitted_mcp.is_none() && cooperation.is_none() && state.tasks.values().any(|task| { let task = task.lock().unwrap(); !task.revoked && task.snapshot.status == TaskStatus::Unknown }) {
+            if kind == TaskKind::Mutation && admitted_mcp.is_none() && cooperation.is_none() && state.tasks.values().any(|task| { let task = task.lock().unwrap(); task.blocks_mutations && !task.revoked && task.snapshot.status == TaskStatus::Unknown }) {
                 return Err("management scope has an unknown outcome".into());
             }
             let evidence = if policy == OperationPolicy::PersistentMutation {
@@ -637,12 +685,28 @@ impl ManagementInstance {
                 return;
             }
             match result {
-                Ok(value) => {
+                Ok(mut value) => {
+                    let mut probe_confirmed = false;
+                    if operation == "mcp.test" {
+                        let receipt = value.as_object_mut().and_then(|object| object.remove("_probeReceipt"));
+                        let valid = probe_expected.as_ref().is_some_and(|(config, _)| value.get("configKey").and_then(Value::as_str) == Some(config.as_str()));
+                        let safe = valid && receipt.as_ref().is_some_and(|r| r.get("schema").and_then(Value::as_u64) == Some(1)
+                            && r.get("localWritesClosed").and_then(Value::as_bool) == Some(true)
+                            && r.get("pastLocal").and_then(Value::as_str) == Some("settled")
+                            && r.get("remoteToken").and_then(Value::as_str) == Some("none-observed"));
+                        if !safe || record.snapshot.status == TaskStatus::Unknown {
+                            record.snapshot.status = TaskStatus::Unknown;
+                            record.snapshot.error = Some("MCP probe credential outcome requires reconciliation".into());
+                            if valid { record.snapshot.result = Some(value); }
+                            drop(record); drop(activity); return;
+                        }
+                        probe_confirmed = true;
+                    }
                     // A deadline/response-loss/forced stop remains unknown even
                     // if a late envelope subsequently arrives. Exclusive writers
                     // must also have completed an orderly, unforced leader exit.
                     if let Some((ledger, id)) = evidence {
-                        if record.snapshot.status == TaskStatus::Unknown || (record.exclusive && !exclusive_clean_exit) || !confirmed_success(&operation, &value) {
+                        if record.snapshot.status == TaskStatus::Unknown || (record.exclusive && !exclusive_clean_exit) || !(probe_confirmed || confirmed_success(&operation, &value)) {
                             record.snapshot.status = TaskStatus::Unknown;
                             record.snapshot.error = Some("management outcome requires reconciliation".into());
                             if operation == "mcp.test" { record.snapshot.result = Some(value); }
@@ -1490,7 +1554,7 @@ mod tests {
         let pending = Mutex::new(HashMap::new());
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None }));
+        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, blocks_mutations: true, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None }));
         let task_a = task();
         pending.lock().unwrap().insert("a".to_string(), PendingTask { tx: a_tx, task: Arc::clone(&task_a), nonce: "good".into() });
         pending.lock().unwrap().insert("b".to_string(), PendingTask { tx: b_tx, task: task(), nonce: "good".into() });

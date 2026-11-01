@@ -2859,11 +2859,11 @@ fn mcp_test_dispatch(state: &IpcHostState, id: &str, payload: Value) -> Value {
         Ok(instance) => instance,
         Err(error) => return protocol_error(id, "management_unavailable", &error),
     };
-    let admission = match instance.resolve_mcp_admission(payload) {
+    let admission = match instance.resolve_mcp_probe(payload) {
         Ok(admission) => admission,
         Err(error) => return protocol_error(id, "io", &error),
     };
-    let (handle, _) = match instance.start_admitted_mcp("mcp.test", admission, Duration::from_secs(60)) {
+    let handle = match instance.start_mcp_probe(admission, Duration::from_secs(60)) {
         Ok(result) => result,
         Err(error) => return protocol_error(id, "io", &error),
     };
@@ -2878,6 +2878,9 @@ fn mcp_test_dispatch(state: &IpcHostState, id: &str, payload: Value) -> Value {
                     }
                 }
                 return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("MCP test outcome unknown"));
+            }
+            Ok(snapshot) if snapshot.status == management_host::TaskStatus::Succeeded => {
+                return match snapshot.result { Some(result) => mcp_management_response(id, result), None => protocol_error(id, "io", "MCP test result unavailable") };
             }
             Ok(snapshot) => return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("MCP test outcome unavailable")),
             Err(error) => return protocol_error(id, "io", &error),
@@ -7072,7 +7075,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&managed).unwrap();
         symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
-        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"alias":{"url":url},"signout":{"url":second_url},"exit":{"url":second_url}}}).to_string()).unwrap();
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"alias":{"url":url},"plain":{"url":url,"headers":{"Authorization":"Bearer fixture"}},"signout":{"url":second_url},"exit":{"url":second_url}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable, agent_dir: Some(agent.clone()),
@@ -7080,6 +7083,10 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
         });
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let plain = call("mcp.test", json!({"scope":"global","name":"plain"}));
+        assert_eq!(plain["ok"], true, "{plain}");
+        assert!(plain["data"].get("credentialOutcomeUnknown").is_none(), "settled non-OAuth probe: {plain}");
+        assert!(plain["data"].get("_probeReceipt").is_none(), "private receipt is never exposed");
         let start = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
         assert_eq!(start["ok"], true, "{start}");
         let handle = start["data"]["flowId"].as_str().unwrap().to_string();
@@ -7137,7 +7144,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         }
         let probe = call("mcp.test", json!({"scope":"global","name":"fixture"}));
         assert_eq!(probe["ok"], true, "{probe}");
-        assert_eq!(probe["data"]["credentialOutcomeUnknown"], true, "probe result must not claim credential completion: {probe}");
+        assert!(probe["data"].get("credentialOutcomeUnknown").is_none(), "settled credential receipt should finish normally: {probe}");
+        assert!(probe["data"].get("_probeReceipt").is_none(), "private receipt is never exposed");
         assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
         let out = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"fixture"}));
         assert_eq!(out["data"]["signedOut"]["removed"], true, "{out}");

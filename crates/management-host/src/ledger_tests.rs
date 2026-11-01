@@ -132,7 +132,7 @@ for line in sys.stdin:
     data=json.loads(base64.urlsafe_b64decode(parts[2] + '='*((-len(parts[2]))%4)))
     root=os.environ['PI_CODING_AGENT_DIR']
     mode=os.environ.get('MODE')
-    if mode in ('coop','coop_lost'):
+    if mode in ('coop','coop_lost','probe_good','probe_unknown','probe_broad'):
         op=data['op']; args=data['args']
         print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
         name=args.get('name','fixture')
@@ -140,6 +140,11 @@ for line in sys.stdin:
         canonical='mcp__'+name+'|'+legacy; config='fixture-config'
         if op == 'mcp.credentialTarget':
             emit(rid,data['nonce'],{'schema':1,'admissionSchema':1,'canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation})
+        elif op == 'mcp.probeTarget':
+            emit(rid,data['nonce'],{'schema':1,'probeAdmissionSchema':1,'kind':'broad' if mode == 'probe_broad' else 'mcp-oauth','canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation})
+        elif op == 'mcp.test':
+            assert args['probeAdmission'] == {'schema':1,'kind':'mcp-oauth','canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation}
+            emit(rid,data['nonce'],{'scope':'global','name':name,'configKey':config,'result':{'state':'connected'},'_probeReceipt':{'schema':1,'localWritesClosed':True,'pastLocal':'settled','remoteToken':'unknown' if mode == 'probe_unknown' else 'none-observed'}})
         elif op == 'mcp.signInStart':
             assert args['credentialAdmission'] == {'schema':1,'canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation}
             old=(rid,data['nonce'])
@@ -214,7 +219,7 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
     let id = ledger.begin(&descriptor).unwrap();
     let task = Arc::new(Mutex::new(super::TaskRecord {
         snapshot: super::TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false },
-        finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
+        finished_at: None, serial_scope: false, blocks_mutations: true, exclusive: false, operation: "mcp.signInStart".into(),
         ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
         mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), revoked: false, runner: None,
     }));
@@ -245,6 +250,43 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
     assert!(fresh.reserve_mcp_cooperation(&target).is_err(), "restart cannot claim old task ownership");
     restarted.shutdown_all(Duration::from_secs(1));
     host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn broad_probe_is_refused_before_start_or_ledger_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &fixture(&temp, "probe_broad")).unwrap();
+    let context = serde_json::json!({"scope":"global","name":"fixture","agentDir":temp.path(),"allowedRoots":[]});
+    assert!(instance.resolve_mcp_probe(context).is_err());
+    assert!(!temp.path().join("pi-web/management-operations").exists());
+    assert!(!temp.path().join("effect-marker").exists());
+    host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn routed_probe_receipt_separates_settled_and_unknown_outcomes() {
+    for (mode, expected) in [("probe_good", TaskStatus::Succeeded), ("probe_unknown", TaskStatus::Unknown)] {
+        let temp = tempfile::tempdir().unwrap();
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &fixture(&temp, mode)).unwrap();
+        let context = serde_json::json!({"scope":"global","name":"fixture","agentDir":temp.path(),"allowedRoots":[]});
+        let admission = instance.resolve_mcp_probe(context).unwrap();
+        let handle = instance.start_mcp_probe(admission, Duration::from_secs(5)).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = instance.task_snapshot(&handle).unwrap();
+            if snapshot.status != TaskStatus::Running { break snapshot; }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(snapshot.status, expected);
+        let result = snapshot.result.unwrap();
+        assert_eq!(result["result"]["state"], "connected");
+        assert!(result.get("_probeReceipt").is_none(), "private receipt must not escape");
+        assert_eq!(OperationLedger::inspect(temp.path()).unwrap().len(), usize::from(expected == TaskStatus::Unknown));
+        host.shutdown_all(Duration::from_secs(1));
+    }
 }
 
 #[test]
@@ -348,7 +390,7 @@ fn partial_revocation_persistence_leaves_remaining_writer_blocked() {
     for id in [&first, &second] {
         let task = super::TaskRecord {
             snapshot: super::TaskSnapshot { status: TaskStatus::Unknown, progress: None, result: None, error: Some("unknown".into()), cancel_requested: false },
-            finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
+            finished_at: None, serial_scope: false, blocks_mutations: true, exclusive: false, operation: "mcp.signInStart".into(),
             ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
             mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), revoked: false, runner: None,
         };
@@ -383,7 +425,7 @@ fn confirmed_local_revocation_is_monotonic_and_allows_new_generation() {
     let id = ledger.begin(&descriptor).unwrap();
     let task = Arc::new(Mutex::new(super::TaskRecord {
         snapshot: super::TaskSnapshot { status: TaskStatus::Unknown, progress: None, result: None, error: Some("outcome unknown".into()), cancel_requested: true },
-        finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
+        finished_at: None, serial_scope: false, blocks_mutations: true, exclusive: false, operation: "mcp.signInStart".into(),
         ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
         mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), revoked: false, runner: None,
     }));
@@ -422,7 +464,7 @@ fn cooperative_revocation_evidence_is_instance_and_target_bound() {
         snapshot: super::TaskSnapshot { status: TaskStatus::Succeeded, progress: None,
             result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"legacyKey":"https://example.invalid","configKey":"trusted-config","generation":3}})),
             error: None, cancel_requested: false },
-        finished_at: Some(Instant::now()), serial_scope: false, exclusive: false,
+        finished_at: Some(Instant::now()), serial_scope: false, blocks_mutations: true, exclusive: false,
         operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None,
     }));
     instance.state.lock().unwrap().tasks.insert("fake-routed".into(), Arc::clone(&task));
