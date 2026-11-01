@@ -250,6 +250,7 @@ impl IpcHostState {
         self.dispatch_control_gate.close();
         self.registry.begin_shutdown();
         self.management.begin_shutdown();
+        self.session_writers.begin_shutdown();
     }
 
     pub(crate) fn drain_static_ipc_until(&self, deadline: std::time::Instant) -> Result<(), String> {

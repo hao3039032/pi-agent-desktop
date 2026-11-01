@@ -9,6 +9,7 @@ use crate::pi_ipc::IpcHostState;
 #[derive(Default)]
 pub struct TrackedShutdown {
     pub sessions: Option<session_host::SessionShutdownReport>,
+    pub session_writers: Option<crate::session_writer_lifecycle::SessionWriterShutdownReport>,
     pub management: Option<management_host::ManagementShutdownReport>,
 }
 
@@ -38,6 +39,14 @@ impl IsolatedStaticHost {
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
+        lifecycle.register_until(ShutdownStage::SessionChild, "session-writers", move |deadline| {
+            let result = host.session_writers.shutdown_until(deadline);
+            let unknown = result.unknown.clone();
+            report.lock().map_err(|_| "writer report lock poisoned")?.session_writers = Some(result);
+            if unknown.is_empty() { Ok(()) } else { Err(format!("session writer unknown: {}", unknown.join(", "))) }
+        })?;
+        let host = Arc::clone(&state);
+        let report = Arc::clone(&tracked);
         lifecycle.register_until(ShutdownStage::SessionChild, "session-leaders", move |deadline| {
             let result = host.registry.shutdown_until(deadline);
             let unknown = result.unknown.clone();
@@ -57,8 +66,8 @@ impl IsolatedStaticHost {
 
     pub fn recovery_status(&self) -> RecoveryStatus { self.lifecycle.recovery_status() }
 
-    /// Only registered leader/admission reports are returned. PTYs, detached
-    /// descendants, short-lived writers and scheduler runs are not covered.
+    /// Reports cover only registered operations and leaders. PTYs, detached
+    /// descendants, unregistered writers and scheduler runs are not covered.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), Vec<ShutdownFailure>> {
         self.lifecycle.shutdown_until(deadline)
     }
@@ -80,12 +89,46 @@ mod tests {
         host.shutdown_until(Instant::now() + Duration::from_secs(1)).unwrap();
         let tracked = host.tracked().unwrap();
         assert!(tracked.sessions.as_ref().unwrap().unknown.is_empty());
+        assert!(tracked.session_writers.as_ref().unwrap().unknown.is_empty());
         assert!(tracked.management.as_ref().unwrap().unknown.is_empty());
         drop(tracked);
         let response = tauri::async_runtime::block_on(crate::pi_ipc::dispatch_envelope_gated(
             Arc::clone(&host.state), serde_json::json!({"v":1,"id":"after","op":"desktop.identity"}),
         ));
         assert_ne!(response["ok"], true);
+    }
+
+    #[test]
+    fn in_flight_session_writer_is_reported_unknown_and_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = IsolatedStaticHost::init(dir.path()).unwrap();
+        let mut writer = host.state.session_writers.admit("fixture-operation").unwrap();
+        writer.before_spawn().unwrap();
+        let failures = host.shutdown_until(Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert!(failures.iter().any(|failure| failure.name == "session-writers"));
+        let tracked = host.tracked().unwrap();
+        assert!(tracked.session_writers.as_ref().unwrap().unknown.iter().any(|item| item.contains("fixture-operation")));
+        assert!(tracked.sessions.as_ref().unwrap().exited.is_empty());
+        drop(tracked);
+        assert!(host.state.session_writers.admit("new-operation").is_err());
+        drop(writer);
+    }
+
+    #[test]
+    fn admitted_writer_completes_before_shared_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = IsolatedStaticHost::init(dir.path()).unwrap();
+        let mut writer = host.state.session_writers.admit("finishing-operation").unwrap();
+        writer.before_spawn().unwrap();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            writer.complete();
+        });
+        host.shutdown_until(Instant::now() + Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        let tracked = host.tracked().unwrap();
+        assert_eq!(tracked.session_writers.as_ref().unwrap().exited, vec!["finishing-operation"]);
+        assert!(tracked.session_writers.as_ref().unwrap().unknown.is_empty());
     }
 
     #[cfg(unix)]

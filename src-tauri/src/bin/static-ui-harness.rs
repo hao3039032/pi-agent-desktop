@@ -421,9 +421,11 @@ fn main() {
                         "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
                         "sessionExited": report.sessions.as_ref().map(|r| &r.exited),
                         "sessionUnknown": report.sessions.as_ref().map(|r| &r.unknown),
+                        "writerCompleted": report.session_writers.as_ref().map(|r| &r.exited),
+                        "writerUnknown": report.session_writers.as_ref().map(|r| &r.unknown),
                         "managementExited": report.management.as_ref().map(|r| &r.exited),
                         "managementUnknown": report.management.as_ref().map(|r| &r.unknown),
-                        "uncovered": ["short-lived writers", "scheduler", "terminals", "detached descendants"]
+                        "uncovered": ["unregistered writers", "scheduler", "terminals", "detached descendants", "cross-restart writer durability"]
                     })
                 }
                 HostCall::Shutdown => {

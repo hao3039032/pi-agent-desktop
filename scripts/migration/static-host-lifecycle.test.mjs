@@ -35,7 +35,10 @@ test("isolated static host drains IPC and reports tracked shutdown coverage", { 
     assert.equal(report.ok, true);
     assert.deepEqual(report.sessionUnknown, []);
     assert.deepEqual(report.managementUnknown, []);
-    assert.ok(report.uncovered.includes("short-lived writers"));
+    assert.deepEqual(report.writerUnknown, []);
+    assert.deepEqual(report.writerCompleted, []);
+    assert.ok(report.uncovered.includes("unregistered writers"));
+    assert.ok(report.uncovered.includes("cross-restart writer durability"));
     assert.ok(report.uncovered.includes("detached descendants"));
     assert.equal(await exited, 0, stderr);
   } finally {
