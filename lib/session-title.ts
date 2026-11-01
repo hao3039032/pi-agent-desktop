@@ -9,7 +9,7 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 const TITLE_TIMEOUT_MS = 90_000;
 const TITLE_MAX_TOKENS = 256;
@@ -86,7 +86,10 @@ export function resolveTitleThinkingLevel(model: Model<Api>): ThinkingLevel {
  * unique to reuse the live session's prefix or write a cache nobody will read.
  */
 export function buildTitleRequest(source: Agent, transcript: string): TitleRequest {
-  const model = source.state.model;
+  return buildTitleRequestForModel(source.state.model, transcript, source);
+}
+
+function buildTitleRequestForModel(model: Model<Api>, transcript: string, source?: Agent): TitleRequest {
   const thinkingLevel = resolveTitleThinkingLevel(model);
   return {
     model,
@@ -102,9 +105,9 @@ export function buildTitleRequest(source: Agent, transcript: string): TitleReque
       maxTokens: TITLE_MAX_TOKENS,
       cacheRetention: "none",
       sessionId: randomUUID(),
-      transport: source.transport,
-      thinkingBudgets: source.thinkingBudgets,
-      maxRetryDelayMs: source.maxRetryDelayMs,
+      transport: source?.transport,
+      thinkingBudgets: source?.thinkingBudgets,
+      maxRetryDelayMs: source?.maxRetryDelayMs,
       ...(thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
     },
   };
@@ -276,6 +279,44 @@ function titleFromAssistant(message: AssistantMessage): GeneratedSessionTitle {
       },
     } : {}),
   };
+}
+
+/** Generate from the live extension's model registry, preserving its provider and request-time authentication. */
+export async function generateSessionTitleFromRegistry(
+  model: Model<Api>,
+  messages: AgentMessage[],
+  registry: Pick<ModelRegistry, "streamSimple">,
+  signal?: AbortSignal,
+): Promise<GeneratedSessionTitle> {
+  const transcript = buildTitleTranscript(messages);
+  if (!transcript.trim()) throw new Error("The session has no usable text to name");
+  const { context, options } = buildTitleRequestForModel(model, transcript);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(abort, TITLE_TIMEOUT_MS);
+  try {
+    if (controller.signal.aborted) throw new Error("Session title generation cancelled");
+    const stream = registry.streamSimple(model, normalizeContext(context), { ...options, signal: controller.signal });
+    const result = await new Promise<AssistantMessage>((resolve, reject) => {
+      const onAbort = () => {
+        controller.signal.removeEventListener("abort", onAbort);
+        reject(new Error("Session title generation aborted"));
+      };
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      stream.result().then(resolve, reject).finally(() => controller.signal.removeEventListener("abort", onAbort));
+      if (controller.signal.aborted) onAbort();
+    });
+    if (controller.signal.aborted) throw new Error(signal?.aborted ? "Session title generation cancelled" : "Session title generation timed out");
+    return titleFromAssistant(result);
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(signal?.aborted ? "Session title generation cancelled" : "Session title generation timed out");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
+  }
 }
 
 export async function generateSessionTitle(source: AgentSession): Promise<GeneratedSessionTitle> {

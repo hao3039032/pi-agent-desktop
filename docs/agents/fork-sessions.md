@@ -10,6 +10,21 @@ It never silently switches providers. A synchronous per-session guard prevents
 duplicate submissions; results refresh the sidebar but only update the active
 header when they still belong to that conversation.
 
+The static host starts a bounded title task in the owning pi child's bridge,
+using its live `ctx.model` and `ctx.modelRegistry.streamSimple` (including
+providers registered during `session_start`). The title helper is loaded from
+the fixed managed module tree; no credential or provider implementation crosses
+IPC and no second AgentSession is created. The host releases its session activity
+gate while the provider request runs. Before rename it reacquires the policy and
+activity gates, verifies the same child and unchanged snapshot, and invokes the
+existing guarded rename. Navigation or model selection invalidates the task even
+if the user returns to the original state. Cancellation aborts only that title
+request; if a rename has already been dispatched its outcome is never called a
+confirmed cancellation. A durable session-writer fence is created before rename;
+only the matching owned operation can pass it, and an unknown reply leaves it
+in place across host restart. A proven pre-append refusal or confirmed success
+clears it. This does not add cross-process writer exclusion or automatic recovery.
+
 ## Editable composer outbox
 
 `lib/composer-queue.ts` owns individually identified pending composer messages, including images.
