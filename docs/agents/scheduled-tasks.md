@@ -50,6 +50,24 @@ d  does not count against the task, and a run past its time limit is aborted.
 - Routes: `app/api/scheduled-tasks/**` (list, create, edit, delete, run now, runs, seen, cron
   preview, SSE). Writes use `isApiRequestAllowed` and `hasJsonContentType` like the other settings routes.
 
+## Static-host final shutdown
+
+`IpcHostState::begin_scheduler_shutdown()` fences scheduler and session
+admission; `shutdown_scheduler_until(deadline)` returns `SchedulerShutdownReport
+{ stopped, active_unknown }` using the caller's absolute deadline and the
+session registry's leader/prompt report. It is a **final host shutdown**, not
+the scheduler pause operation: it begins shutdown of all registered sessions.
+In-flight manual and timer starts are registered before the claim; unresolved
+claim/runner outcomes remain tracked and are not reclassified as orphans.
+Busy tracking, an unfinished timer, prompt uncertainty or an unconfirmed child
+exit reports unknown rather than an empty active set. Final shutdown leaves
+the lease in place; it does not authorize recovery or prove descendant exit.
+Ordinary pause still stops the timer and releases its own lease. If runs are
+active, release is deferred until their verified completion; an unresolved
+claim retains it. Restart cancels a deferred release, or refuses while a
+release is in progress or unresolved. This changes release timing during an
+active run to avoid dropping its lease under final shutdown.
+
 ## Client
 - `hooks/useScheduledTasks.ts`: one store shared by the sidebar badge and the page, fed by
   `lib/scheduled-tasks/shared-stream.ts` (one stream per browser, led by one tab; see the ADR). Events

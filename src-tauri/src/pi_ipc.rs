@@ -30,6 +30,13 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// The managed host state (one registry per app process). The registry and
 /// version counter are Arc-backed so stream relays (the running-set stream)
 /// outlive the request that opened them.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerShutdownReport {
+    pub stopped: bool,
+    pub active_unknown: Vec<String>,
+}
+
 pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
     /// Global policy transaction gate shared with session admission and drains.
@@ -78,6 +85,7 @@ pub struct IpcHostState {
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
     pub(crate) scheduled_active: Arc<Mutex<BTreeSet<String>>>,
+    pub(crate) scheduled_lifecycle: Arc<crate::scheduled_lifecycle::ScheduledLifecycle>,
     pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
@@ -224,6 +232,7 @@ impl IpcHostState {
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
+            scheduled_lifecycle: Arc::new(crate::scheduled_lifecycle::ScheduledLifecycle::default()),
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             native_drops: crate::native_drop::NativeDrops::default(),
@@ -272,8 +281,10 @@ impl IpcHostState {
 
     pub fn start_scheduler(self: &Arc<Self>) -> Result<(), String> {
         let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        if self.scheduled_lifecycle.is_closing() { return Err("Scheduler is shutting down".into()); }
         let mut current = self.scheduler_loop.lock().unwrap();
         if current.is_none() {
+            self.scheduled_lifecycle.prepare_start().map_err(str::to_string)?;
             *current = Some(crate::scheduler_tick::SchedulerLoop::start(Arc::clone(self), Duration::from_secs(30))?);
         }
         Ok(())
@@ -291,29 +302,50 @@ impl IpcHostState {
         self.scheduler_owner.store(false, Ordering::SeqCst);
     }
 
-    /// Host shutdown: stop new claims, reap linked child sessions, then let
-    /// their workers persist outcomes before management instances are closed.
-    pub fn shutdown_scheduler(&self) -> Result<(), String> {
-        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
-        self.stop_scheduler_locked();
-        let repo = task_scheduler::task_repository::TaskRepository::new(self.agent_dir());
-        let deadline = std::time::Instant::now() + Duration::from_secs(35);
-        loop {
-            let active = self.scheduled_active.lock().unwrap().clone();
-            if active.is_empty() { return Ok(()); }
-            for task in repo.list()? {
-                let Some(task_id) = task["id"].as_str() else { continue };
-                for run in repo.runs(task_id)? {
-                    if run["runId"].as_str().is_some_and(|id| active.contains(id)) {
-                        if let Some(session_id) = run["sessionId"].as_str() {
-                            self.registry.remove(session_id, Duration::from_secs(5));
-                        }
-                    }
-                }
-            }
-            if std::time::Instant::now() >= deadline { return Err("Scheduled runs did not stop during host shutdown".into()); }
-            std::thread::sleep(Duration::from_millis(20));
+    /// Fence final scheduler and session admission without acquiring a lock.
+    pub fn begin_scheduler_shutdown(&self) {
+        self.scheduled_lifecycle.begin_shutdown();
+        self.registry.begin_shutdown();
+        if let Ok(current) = self.scheduler_loop.try_lock() {
+            if let Some(scheduler) = current.as_ref() { scheduler.begin_shutdown(); }
         }
+    }
+
+    /// Final host shutdown, distinct from pausing the scheduler. The session
+    /// registry's report includes prompt/child unknowns and uses this deadline.
+    pub fn shutdown_scheduler_until(&self, deadline: std::time::Instant) -> SchedulerShutdownReport {
+        self.begin_scheduler_shutdown();
+        let sessions = self.registry.shutdown_until(deadline);
+        let mut unknown = sessions.unknown;
+        loop {
+            let lifecycle_free = self.scheduler_lifecycle.try_lock().is_ok();
+            let timer_stopped = match self.scheduler_loop.try_lock() {
+                Ok(mut current) => match current.as_mut() {
+                    Some(timer) => timer.shutdown_until(std::time::Instant::now()),
+                    None => true,
+                },
+                Err(_) => false,
+            };
+            let active = self.scheduled_lifecycle.snapshot();
+            if lifecycle_free && timer_stopped && matches!(&active, Ok(entries) if entries.is_empty()) { break; }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                if !lifecycle_free { unknown.push("scheduler lifecycle busy".into()); }
+                if !timer_stopped { unknown.push("scheduler timer still running or unavailable".into()); }
+                match active {
+                    Ok(entries) => unknown.extend(entries.into_iter().map(|(id, session, unresolved)| format!("{id}: {}{}", if unresolved { "scheduled outcome unresolved" } else { "scheduled run or start in flight" }, session.map(|id| format!(" (session {id})")).unwrap_or_default()))),
+                    Err(error) => unknown.push(error.into()),
+                }
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        SchedulerShutdownReport { stopped: unknown.is_empty(), active_unknown: unknown }
+    }
+
+    pub fn shutdown_scheduler(&self) -> Result<(), String> {
+        let report = self.shutdown_scheduler_until(std::time::Instant::now() + Duration::from_secs(35));
+        if report.stopped { Ok(()) } else { Err(report.active_unknown.join("; ")) }
     }
 
     /// Record a path the HOST derived (a session cwd or project root from
@@ -5582,6 +5614,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         }
         let _shutdown = Shutdown(&state);
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        state.propose_path(&project).unwrap();
         let bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         let created = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"] })).expect("start session");
@@ -5657,8 +5690,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(types.iter().any(|kind| kind == "run_started"));
         assert!(types.iter().any(|kind| kind == "run_finished"));
         state.scheduled_events.unsubscribe(&subscription);
-        state.shutdown_scheduler().unwrap();
-        assert!(!agent.join("scheduled-tasks/scheduler.lock").exists());
+        let report = state.shutdown_scheduler_until(std::time::Instant::now() + Duration::from_secs(5));
+        assert!(report.active_unknown.iter().any(|item| item.contains("prompt")), "{report:?}");
+        assert!(agent.join("scheduled-tasks/scheduler.lock").exists());
         server.join().unwrap();
     }
 

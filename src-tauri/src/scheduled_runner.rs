@@ -36,24 +36,30 @@ fn failure(error: impl Into<String>) -> RunOutcome {
 /// Admit one manual run and return once its session is durably linked, or its
 /// early failure is recorded. Never retries a prompt whose outcome is unknown.
 pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
+    let run_id = new_run_id()?;
+    let mut tracking = state.scheduled_lifecycle.admit(&run_id).map_err(str::to_string)?;
     let lifecycle = state.scheduler_lifecycle.lock().unwrap();
-    if !state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst) { return Err("Scheduler is not the owner".into()); }
+    if !state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst) || state.scheduled_lifecycle.is_closing() { return Err("Scheduler is not the owner".into()); }
     let agent = state.agent_dir();
     let repo = TaskRepository::new(&agent);
     let task = repo.list()?.into_iter().find(|task| task["id"] == task_id).ok_or("Task not found")?;
-    let run_id = new_run_id()?;
     let record = json!({ "runId": run_id, "taskId": task_id, "trigger": "manual", "startedAt": now_iso(), "status": "running", "pid": std::process::id() });
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis() as i64;
     state.scheduled_active.lock().unwrap().insert(run_id.clone());
+    tracking.claimed();
     if let Err(error) = repo.admit_manual(task_id, &task, record.clone(), now_ms, std::process::id()) {
         state.scheduled_active.lock().unwrap().remove(&run_id);
+        // These repository rejections precede its write. I/O errors may
+        // follow a partial write and remain unresolved instead.
+        if matches!(error.as_str(), "Invalid task id" | "Scheduler is not the owner" | "Task not found" | "Task changed during run admission; reload before retrying" | "This task is already running")
+            || error.starts_with("scheduler transaction busy:") { tracking.resolved(); }
         return Err(error);
     }
     drop(lifecycle);
-    spawn_claimed(state, task, record)
+    spawn_claimed(state, task, record, tracking)
 }
 
-pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) -> Result<Value, String> {
+pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value, mut tracking: crate::scheduled_lifecycle::ScheduledRunGuard) -> Result<Value, String> {
     struct ActiveGuard { active: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>, run_id: String }
     impl Drop for ActiveGuard { fn drop(&mut self) { self.active.lock().unwrap().remove(&self.run_id); } }
     let agent = state.agent_dir();
@@ -64,17 +70,23 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let trigger = record["trigger"].as_str().ok_or("Run missing trigger")?.to_string();
     let cwd = task["cwd"].as_str().unwrap_or("");
     if !std::path::Path::new(cwd).is_dir() {
-        return finish_early(state, &agent, &task, &record, RunOutcome {
+        let result = finish_early(state, &agent, &task, &record, RunOutcome {
             status: "failed", error: Some(format!("Directory does not exist: {cwd}")), error_code: Some("cwd-missing"),
             error_params: Some(json!({ "path": cwd })), counts_as_failure: true,
         });
+        if result.is_ok() { tracking.resolved(); }
+        return result;
     }
     let names = match task["toolPreset"].as_str().unwrap_or("read-only") {
         "none" => vec![],
         "read-only" => vec!["read", "grep", "find", "ls"],
         "default" => vec!["read", "bash", "edit", "write"],
         "full" => vec!["bash", "read", "edit", "write", "grep", "find", "ls"],
-        _ => return finish_early(state, &agent, &task, &record, failure("Invalid task tool preset")),
+        _ => {
+            let result = finish_early(state, &agent, &task, &record, failure("Invalid task tool preset"));
+            if result.is_ok() { tracking.resolved(); }
+            return result;
+        },
     };
     let mut args = json!({ "cwd": task["cwd"], "type": "ensure_session", "toolNames": names });
     if task["model"].is_object() { args["provider"] = task["model"]["provider"].clone(); args["modelId"] = task["model"]["modelId"].clone(); }
@@ -89,6 +101,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let Some(session) = state.registry.get(session_id) else {
         return finish_early(state, &agent, &task, &record, failure("Created session disappeared"));
     };
+    tracking.set_session(session_id).map_err(str::to_string)?;
     let task_id = task_id.to_string();
     let prompt = task["prompt"].as_str().unwrap_or("").to_string();
     let duration = task["maxDurationMin"].as_u64().unwrap_or(30).clamp(1, 1440);
@@ -103,6 +116,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let task_name = task["name"].as_str().unwrap_or("").to_string();
     let spawned = std::thread::Builder::new().name(format!("scheduled-run-{run_id}")).spawn(move || {
         let _guard = guard;
+        let mut tracking = tracking;
         let link_tx = ready_tx.clone();
         let attention_events = std::sync::Arc::clone(&events);
         let outcome = run_session(&session, marker, &prompt, Duration::from_secs(duration * 60), |session_id| {
@@ -135,6 +149,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
         let error_code = outcome.error_code;
         let error_params = outcome.error_params.clone();
         let finished = finish_run(&thread_agent, &thread_task, &thread_run, outcome);
+        if finished.is_ok() { tracking.resolved(); }
         if let Ok((run, auto_paused)) = &finished {
             let mut event = json!({ "type": "run_finished", "taskId": thread_task, "taskName": task_name, "runId": thread_run, "trigger": trigger, "status": status });
             if run["sessionId"].is_string() { event["sessionId"] = run["sessionId"].clone(); }
