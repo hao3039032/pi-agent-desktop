@@ -14,7 +14,6 @@ fn err(code: &str, message: impl ToString) -> (String, String) { (code.into(), m
 pub(crate) struct TitleTask {
     session: Arc<session_host::Session>,
     id: String,
-    snapshot: Value,
     expires: Instant,
 }
 
@@ -22,15 +21,6 @@ fn identity(args: &Value) -> Result<(&str, &str), (String, String)> {
     let session = args.get("session").and_then(Value::as_str).filter(|v| !v.is_empty()).ok_or_else(|| err("invalid_args", "session is required"))?;
     let id = args.get("task").and_then(Value::as_str).filter(|v| !v.is_empty()).ok_or_else(|| err("invalid_args", "task is required"))?;
     Ok((session, id))
-}
-
-fn snapshot(session: &session_host::Session) -> Result<Value, (String, String)> {
-    let state = session.get_state().map_err(|e| err("op_failed", e))?;
-    let entries = session.command("get_entries", json!({}), Some(Duration::from_secs(30))).map_err(|e| err("op_failed", e))?;
-    if !entries.get("entries").is_some_and(Value::is_array) || !entries.get("leafId").is_some() || !state.get("model").is_some_and(Value::is_object) {
-        return Err(err("op_failed", "Live session snapshot is incomplete"));
-    }
-    Ok(json!({"model":state["model"],"name":state["sessionName"],"entries":entries}))
 }
 
 pub(crate) fn start(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
@@ -54,16 +44,13 @@ pub(crate) fn start(state: &IpcHostState, args: &Value) -> Result<Value, (String
     }
     let _reservation = Reservation { state, id };
     let guard = session.try_branch_activity().map_err(|e| err("busy", e))?;
-    if session.run_state().is_running() || !session.composer_outbox.snapshot().0.is_empty() { return Err(err("busy", "Wait for the current response and queued messages before generating a title")); }
-    session.bridge_request("tree.assertIdle", None, Some(Duration::from_secs(30))).map_err(|e| err("busy", e))?;
-    let saved = snapshot(&session)?;
     let config = state.management_config.lock().unwrap().clone().ok_or_else(|| err("management_unavailable", "Managed title modules are unavailable"))?;
     let dir = config.env.iter().find(|(key, _)| key == "PI_WEB_MANAGED_MODULES").map(|(_, value)| value).ok_or_else(|| err("management_unavailable", "Managed title modules are unavailable"))?;
     let module = std::path::Path::new(dir).join("pi-web-session-title.mjs").canonicalize().map_err(|e| err("management_unavailable", e))?;
     let result = session.bridge_request("title.start", Some(json!({"module":module})), Some(Duration::from_secs(30))).map_err(|e| err("op_failed", e))?;
     let task = result.get("id").and_then(Value::as_str).filter(|v| !v.is_empty()).ok_or_else(|| err("op_failed", "Invalid title task"))?.to_owned();
     drop(guard);
-    state.title_tasks.lock().unwrap().insert(id.to_owned(), Some(Arc::new(Mutex::new(TitleTask { session, id: task.clone(), snapshot: saved, expires: Instant::now() + Duration::from_secs(120) }))));
+    state.title_tasks.lock().unwrap().insert(id.to_owned(), Some(Arc::new(Mutex::new(TitleTask { session, id: task.clone(), expires: Instant::now() + Duration::from_secs(120) }))));
     Ok(json!({"task":task}))
 }
 
@@ -121,28 +108,25 @@ pub(crate) fn status(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     let result = (|| {
         if response["status"] != "succeeded" { return Err(err(if response["status"] == "stale" { "stale" } else { "op_failed" }, response["error"].as_str().unwrap_or("Title generation cancelled"))); }
         let title = response["result"]["title"].as_str().filter(|v| !v.is_empty()).ok_or_else(|| err("op_failed", "Invalid title result"))?;
-        if task_guard.session.run_state().is_running() || !task_guard.session.composer_outbox.snapshot().0.is_empty() { return Err(err("busy", "Session is no longer idle")); }
-        task_guard.session.bridge_request("tree.assertIdle", None, Some(Duration::from_secs(30))).map_err(|e| err("busy", e))?;
-        if snapshot(&task_guard.session)? != task_guard.snapshot { return Err(err("stale", "Session changed while generating the title")); }
         let agent = state.agent_dir();
         let operation_id = crate::chat_sessions::random_id()?;
-        crate::session_writer_fence::begin(&agent, id, &operation_id, "title-rename", &session.session_file, None, None)
+        crate::session_writer_fence::begin_live_title(&agent, id, &operation_id, &session.session_file)
             .map_err(|e| err("outcome_unknown", format!("Could not persist title rename fence; do not retry: {e}")))?;
         #[cfg(test)]
         let timeout = *state.title_rename_timeout.lock().unwrap();
         #[cfg(not(test))]
         let timeout = Duration::from_secs(30);
-        let renamed = session.title_rename_with_owned_fence(&guard, &operation_id, title, Some(timeout));
+        let renamed = session.title_rename_with_owned_fence(&guard, &operation_id, task_id, title, Some(timeout));
         match renamed {
             Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
                 crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id)
                     .map_err(|e| err("outcome_unknown", format!("Title was renamed but its fence remains; do not retry: {e}")))?;
                 Ok(json!({"title":title,"usage":response["result"]["usage"]}))
             }
-            Err(pi_host::bridge::BridgeError::Op(ref error)) if error.code.as_deref() == Some("rename_not_applied") => {
+            Err(pi_host::bridge::BridgeError::Op(ref error)) if matches!(error.code.as_deref(), Some("rename_not_applied" | "title_stale")) => {
                 crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id)
                     .map_err(|e| err("outcome_unknown", format!("Rename was refused but its fence remains; do not retry: {e}")))?;
-                Err(err("busy", &error.message))
+                Err(err(if error.code.as_deref() == Some("title_stale") { "stale" } else { "busy" }, &error.message))
             }
             other => Err(err("outcome_unknown", format!("Title rename outcome is unknown; its writer fence remains and retry is blocked: {other:?}"))),
         }

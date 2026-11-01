@@ -52,6 +52,49 @@ pub(crate) fn finish_owned_title_fence(agent_dir: &Path, session_id: &str, opera
     finish_checked(agent_dir, session_id, operation_id, Some("title-rename"))
 }
 
+/// A live title rename may run while the session file is being appended, or
+/// before the SDK has flushed it. This bounded prefix is diagnostic only;
+/// neither its presence nor its digest grants write authority.
+pub(crate) fn begin_live_title(agent_dir: &Path, session_id: &str, operation_id: &str, source: &Path) -> Result<(), String> {
+    use std::io::Read;
+    assert_session_writable(agent_dir, session_id)?;
+    let path = fence_path(agent_dir, session_id);
+    let dir = path.parent().ok_or("Invalid fence path")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    assert_session_writable(agent_dir, session_id)?;
+    let diagnostic = std::fs::symlink_metadata(source).ok().filter(|meta| meta.file_type().is_file()).and_then(|_| {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(source).ok()?;
+        if !file.metadata().ok()?.file_type().is_file() { return None; }
+        let mut bytes = Vec::new();
+        file.take(65536).read_to_end(&mut bytes).ok()?;
+        let digest = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        Some(json!({"prefixBytes": bytes.len(), "prefixSha256": digest}))
+    });
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|e| format!("Cannot create session writer fence: {e}"))?;
+    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":"title-rename", "source":{"path":source,"diagnosticOnly":true,"prefix":diagnostic}});
+    file.write_all(record.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(dir).and_then(|directory| directory.sync_all()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Caller holds the session offline-writer gate. A failed or interrupted write
 /// deliberately leaves a refusing fence, never a falsely clean state.
 pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>, target_id: Option<&str>) -> Result<(), String> {
@@ -127,6 +170,24 @@ fn finish_checked(agent_dir: &Path, session_id: &str, operation_id: &str, kind: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_title_fence_allows_unflushed_source_and_bounds_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("not-flushed.jsonl");
+        begin_live_title(root, "s", "one", &source).unwrap();
+        let path = fence_path(root, "s");
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["source"]["diagnosticOnly"], true);
+        assert!(record["source"]["prefix"].is_null());
+        finish_owned_title_fence(root, "s", "one").unwrap();
+        std::fs::write(&source, vec![b'x'; 200_000]).unwrap();
+        begin_live_title(root, "s", "two", &source).unwrap();
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["source"]["prefix"]["prefixBytes"], 65536);
+        finish_owned_title_fence(root, "s", "two").unwrap();
+    }
+
     #[test]
     fn title_fence_requires_exact_owner_and_kind() {
         let temp = tempfile::tempdir().unwrap();

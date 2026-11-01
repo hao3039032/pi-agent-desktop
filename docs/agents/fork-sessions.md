@@ -16,14 +16,20 @@ providers registered during `session_start`). The title helper is loaded from
 the fixed managed module tree; no credential or provider implementation crosses
 IPC and no second AgentSession is created. The host releases its session activity
 gate while the provider request runs. Before rename it reacquires the policy and
-activity gates, verifies the same child and unchanged snapshot, and invokes the
-existing guarded rename. Navigation or model selection invalidates the task even
-if the user returns to the original state. Cancellation aborts only that title
+activity gates and verifies the same child. The child then checks the captured
+model, tree/model epochs, original leaf ancestry and latest name-entry identity
+in one synchronous turn before appending the title. Normal same-branch entries,
+including a running response and queued continuation, do not invalidate it;
+navigation or model selection does, even if the user returns to the original
+state. Cancellation aborts only that title
 request; if a rename has already been dispatched its outcome is never called a
 confirmed cancellation. A durable session-writer fence is created before rename;
 only the matching owned operation can pass it, and an unknown reply leaves it
 in place across host restart. A proven pre-append refusal or confirmed success
-clears it. This does not add cross-process writer exclusion or automatic recovery.
+clears it. Its source prefix is bounded diagnostic data only and does not assert
+that an actively written file is frozen. A previously admitted run can continue
+writing; the fence prevents new host admissions. This does not add cross-process
+writer exclusion or automatic recovery.
 
 ## Editable composer outbox
 
