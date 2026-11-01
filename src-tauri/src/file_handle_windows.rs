@@ -87,6 +87,10 @@ pub(crate) fn entries(directory: &std::fs::File) -> io::Result<Vec<(OsString, bo
 
 /// Limit materialized names, reporting whether another entry was present.
 pub(crate) fn entries_bounded(directory: &std::fs::File, limit: usize) -> io::Result<(Vec<(OsString, bool, bool)>, bool)> {
+    entries_path_bounded(directory, limit, usize::MAX, 0)
+}
+
+pub(crate) fn entries_path_bounded(directory: &std::fs::File, limit: usize, byte_limit: usize, prefix_bytes: usize) -> io::Result<(Vec<(OsString, bool, bool)>, bool)> {
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReOpenFile, GetFileInformationByHandleEx, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FILE_ID_BOTH_DIR_INFO, FILE_ATTRIBUTE_DIRECTORY};
     let handle = unsafe { ReOpenFile(directory.as_raw_handle() as isize, FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -98,6 +102,7 @@ pub(crate) fn entries_bounded(directory: &std::fs::File, limit: usize) -> io::Re
     let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
     let mut first = true;
     let mut output = Vec::new();
+    let mut path_bytes = 0usize;
     loop {
         let kind = if first { FileIdBothDirectoryRestartInfo } else { FileIdBothDirectoryInfo };
         first = false;
@@ -119,7 +124,9 @@ pub(crate) fn entries_bounded(directory: &std::fs::File, limit: usize) -> io::Re
             let units: Vec<u16> = (0..length / 2).map(|i| unsafe { std::ptr::read_unaligned(base.add(name_offset + i * 2).cast::<u16>()) }).collect();
             let name = OsString::from_wide(&units);
             if name != "." && name != ".." {
-                if output.len() == limit { return Ok((output, true)); }
+                let cost = prefix_bytes.saturating_add(name.to_string_lossy().len());
+                if output.len() == limit || path_bytes.saturating_add(cost) > byte_limit { return Ok((output, true)); }
+                path_bytes += cost;
                 output.push((name, record.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0, record.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0));
             }
             if record.NextEntryOffset == 0 { break; }

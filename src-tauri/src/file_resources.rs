@@ -24,10 +24,14 @@ pub const WALK_HARD_CAP: usize = 50_000;
 /// Open directory handles waiting to be visited; the active directory and
 /// one temporary enumeration handle are additional to this queue.
 const WALK_MAX_PENDING_DIRECTORIES: usize = 64;
+/// Cumulative bytes of materialized relative paths, including queued directories.
+const WALK_MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_WALK_DEPTH: usize = 8;
 pub const MAX_QUERY_LENGTH: usize = 500;
 pub const CACHE_TTL: Duration = Duration::from_secs(10);
 pub const CACHE_MAX_ENTRIES: usize = 20;
+/// Maximum retained allocation for cached index keys and file paths.
+const CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MATCH_LIMIT: usize = 20;
 pub const MAX_MATCH_LIMIT: usize = 200;
 
@@ -57,6 +61,14 @@ pub struct CachedFileIndex {
     pub expires_at: Instant,
 }
 
+// Include Vec and String backing allocations and conservative per-entry map
+// overhead. Search-derived directory entries are not stored in this cache.
+fn cached_index_bytes(key: &String, entry: &CachedFileIndex) -> usize {
+    key.capacity().saturating_add(128)
+        .saturating_add(entry.files.capacity().saturating_mul(std::mem::size_of::<String>()))
+        .saturating_add(entry.files.iter().map(String::capacity).sum::<usize>())
+}
+
 /// MIME by extension for images (lib/file-types.ts IMAGE_EXT_TO_MIME).
 pub fn get_image_mime(path: &Path) -> Option<&'static str> {
     let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
@@ -78,39 +90,92 @@ pub fn get_image_mime(path: &Path) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn collect_files_with_git(cwd: &std::fs::File) -> Option<(Vec<String>, bool)> {
-    let mut command = std::process::Command::new("git");
+fn collect_files_with_git(cwd: &std::fs::File, state: &IpcHostState) -> Result<Option<(Vec<String>, bool, bool)>, String> {
+    #[cfg(test)]
+    let executable = state.index_git_executable.lock().unwrap().clone().unwrap_or_else(|| PathBuf::from("git"));
+    #[cfg(not(test))]
+    let executable = PathBuf::from("git");
+    collect_git_command(cwd, &state.index_children, executable.as_os_str(), 8 * 1024 * 1024, Duration::from_secs(5))
+}
+
+#[cfg(unix)]
+fn collect_git_command(cwd: &std::fs::File, owner: &crate::index_children::IndexChildOwner, executable: &std::ffi::OsStr, byte_limit: usize, timeout: Duration) -> Result<Option<(Vec<String>, bool, bool)>, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let deadline = Instant::now() + timeout;
+    let mut lease = owner.reserve()?;
+    let mut command = std::process::Command::new(executable);
     crate::file_access::file_directory_unix::git_directory(&mut command, cwd);
-    let output = command
-        .args(["-c", "core.fsmonitor=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z"])
-        .env("LC_ALL", "C")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    command.args(["-c", "core.fsmonitor=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .env("LC_ALL", "C").stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    if lease.spawn(&mut command).is_err() { return Ok(None); }
+    let Some(mut stdout) = lease.child_mut().stdout.take() else {
+        let cleanup_unknown = !terminate_index_child(&mut lease, deadline);
+        return Ok(Some((Vec::new(), true, cleanup_unknown)));
+    };
+    let fd = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let nonblocking = flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0;
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 16384];
+    let mut status = None;
+    let mut eof = false;
+    let mut truncated = !nonblocking;
+    while nonblocking {
+        if owner.is_closing() || Instant::now() >= deadline { truncated = true; break; }
+        if !eof {
+            let remaining = byte_limit.saturating_sub(bytes.len());
+            if remaining == 0 { truncated = true; break; }
+            let read_size = remaining.min(buf.len());
+            match stdout.read(&mut buf[..read_size]) {
+                Ok(0) => eof = true,
+                Ok(n) => { bytes.extend_from_slice(&buf[..n]); continue; }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::Interrupted => {},
+                Err(_) => { truncated = true; break; }
+            }
+        }
+        if status.is_none() {
+            match lease.try_wait() {
+                Ok(Some(exit)) => status = Some(exit),
+                Ok(None) => {},
+                Err(_) => { truncated = true; break; }
+            }
+        }
+        if eof && status.is_some() { break; }
+        let timeout_ms = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25)).as_millis() as i32;
+        if eof { std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now()))); }
+        else { let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 }; unsafe { libc::poll(&mut pollfd, 1, timeout_ms); } }
     }
-    let stdout = output.stdout;
+    drop(stdout);
+    let cleanup_unknown = status.is_none() && !terminate_index_child(&mut lease, deadline);
+    if !truncated && status.is_some_and(|exit| !exit.success()) { return Ok(None); }
+    if !bytes.is_empty() && bytes.last() != Some(&0) { truncated = true; }
     let mut files = Vec::new();
-    let mut hard_truncated = false;
-    for chunk in stdout.split(|&b| b == 0) {
-        if chunk.is_empty() {
-            continue;
-        }
-        let Ok(text) = std::str::from_utf8(chunk) else {
-            continue;
-        };
-        if text == ".git" || text.starts_with(".git/") || text == ".DS_Store" {
-            continue;
-        }
+    for chunk in bytes.split_inclusive(|&b| b == 0) {
+        if chunk.last() != Some(&0) { break; }
+        let chunk = &chunk[..chunk.len() - 1];
+        if chunk.is_empty() { continue; }
+        let Ok(text) = std::str::from_utf8(chunk) else { truncated = true; continue };
+        if text == ".git" || text.starts_with(".git/") || text == ".DS_Store" { continue; }
         files.push(text.to_string());
-        if files.len() >= GIT_HARD_CAP {
-            hard_truncated = true;
-            break;
-        }
+        if files.len() >= GIT_HARD_CAP { truncated = true; break; }
     }
-    Some((files, hard_truncated))
+    Ok(Some((files, truncated, cleanup_unknown)))
+}
+
+#[cfg(unix)]
+fn terminate_index_child(lease: &mut crate::index_children::ChildLease, deadline: Instant) -> bool {
+    lease.kill();
+    loop {
+        match lease.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {},
+        }
+        if Instant::now() >= deadline { return false; }
+        std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())));
+    }
 }
 
 /// The node budget counts every enumerated entry, including directories and
@@ -120,12 +185,21 @@ struct FileWalkBudget<T> {
     visited: usize,
     node_limit: usize,
     pending_limit: usize,
+    path_bytes: usize,
+    path_byte_limit: usize,
+    path_exhausted: bool,
     truncated: bool,
 }
 
 impl<T> FileWalkBudget<T> {
     fn new(root: T, node_limit: usize, pending_limit: usize) -> Self {
-        Self { pending: std::collections::VecDeque::from([root]), visited: 0, node_limit, pending_limit, truncated: false }
+        Self { pending: std::collections::VecDeque::from([root]), visited: 0, node_limit, pending_limit, path_bytes: 0, path_byte_limit: WALK_MAX_PATH_BYTES, path_exhausted: false, truncated: false }
+    }
+    fn record_path(&mut self, path: &str) -> bool {
+        match self.path_bytes.checked_add(path.len()) {
+            Some(total) if total <= self.path_byte_limit => { self.path_bytes = total; true }
+            _ => { self.path_exhausted = true; self.truncated = true; false }
+        }
     }
     fn remaining(&self) -> usize { self.node_limit - self.visited }
     fn record(&mut self, count: usize, more: bool) {
@@ -153,19 +227,21 @@ impl<T> FileWalkBudget<T> {
 
 #[cfg(unix)]
 fn collect_files_with_walk(cwd: &std::fs::File) -> (Vec<String>, bool) {
-    collect_files_with_walk_limits(cwd, WALK_HARD_CAP, WALK_MAX_PENDING_DIRECTORIES)
+    collect_files_with_walk_limits(cwd, WALK_HARD_CAP, WALK_MAX_PENDING_DIRECTORIES, WALK_MAX_PATH_BYTES)
 }
 
 #[cfg(unix)]
-fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pending_limit: usize) -> (Vec<String>, bool) {
+fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pending_limit: usize, path_byte_limit: usize) -> (Vec<String>, bool) {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let mut files = Vec::new();
     let Ok(root) = cwd.try_clone() else { return (files, true) };
     let mut budget = FileWalkBudget::new((root, String::new(), 0), node_limit, pending_limit);
+    budget.path_byte_limit = path_byte_limit;
 
     while let Some((directory, rel, depth)) = budget.pop() {
-        let (read_dir, more) = match crate::file_access::file_directory_unix::directory_entries_bounded(&directory, budget.remaining()) {
+        let prefix_bytes = if rel.is_empty() { 0 } else { rel.len() + 1 };
+        let (read_dir, more) = match crate::file_access::file_directory_unix::directory_entries_path_bounded(&directory, budget.remaining(), budget.path_byte_limit.saturating_sub(budget.path_bytes), prefix_bytes) {
             Ok(entries) => entries,
             Err(_) => { budget.truncated = true; continue; }
         };
@@ -180,6 +256,7 @@ fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pendin
             } else {
                 format!("{rel}/{name}")
             };
+            if !budget.record_path(&child_rel) { break; }
             let Ok(cname) = std::ffi::CString::new(entry.as_bytes()) else { budget.truncated = true; continue };
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
             if unsafe { libc::fstatat(directory.as_raw_fd(), cname.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 { budget.truncated = true; continue; }
@@ -193,7 +270,7 @@ fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pendin
                 files.push(child_rel);
             }
         }
-        if more || budget.exhausted() { break; }
+        if more || budget.path_exhausted || budget.exhausted() { break; }
     }
     (files, budget.truncated)
 }
@@ -258,30 +335,50 @@ fn score_entry(entry: &FileIndexEntry, lower_query: &str) -> i32 {
     score
 }
 
-pub fn derive_entries_from_files(files: &[String]) -> Vec<FileIndexEntry> {
-    let mut dirs = HashSet::new();
-    for f in files {
-        let mut idx = f.find('/');
-        while let Some(i) = idx {
-            dirs.insert(f[..i].to_string());
-            idx = f[i + 1..].find('/').map(|n| n + i + 1);
+const INDEX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+// Charge directory set and vector capacity conservatively, not just the path
+// payload. A prefix fan-out can otherwise dwarf the original file listing.
+fn derive_entries_bounded(files: &[String], limit: usize) -> (Vec<FileIndexEntry>, bool) {
+    let mut dirs: HashSet<&str> = HashSet::new();
+    let mut entries = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    'files: for f in files {
+        for (i, _) in f.match_indices('/') {
+            let dir = &f[..i];
+            if dirs.contains(dir) { continue; }
+            let cost = dir.len().saturating_add(128);
+            if used.saturating_add(cost) > limit { truncated = true; break 'files; }
+            used += cost;
+            dirs.insert(dir);
+            entries.push(FileIndexEntry { path: dir.to_owned(), is_dir: true });
         }
-    }
-    let mut entries = Vec::with_capacity(dirs.len() + files.len());
-    for d in dirs {
-        entries.push(FileIndexEntry { path: d, is_dir: true });
-    }
-    for f in files {
         if !f.is_empty() {
+            let cost = f.len().saturating_add(64);
+            if used.saturating_add(cost) > limit { truncated = true; break; }
+            used += cost;
             entries.push(FileIndexEntry { path: f.clone(), is_dir: false });
         }
     }
-    entries.sort_by(|a, b| {
-        path_depth(&a.path)
-            .cmp(&path_depth(&b.path))
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    entries
+    entries.sort_by(|a, b| path_depth(&a.path).cmp(&path_depth(&b.path)).then_with(|| a.path.cmp(&b.path)));
+    (entries, truncated)
+}
+
+fn encoded_path_bytes(path: &str) -> usize {
+    path.bytes().fold(2usize, |size, byte| size.saturating_add(match byte {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+        0..=31 => 6,
+        _ => 1,
+    }))
+}
+
+fn response_prefix_len(sizes: impl Iterator<Item = usize>, byte_limit: usize) -> usize {
+    let mut used = 128usize; // envelope, array punctuation, and truncation flag
+    sizes.take_while(|size| {
+        used = used.saturating_add(size.saturating_add(1));
+        used <= byte_limit
+    }).count()
 }
 
 pub fn filter_file_entries(
@@ -336,13 +433,8 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
         Ok(handle) => handle,
         Err(error) => return protocol_error(id, "unauthorized_scope", &error.to_string()),
     };
-    let query = args.get("q").and_then(Value::as_str).map(|q| {
-        if q.len() > MAX_QUERY_LENGTH {
-            &q[..MAX_QUERY_LENGTH]
-        } else {
-            q
-        }
-    });
+    let query = args.get("q").and_then(Value::as_str);
+    if query.is_some_and(|q| q.len() > MAX_QUERY_LENGTH) { return protocol_error(id, "invalid_args", "query is too long"); }
 
     let match_limit = args
         .get("limit")
@@ -350,51 +442,56 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
         .map(|l| (l as usize).clamp(1, MAX_MATCH_LIMIT))
         .unwrap_or(DEFAULT_MATCH_LIMIT);
 
-    // Retrieve or populate cache.
-    let listing = {
-        let mut cache = state.file_index_cache.lock().unwrap();
-        let now = Instant::now();
-        cache.retain(|_, v| v.expires_at > now);
-        use std::os::unix::fs::MetadataExt;
-        let metadata = match cwd_handle.metadata() { Ok(meta) => meta, Err(error) => return protocol_error(id, "io", &error.to_string()) };
-        let cache_key = format!("{}:{}:{}", cwd_str, metadata.dev(), metadata.ino());
-        if let Some(entry) = cache.get(&cache_key) {
-            entry.clone()
-        } else {
-            let (files, hard_truncated) = collect_files_with_git(&cwd_handle)
-                .unwrap_or_else(|| collect_files_with_walk(&cwd_handle));
-            if cache.len() >= CACHE_MAX_ENTRIES {
-                cache.clear();
+    // Identify the opened directory, not just the user-provided spelling. Never
+    // hold the cache mutex across Git or filesystem enumeration.
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match cwd_handle.metadata() { Ok(meta) => meta, Err(error) => return protocol_error(id, "io", &error.to_string()) };
+    let cache_key = format!("{}:{}:{}", cwd_str, metadata.dev(), metadata.ino());
+    let cached = state.file_index_cache.try_lock().ok().and_then(|cache| {
+        cache.get(&cache_key).filter(|entry| entry.expires_at > Instant::now()).cloned()
+    });
+    let (listing, cleanup_unknown) = if let Some(entry) = cached {
+        (entry, false)
+    } else {
+        let (files, hard_truncated, cleanup_unknown) = match collect_files_with_git(&cwd_handle, state) {
+            Ok(Some(listing)) => listing,
+            Ok(None) => { let (files, truncated) = collect_files_with_walk(&cwd_handle); (files, truncated, false) },
+            Err(error) => return protocol_error(id, "resource_busy", &error),
+        };
+        let entry = CachedFileIndex { files, hard_truncated, expires_at: Instant::now() + CACHE_TTL };
+        if !cleanup_unknown { if let Ok(mut cache) = state.file_index_cache.try_lock() {
+            cache.retain(|_, value| value.expires_at > Instant::now());
+            let cost = cached_index_bytes(&cache_key, &entry);
+            if cost <= CACHE_MAX_BYTES {
+                let total = cache.iter().fold(0usize, |sum, (key, value)| sum.saturating_add(cached_index_bytes(key, value)));
+                if cache.len() >= CACHE_MAX_ENTRIES || total.saturating_add(cost) > CACHE_MAX_BYTES {
+                    cache.clear();
+                }
+                cache.insert(cache_key, entry.clone());
             }
-            let entry = CachedFileIndex {
-                files,
-                hard_truncated,
-                expires_at: now + CACHE_TTL,
-            };
-            cache.insert(cache_key, entry.clone());
-            entry
-        }
+        } }
+        (entry, cleanup_unknown)
     };
 
     if let Some(q) = query {
         if !q.is_empty() {
-            let all_entries = derive_entries_from_files(&listing.files);
+            let (all_entries, derived_truncated) = derive_entries_bounded(&listing.files, INDEX_RESPONSE_BYTES);
             let matches = filter_file_entries(&all_entries, q, match_limit);
-            return protocol_ok(id, json!({ "matches": matches, "truncated": listing.hard_truncated }));
+            let count = response_prefix_len(matches.iter().map(|entry| encoded_path_bytes(&entry.path).saturating_add(32)), INDEX_RESPONSE_BYTES.saturating_sub(encoded_path_bytes(id)));
+            return protocol_ok(id, json!({ "matches": &matches[..count], "truncated": listing.hard_truncated || derived_truncated || count < matches.len(), "cleanupUnknown": cleanup_unknown }));
         }
     }
 
-    let truncated = listing.hard_truncated || listing.files.len() > MAX_FILES;
-    let files_slice: &[String] = if listing.files.len() > MAX_FILES {
-        &listing.files[..MAX_FILES]
-    } else {
-        &listing.files
-    };
+    let capped = listing.files.len().min(MAX_FILES);
+    let count = response_prefix_len(listing.files[..capped].iter().map(|path| encoded_path_bytes(path)), INDEX_RESPONSE_BYTES.saturating_sub(encoded_path_bytes(id)));
+    let truncated = listing.hard_truncated || count < listing.files.len();
+    let files_slice = &listing.files[..count];
     protocol_ok(
         id,
         json!({
             "files": files_slice,
             "truncated": truncated,
+            "cleanupUnknown": cleanup_unknown,
         }),
     )
 }
@@ -409,7 +506,8 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
     let mut budget = FileWalkBudget::new((handle, String::new(), 0usize), WALK_HARD_CAP, WALK_MAX_PENDING_DIRECTORIES);
     let mut files = Vec::new();
     while let Some((directory, relative, depth)) = budget.pop() {
-        let (entries, more) = match crate::file_access::file_handle_windows::entries_bounded(&directory, budget.remaining()) {
+        let prefix_bytes = if relative.is_empty() { 0 } else { relative.len() + 1 };
+        let (entries, more) = match crate::file_access::file_handle_windows::entries_path_bounded(&directory, budget.remaining(), budget.path_byte_limit.saturating_sub(budget.path_bytes), prefix_bytes) {
             Ok(entries) => entries, Err(error) => return protocol_error(id, "io", &error.to_string()),
         };
         budget.record(entries.len(), more);
@@ -417,6 +515,7 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
             let Some(name) = name.to_str() else { return protocol_error(id, "io", "Directory contains a non-Unicode name") };
             if is_hidden_outside_git(name) || reparse { continue; }
             let child = if relative.is_empty() { name.to_owned() } else { format!("{relative}/{name}") };
+            if !budget.record_path(&child) { break; }
             if is_dir && depth < MAX_WALK_DEPTH {
                 if let Err(error) = budget.enqueue(|| crate::file_access::file_handle_windows::open_child(&directory, std::ffi::OsStr::new(name), true).map(|dir| (dir, child, depth + 1))) {
                     return protocol_error(id, "io", &error.to_string());
@@ -425,14 +524,19 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
                 files.push(child);
             } else { budget.truncated = true; }
         }
-        if more || budget.exhausted() { break; }
+        if more || budget.path_exhausted || budget.exhausted() { break; }
     }
     if let Some(query) = args.get("q").and_then(Value::as_str).filter(|q| !q.is_empty()) {
         if query.len() > MAX_QUERY_LENGTH { return protocol_error(id, "invalid_args", "query is too long"); }
         let limit = args.get("limit").and_then(Value::as_u64).map(|n| (n as usize).clamp(1, MAX_MATCH_LIMIT)).unwrap_or(DEFAULT_MATCH_LIMIT);
-        return protocol_ok(id, json!({ "matches": filter_file_entries(&derive_entries_from_files(&files), query, limit), "truncated": true }));
+        let (entries, _) = derive_entries_bounded(&files, INDEX_RESPONSE_BYTES);
+        let matches = filter_file_entries(&entries, query, limit);
+        let count = response_prefix_len(matches.iter().map(|entry| encoded_path_bytes(&entry.path).saturating_add(32)), INDEX_RESPONSE_BYTES.saturating_sub(encoded_path_bytes(id)));
+        return protocol_ok(id, json!({ "matches": &matches[..count], "truncated": true }));
     }
     files.truncate(MAX_FILES);
+    let count = response_prefix_len(files.iter().map(|path| encoded_path_bytes(path)), INDEX_RESPONSE_BYTES.saturating_sub(encoded_path_bytes(id)));
+    files.truncate(count);
     // Git visibility cannot yet be evaluated through a pinned Windows cwd.
     protocol_ok(id, json!({ "files": files, "truncated": true }))
 }
@@ -823,6 +927,199 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn fake_git(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-git");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_output_limit_preserves_only_complete_items_and_reaps() {
+        let dir = tempdir().unwrap();
+        let script = fake_git(dir.path(), "printf 'one\\000two\\000unfinished'; while :; do printf 'xxxxxxxxxxxxxxxx'; done");
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let owner = crate::index_children::IndexChildOwner::default();
+        let (files, truncated, cleanup_unknown) = collect_git_command(&root, &owner, script.as_os_str(), 64, Duration::from_secs(2)).unwrap().unwrap();
+        assert!(!cleanup_unknown);
+        assert_eq!(files, ["one", "two"]);
+        assert!(truncated);
+        let report = owner.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert_eq!(report.unknown, 0, "{report:?}");
+        assert!(!report.tracker_busy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_invalid_utf8_path_is_not_reported_as_complete() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let owner = crate::index_children::IndexChildOwner::default();
+        let script = fake_git(dir.path(), "printf '\\377\\000ok\\000'");
+        let (files, truncated, cleanup_unknown) = collect_git_command(&root, &owner, script.as_os_str(), 1024, Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(files, ["ok"]);
+        assert!(truncated);
+        assert!(!cleanup_unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_and_nonzero_exit_reap_direct_child() {
+        let dir = tempdir().unwrap();
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let owner = crate::index_children::IndexChildOwner::default();
+        let script = fake_git(dir.path(), "printf 'ok\\000'; while :; do printf 'stderr noise' >&2; done");
+        let (files, truncated, _cleanup_unknown) = collect_git_command(&root, &owner, script.as_os_str(), 1024, Duration::from_millis(80)).unwrap().unwrap();
+        assert_eq!(files, ["ok"]);
+        assert!(truncated);
+        std::fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+        assert!(collect_git_command(&root, &owner, script.as_os_str(), 1024, Duration::from_secs(2)).unwrap().is_none());
+        let report = owner.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert_eq!(report.unknown, 0, "{report:?}");
+        assert!(!report.tracker_busy);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_index_bounds_fake_git_output_in_actual_consumer() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let script = fake_git(dir.path(), &format!("while :; do printf '{}\\000'; done", "x".repeat(512)));
+        let state = setup_state(&repo);
+        *state.index_git_executable.lock().unwrap() = Some(script);
+        let result = handle_files_index(&state, "large", &json!({"cwd": repo}));
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["truncated"], true);
+        assert!(!result["data"]["files"].as_array().unwrap().is_empty());
+        assert_eq!(state.index_children.shutdown_until(Instant::now() + Duration::from_secs(2)).unknown, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn different_roots_do_not_wait_for_slow_git_cache_fill() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let slow = dir.path().join("slow"); let fast = dir.path().join("fast");
+        std::fs::create_dir(&slow).unwrap(); std::fs::create_dir(&fast).unwrap();
+        std::fs::write(slow.join("slow"), b"").unwrap();
+        let script = fake_git(dir.path(), "if [ -f slow ]; then printf x > started; while :; do :; done; else printf 'quick\\000'; fi");
+        let state = Arc::new(setup_state(dir.path()));
+        *state.index_git_executable.lock().unwrap() = Some(script);
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || handle_files_index(&worker_state, "slow", &json!({"cwd": slow})));
+        let until = Instant::now() + Duration::from_secs(2);
+        while !dir.path().join("slow/started").exists() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+        let started = dir.path().join("slow/started").exists();
+        let now = Instant::now();
+        let answer = handle_files_index(&state, "fast", &json!({"cwd": fast}));
+        let elapsed = now.elapsed();
+        state.index_children.begin_shutdown();
+        let slow_answer = worker.join().unwrap();
+        let report = state.index_children.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert!(started);
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(answer["data"]["files"][0], "quick");
+        assert_eq!(slow_answer["data"]["truncated"], true);
+        assert_eq!(report.unknown, 0, "{report:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_query_reports_directory_derivation_budget_exhaustion() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().unwrap();
+        let state = setup_state(dir.path());
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let key = format!("{}:{}:{}", dir.path().display(), meta.dev(), meta.ino());
+        let files = (0..12000).map(|n| format!("{n:05}/a/b/c/d/e/f/g/h/needle")).collect();
+        state.file_index_cache.lock().unwrap().insert(key, CachedFileIndex { files, hard_truncated: false, expires_at: Instant::now() + CACHE_TTL });
+        let answer = handle_files_index(&state, "query", &json!({"cwd": dir.path(), "q": "needle"}));
+        assert_eq!(answer["ok"], true, "{answer}");
+        assert_eq!(answer["data"]["truncated"], true);
+        assert!(!answer["data"]["matches"].as_array().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_cache_budget_is_enforced_across_actual_root_scans() {
+        let dir = tempdir().unwrap();
+        let script = fake_git(dir.path(), &format!("i=0; while [ $i -lt 10000 ]; do printf '{}\\000'; i=$((i+1)); done", "x".repeat(900)));
+        let state = setup_state(dir.path());
+        *state.index_git_executable.lock().unwrap() = Some(script);
+        for n in 0..5 {
+            let root = dir.path().join(format!("root-{n}"));
+            std::fs::create_dir(&root).unwrap();
+            let result = handle_files_index(&state, "root", &json!({"cwd": root}));
+            assert_eq!(result["ok"], true, "{result}");
+            let cache = state.file_index_cache.lock().unwrap();
+            let bytes: usize = cache.iter().map(|(key, value)| cached_index_bytes(key, value)).sum();
+            assert!(bytes <= CACHE_MAX_BYTES, "{bytes}");
+            assert!(cache.len() <= CACHE_MAX_ENTRIES);
+        }
+        let report = state.index_children.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert_eq!(report.unknown, 0, "{report:?}");
+    }
+
+    #[test]
+    fn derived_and_encoded_response_budgets_report_partial() {
+        let files = vec!["a/b/c/d/e/file".to_string(), "another".to_string()];
+        let (entries, truncated) = derive_entries_bounded(&files, 300);
+        assert!(truncated);
+        assert!(entries.len() < 6);
+        let escaped = vec!["\n".repeat(100), "ok".to_string()];
+        assert_eq!(response_prefix_len(escaped.iter().map(|path| encoded_path_bytes(path)), 200), 0);
+        for text in ["simple", "a\u{0}\t\n\\\"", "目录/文件"] {
+            assert_eq!(encoded_path_bytes(text), serde_json::to_string(text).unwrap().len());
+        }
+    }
+
+    #[test]
+    fn file_walk_path_budget_is_cumulative_and_marks_truncation() {
+        let mut budget = FileWalkBudget::new((), 20, 10);
+        budget.path_byte_limit = 5;
+        assert!(budget.record_path("abc"));
+        assert!(budget.record_path("de"));
+        assert!(!budget.record_path("x"));
+        assert!(budget.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_walk_returns_partial_when_path_bytes_exhausted() {
+        let dir = tempdir().unwrap();
+        for name in ["aaaa", "bbbb", "cccc"] { std::fs::write(dir.path().join(name), b"").unwrap(); }
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let (files, truncated) = collect_files_with_walk_limits(&root, 100, 10, 8);
+        assert!(truncated);
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn cached_index_bytes_counts_allocated_capacity() {
+        let key = String::with_capacity(100);
+        let mut files = Vec::with_capacity(10);
+        files.push(String::with_capacity(200));
+        let entry = CachedFileIndex { files, hard_truncated: false, expires_at: Instant::now() };
+        assert!(cached_index_bytes(&key, &entry) >= 100 + 200 + 10 * std::mem::size_of::<String>());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_index_scans_when_cache_lock_is_busy() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("fixture.txt"), b"fixture").unwrap();
+        let state = setup_state(tmp.path());
+        let guard = state.file_index_cache.lock().unwrap();
+        let response = handle_files_index(&state, "busy", &json!({"cwd": tmp.path()}));
+        assert_eq!(response["ok"], true, "{response}");
+        assert!(response["data"]["files"].as_array().unwrap().iter().any(|file| file == "fixture.txt"));
+        drop(guard);
+    }
+
     #[test]
     fn file_walk_budget_bounds_wide_empty_directories_and_drops_handles() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
@@ -928,7 +1225,7 @@ mod tests {
         let temp = tempdir().unwrap();
         for n in 0..12 { std::fs::create_dir(temp.path().join(format!("empty-{n}"))).unwrap(); }
         let root = std::fs::File::open(temp.path()).unwrap();
-        let (files, truncated) = collect_files_with_walk_limits(&root, 5, 10);
+        let (files, truncated) = collect_files_with_walk_limits(&root, 5, 10, WALK_MAX_PATH_BYTES);
         assert!(files.is_empty());
         assert!(truncated);
     }

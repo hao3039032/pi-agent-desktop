@@ -22,6 +22,7 @@ pub mod fonts;
 mod git_changes;
 mod worktrees;
 pub mod file_resources;
+mod index_children;
 mod logging;
 mod native_prefs;
 mod native_drop;

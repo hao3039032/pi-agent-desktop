@@ -12,6 +12,7 @@ pub struct TrackedShutdown {
     pub sessions: Option<session_host::SessionShutdownReport>,
     pub session_writers: Option<crate::session_writer_lifecycle::SessionWriterShutdownReport>,
     pub management: Option<management_host::ManagementShutdownReport>,
+    pub index_children: Option<crate::index_children::IndexChildShutdownReport>,
 }
 
 /// Availability describes publication only; it does not certify a clean shutdown.
@@ -60,6 +61,13 @@ impl IsolatedStaticHost {
         lifecycle.register_until(ShutdownStage::Admission, "ipc", move |deadline| {
             host.begin_static_shutdown();
             host.drain_static_ipc_until(deadline)
+        })?;
+        let host = Arc::clone(&state);
+        let report = Arc::clone(&tracked);
+        lifecycle.register_until(ShutdownStage::SessionChild, "index-children", move |deadline| {
+            let result = host.index_children.shutdown_until(deadline);
+            let outcome = if result.unknown == 0 && !result.tracker_busy { Ok(()) } else { Err(format!("index children unknown: {}, tracker busy: {}", result.unknown, result.tracker_busy)) };
+            publish_report(&report, "index children", result, outcome, |report, value| report.index_children = Some(value))
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
@@ -127,6 +135,18 @@ mod tests {
         assert!(host.state.registry.start_with_plan("late", dir, "late", dir, || panic!("spawn plan must not run")).is_err());
         let config = management_host::ManagementSpawnConfig { executable: "unused".into(), agent_dir: None, extensions: vec![], env: vec![] };
         assert!(host.state.management.instance("late", &config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_child_shutdown_reports_unknown_with_shared_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = IsolatedStaticHost::init(dir.path()).unwrap();
+        let lease = host.state.index_children.reserve().unwrap();
+        let result = host.shutdown_until(Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(result.iter().any(|failure| failure.name == "index-children" && failure.error.contains("unknown: 1")), "{result:?}");
+        assert_eq!(host.tracked().unwrap().index_children.as_ref().unwrap().unknown, 1);
+        drop(lease);
     }
 
     #[test]

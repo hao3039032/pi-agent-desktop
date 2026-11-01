@@ -439,6 +439,7 @@ fn main() {
                         "writerUnknown": report.session_writers.as_ref().map(|r| &r.unknown),
                         "managementExited": report.management.as_ref().map(|r| &r.exited),
                         "managementUnknown": report.management.as_ref().map(|r| &r.unknown),
+                        "indexChildren": report.index_children.as_ref(),
                         "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability"]
                     })
                 }

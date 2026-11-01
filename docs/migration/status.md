@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至 `a38b2bf5` 生命周期／结构化关闭报告增量整合的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至 `c4b46e72` 索引预算及此前生命周期／结构化关闭报告增量整合的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -19,7 +19,7 @@
 | Provider 认证 | provider 列表/API key/类型安全删除/logout、OAuth 进度流及关联 task-input/取消 | SDK 内置 OAuth callback 仍在 Node；Rust loopback 尚未接内置 provider |
 | MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 超时/取消显示远端 token 不确定性，保留 15 秒期限及迟到本地写保护；canonical/legacy/config/generation 私有 admission 已接 JS，native ledger/reservation/ACK 验证尚在实施，不能据 JS 合同直接解除 pending；仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
 | 插件/技能 | 列表/开关/批量技能禁用、搜索/check、install/update/remove 任务 UI/IPC | 不可取消的 SDK mutation 使用独占短寿命 pi；强停可能部分写入，结果 unknown；官方 skills CLI、真实 npm/git 安装及 Windows mutation 未验/未支持 |
-| 文件/资源 | Unix root grant 保留目录对象与身份、准入复核路径、beneath-walk、目录/index/精确会话引用；普通 add 不续授已替换根，显式 native picker 可重新授权；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows roots/read/index/pi-resource 句柄源码已接但未目标编译或原生执行，save/bash 与根外精确 session 引用仍缺；Windows index 的 Git 可见性尚未完成，故持续标记截断；Windows/Unix fallback 已加总节点与目录句柄预算；真实 dialogs/ACL 未验 |
+| 文件/资源 | Unix root grant 保留目录对象与身份、准入复核路径、beneath-walk、目录/index/精确会话引用；普通 add 不续授已替换根，显式 native picker 可重新授权；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows roots/read/index/pi-resource 句柄源码已接但未目标编译或原生执行，save/bash 与根外精确 session 引用仍缺；Windows index 的 Git 可见性尚未完成，故持续标记截断；Windows/Unix fallback 已加总节点、目录句柄及路径字节预算，Unix Git stdout/派生目录/响应和 cache 已有字节预算；Git 直接 child 最多 8 个预留槽、单一 reaper、宿主分域关闭报告；pre-exec 外部停止可阻塞 spawn，5 秒不是整个扫描硬期限，Git 路径重解析及后代仍不在证明内；真实 dialogs/ACL 未验 |
 | Git/worktrees | status/diff/list/create/switch/delete/fetch、隔离 Git fixture | Windows runner fail-closed；macOS 尚未验证 |
 | 设置 | 字体偏好/系统字体、tools/artifacts/Chat settings、自定义 CSS、状态镜像 | 非 Linux 字体与原生 UI 未验；跨版本镜像导入及升级仍需验收 |
 | 终端 | Linux 真 PTY、原 TerminalPanel、输入/resize/history/ACK/lease/reconnect/close/settings | macOS/Windows 安全 cwd-handle spawn 未完成，创建 fail-closed |
@@ -42,6 +42,8 @@
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- `c4b46e72` 索引预算整合：父代理保留 Session 结构化诊断和 index-child 独立报告，合并 harness 最小静态 fixture 冲突；index unknown 计数明确是预留槽而非精确进程数。合并后 Linux 定向 Rust **38 passed / 0 failed / 0 ignored**（文件资源 25、tracker 2、static-host 11）；harness 构建通过（7 条 dead-code warning），生命周期 HTTP 测试 **1 passed / 0 skipped**。使用空 Tauri resources 和临时 HTML，不是独立包/原生验收。复用已空闲 resource-ui target，完成后 **3.4 GiB**；临时 HOME 已清理。8 MiB stdout/路径/派生与响应预算、32 MiB cache 估算上限不涵盖 Tauri/WebView 内部队列；spawn 不可返回及 Git 路径重解析门禁保留。
 
 - `d242addc` PTY 测试单独选入：父代理审阅 nonce 时序、未绑定不发信号、停止状态观测和清理路径；只纳入测试/文档，不合入 vendor 或终止实现。lane Linux **2 passed / 0 failed**，本次日志无 SKIP；fixture 在 pidfd 不支持时会打印 SKIP 并提前返回，Rust 会把这种返回计作 pass，因此以后必须检查日志，不能仅凭测试总数宣称故障实际执行。父代理未重跑该未改变的 fixture。
 
