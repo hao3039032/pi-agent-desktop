@@ -9,6 +9,11 @@
 - 最近确认推送的迁移主线为 `13be8244`；之后的本轮整合尚未推送。没有发布产品、修改更新仓库或签名策略。
 - 本地托管 pi、SDK symlink、浏览器桥及 `tauri::test::mock_app` 都不是 standalone/native WebView/安装升级证明。
 
+## 最新架构决定（尚待实现验证）
+
+- 用户已明确允许：**管理侧独立使用官方 pi SDK 源码／模块发行版，与打包 CLI 严格同版本，不用于对话**。对话继续仅由 CLI 持有 AgentSession；不得把 CLI 的运行时对象交给另一 SDK 图使用。后续管理运行时可以有自己的单一、固定依赖图与受限协议，不再要求管理 SDK 与 CLI 内置 SDK 的对象具有跨运行时 class identity；仍需各自的版本、来源、模块根与协议边界校验。这不是授权修改／fork SDK、升级 SDK或增加第二个对话引擎，也不是已有 standalone 测试通过的证明。
+- 用户尚未认可“非协作外部 writer 必须停止”的支持边界，并指出这是 PC 工具。此前提法需要解释为单机上的多实例／同数据目录并发修改问题；正常单机使用应由软件的实例协调和文件／事务锁承担，不要求用户日常手工停止后台程序。异常未决结果仍不能凭超时或进程退出清除；危险操作的最终许可与正式切换尚未授予。不要将用户要求澄清误记成接受忽略外部写入或解除恢复门禁。
+
 ## 已集成的实现
 
 | 领域 | 当前范围 | 仍需区分的边界 |
@@ -36,7 +41,7 @@
 - **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
 - **未决结果与生命周期**：在 `073815f2` 基础上整合截至 `ca23c638` 的 registry/management/短 writer 关闭、内存 prompt receipt、已验证结果的 resolved fence 与 cleanupWarning，以及实验 static host 的 IPC drain、scheduler 和 child 关闭链。共用绝对 deadline；实际准入先关闭，报告/生命周期锁忙不阻塞、保留失败，重复调用不重放 FnOnce。若首次无法取得 callbacks，失败永久保留，不自动补清理。resolved 只证明运行时结果已知，不证明 SDK 数据断电耐久，也不授予恢复权。prompt receipt 尚非跨重启证据；`a38b2bf5` 保留原 exited/unknown 并增加结构化诊断，分别表达未决 receipt、leader 退出未确认及锁忙/在途范围。实验 harness 的 available 仅表示取得报告，缺报告返回 null/unknown，不是空成功。无关联 start/terminal 观测和 leader 退出均不清历史 unknown；旧宿主、脱管 writer、正式 bootstrap/seed/scheduler 和产品恢复仍未完成。
 - **PTY 关闭门禁（提案及测试，非生产实现）**：[pre-exec 身份绑定提案](pty-preexec-binding-proposal.md) 来自 `c06be727`，独立测试控制器 `d242addc` 已单独纳入；没有吸收 observation-only `shutdown()` 回退或 vendor 实现。Linux fixture 以 post-open nonce 验证独立 pidfd、实际观测 SIGSTOP，证实截止时间不使 spawn worker 自动回收，随后由测试控制器安全终止并等待线程完成。它依赖正常调度、内核调用返回和受信 fixture；不证明生产绑定前任意停止可回收。vendor fd sweep 的异步信号安全及 spawn-error FD 风险仍开放，不能把测试变成生产终止授权。
-- **Terra 并行续作**：按领域使用隔离工作树实施生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git；本轮两路认证续作已交付并整合，不代表所有领域或验收完成。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。SDK 最小补丁分发与合作升级/非合作 CLI 支持边界已向用户求决，尚未获准，不默认放行。
+- **Terra 并行续作**：按领域使用隔离工作树实施生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git；本轮两路认证续作已交付并整合，不代表所有领域或验收完成。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。用户已允许同版本官方 SDK 独立用于管理，不用于对话；SDK 修改／fork 未获准。外部 writer 支持边界仍在澄清，不默认放行，详见上方最新架构决定。
 - **自动命名**：`963f20fd` 接通 live child 的实际 model registry 和专用纯 helper bundle，`50714c76` 恢复运行中及 queued follow-up 的原行为；同分支正常追加不作 stale，模型/树 ABA、名称或 child 实例变化拒绝。改名使用公开 `pi.setSessionName`，不调用只读 extension context 未暴露的写方法；写前持久 marker，只有关联成功或明确写前拒绝清除，ACK 丢失/append 异常保留。最多 64 KiB 的 source 前缀仅为诊断，不冻结已准入运行。真实 90 秒 deadline 和原生 UI 仍待验。
 - **独立打包与待整合续作**：生命周期与包装线至 `ca23c638` 的源码已整合，但不激活产品入口。固定官方 pi 的 relocation/manifest 和部分 session/cron/DOCX/OAuth 探针有 lane 证据，完整 standalone MCP 仍因第二 SDK 图 identity guard 失败，不得移除该 guard。transport 的 management ledger/reservation/probe receipt、running/scheduled 流预算、结构化关闭诊断、索引字节预算和 PTY 测试已分批整合（详见验证记录），但完整生命周期与原生验收仍未闭环。平台 `0c61b276` 已作为 `ef075806` 合入 Windows roots/read/index/资源句柄及 Unix 嵌套根回退修复；Windows 未目标编译。整合检查确认的空目录无界队列已在 `e099bbf3` 修复：最多物化 50,000 个条目、最多 64 个待处理目录句柄，当前目录及临时枚举句柄另计；耗尽保留 partial/truncated。该修复不代替 Windows 目标编译或原生验收。MCP lane 的 probe mode admission/局部 guard/私有 receipt 已接 native 消费，真实 MCP 测试仍未通过；stdio/provider-auth/`!command` 的宽 scope 不作为只读放行。这些均不是正式 bootstrap 或 M5 验收。
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
