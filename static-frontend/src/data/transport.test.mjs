@@ -258,6 +258,45 @@ test("agent-client failures keep the HTTP-shaped error contract", async () => {
   assert.match(aborted.message, /aborted/);
 });
 
+test("session frames are acknowledged after delivery even before subscribe ACK; close detaches", async () => {
+  let callback;
+  let finishSubscribe;
+  const calls = [];
+  const events = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 41; },
+    unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_subscribe_events") {
+        callback({ index: 0, message: { subscriptionId: "sub-early", epoch: 1, seq: 1, kind: "snapshot", payload: {} } });
+        return new Promise((resolve) => { finishSubscribe = resolve; });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    const transport = detectTransport().transport;
+    const close = transport.subscribe("agent.subscribeEvents", { session: "s" }, () => events.push("delivered"), () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "agent.ackEvents"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(events, ["delivered"]);
+    const ack = calls.find((call) => call.args?.request?.op === "agent.ackEvents");
+    assert.deepEqual(ack?.args.request.args, { subscriptionId: "sub-early", seq: 1 });
+    close();
+    finishSubscribe({ subscriptionId: "sub-early" });
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "agent.unsubscribeEvents"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(calls.some((call) => call.args?.request?.op === "agent.unsubscribeEvents"));
+    callback({ index: 1, message: { subscriptionId: "sub-early", epoch: 1, seq: 2, kind: "event", payload: {} } });
+    assert.equal(events.length, 1, "late frame cannot deliver or create another ACK");
+    assert.equal(calls.filter((call) => call.args?.request?.op === "agent.ackEvents").length, 1);
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
+});
+
 // --- the subscribe ACK contract (a refused stream must reach onError) ------
 
 test("a protocol-error subscribe ACK becomes an onError, never a silent wait", async () => {

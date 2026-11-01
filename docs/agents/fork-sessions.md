@@ -418,8 +418,12 @@ child queues, or unacknowledged channels. Session event relay threads have a
 separate 32-slot immediate admission cap, held until each relay really exits.
 Each session relay ingress has 16 frames of at most 256 KiB serialized event
 payload; overflow or an oversized event disconnects that ingress and emits a
-`reset` so the client must reconcile. This does not bound the upstream pi
-listener, initial UI snapshot, or downstream Channel/Tauri buffers. Other
+`reset` so the client must reconcile. A relay sends one frame at a time and
+waits up to 15 seconds after Channel send returns for its sequence ACK after
+client delivery; an ACK loss
+ends the relay and may send one additional terminal reset (at most two frames
+outstanding). This does not bound the upstream pi listener, initial UI snapshot,
+or downstream Channel/Tauri buffers. Other
 direct stream subscription commands are not covered. These remain M5 work, not
 an end-to-end backpressure claim.
 

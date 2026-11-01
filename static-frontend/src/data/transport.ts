@@ -152,6 +152,13 @@ class HostBridgeTransport implements IpcTransport {
         const handle = await tauriHostChannel((message) => {
           if (closed) return;
           onMessage(message as IpcStreamMessage);
+          if (!closed && op === "agent.subscribeEvents" && isRecord(message)
+              && typeof message.subscriptionId === "string" && Number.isSafeInteger(message.seq)
+              && typeof message.seq === "number" && message.seq > 0 && message.kind !== "reset") {
+            // ACK only after local delivery. It may precede the subscribe
+            // command's own response; the frame already carries its id.
+            void invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `ack-${message.subscriptionId}-${message.seq}`, op: "agent.ackEvents", args: { subscriptionId: message.subscriptionId, seq: message.seq } } }).catch(() => {});
+          }
         });
         if (closed) {
           handle.stopLocalDelivery();

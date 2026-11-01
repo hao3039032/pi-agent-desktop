@@ -128,6 +128,32 @@ struct EventRelayHandle {
     /// The session subscriber id to detach (0 = none; snapshot-only relay).
     subscriber_id: u64,
     session_id: String,
+    ack: Option<Arc<SessionRelayAck>>,
+}
+
+#[derive(Default)]
+struct SessionRelayAck {
+    state: Mutex<(u64, u64)>, // sent, acknowledged
+    wake: std::sync::Condvar,
+}
+impl SessionRelayAck {
+    fn acknowledge(&self, seq: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else { return false };
+        if seq == 0 || seq > state.0 { return false; }
+        state.1 = state.1.max(seq);
+        self.wake.notify_all();
+        true
+    }
+    fn forward(&self, channel: &Channel<Value>, frame: Value, seq: u64, stop: &std::sync::atomic::AtomicBool, timeout: Duration) -> bool {
+        {
+            let Ok(mut state) = self.state.lock() else { return false };
+            state.0 = seq;
+        }
+        if channel.send(frame).is_err() { return false; }
+        let Ok(state) = self.state.lock() else { return false };
+        let Ok((state, _)) = self.wake.wait_timeout_while(state, timeout, |state| state.1 < seq && !stop.load(Ordering::SeqCst)) else { return false };
+        state.1 >= seq && !stop.load(Ordering::SeqCst)
+    }
 }
 
 impl IpcHostState {
@@ -658,6 +684,8 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ack = Arc::new(SessionRelayAck::default());
+    let ack_for_relay = Arc::clone(&ack);
     let stop_for_relay = Arc::clone(&stop);
     let relays_for_thread = Arc::clone(&state.event_relays);
     let subscription_for_cleanup = subscription_id.clone();
@@ -667,6 +695,7 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
             stop: Arc::clone(&stop),
             subscriber_id,
             session_id: session.clone(),
+            ack: Some(ack),
         },
     );
 
@@ -693,14 +722,18 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                 // dialog queue against what the session still holds.
                 "pendingExtensionUiIds": pending_ui.iter().filter_map(|record| record.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
             });
+            let send = |seq, kind, payload| ack_for_relay.forward(&on_event, stream_frame(&subscription_id, epoch, seq, kind, payload), seq, &stop_for_relay, Duration::from_secs(15));
+            let reset = |seq| { if !stop_for_relay.load(Ordering::SeqCst) { let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"}))); } };
             seq += 1;
-            if on_event.send(stream_frame(&subscription_id, epoch, seq, "snapshot", snapshot)).is_err() {
+            if !send(seq, "snapshot", snapshot) {
+                reset(seq + 1);
                 detach(subscriber_id);
                 return;
             }
             for record in pending_ui {
                 seq += 1;
-                if on_event.send(stream_frame(&subscription_id, epoch, seq, "event", record)).is_err() {
+                if !send(seq, "event", record) {
+                    reset(seq + 1);
                     detach(subscriber_id);
                     return;
                 }
@@ -719,10 +752,8 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                 match events.recv_timeout(Duration::from_millis(500)) {
                     Ok(record) => {
                         seq += 1;
-                        if on_event
-                            .send(stream_frame(&subscription_id, epoch, seq, "event", record))
-                            .is_err()
-                        {
+                        if !send(seq, "event", record) {
+                            reset(seq + 1);
                             detach(subscriber_id);
                             return;
                         }
@@ -829,6 +860,7 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
             stop: Arc::clone(&stop),
             subscriber_id: 0,
             session_id: String::new(),
+            ack: None,
         },
     );
     let registry = Arc::clone(&state.registry);
@@ -1711,6 +1743,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "agent.ackEvents" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let ack = state.event_relays.lock().unwrap().get(subscription).and_then(|handle| handle.ack.clone());
+            if ack.is_some_and(|ack| ack.acknowledge(seq)) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid session stream acknowledgement") }
+        }
         // End one event-stream subscription (page hide, session switch):
         // detaches the session subscriber and ends the relay thread. The
         // client never re-subscribes blindly — a new subscription carries a
@@ -1727,6 +1766,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 match handle {
                     Some(handle) => {
                         handle.stop.store(true, Ordering::SeqCst);
+                        if let Some(ack) = &handle.ack { ack.wake.notify_all(); }
                         if let Some(session) = state.registry.get(&handle.session_id) {
                             session.unsubscribe(handle.subscriber_id);
                         }
@@ -2753,7 +2793,7 @@ pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -
     let id = envelope_id(&request);
     let op = request.get("op").and_then(Value::as_str);
     let control = matches!(op,
-        Some("agent.unsubscribeEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
+        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
              "agent.interrupt" | "auth.loginCancel" | "mcp.signInCancel" |
              "plugins.mutation.cancel" | "plugins.install.cancel" | "skills.mutation.cancel"))
         || (op == Some("agent.command") && matches!(request.pointer("/args/type").and_then(Value::as_str),
@@ -6607,6 +6647,43 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let slow = tauri::async_runtime::block_on(slow).expect("the slow dispatch joins");
         assert_eq!(slow["ok"], false, "the stub child exits: models.list answers its real failure");
         assert_eq!(slow["error"]["code"], "io", "{slow}");
+    }
+
+    #[test]
+    fn session_relay_waits_for_ack_before_next_frame() {
+        let ack = Arc::new(SessionRelayAck::default());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |message| { tx.send(message).unwrap(); Ok(()) });
+        let worker_ack = Arc::clone(&ack);
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            assert!(worker_ack.forward(&channel, json!({"seq":1}), 1, &worker_stop, Duration::from_secs(2)));
+            assert!(worker_ack.forward(&channel, json!({"seq":2}), 2, &worker_stop, Duration::from_secs(2)));
+        });
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err(), "second frame must wait for ACK");
+        assert!(!ack.acknowledge(2));
+        assert!(ack.acknowledge(1));
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ack.acknowledge(2));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn session_relay_ack_handles_early_duplicate_future_loss_and_stop() {
+        let ack = Arc::new(SessionRelayAck::default());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let early = Arc::clone(&ack);
+        let channel = Channel::new(move |_| { assert!(early.acknowledge(1)); Ok(()) });
+        assert!(!ack.acknowledge(1), "future ACK cannot open the window");
+        assert!(ack.forward(&channel, json!({"seq":1}), 1, &stop, Duration::from_millis(100)));
+        assert!(ack.acknowledge(1), "duplicate ACK is harmless");
+        assert!(!ack.acknowledge(3), "future ACK is rejected");
+        let silent = Channel::new(|_| Ok(()));
+        assert!(!ack.forward(&silent, json!({"seq":2}), 2, &stop, Duration::from_millis(10)), "lost ACK closes the window");
+        stop.store(true, Ordering::SeqCst);
+        assert!(!ack.forward(&silent, json!({"seq":3}), 3, &stop, Duration::from_millis(10)));
     }
 
     #[test]
