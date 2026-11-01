@@ -259,6 +259,8 @@ interface Flow {
   /** Captured synchronously before the flow can open a credential store. */
   credentialGuard: McpSignInWriteGuard;
   admission?: McpCredentialAdmission;
+  /** Old hot-reloaded flows may carry a legacyKey they never validated. */
+  admissionLegacyVerified?: true;
   phase: McpSignInPhase;
   expiresAt: number;
   keepMs: number;
@@ -589,8 +591,8 @@ export function startMcpSignIn(
   const activeId = active.get(key);
   const existing = activeId === undefined ? undefined : flows.get(activeId);
   if (existing && !isEnded(existing)) {
-    if (admission && (!existing.admission || existing.admission.canonicalKey !== admission.canonicalKey ||
-        existing.admission.configKey !== admission.configKey || existing.admission.generation !== admission.generation)) {
+    if (admission && (!existing.admissionLegacyVerified || !existing.admission || existing.admission.canonicalKey !== admission.canonicalKey ||
+        existing.admission.legacyKey !== admission.legacyKey || existing.admission.configKey !== admission.configKey || existing.admission.generation !== admission.generation)) {
       throw new McpCredentialAdmissionError();
     }
     return { flow: describeFlow(existing), joined: true };
@@ -602,7 +604,7 @@ export function startMcpSignIn(
     key,
     target,
     credentialGuard,
-    ...(admission ? { admission: { ...admission } } : {}),
+    ...(admission ? { admission: { ...admission }, admissionLegacyVerified: true as const } : {}),
     phase: "connecting",
     expiresAt: Date.now() + ttlMs,
     keepMs: options.keepMs ?? MCP_SIGN_IN_KEEP_MS,
