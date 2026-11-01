@@ -616,6 +616,28 @@ fn offline_writer_timeout_never_kills_child_or_runs_mutation() {
     registry.remove(&id, Duration::from_secs(2));
 }
 
+#[test]
+fn copy_writer_keeps_finalize_blocked_when_preflight_or_source_exit_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = dir.path().join("agent");
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(&agent, &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-stay-after-eof"]);
+    let registry = SessionRegistry::new();
+    let child = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let rejected: Result<(), _> = registry.with_idle_session_copy(&id, Duration::from_millis(100), |_| Err::<((), bool), _>("preflight"), |_| panic!("must not finalize"));
+    assert!(matches!(rejected, Err(session_host::SessionWriterError::Operation("preflight"))));
+    assert!(!child.client_has_exited_for_tests());
+    let timeout = registry.with_idle_session_copy(&id, Duration::from_millis(500), |_| Ok::<_, ()>(((), true)), |_| -> Result<(), ()> { panic!("must not finalize before confirmed exit") });
+    assert!(matches!(timeout, Err(session_host::SessionWriterError::Busy(_))));
+    assert!(!child.client_has_exited_for_tests());
+    assert!(registry.get(&id).is_some());
+    child.client_kill_for_tests();
+    registry.remove(&id, Duration::from_secs(2));
+}
+
 /// The chat handshake must prove the POLICY actually loaded: a child that
 /// reports the bridge command but NO `pi-web:chat-policy` (an empty or
 /// wrong-but-loadable asset file) fails closed — the session never starts

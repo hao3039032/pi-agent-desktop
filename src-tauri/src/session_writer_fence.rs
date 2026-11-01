@@ -31,6 +31,14 @@ pub(crate) fn assert_session_writable(agent_dir: &Path, session_id: &str) -> Res
 /// Caller holds the session offline-writer gate. A failed or interrupted write
 /// deliberately leaves a refusing fence, never a falsely clean state.
 pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>, target_id: Option<&str>) -> Result<(), String> {
+    begin_record(agent_dir, session_id, operation_id, operation, source, target, target_id, None)
+}
+
+pub(crate) fn begin_fork(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: &Path, target_id: &str, staging: &Path) -> Result<(), String> {
+    begin_record(agent_dir, session_id, operation_id, operation, source, Some(target), Some(target_id), Some(staging))
+}
+
+fn begin_record(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>, target_id: Option<&str>, staging: Option<&Path>) -> Result<(), String> {
     assert_session_writable(agent_dir, session_id)?;
     let path = fence_path(agent_dir, session_id);
     let dir = path.parent().ok_or("Invalid fence path")?;
@@ -61,7 +69,7 @@ pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, oper
         options.mode(0o600);
     }
     let mut file = options.open(&path).map_err(|e| format!("Cannot create session writer fence: {e}"))?;
-    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":operation,"source":identity,"target":target,"targetId":target_id});
+    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":operation,"source":identity,"target":target,"targetId":target_id,"staging":staging});
     file.write_all(record.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     std::fs::File::open(dir).and_then(|directory| directory.sync_all()).map_err(|e| e.to_string())?;

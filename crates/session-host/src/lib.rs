@@ -292,6 +292,12 @@ impl Session {
         let refusal = |message: String| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
             op: op.to_string(), message, code: Some("busy".into()),
         });
+        let _branch_policy = if matches!(op, "tree.navigate" | "session.rename") {
+            Some(self.policy_gate.try_read().map_err(|_| refusal("session policy change is in progress".into()))?)
+        } else { None };
+        let _branch = if _branch_policy.is_some() {
+            Some(self.try_branch_activity().map_err(|message| refusal(message.into()))?)
+        } else { None };
         let _policy = if op == "subagents.steer" {
             Some(self.policy_gate.try_read().map_err(|_| refusal("session policy change is in progress".into()))?)
         } else { None };
@@ -299,6 +305,23 @@ impl Session {
             Some(self.activity_gate.try_read().map_err(|_| refusal("session branch operation is in progress".into()))?)
         } else { None };
         if _admission.is_some() { (self.fence_checker)(&self.id).map_err(refusal)?; }
+        self.bridge.request(op, args, timeout)
+    }
+
+    /// Issue a branch mutation while the caller holds this session's activity
+    /// guard. This avoids reacquiring the guard in composite host operations.
+    pub fn bridge_request_with_activity(
+        &self, _guard: &std::sync::RwLockWriteGuard<'_, ()>, op: &str,
+        args: Option<Value>, timeout: Option<Duration>,
+    ) -> Result<Value, pi_host::bridge::BridgeError> {
+        if !matches!(op, "tree.navigate" | "session.rename") {
+            return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+                op: op.to_string(), message: "invalid guarded branch operation".into(), code: Some("invalid_args".into()),
+            }));
+        }
+        (self.fence_checker)(&self.id).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+            op: op.to_string(), message, code: Some("busy".into()),
+        }))?;
         self.bridge.request(op, args, timeout)
     }
 
@@ -829,6 +852,39 @@ impl SessionRegistry {
             return Err(SessionWriterError::Busy("session is running or has pending messages"));
         }
         operation(session.as_ref()).map_err(SessionWriterError::Operation)
+    }
+
+    /// Run a snapshot-based copy while admission is held. When the copy is
+    /// ready, optionally close the exact guarded source before finalizing its
+    /// fences. Neither callback may re-enter this session's admission gate.
+    pub fn with_idle_session_copy<T, U, E>(
+        &self, id: &str, grace: Duration,
+        copy: impl FnOnce(Option<&Arc<Session>>) -> Result<(T, bool), E>,
+        finalize: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<U, SessionWriterError<E>> {
+        match self.with_idle_session_writer(id, |session| {
+            let (value, close_source) = copy(session).map_err(SessionWriterError::Operation)?;
+            if close_source {
+                if let Some(session) = session {
+                    if session.run_state().is_running() || session.composer_outbox.has_pending_or_in_flight()
+                        || session.bridge_request("tree.assertIdle", None, Some(grace)).is_err() {
+                        return Err(SessionWriterError::Busy("copy completed but source is no longer idle; do not retry"));
+                    }
+                    if !session.client.close_without_kill(grace) {
+                        return Err(SessionWriterError::Busy("copy completed but source exit is unconfirmed; do not retry"));
+                    }
+                    self.remove_locked(id, Duration::ZERO);
+                    if !session.client.has_exited() {
+                        return Err(SessionWriterError::Busy("copy completed but source exit is unconfirmed; do not retry"));
+                    }
+                }
+            }
+            finalize(value).map_err(SessionWriterError::Operation)
+        }) {
+            Ok(value) => Ok(value),
+            Err(SessionWriterError::Busy(message)) => Err(SessionWriterError::Busy(message)),
+            Err(SessionWriterError::Operation(error)) => Err(error),
+        }
     }
 
     /// Lock a set of writers in lexical id order, then acquire their activity

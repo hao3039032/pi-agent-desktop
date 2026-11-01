@@ -781,14 +781,14 @@ fn spawn_management(
     spawn_management_with_environment(scope, config, false)
 }
 
-/// Dedicated host-owned process for the two synchronous session-file operations.
+/// Dedicated host-owned process for the synchronous session-file operations.
 /// Caller must pin the management asset and module tree and hold the session gate.
-/// The two operation graphs must never spawn commands or detached children.
+/// These operation graphs must never spawn commands or detached children.
 pub struct SessionFileWriter(Arc<ManagementInstance>);
 
 impl SessionFileWriter {
     pub fn call(&self, op: &str, args: Value, timeout: Duration) -> Result<Value, String> {
-        if !matches!(op, "session.setOfflineChatUnlock" | "session.continueChat") {
+        if !matches!(op, "session.setOfflineChatUnlock" | "session.continueChat" | "session.forkStaged") {
             return Err("operation is not a session-file writer operation".into());
         }
         self.0.management_call(op, args, timeout)
