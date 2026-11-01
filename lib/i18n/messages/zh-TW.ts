@@ -816,6 +816,7 @@ export const zhTWLocale: LocalePlugin = {
     "mcp.test.readOnly": "唯讀",
     "mcp.test.moreTools": "另有 {count} 個未顯示。",
     "mcp.test.queueTimedOut": "另一個會執行 shell 命令的伺服器的測試沒有及時完成，因此此測試沒有開始。請再試一次。",
+    "mcp.test.credentialOutcomeUnknown": "已顯示連線結果，但憑證變更仍可能不確定。請稍後檢查連線與登入狀態。",
     "mcp.test.requestFailed": "無法測試該伺服器：",
     "mcp.test.requestTimedOut": "Pi Web 沒有及時回應。測試可能仍會完成，按「重新整理」查看結果。",
     "mcp.state.connecting": "正在工作階段中連線",

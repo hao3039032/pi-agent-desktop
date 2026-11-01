@@ -1312,6 +1312,10 @@ test("the panel's own answer shows over the listing while it is about the entry 
   const shown = testView({}, { view: { tests: { [key]: { running: false, response: response("key") } } } });
   assert.match(row(shown, "docs"), /aria-label="docs: Did not connect when tested"/);
   assert.match(connection(shown).text, /^Did not connect/);
+  const uncertain = { ...response("key"), credentialOutcomeUnknown: true };
+  assert.match(connection(testView({}, { view: { tests: { [key]: { running: false, response: uncertain } } } })).text, /credential changes may still be uncertain/);
+  const staleUncertain = { ...response("old-key"), credentialOutcomeUnknown: true };
+  assert.doesNotMatch(connection(testView({}, { view: { tests: { [key]: { running: false, response: staleUncertain } } } })).text, /credential changes may still be uncertain/);
   // An answer about the entry before it was edited is not this entry's.
   const stale = testView({}, { view: { tests: { [key]: { running: false, response: response("old-key") } } } });
   assert.match(connection(stale).text, /^Not tested yet\./);

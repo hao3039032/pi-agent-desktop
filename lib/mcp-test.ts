@@ -1,4 +1,6 @@
 import { ModelRegistry, type McpExposure, type McpServerConfig, type McpServerEntry } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import type { McpProbeCredentialFence } from "./mcp-probe-receipt";
 import type { McpScope, McpTestResult, McpTestState, McpTestTool } from "./api-types";
 import {
   argSecretParts,
@@ -118,6 +120,8 @@ export interface McpTestOptions {
   connect?: McpTestConnect;
   /** Host-only preflight; never exposed in test results. */
   credentialAdmission?: unknown;
+  /** Host-only: one isolated probe's credential-store fence. */
+  probeFence?: McpProbeCredentialFence;
 }
 
 function errorMessage(error: unknown): string {
@@ -497,11 +501,14 @@ export async function connectForTest(
   target: McpTestTarget,
   internals: McpTestInternals,
   signal: AbortSignal,
-  options: { requestTimeoutMs?: number; closeWaitMs?: number; guard?: McpSignInWriteGuard } = {},
+  options: { requestTimeoutMs?: number; closeWaitMs?: number; guard?: McpSignInWriteGuard; probeFence?: McpProbeCredentialFence } = {},
 ): Promise<McpTestRun> {
+  const fence = options.probeFence;
   const opened = openTestConnection(target, internals, {
     ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
-    ...(options.guard ? { credentials: guardedCredentialStore(internals, options.guard) } : {}),
+    ...(options.guard ? { credentials: guardedCredentialStore(internals, options.guard,
+      fence ? { signal, onRefresh: (active) => fence.refresh(active) } : undefined,
+      fence ? (call) => fence.storeCall(call) : undefined) } : {}),
   });
   // Whatever happens, the connection and its transports are closed: a result
   // that could not be built must not leave a stdio server running.
@@ -594,8 +601,10 @@ function flightKey(target: McpTestTarget, admitted: boolean): string {
  * every caller gave up first, or it never left the queue.
  */
 export function testMcpServer(target: McpTestTarget, internals: McpTestInternals, options: McpTestOptions = {}): Promise<McpTestResult> {
-  const guard = signOutGuardFor(target, options.credentialAdmission);
-  const key = flightKey(target, options.credentialAdmission !== undefined);
+  const canonicalGuard = signOutGuardFor(target, options.credentialAdmission);
+  const guard = options.probeFence ? options.probeFence.guard(canonicalGuard) : canonicalGuard;
+  // A private receipt belongs to one task, never to a shared probe flight.
+  const key = options.probeFence ? `private:${randomUUID()}` : flightKey(target, options.credentialAdmission !== undefined);
   const running = flights();
   const existing = running.get(key);
   if (existing) {
@@ -627,7 +636,7 @@ function startTest(
   const closeWaitMs = options.closeWaitMs ?? MCP_TEST_CLOSE_WAIT_MS;
   // The guard was captured synchronously before joining or starting this flight.
   const connect: McpTestConnect = options.connect
-    ?? ((entry, signal) => connectForTest(entry, internals, signal, { requestTimeoutMs: options.requestTimeoutMs, closeWaitMs, guard }));
+    ?? ((entry, signal) => connectForTest(entry, internals, signal, { requestTimeoutMs: options.requestTimeoutMs, closeWaitMs, guard, probeFence: options.probeFence }));
   const signedOutSince = (): boolean => {
     try {
       guard?.();

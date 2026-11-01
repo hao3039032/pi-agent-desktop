@@ -1829,6 +1829,7 @@ function McpConnectionRows({
       <ConfigDetailGridRow label={t("mcp.detail.connection")} tone="plain">
         <span className="mcp-config-lines">
           {status ? <McpStatusLines status={status} /> : <span className="mcp-config-line">{t("mcp.test.never")}</span>}
+          {test?.response?.configKey === server.configKey && test.response.credentialOutcomeUnknown && <span role="status" className="mcp-config-line is-warning">{t("mcp.test.credentialOutcomeUnknown")}</span>}
           {test?.queueTimedOut && <span role="alert" className="mcp-config-line is-error">{t("mcp.test.queueTimedOut")}</span>}
           {test?.error && (
             <span role="alert" className="mcp-config-line is-error">
