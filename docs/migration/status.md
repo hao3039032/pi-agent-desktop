@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至生命周期与 MCP Rust OAuth 整合点 `f544e566` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至生命周期、MCP Rust OAuth 与 IPC 准入整合点 `6dafa016` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -25,7 +25,7 @@
 | 终端 | Linux 真 PTY、原 TerminalPanel、输入/resize/history/ACK/lease/reconnect/close/settings | macOS/Windows 安全 cwd-handle spawn 未完成，创建 fail-closed |
 | 调度器 | CRUD/preview/history/seen、marker 确认后的真实 RunSpawner、手动执行、事件、显式启动的 30s loop/租约/slot/overlap/catch-up、TS/Rust 共同事务门、scheduled-session index | 正式启动切换未做；旧已发布二进制不参与新门；崩溃事务锁恢复未完；引用扫描需为删除严格拒绝损坏行 |
 | 桌面服务 | 宿主原生目录选择授权、已知会话目录验证、distro/status/configure、updates.check；seed 为宿主内部操作 | 正式 seed 启动未切换；真实更新安装未执行；cwd.validate 不再授予任意前端路径权限 |
-| 管理运行时 | 实例级结果 router、rid/nonce task、deadline/cancel/状态、关联输入、物理 scope 协调、插件独占实例 process-group 清理；Chat/session writer 与 trust 有持久拒绝标记 | 通用 task unknown 仍仅内存，重启恢复未完；标记不是跨进程锁；Semaphore(16) 仅限制活动调用，未限制全部待准入请求 |
+| 管理运行时 | 实例级结果 router、rid/nonce task、deadline/cancel/状态、关联输入、物理 scope 协调、插件独占实例 process-group 清理；Chat/session writer 与 trust 有持久拒绝标记 | 通用 task unknown 持久 ledger 正在实施，重启恢复未完；标记不是跨进程锁；`6dafa016` 已改为 16 个普通槽 + 4 个清理/ACK 槽立即准入或 busy，不再排队等待 semaphore，但请求字节、其他流及 Tauri/WebView 内部队列仍未完成全链有界验证 |
 
 ## 当前实施工作
 
@@ -41,7 +41,8 @@
 ## 集成验证记录（不是全量/跨平台验收）
 
 - `073815f2` 生命周期合并树与 lane 的 `5ca2059c` 完全一致。lane 报告 ownership **4**、lifecycle **3**、recovery IPC **1**、配对证据 **3**、前端服务/SSR **4** 通过及静态 tsc 通过；父代理未重复相同 Rust 重构建。它们不证明真实服务均已登记或未知 writer 已结束。
-- `f544e566` Rust MCP callback 整合：父代理在合并后的源码执行 broker/hosted OAuth/取消与恢复状态定向 JS **7 passed / 0 failed / 0 skipped**。lane 报告隔离 fake OAuth/MCP + 实际 pi 管理 child 的 IPC fixture **1**、loopback crate **13**、MCP/OAuth JS **38** 通过，以及 TS、Rust library+harness check 通过；后者是 lane 证据且使用空 resources，不是 standalone/native 验收。provider callback 仍未接 Rust。不因此重启逐提交独立审阅循环。
+- `f544e566` Rust MCP callback 整合：父代理在合并后的源码执行 broker/hosted OAuth/取消与恢复状态定向 JS **7 passed / 0 failed / 0 skipped**。lane 报告隔离 fake OAuth/MCP + 实际 pi 管理 child 的 IPC fixture **1**、loopback crate **13**、MCP/OAuth JS **38** 通过，以及 TS、Rust library+harness check 通过；后者是 lane 证据且使用空 resources，不是 standalone/native 验收。provider callback 仍未接 Rust。不因此重启逐提交独立审阅循环。父代理随后执行静态 tsc 与排除遗留 Next 生成类型的 root source-only tsc，均通过。
+- `6dafa016` 合入 IPC 立即准入与 management nonce 修复；lane 的准入饱和测试 **1 passed**（含 1,000 个拒绝请求及预留控制容量），nonce router 测试 **1 passed**。错误 nonce 不再消耗 pending rid。父代理核对源变更及合并冲突，不将未执行的合并后 Rust 重构建称为通过；更广泛取消、事件和字节预算仍由该 lane 继续。
 
 - `1552bd06` 调度器合并后：静态前端 **112 passed / 0 skipped**；静态 `tsc --noEmit` 通过；Rust `cargo check --lib --features harness --bin static-ui-harness` 通过。
 - `507c6778` MCP checkpoint 合并后：静态 tsc 通过；MCP/service 定向测试 **17 passed**，同次没有指定 pi 的管理测试 **8 skipped**；随后显式指定本地 pi 重跑管理扩展 **8 passed / 0 skipped**。
