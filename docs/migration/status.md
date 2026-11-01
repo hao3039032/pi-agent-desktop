@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至搜索 P1 修复集成点 `0e0341e5` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至生命周期、MCP Rust OAuth 与 IPC 准入整合点 `6dafa016` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -17,7 +17,7 @@
 | Chat | 解锁读写、继续到宿主已授权项目；旧 child 确认退出、固定短寿命文件 writer、source/target 持久 fence | 正式启动与 harness 默认拒绝解锁；原生主窗口/iframe ACL、Windows mutation、跨宿主排他及未决结果恢复未验/未完成 |
 | 模型 | 列表/默认/启用模型最小编辑、models.json 读写、catalog/discover/test/nonchat/refresh/provider usage | 保留手动目录刷新及原配置校验，真实账户/付费请求未参与测试 |
 | Provider 认证 | provider 列表/API key/类型安全删除/logout、OAuth 进度流及关联 task-input/取消 | SDK 内置 OAuth callback 仍在 Node；Rust loopback 尚未接内置 provider |
-| MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | SDK OAuth callback 仍在 Node；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
+| MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
 | 插件/技能 | 列表/开关/批量技能禁用、搜索/check、install/update/remove 任务 UI/IPC | 不可取消的 SDK mutation 使用独占短寿命 pi；强停可能部分写入，结果 unknown；官方 skills CLI、真实 npm/git 安装及 Windows mutation 未验/未支持 |
 | 文件/资源 | Unix beneath-walk、目录/index/精确会话引用；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows 安全句柄及真实 dialogs/ACL 未验/未完成 |
 | Git/worktrees | status/diff/list/create/switch/delete/fetch、隔离 Git fixture | Windows runner fail-closed；macOS 尚未验证 |
@@ -25,7 +25,7 @@
 | 终端 | Linux 真 PTY、原 TerminalPanel、输入/resize/history/ACK/lease/reconnect/close/settings | macOS/Windows 安全 cwd-handle spawn 未完成，创建 fail-closed |
 | 调度器 | CRUD/preview/history/seen、marker 确认后的真实 RunSpawner、手动执行、事件、显式启动的 30s loop/租约/slot/overlap/catch-up、TS/Rust 共同事务门、scheduled-session index | 正式启动切换未做；旧已发布二进制不参与新门；崩溃事务锁恢复未完；引用扫描需为删除严格拒绝损坏行 |
 | 桌面服务 | 宿主原生目录选择授权、已知会话目录验证、distro/status/configure、updates.check；seed 为宿主内部操作 | 正式 seed 启动未切换；真实更新安装未执行；cwd.validate 不再授予任意前端路径权限 |
-| 管理运行时 | 实例级结果 router、rid/nonce task、deadline/cancel/状态、关联输入、物理 scope 协调、插件独占实例 process-group 清理；Chat/session writer 与 trust 有持久拒绝标记 | 通用 task unknown 仍仅内存，重启恢复未完；标记不是跨进程锁；Semaphore(16) 仅限制活动调用，未限制全部待准入请求 |
+| 管理运行时 | 实例级结果 router、rid/nonce task、deadline/cancel/状态、关联输入、物理 scope 协调、插件独占实例 process-group 清理；Chat/session writer 与 trust 有持久拒绝标记 | 通用 task unknown 持久 ledger 正在实施，重启恢复未完；标记不是跨进程锁；`6dafa016` 已改为 16 个普通槽 + 4 个清理/ACK 槽立即准入或 busy，不再排队等待 semaphore，但请求字节、其他流及 Tauri/WebView 内部队列仍未完成全链有界验证 |
 
 ## 当前实施工作
 
@@ -34,10 +34,15 @@
 - **会话删除**：group journal、严格 scheduled 引用、session admission、直接子 header 重写、传递 subagent 级联、共享/独占 Chat 文件夹规则已整合。生产破坏性删除许可和 journal 恢复许可彼此独立，均默认不授予；DELETE 返回 `busy`，reason 为 `session_deletion_exclusive_maintenance_required`。活动的其他受影响会话、跨目录直接 fork child、无法核验的 cwd/引用仍保守拒绝，尚未达到完整旧行为。
 - **会话资源消费者**：已合并工具图片 resolver、late-result revoke、Markdown sessionId 和安全 bash 下载；历史图片投影已配套启用。继续保留真实原生窗口/预览 ACL、对话框与平台验收门槛。
 - **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
-- **未决结果与生命周期**：trust/session 持久标记保留拒绝语义，产品恢复流程、旧宿主排他、正式 seed/scheduler 启动仍属 M5。
+- **未决结果与生命周期**：`073815f2` 已集成合作式 Unix ownership guard、`HostLifecycle::init/register/shutdown` 顺序关闭、`desktop.recoveryStatus` 及静态只读提示、fork/continue 双端 fence 配对诊断。未接正式 bootstrap，guard 不证明旧宿主或脱管 writer 已退出；记录匹配不授予恢复权。产品恢复、旧宿主排他、正式 seed/scheduler 启动仍属 M5。
+- **Terra 并行续作**：八个隔离工作树继续生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。SDK 最小补丁分发与合作升级/非合作 CLI 支持边界已向用户求决，尚未获准，不默认放行。
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- `073815f2` 生命周期合并树与 lane 的 `5ca2059c` 完全一致。lane 报告 ownership **4**、lifecycle **3**、recovery IPC **1**、配对证据 **3**、前端服务/SSR **4** 通过及静态 tsc 通过；父代理未重复相同 Rust 重构建。它们不证明真实服务均已登记或未知 writer 已结束。
+- `f544e566` Rust MCP callback 整合：父代理在合并后的源码执行 broker/hosted OAuth/取消与恢复状态定向 JS **7 passed / 0 failed / 0 skipped**。lane 报告隔离 fake OAuth/MCP + 实际 pi 管理 child 的 IPC fixture **1**、loopback crate **13**、MCP/OAuth JS **38** 通过，以及 TS、Rust library+harness check 通过；后者是 lane 证据且使用空 resources，不是 standalone/native 验收。provider callback 仍未接 Rust。不因此重启逐提交独立审阅循环。父代理随后执行静态 tsc 与排除遗留 Next 生成类型的 root source-only tsc，均通过。
+- `6dafa016` 合入 IPC 立即准入与 management nonce 修复；lane 的准入饱和测试 **1 passed**（含 1,000 个拒绝请求及预留控制容量），nonce router 测试 **1 passed**。错误 nonce 不再消耗 pending rid。父代理核对源变更及合并冲突，不将未执行的合并后 Rust 重构建称为通过；更广泛取消、事件和字节预算仍由该 lane 继续。
 
 - `1552bd06` 调度器合并后：静态前端 **112 passed / 0 skipped**；静态 `tsc --noEmit` 通过；Rust `cargo check --lib --features harness --bin static-ui-harness` 通过。
 - `507c6778` MCP checkpoint 合并后：静态 tsc 通过；MCP/service 定向测试 **17 passed**，同次没有指定 pi 的管理测试 **8 skipped**；随后显式指定本地 pi 重跑管理扩展 **8 passed / 0 skipped**。
@@ -77,7 +82,7 @@ Tauri 自定义协议接受缓冲 body，不是流。当前预算只覆盖读取
 2. DELETE、自动命名、可取消分支摘要等剩余功能完整实现；已合并的 fork/clone/Chat/扩展 UI/fleet/消息图片/安全下载还需跨域回归与完整原生验收。公开 SDK 缺口需明确解决，不能靠静默降级、私有字段反射或另起 AgentSession。
 3. IPC 真正有界准入、会话流背压/ACK/原子快照、未知副作用重启恢复与可见状态、所有退出/取消资源清理。
 4. 调度器新旧产品运行排他、崩溃事务门安全恢复、后台/隐藏窗口运行和退出中的 active run 语义。引用检查和删除不能分离到门外。
-5. Rust 拥有 OAuth loopback；SDK 当前未暴露 callback 注入点，PoC 不算接入。
+5. Rust 拥有 OAuth loopback：MCP 静态路径已采用公开协议引擎及 Rust listener，仍需原生和平台验收；provider SDK 当前未暴露 callback 注入点，provider PoC 不算接入。
 6. Windows/macOS 缺失的安全文件/进程/PTY 实现与实际平台证据。
 7. 固定 SDK 管理树的 genuine standalone 布局、原生 WebView/preview ACL、官方安装工具行为、系统 dialogs、升级与状态迁移验收。
 8. 完成统一 review/修复和回归后，才切换产品启动、启用正式 Rust scheduler、删 Next/backend-only 依赖与代码。当前没有声称到达此步。

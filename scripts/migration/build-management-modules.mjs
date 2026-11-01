@@ -122,11 +122,13 @@ export {
   McpServiceError,
   getMcpConfig,
   executeMcpAction,
+  managedMcpCredentialTarget,
+  signOutMcpCooperative,
   getProjectMcpListing,
   trustProjectFolder,
 } from "${ROOT}/lib/mcp-service.server.ts";
 export { probeMcpServer } from "${ROOT}/lib/mcp-probe-service.server.ts";
-export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn } from "${ROOT}/lib/mcp-sign-in-service.server.ts";
+export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn, McpOAuthBroker } from "${ROOT}/lib/mcp-sign-in-service.server.ts";
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
@@ -148,7 +150,7 @@ export async function bundleProjectionModules() {
     platform: "node",
     target: "node20",
     // MCP internals and the public SDK must resolve from the same managed tree.
-    external: ["@earendil-works/pi-coding-agent"],
+    external: ["@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph

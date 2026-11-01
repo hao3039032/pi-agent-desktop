@@ -405,6 +405,18 @@ Session starts, tool-policy restarts and chat-unlock writes share the per-sessio
   `lib/pi-rpc/recovery.smoke.test.mjs`. The real-CLI smoke isolates cwd/agent/session
   storage and supplies compaction with a fixture extension (no provider request).
 
+## Static desktop dispatch admission (partial M5)
+
+The shared product/harness envelope dispatcher admits at most 16 ordinary
+blocking tasks and 4 independent stream-cleanup/terminal-ACK tasks, with no
+semaphore wait queue. Saturation returns `busy` / `dispatch_not_admitted`
+before the operation executes. An admitted call abandoned by its WebView is
+not cancelled and may have an unknown outcome. The separate control budget
+prevents ordinary saturation starving cleanup, but can itself saturate; neither
+budget bounds messages already buffered by Tauri or the WebView, direct stream
+subscription commands, request bytes, child queues, or unacknowledged channels.
+These remain M5 work, not an end-to-end backpressure claim.
+
 ## Static desktop session deletion — gated pending M5
 
 The Rust deletion implementation is **not enabled in production**: the host

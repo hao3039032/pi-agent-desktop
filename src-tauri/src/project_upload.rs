@@ -6,9 +6,8 @@ use serde_json::Value;
 fn directory(state: &IpcHostState, args: &Value) -> Result<std::fs::File, &'static str> {
     use std::path::Path;
     let path = Path::new(args.get("directory").and_then(Value::as_str).unwrap_or(""));
-    let scoped = { let roots = state.file_roots.lock().unwrap(); crate::file_access::resolved_read_target_with_root(&roots, path) };
-    let (target, root) = scoped.ok_or("Destination is outside authorized roots")?;
-    crate::file_access::open_directory_beneath_root(&root, &target).map_err(|_| "Cannot open destination safely")
+    let roots = state.file_roots.lock().unwrap();
+    roots.open_directory(path).map_err(|_| "Cannot open destination safely")
 }
 
 #[cfg(unix)]
@@ -153,7 +152,7 @@ mod tests {
         let outside = tmp.path().join("outside"); std::fs::write(&outside, b"outside sentinel").unwrap();
         let target = project.join("report.txt"); std::fs::hard_link(&outside, &target).unwrap();
         let old_inode = std::fs::metadata(&outside).unwrap().ino();
-        let state = IpcHostState::new(); state.file_roots.lock().unwrap().add(&project);
+        let state = IpcHostState::new(); state.file_roots.lock().unwrap().add(&project).expect("fixture root");
         let result = upload_one(&state, "overwrite", &json!({ "directory": project, "name": "report.txt", "data": base64::engine::general_purpose::STANDARD.encode(b"new content"), "conflict": "overwrite" }));
         assert_eq!(result["ok"], true, "{result}");
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
@@ -256,7 +255,7 @@ mod tests {
         let state = IpcHostState::new();
         let args = json!({ "directory": project, "name": "a.txt", "data": base64::engine::general_purpose::STANDARD.encode(b"upload"), "conflict": "skip" });
         assert_eq!(upload_one(&state, "a", &args)["error"]["code"], "unauthorized_scope");
-        state.file_roots.lock().unwrap().add(&project);
+        state.file_roots.lock().unwrap().add(&project).expect("fixture root");
         assert_eq!(upload_one(&state, "b", &args)["data"]["outcome"], "uploaded");
         assert_eq!(upload_one(&state, "c", &args)["data"]["outcome"], "skipped");
         assert_eq!(std::fs::read(project.join("a.txt")).unwrap(), b"upload");
