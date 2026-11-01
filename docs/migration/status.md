@@ -12,17 +12,17 @@
 ## 最新架构决定（尚待实现验证）
 
 - 用户已明确允许：**管理侧独立使用官方 pi SDK 源码／模块发行版，与打包 CLI 严格同版本，不用于对话**。对话继续仅由 CLI 持有 AgentSession；不得把 CLI 的运行时对象交给另一 SDK 图使用。后续管理运行时可以有自己的单一、固定依赖图与受限协议，不再要求管理 SDK 与 CLI 内置 SDK 的对象具有跨运行时 class identity；仍需各自的版本、来源、模块根与协议边界校验。这不是授权修改／fork SDK、升级 SDK或增加第二个对话引擎，也不是已有 standalone 测试通过的证明。
-- 用户尚未认可“非协作外部 writer 必须停止”的支持边界，并指出这是 PC 工具。此前提法需要解释为单机上的多实例／同数据目录并发修改问题；正常单机使用应由软件的实例协调和文件／事务锁承担，不要求用户日常手工停止后台程序。异常未决结果仍不能凭超时或进程退出清除；危险操作的最终许可与正式切换尚未授予。不要将用户要求澄清误记成接受忽略外部写入或解除恢复门禁。
+- 用户已明确接受内部使用的风险边界：**外部 pi CLI、其他非协作实例／程序同时修改同一目录或数据，其冲突风险由用户承担**，与直接使用多个 pi 的情况相同。不要求普遍证明外部 writer 已停止，不再以无法排除任意外部写入作为 M5 完成或正常功能可用的阻断条件；后续维护、恢复、删除和调度接管应据此调整旧的外部排他前提，而不是永久 fail-closed。应用仍须协调自身管理的会话／任务／写入者及协作实例，保留路径授权、文件／事务保护、备份和必要确认；自身未决结果不能凭超时／leader 退出假称成功或自动清除。这个支持边界决定不等于已实现功能、SDK fork 授权或正式发布／切换验收。
 
 ## 已集成的实现
 
 | 领域 | 当前范围 | 仍需区分的边界 |
 |---|---|---|
 | 会话基础 | 原 UI 创建/发送/流式/停止/队列编辑与立即发送、重开历史；目录/上下文投影、普通 fork/clone/navigate、rename/search/export；扩展 pending UI/回复/取消、fleet、thinking、prompt 与有证据的状态 | 自动命名已接 live registry、运行中/队列兼容和持久 rename fence；DELETE、带摘要分支及其关联 Stop 尚未完成；历史工具图片 resolver/URL 生命周期与安全 bash 下载已接线，原生验收未做；RPC custom UI 不支持，不伪造替代 |
-| Chat | 解锁读写、继续到宿主已授权项目；旧 child 确认退出、固定短寿命文件 writer、source/target 持久 fence | 正式启动与 harness 默认拒绝解锁；原生主窗口/iframe ACL、Windows mutation、跨宿主排他及未决结果恢复未验/未完成 |
+| Chat | 解锁读写、继续到宿主已授权项目；旧 child 确认退出、固定短寿命文件 writer、source/target 持久 fence | 正式启动与 harness 默认拒绝解锁；原生主窗口/iframe ACL、Windows mutation、本应用协作宿主协调及未决结果恢复未验/未完成（非协作外部并发按用户承担风险） |
 | 模型 | 列表/默认/启用模型最小编辑、models.json 读写、catalog/discover/test/nonchat/refresh/provider usage | 保留手动目录刷新及原配置校验，真实账户/付费请求未参与测试 |
 | Provider 认证 | provider 列表/API key/类型安全删除/logout、OAuth 进度流及关联 task-input/取消；有界观察、原 task 重连、当前交互恢复和实验 static-host observer 关闭报告 | SDK 内置 OAuth callback 仍在 Node；Rust loopback 尚未接内置 provider；SDK abort race 不证明底层 writer 停止，未决 flow/ledger 不释放；真实账户及 native/standalone 未验 |
-| MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 超时/取消显示远端 token 不确定性，保留 15 秒期限及迟到本地写保护；canonical/legacy/config/generation 私有 admission 已接 JS，native ledger/reservation/probe receipt 消费已整合，但真实 MCP 链路仍失败，不能据 JS 合同或局部测试直接解除 pending；仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
+| MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 超时/取消显示远端 token 不确定性，保留 15 秒期限及迟到本地写保护；canonical/legacy/config/generation 私有 admission 已接 JS，native ledger/reservation/probe receipt 消费已整合，但真实 MCP 链路仍失败，不能据 JS 合同或局部测试直接解除 pending；仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与本应用协作宿主协调未完成；非协作外部并发不再作为不可证明的阻断条件 |
 | 插件/技能 | 列表/开关/批量技能禁用、搜索/check、install/update/remove 任务 UI/IPC | 不可取消的 SDK mutation 使用独占短寿命 pi；强停可能部分写入，结果 unknown；官方 skills CLI、真实 npm/git 安装及 Windows mutation 未验/未支持 |
 | 文件/资源 | Unix root grant 保留目录对象与身份、准入复核路径、beneath-walk、目录/index/精确会话引用；普通 add 不续授已替换根，显式 native picker 可重新授权；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows roots/read/index/pi-resource 句柄源码已接但未目标编译或原生执行，save/bash 与根外精确 session 引用仍缺；Windows index 的 Git 可见性尚未完成，故持续标记截断；Windows/Unix fallback 已加总节点、目录句柄及路径字节预算，Unix Git stdout/派生目录/响应和 cache 已有字节预算；Git 直接 child 最多 8 个预留槽、单一 reaper、宿主分域关闭报告；pre-exec 外部停止可阻塞 spawn，5 秒不是整个扫描硬期限，Git 路径重解析及后代仍不在证明内；真实 dialogs/ACL 未验 |
 | Git/worktrees | status/diff/list/create/switch/delete/fetch、隔离 Git fixture | Windows runner fail-closed；macOS 尚未验证 |
@@ -38,10 +38,10 @@
 
 - **会话删除**：group journal、严格 scheduled 引用、session admission、直接子 header 重写、传递 subagent 级联、共享/独占 Chat 文件夹规则已整合。生产破坏性删除许可和 journal 恢复许可彼此独立，均默认不授予；DELETE 返回 `busy`，reason 为 `session_deletion_exclusive_maintenance_required`。活动的其他受影响会话、跨目录直接 fork child、无法核验的 cwd/引用仍保守拒绝，尚未达到完整旧行为。
 - **会话资源消费者**：已合并工具图片 resolver、late-result revoke、Markdown sessionId 和安全 bash 下载；历史图片投影已配套启用。继续保留真实原生窗口/预览 ACL、对话框与平台验收门槛。
-- **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
+- **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替本应用管理的未知 writer 的终止证明，协作宿主协调与用户恢复未完成；不再要求普遍排除非协作外部 writer。
 - **未决结果与生命周期**：在 `073815f2` 基础上整合截至 `ca23c638` 的 registry/management/短 writer 关闭、内存 prompt receipt、已验证结果的 resolved fence 与 cleanupWarning，以及实验 static host 的 IPC drain、scheduler 和 child 关闭链。共用绝对 deadline；实际准入先关闭，报告/生命周期锁忙不阻塞、保留失败，重复调用不重放 FnOnce。若首次无法取得 callbacks，失败永久保留，不自动补清理。resolved 只证明运行时结果已知，不证明 SDK 数据断电耐久，也不授予恢复权。prompt receipt 尚非跨重启证据；`a38b2bf5` 保留原 exited/unknown 并增加结构化诊断，分别表达未决 receipt、leader 退出未确认及锁忙/在途范围。实验 harness 的 available 仅表示取得报告，缺报告返回 null/unknown，不是空成功。无关联 start/terminal 观测和 leader 退出均不清历史 unknown；旧宿主、脱管 writer、正式 bootstrap/seed/scheduler 和产品恢复仍未完成。
 - **PTY 关闭门禁（提案及测试，非生产实现）**：[pre-exec 身份绑定提案](pty-preexec-binding-proposal.md) 来自 `c06be727`，独立测试控制器 `d242addc` 已单独纳入；没有吸收 observation-only `shutdown()` 回退或 vendor 实现。Linux fixture 以 post-open nonce 验证独立 pidfd、实际观测 SIGSTOP，证实截止时间不使 spawn worker 自动回收，随后由测试控制器安全终止并等待线程完成。它依赖正常调度、内核调用返回和受信 fixture；不证明生产绑定前任意停止可回收。vendor fd sweep 的异步信号安全及 spawn-error FD 风险仍开放，不能把测试变成生产终止授权。
-- **Terra 并行续作**：按领域使用隔离工作树实施生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git；本轮两路认证续作已交付并整合，不代表所有领域或验收完成。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。用户已允许同版本官方 SDK 独立用于管理，不用于对话；SDK 修改／fork 未获准。外部 writer 支持边界仍在澄清，不默认放行，详见上方最新架构决定。
+- **Terra 并行续作**：按领域使用隔离工作树实施生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git；本轮两路认证续作已交付并整合，不代表所有领域或验收完成。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。用户已允许同版本官方 SDK 独立用于管理，不用于对话；SDK 修改／fork 未获准。非协作外部 writer 并发风险已由用户明确接受；不得继续当作普遍排他证明门禁，具体内部协调和恢复实现仍需验证，详见上方最新架构决定。
 - **自动命名**：`963f20fd` 接通 live child 的实际 model registry 和专用纯 helper bundle，`50714c76` 恢复运行中及 queued follow-up 的原行为；同分支正常追加不作 stale，模型/树 ABA、名称或 child 实例变化拒绝。改名使用公开 `pi.setSessionName`，不调用只读 extension context 未暴露的写方法；写前持久 marker，只有关联成功或明确写前拒绝清除，ACK 丢失/append 异常保留。最多 64 KiB 的 source 前缀仅为诊断，不冻结已准入运行。真实 90 秒 deadline 和原生 UI 仍待验。
 - **独立打包与待整合续作**：生命周期与包装线至 `ca23c638` 的源码已整合，但不激活产品入口。固定官方 pi 的 relocation/manifest 和部分 session/cron/DOCX/OAuth 探针有 lane 证据，完整 standalone MCP 仍因第二 SDK 图 identity guard 失败，不得移除该 guard。transport 的 management ledger/reservation/probe receipt、running/scheduled 流预算、结构化关闭诊断、索引字节预算和 PTY 测试已分批整合（详见验证记录），但完整生命周期与原生验收仍未闭环。平台 `0c61b276` 已作为 `ef075806` 合入 Windows roots/read/index/资源句柄及 Unix 嵌套根回退修复；Windows 未目标编译。整合检查确认的空目录无界队列已在 `e099bbf3` 修复：最多物化 50,000 个条目、最多 64 个待处理目录句柄，当前目录及临时枚举句柄另计；耗尽保留 partial/truncated。该修复不代替 Windows 目标编译或原生验收。MCP lane 的 probe mode admission/局部 guard/私有 receipt 已接 native 消费，真实 MCP 测试仍未通过；stdio/provider-auth/`!command` 的宽 scope 不作为只读放行。这些均不是正式 bootstrap 或 M5 验收。
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
@@ -124,7 +124,7 @@ Tauri 自定义协议接受缓冲 body，不是流。当前预算只覆盖读取
 1. 清完保留功能的 HTTP/EventSource/资源 URL 残留；同步 runtime op、静态服务 alias 与 UI 调用。存在 op 字符串不等于功能已实现。
 2. DELETE、可取消分支摘要等剩余功能完整实现；自动命名的运行中主链已接，仍须真实 deadline/原生验收；已合并的 fork/clone/Chat/扩展 UI/fleet/消息图片/安全下载还需跨域回归与完整原生验收。公开 SDK 缺口需明确解决，不能靠静默降级、私有字段反射或另起 AgentSession。
 3. IPC 真正有界准入、会话流背压/ACK/原子快照、未知副作用重启恢复与可见状态、所有退出/取消资源清理。
-4. 调度器新旧产品运行排他、崩溃事务门安全恢复、后台/隐藏窗口运行和退出中的 active run 语义。引用检查和删除不能分离到门外。
+4. 本应用管理的调度器／协作实例运行协调、崩溃事务门安全恢复、后台/隐藏窗口运行和退出中的 active run 语义。引用检查和删除不能分离到门外；用户自行启动的非协作外部 writer 风险按已批准支持边界处理，不要求普遍排他证明。
 5. Rust 拥有 OAuth loopback：MCP 静态路径已采用公开协议引擎及 Rust listener，仍需原生和平台验收；provider SDK 当前未暴露 callback 注入点，provider PoC 不算接入。
 6. Windows/macOS 缺失的安全文件/进程/PTY 实现与实际平台证据。
 7. 固定 SDK 管理树的 genuine standalone 布局、原生 WebView/preview ACL、官方安装工具行为、系统 dialogs、升级与状态迁移验收。
