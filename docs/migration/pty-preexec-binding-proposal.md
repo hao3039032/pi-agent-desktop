@@ -169,7 +169,27 @@ and bounded release of every reader, writer, master clone and thread, followed
 by a real leader-exit observation. Never infer that a leader's exit or a PTY
 EOF proves detached descendants ended.
 
-## Isolated failure-test plan — not yet run
+## Isolated failure-test boundary
+
+`crates/pty-host/tests/preexec_controller.rs` exercises one Linux-only
+`std::Command` boundary: a separate test controller binds a pidfd using a fresh
+post-open nonce, stops the child before the simulated ready point, observes the
+stop through that pidfd, and verifies that a deadline does not reclaim the
+blocked spawn worker. It kills through the bound pidfd and joins only after the
+worker reports completion. The child has its own bounded poll before injection;
+the cleanup guard handles failures before and after binding. Unsupported or
+forbidden pidfd operations are printed as SKIP before injection (Rust's test
+harness still counts that return as a pass).
+
+This fixture assumes normal scheduling, returning kernel calls, a fixed trusted
+child, and no other signaler or reaper. It does not establish vendor pre-exec
+safety or production termination/reclaimability. A temporarily inherited
+CLOEXEC pipe reference can delay EOF; that alone cannot echo the fresh nonce,
+while a malicious hook able to read and forge the correct nonce breaks the
+trusted-host assumption. The existing `close_random_fds` allocation and
+spawn-error-FD risks remain a separate production gate.
+
+Remaining fault-test plan:
 
 A Linux test controller must own a **separate test-only, challenge-verified
 pidfd** for the fixture child *before* injecting `SIGSTOP`. The fixture's child
