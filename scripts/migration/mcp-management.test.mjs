@@ -23,7 +23,7 @@ test("real management pi reads and edits MCP without starting configured servers
     await buildProjectionInto(managed);
     const marker = join(root, "started");
     await writeFile(join(cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { project: { command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(marker)},'started')`] }, probe: { command: process.execPath, args: [resolve("lib/__fixtures__/mcp-env-server.mjs")] } } }));
-    await writeFile(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { oauth: { url: "http://127.0.0.1:9/mcp?token=fixture-secret" } } }));
+    await writeFile(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { oauth: { url: "http://127.0.0.1:9/mcp?token=fixture-secret" }, noauth: { url: "http://127.0.0.1:9/mcp?token=fixture-secret", headers: { Authorization: "Bearer fake" } } } }));
     const nonce = "fixture-nonce";
     const logs = [];
     client = new PiRpcClient(executable, { cwd, args: ["--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", resolve("lib/pi-rpc/assets/pi-web-management.mjs")], env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce }, onLog: (message) => logs.push(message) });
@@ -74,6 +74,17 @@ test("real management pi reads and edits MCP without starting configured servers
     }
     assert.doesNotMatch(JSON.stringify(progress), /fixture-secret/);
     assert.doesNotMatch(JSON.stringify(logs), /fixture-secret/);
+    const httpTarget = await call("mcp.probeTarget", { scope: "global", name: "noauth" });
+    assert.equal(httpTarget.probeAdmissionSchema, 1);
+    assert.equal(httpTarget.kind, "http-no-mcp-oauth");
+    const httpProbe = await call("mcp.test", { scope: "global", name: "noauth", probeAdmission: httpTarget });
+    assert.deepEqual(httpProbe._probeReceipt, { schema: 1, localWritesClosed: true, pastLocal: "settled", remoteToken: "none-observed" });
+    assert.doesNotMatch(JSON.stringify(httpProbe), /fixture-secret/);
+    const stdioTarget = await call("mcp.probeTarget", { cwd, scope: "project", name: "probe" });
+    assert.equal(stdioTarget.kind, "broad");
+    const stdioProbe = await call("mcp.test", { cwd, scope: "project", name: "probe", probeAdmission: stdioTarget });
+    assert.equal(stdioProbe.result.state, "connected");
+    assert.equal(stdioProbe._probeReceipt.remoteToken, "unknown");
     const added = await call("mcp.configAction", { cwd, action: "add", scope: "global", text: "node fixture.js", name: "fixture" });
     assert.equal(added.added.name, "fixture", JSON.stringify(added));
     const duplicate = await call("mcp.configAction", { cwd, action: "add", scope: "global", text: "node fixture.js", name: "fixture" });

@@ -136,10 +136,11 @@ export function mcpSignOutGuard(name: string, url: string, configKey?: string, a
  * their locked file operation synchronously before returning; an async deferred
  * write would escape the generation check. Load may migrate legacy state.
  */
-export function guardMcpOAuthStateStore(store: McpOAuthStateStore, guard: McpSignInWriteGuard): McpOAuthStateStore {
+export function guardMcpOAuthStateStore(store: McpOAuthStateStore, guard: McpSignInWriteGuard, observe?: <T>(call: () => T) => T): McpOAuthStateStore {
+  const call = <T>(operation: () => T): T => { guard(); return observe ? observe(operation) : operation(); };
   return {
-    load: () => { guard(); return store.load(); },
-    save: (state) => { guard(); return store.save(state); },
+    load: () => call(() => store.load()),
+    save: (state) => call(() => store.save(state)),
   };
 }
 
@@ -148,10 +149,12 @@ export function guardMcpOAuthServerStore(
   store: McpOAuthServerStore,
   guard: McpSignInWriteGuard,
   refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void },
+  observe?: <T>(call: () => T) => T,
 ): McpOAuthServerStore {
   return {
-    ...guardMcpOAuthStateStore(store, guard),
+    ...guardMcpOAuthStateStore(store, guard, observe),
     withRefreshLock: async (fn) => {
+      guard();
       if (refresh?.signal.aborted) throw new Error("Sign-in cancelled");
       refresh?.onPending?.(true);
       try {
@@ -182,11 +185,12 @@ export function guardedCredentialStore(
   internals: Pick<PiSdkInternals, "McpOAuthCredentialStore">,
   guard: McpSignInWriteGuard,
   refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void },
+  observe?: <T>(call: () => T) => T,
 ): McpOAuthCredentialStore {
   class GuardedCredentialStore extends internals.McpOAuthCredentialStore {
     forServer(name: string, serverUrl: string): McpOAuthServerStore {
       const store = super.forServer(name, serverUrl);
-      return guardMcpOAuthServerStore(store, guard, refresh);
+      return guardMcpOAuthServerStore(store, guard, refresh, observe);
     }
   }
   return new GuardedCredentialStore();

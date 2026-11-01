@@ -1304,7 +1304,7 @@ test("a test request that failed says why in a test's words, and keeps the last 
   const queued = connection(testView({}, { view: { tests: { [key]: { running: false, queueTimedOut: true, configKey: "key" } } } }));
   assert.match(queued.value, /<span role="alert" class="mcp-config-line is-error">Another test of a server that runs a shell command did not finish in time, so this one did not start\. Try again\.<\/span>/);
   assert.doesNotMatch(connection(testView({}, { view: { tests: { [key]: { running: false, queueTimedOut: true, configKey: "old-key" } } } })).text, /did not start/);
-  const unknown = connection(testView({}, { view: { tests: { [key]: { running: false, credentialOutcomeUnknown: true, configKey: "key" } } } }));
+  const unknown = connection(testView({}, { view: { tests: { [key]: { running: false, credentialOutcomeUnknown: true, queueTimedOut: true, configKey: "key" } } } }));
   assert.match(unknown.text, /credential write may still be unresolved/);
   assert.match(unknown.value, /role="alert"/);
 });
@@ -1315,6 +1315,10 @@ test("the panel's own answer shows over the listing while it is about the entry 
   const shown = testView({}, { view: { tests: { [key]: { running: false, response: response("key") } } } });
   assert.match(row(shown, "docs"), /aria-label="docs: Did not connect when tested"/);
   assert.match(connection(shown).text, /^Did not connect/);
+  const uncertain = { ...response("key"), credentialOutcomeUnknown: true };
+  assert.match(connection(testView({}, { view: { tests: { [key]: { running: false, response: uncertain } } } })).text, /credential write may still be unresolved/);
+  const staleUncertain = { ...response("old-key"), credentialOutcomeUnknown: true };
+  assert.doesNotMatch(connection(testView({}, { view: { tests: { [key]: { running: false, response: staleUncertain } } } })).text, /credential write may still be unresolved/);
   // An answer about the entry before it was edited is not this entry's.
   const stale = testView({}, { view: { tests: { [key]: { running: false, response: response("old-key") } } } });
   assert.match(connection(stale).text, /^Not tested yet\./);
