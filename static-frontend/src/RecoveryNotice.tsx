@@ -12,7 +12,6 @@ const messages = {
 /** Read-only: a status refresh never retries or clears a mutation. */
 export function RecoveryNotice({ client }: { client: IpcClient }) {
   const { locale } = useI18n();
-  const text = messages[locale];
   const [status, setStatus] = useState<RecoveryStatus | null>(null);
   const [error, setError] = useState(false);
   const generation = useRef(0);
@@ -30,6 +29,16 @@ export function RecoveryNotice({ client }: { client: IpcClient }) {
     const timer = setInterval(() => void refresh(), 30_000);
     return () => { ++generation.current; clearInterval(timer); };
   }, [refresh]);
+  return <RecoveryNoticeContent locale={locale} status={status} error={error} onRefresh={() => void refresh()} />;
+}
+
+export function RecoveryNoticeContent({ locale, status, error, onRefresh }: {
+  locale: keyof typeof messages;
+  status: RecoveryStatus | null;
+  error: boolean;
+  onRefresh: () => void;
+}) {
+  const text = messages[locale];
   const entries = status ? [
     [text.trust, status.trustPolicy], [text.sessions, status.sessionWriters], [text.deletion, status.deletionJournal],
   ] as const : [];
@@ -40,6 +49,6 @@ export function RecoveryNotice({ client }: { client: IpcClient }) {
     {error && <p>{text.error}</p>}
     {unresolved.length > 0 && <ul>{unresolved.map(([label, value]) => <li key={label}>{label}: {value === "pending" ? text.pending : text.uninspectable}</li>)}</ul>}
     <p>{text.detail}</p>
-    <button type="button" onClick={() => void refresh()}>{text.refresh}</button>
+    <button type="button" onClick={onRefresh}>{text.refresh}</button>
   </aside>;
 }
