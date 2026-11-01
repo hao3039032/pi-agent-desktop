@@ -34,17 +34,29 @@ fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) { a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()) } else { a == b }
 }
 
+fn verified_subagent_parent(entry: &Value) -> Result<&str, (String, String)> {
+    if entry.pointer("/data/version").and_then(Value::as_u64) != Some(1)
+        || entry.pointer("/data/parentSessionPath").and_then(Value::as_str).is_none_or(str::is_empty) {
+        return Err(error("not_supported", "Cannot verify subagent metadata."));
+    }
+    entry.pointer("/data/parentSessionId").and_then(Value::as_str).filter(|id| !id.is_empty())
+        .ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))
+}
+
 #[derive(Debug)]
 struct SessionReference {
     id: String,
     path: PathBuf,
     parent: Option<PathBuf>,
     subagent_parent: Option<String>,
+    file: std::fs::File,
+    metadata: std::fs::Metadata,
 }
+struct AffectedSessions { ids: Vec<String>, proofs: Vec<DeleteMemberProof> }
 
 /// Discover every session whose bytes the deletion would remove or rewrite.
 /// The caller repeats this after acquiring all returned writer gates.
-fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Vec<String>, (String, String)> {
+fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<AffectedSessions, (String, String)> {
     use std::collections::{HashMap, HashSet};
     let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
     let mut files = Vec::new();
@@ -69,8 +81,7 @@ fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Vec<Str
         while let Some(entry) = bounded_line(&mut reader, 16 * 1024 * 1024)? {
             if entry.get("type").and_then(Value::as_str) == Some("custom")
                 && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent") {
-                let parent = entry.pointer("/data/parentSessionId").and_then(Value::as_str)
-                    .filter(|id| !id.is_empty()).ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))?;
+                let parent = verified_subagent_parent(&entry)?;
                 if subagent_parent.replace(parent.to_string()).is_some() {
                     return Err(error("not_supported", "Cannot verify duplicate subagent metadata."));
                 }
@@ -78,7 +89,7 @@ fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Vec<Str
         }
         let after = reader.get_ref().metadata().map_err(|e| error("io", e))?;
         if !same_file_version(&before, &after) { return Err(error("busy", "Session changed while checking references")); }
-        records.push(SessionReference { id, path, parent, subagent_parent });
+        records.push(SessionReference { id, path, parent, subagent_parent, file: reader.into_inner(), metadata: after });
     }
     let target = records.iter().find(|record| record.id == target_id).ok_or_else(|| error("not_found", "Session not found"))?;
     let target_path = target.path.canonicalize().map_err(|e| error("io", e))?;
@@ -102,9 +113,11 @@ fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Vec<Str
             if same_path(&parent, &target_path) { affected.insert(record.id.clone()); }
         }
     }
-    let mut result: Vec<_> = affected.into_iter().collect();
-    result.sort();
-    Ok(result)
+    let mut ids: Vec<_> = affected.into_iter().collect();
+    ids.sort();
+    let proofs = records.into_iter().filter(|record| ids.binary_search(&record.id).is_ok())
+        .map(|record| DeleteMemberProof { id: record.id, path: record.path, file: record.file, metadata: record.metadata }).collect();
+    Ok(AffectedSessions { ids, proofs })
 }
 
 /// Scheduler-owned data supplies this proof after a successful, non-corrupt load.
@@ -117,7 +130,10 @@ impl ScheduledReferences for crate::scheduled_session_index::ScheduledSessionInd
 }
 
 #[derive(Debug)]
-struct DeletePreflight { path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata }
+struct DeletePreflight { path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata, affected: Vec<DeleteMemberProof> }
+#[derive(Debug)]
+struct DeleteMemberProof { id: String, path: PathBuf, file: std::fs::File, metadata: std::fs::Metadata }
+struct ScannedMember { id: String, path: PathBuf, header: Value, parent: Option<PathBuf>, subagent_parent: Option<String>, file: std::fs::File, metadata: std::fs::Metadata }
 #[derive(Debug)]
 enum DeleteOutcome { Preflight(DeletePreflight), Deleted(Value) }
 
@@ -184,12 +200,14 @@ fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl Schedu
     }
     let trash_chat_folder = args.get("trashChatFolder").and_then(Value::as_bool) == Some(true);
     let affected = affected_session_ids(state, id)?;
-    state.registry.with_idle_session_writers(&affected, |_| {
-        if affected_session_ids(state, id)? != affected { return Err(error("busy", "Session references changed during deletion preflight")); }
-        if affected.iter().any(|id| scheduled.is_referenced(id)) {
+    state.registry.with_idle_session_writers(&affected.ids, |_| {
+        let checked = affected_session_ids(state, id)?;
+        if checked.ids != affected.ids { return Err(error("busy", "Session references changed during deletion preflight")); }
+        verify_member_proofs(&affected.proofs, &checked.proofs)?;
+        if affected.ids.iter().any(|id| scheduled.is_referenced(id)) {
             return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
         }
-        delete_locked(state, id, scheduled, trash_chat_folder, preflight, proof)
+        delete_locked(state, id, scheduled, trash_chat_folder, preflight, proof, &checked)
     })
         .map_err(|error| match error {
             session_host::SessionWriterError::Busy(message) => self::error("busy", message),
@@ -197,14 +215,27 @@ fn delete_with_index(state: &IpcHostState, args: &Value, scheduled: &impl Schedu
         })
 }
 
-fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool, preflight: bool, proof: Option<&DeletePreflight>) -> Result<DeleteOutcome, (String, String)> {
+fn verify_member_proofs(before: &[DeleteMemberProof], after: &[DeleteMemberProof]) -> Result<(), (String, String)> {
+    if before.len() != after.len() { return Err(error("busy", "Affected sessions changed during deletion")); }
+    for old in before {
+        let current = after.iter().find(|member| member.id == old.id).ok_or_else(|| error("busy", "Affected sessions changed during deletion"))?;
+        let retained = old.file.metadata().map_err(|e| error("io", e))?;
+        if !same_path(&old.path, &current.path) || !same_file_version(&old.metadata, &retained) || !same_file_version(&old.metadata, &current.metadata) {
+            return Err(error("busy", "Affected session changed during deletion"));
+        }
+    }
+    Ok(())
+}
+
+fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledReferences, trash_chat_folder: bool, preflight: bool, proof: Option<&DeletePreflight>, discovery: &AffectedSessions) -> Result<DeleteOutcome, (String, String)> {
+    let affected = &discovery.ids;
     if scheduled.is_referenced(id) {
         return Err(error("not_supported", "Session is still referenced by a scheduled run or archive."));
     }
     // Never stop a writer on the user's behalf; removal waits for a truly
     // inactive child, and prevents a stale queued message from disappearing.
-    if !preflight && state.registry.get(id).is_some() {
-        return Err(error("busy", "Close the session and wait for queued messages before deleting it."));
+    if affected.iter().any(|session| (!preflight || session != id) && state.registry.get(session).is_some()) {
+        return Err(error("busy", "Close affected sessions and wait for queued messages before deleting them."));
     }
     let root = state.agent_dir().join("sessions").canonicalize().map_err(|e| error("io", e))?;
     let mut files = Vec::new();
@@ -212,7 +243,8 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     let mut target: Option<(PathBuf, std::fs::File, std::fs::Metadata)> = None;
     let mut target_cwd: Option<PathBuf> = None;
     let mut session_cwds = Vec::new();
-    let mut references = Vec::new();
+    let mut members = Vec::new();
+    let mut path_ids = Vec::new();
     for file in files {
         let handle = std::fs::File::open(&file).map_err(|e| error("io", e))?;
         let before = handle.metadata().map_err(|e| error("io", e))?;
@@ -237,8 +269,7 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
             if entry.get("type").and_then(Value::as_str) == Some("custom")
                 && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent")
             {
-                let parent = entry.pointer("/data/parentSessionId").and_then(Value::as_str)
-                    .ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))?;
+                let parent = verified_subagent_parent(&entry)?;
                 if subagent_parent.is_some() {
                     return Err(error("not_supported", "Cannot verify duplicate subagent metadata."));
                 }
@@ -249,13 +280,17 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         if before.len() != after.len() || before.modified().map_err(|e| error("io", e))? != after.modified().map_err(|e| error("io", e))? {
             return Err(error("busy", "Session changed while checking references"));
         }
+        path_ids.push((file.clone(), child_id.to_string()));
+        if affected.binary_search_by(|candidate| candidate.as_str().cmp(child_id)).is_ok() {
+            members.push(ScannedMember { id: child_id.to_string(), path: file.clone(), header: header.clone(), parent: parent.clone(),
+                subagent_parent: subagent_parent.clone(), file: reader.get_ref().try_clone().map_err(|e| error("io", e))?, metadata: after.clone() });
+        }
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
             target_cwd = cwd.clone();
             target = Some((file.clone(), reader.into_inner(), after));
         }
         session_cwds.push((child_id.to_string(), cwd));
-        references.push((child_id.to_string(), parent, subagent_parent));
     }
     let (target, target_handle, target_metadata) = target.ok_or_else(|| error("not_found", "Session not found"))?;
     let current_metadata = target_handle.metadata().map_err(|e| error("io", e))?;
@@ -267,32 +302,84 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
     if let Some(proof) = proof {
         let original = proof.file.metadata().map_err(|e| error("io", e))?;
         if !same_path(&proof.path, &canonical_target) || !same_file_version(&proof.metadata, &original)
-            || !same_file_version(&proof.metadata, &target_metadata) {
+            || !same_file_version(&proof.metadata, &target_metadata) || proof.affected.len() != members.len() {
             return Err(error("busy", "Session file changed after deletion preflight"));
         }
-    }
-    for (child_id, parent, subagent_parent) in references {
-        if child_id == id { continue; }
-        if subagent_parent.as_deref() == Some(id) { return Err(error("not_supported", "Session has subagents and requires the full cascade operation.")); }
-        if let Some(parent) = parent {
-            if !parent.is_absolute() { return Err(error("not_supported", "Cannot verify a relative parent session path.")); }
-            if let Ok(path) = parent.canonicalize() {
-                if same_path(&path, &canonical_target) { return Err(error("not_supported", "Session has child branches and requires the full cascade operation.")); }
-            } else if same_path(&parent, &canonical_target) {
-                return Err(error("not_supported", "Session has child branches and requires the full cascade operation."));
+        for old in &proof.affected {
+            let current = members.iter().find(|member| member.id == old.id).ok_or_else(|| error("busy", "Affected sessions changed after deletion preflight"))?;
+            let original = old.file.metadata().map_err(|e| error("io", e))?;
+            if !same_path(&old.path, &current.path) || !same_file_version(&old.metadata, &original) || !same_file_version(&old.metadata, &current.metadata) {
+                return Err(error("busy", "Affected session changed after deletion preflight"));
             }
         }
     }
+    let member_proofs = members.iter().map(|member| Ok(DeleteMemberProof { id: member.id.clone(), path: member.path.clone(),
+        file: member.file.try_clone().map_err(|e| error("io", e))?, metadata: member.metadata.clone() })).collect::<Result<Vec<_>, (String, String)>>()?;
+    verify_member_proofs(&discovery.proofs, &member_proofs)?;
+    for member in &members {
+        if !same_file_version(&member.metadata, &member.file.metadata().map_err(|e| error("io", e))?) {
+            return Err(error("busy", "Affected session changed after reference scan"));
+        }
+    }
+    let mut deleted = std::collections::HashSet::from([id.to_string()]);
+    loop {
+        let mut changed = false;
+        for member in &members {
+            if member.subagent_parent.as_ref().is_some_and(|parent| deleted.contains(parent)) && deleted.insert(member.id.clone()) { changed = true; }
+        }
+        if !changed { break; }
+    }
     if trash_chat_folder {
         if let Some(cwd) = target_cwd.filter(|cwd| crate::session_view::is_chat_folder_path(cwd, &state.agent_dir()) && cwd.exists()) {
-            let shared = session_cwds.iter().any(|(session_id, other)| session_id != id && other.as_ref().is_some_and(|other| same_path(other, &cwd)));
+            let shared = session_cwds.iter().any(|(session_id, other)| !deleted.contains(session_id) && other.as_ref().is_some_and(|other| same_path(other, &cwd)));
             if !shared {
                 return Err(error("not_supported", "Moving an unshared chat folder requires recoverable multi-file deletion."));
             }
         }
     }
-    if preflight { return Ok(DeleteOutcome::Preflight(DeletePreflight { path: canonical_target, file: target_handle, metadata: target_metadata })); }
-    crate::session_deletion_journal::remove(&root, &state.agent_dir(), id, &canonical_target, &target_metadata)?;
+    let root_member = members.iter().find(|member| member.id == id).ok_or_else(|| error("busy", "Target session changed during scan"))?;
+    let target_parent = root_member.parent.clone();
+    let parent_id = target_parent.as_ref().and_then(|parent| {
+        let resolved = parent.canonicalize().unwrap_or_else(|_| parent.clone());
+        path_ids.iter().find(|(path, _)| same_path(&path.canonicalize().unwrap_or_else(|_| path.clone()), &resolved)).map(|(_, id)| id.clone())
+    });
+    for member in &members {
+        if deleted.contains(&member.id) { continue; }
+        if let Some(parent) = &member.parent {
+            if same_path(&parent.canonicalize().unwrap_or_else(|_| parent.clone()), &canonical_target)
+                && member.path.parent() != canonical_target.parent() {
+                return Err(error("not_supported", "Cannot safely reparent a child outside the session directory."));
+            }
+        }
+    }
+    if preflight {
+        let affected = members.iter().map(|member| Ok(DeleteMemberProof { id: member.id.clone(), path: member.path.clone(),
+            file: member.file.try_clone().map_err(|e| error("io", e))?, metadata: member.metadata.clone() })).collect::<Result<Vec<_>, (String, String)>>()?;
+        return Ok(DeleteOutcome::Preflight(DeletePreflight { path: canonical_target, file: target_handle, metadata: target_metadata, affected }));
+    }
+    if members.len() == 1 {
+        crate::session_deletion_journal::remove(&root, &state.agent_dir(), id, &canonical_target, &target_metadata)?;
+    } else {
+        let mut mutations = Vec::new();
+        for mut member in members {
+            let remove = deleted.contains(&member.id);
+            let direct_child = member.parent.as_ref().is_some_and(|parent| same_path(&parent.canonicalize().unwrap_or_else(|_| parent.clone()), &canonical_target));
+            if !remove && !direct_child { continue; }
+            let replacement_header = if remove { None } else {
+                let header = member.header.as_object_mut().ok_or_else(|| error("io", "Invalid session header"))?;
+                match &target_parent {
+                    Some(parent) => { header.insert("parentSession".into(), json!(parent.to_string_lossy())); },
+                    None => { header.remove("parentSession"); },
+                }
+                Some(serde_json::to_string(&member.header).map_err(|e| error("io", e))?)
+            };
+            let marker_parent = if !remove { target_parent.as_ref().zip(parent_id.as_ref()).map(|(path, parent)| (parent.clone(), path.to_string_lossy().into_owned())) } else { None };
+            let path = member.path.canonicalize().map_err(|e| error("io", e))?;
+            if !path.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
+            mutations.push(crate::session_deletion_journal::GroupMutation { session: member.id, path, handle: member.file, metadata: member.metadata, replacement_header, marker_parent });
+        }
+        crate::session_deletion_journal::remove_group(&root, &state.agent_dir(), mutations)?;
+    }
     Ok(DeleteOutcome::Deleted(json!({"ok": true, "folderTrashed": false})))
 }
 
@@ -377,8 +464,11 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(state.registry.get("target").is_some() && target.exists());
         std::fs::remove_file(archive).unwrap();
         let child = session(&root, "child", Some(&target));
-        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        let queue = state.registry.composer_outbox_for("child");
+        let pending = queue.enqueue("pending", None).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "busy");
         assert!(state.registry.get("target").is_some() && target.exists());
+        queue.take(&pending.id);
         std::fs::remove_file(child).unwrap();
         live.command("prompt", json!({"message":"fixture only"}), Some(std::time::Duration::from_secs(2))).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -394,6 +484,32 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         drop(live);
     }
     #[test]
+    fn group_deletion_reparents_forks_and_removes_transitive_subagents() {
+        let (_dir, state, root) = fixture();
+        let grandparent = session(&root, "grandparent", None);
+        let target = session(&root, "target", Some(&grandparent));
+        let fork = session(&root, "fork", Some(&target));
+        let sub1 = session(&root, "sub1", None);
+        let sub2 = session(&root, "sub2", None);
+        use std::io::Write;
+        for (path, parent) in [(&sub1, "target"), (&sub2, "sub1"), (&fork, "other")] {
+            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":parent,"parentSessionPath":"old"}});
+            writeln!(std::fs::OpenOptions::new().append(true).open(path).unwrap(), "{marker}").unwrap();
+        }
+        writeln!(std::fs::OpenOptions::new().append(true).open(&fork).unwrap(), "{}", json!({"type":"message","message":{"role":"user","content":"keep"}})).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
+        assert!(!target.exists() && !sub1.exists() && !sub2.exists());
+        assert!(grandparent.exists());
+        let content = std::fs::read_to_string(&fork).unwrap();
+        let mut lines = content.lines();
+        let header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let marker: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(header["parentSession"], grandparent.to_string_lossy().as_ref());
+        assert_eq!(marker["data"]["parentSessionId"], "grandparent");
+        assert_eq!(marker["data"]["parentSessionPath"], grandparent.to_string_lossy().as_ref());
+        assert!(lines.next().unwrap().contains("keep"));
+    }
+    #[test]
     fn affected_set_includes_transitive_subagents_and_direct_forks() {
         let (dir, state, root) = fixture();
         let target = session(&root, "target", None);
@@ -403,15 +519,28 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let unrelated = session(&root, "unrelated", None);
         use std::io::Write;
         for (path, parent) in [(&sub1, "target"), (&sub2, "sub1")] {
-            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"parentSessionId":parent}});
+            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":parent,"parentSessionPath":"fixture"}});
             writeln!(std::fs::OpenOptions::new().append(true).open(path).unwrap(), "{marker}").unwrap();
         }
-        assert_eq!(affected_session_ids(&state, "target").unwrap(), vec!["fork", "sub1", "sub2", "target"]);
+        assert_eq!(affected_session_ids(&state, "target").unwrap().ids, vec!["fork", "sub1", "sub2", "target"]);
         let args = json!({"session":"target"});
         assert_eq!(delete_with_index(&state, &args, &FixtureIndex(vec!["sub2".into()]), false, None).unwrap_err().0, "not_supported");
         crate::session_writer_fence::begin(dir.path(), "fork", "op", "chat", &fork, None).unwrap();
         assert_eq!(super::delete(&state, &args).unwrap_err().0, "busy");
         assert!(target.exists() && fork.exists() && sub1.exists() && sub2.exists() && unrelated.exists());
+    }
+    #[test]
+    fn affected_discovery_keeps_identity_when_a_child_is_replaced() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let child = session(&root, "child", Some(&target));
+        let before = affected_session_ids(&state, "target").unwrap();
+        std::fs::rename(&child, root.join("old-child.saved")).unwrap();
+        std::fs::write(&child, format!("{}\n", json!({"type":"session","id":"child","cwd":root,"parentSession":target,"replacement":true}))).unwrap();
+        let after = affected_session_ids(&state, "target").unwrap();
+        assert_eq!(before.ids, after.ids);
+        assert_eq!(verify_member_proofs(&before.proofs, &after.proofs).unwrap_err().0, "busy");
+        assert!(std::fs::read_to_string(&child).unwrap().contains("replacement"));
     }
     #[test]
     fn deletion_preflight_keeps_identity_across_replacement() {
@@ -519,12 +648,15 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(sibling.exists());
     }
     #[test]
-    fn rejects_complex_or_queued_deletion_without_side_effects() {
+    fn rejects_queued_deletion_without_side_effects() {
         let (_dir, state, root) = fixture();
         let target = session(&root, "target", None);
         let child = session(&root, "child", Some(&target));
-        assert_eq!(delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        let queue = state.registry.composer_outbox_for("child");
+        let pending = queue.enqueue("pending", None).unwrap();
+        assert_eq!(delete(&state, &json!({"session":"target"})).unwrap_err().0, "busy");
         assert!(target.exists() && child.exists());
+        queue.take(&pending.id);
         let chat = state.agent_dir().join("chats/chat-1");
         std::fs::create_dir_all(&chat).unwrap();
         std::fs::write(&child, format!("{}\n", json!({"type":"session","id":"child","cwd":chat,"parentSession":target}))).unwrap();
@@ -554,7 +686,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let (_dir, state, root) = fixture();
         let parent = session(&root, "parent", None);
         let child = session(&root, "sub", None);
-        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"parent"}});
+        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"parent","parentSessionPath":"fixture"}});
         use std::io::Write;
         writeln!(std::fs::OpenOptions::new().append(true).open(&child).unwrap(), "{marker}").unwrap();
         assert_eq!(super::delete(&state, &json!({"session":"sub"})).unwrap()["ok"], true);
@@ -562,20 +694,30 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         assert!(!child.exists());
     }
     #[test]
-    fn rejects_subagent_references_and_keeps_shared_chat_folder() {
+    fn removes_subagent_subtree_and_keeps_unrelated_chat_folder() {
         let (dir, state, root) = fixture();
         let chat = dir.path().join("chats/chat-1");
         std::fs::create_dir_all(&chat).unwrap();
         std::fs::write(chat.join("kept.txt"), "kept").unwrap();
         let target = session(&root, "target", None);
         let child = session(&root, "sub", None);
-        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target"}});
+        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target","parentSessionPath":"fixture"}});
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().append(true).open(&child).unwrap();
         writeln!(file, "{}", json!({"type":"model_change","provider":"fixture","modelId":"fixture"})).unwrap();
         writeln!(file, "{marker}").unwrap();
-        assert_eq!(delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
-        assert!(target.exists() && child.exists() && chat.join("kept.txt").exists());
+        assert_eq!(delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
+        assert!(!target.exists() && !child.exists() && chat.join("kept.txt").exists());
+    }
+    #[test]
+    fn malformed_subagent_marker_never_authorizes_a_cascade() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let other = session(&root, "other", None);
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&other).unwrap(), "{}", json!({"type":"custom","customType":"pi-web:subagent","data":{"parentSessionId":"target"}})).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(target.exists() && other.exists());
     }
     #[test]
     fn malformed_transcript_cannot_prove_absence_of_subagents() {

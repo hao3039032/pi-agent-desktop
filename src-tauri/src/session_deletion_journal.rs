@@ -49,6 +49,31 @@ mod linux {
     #[serde(deny_unknown_fields)]
     struct Journal { version: u8, session: String, source: String, device: u64, inode: u64, size: u64, mtime: i64, mtime_nsec: i64 }
 
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GroupItem {
+        session: String, source: String, device: u64, inode: u64, size: u64, mtime: i64, mtime_nsec: i64,
+        replacement_header: Option<String>, marker_parent: Option<(String, String)>,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GroupJournal { version: u8, items: Vec<GroupItem> }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FileVersion { device: u64, inode: u64, size: u64, mtime: i64, mtime_nsec: i64 }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GroupReady { replacements: Vec<Option<FileVersion>> }
+
+    pub(crate) struct GroupMutation {
+        pub session: String,
+        pub path: std::path::PathBuf,
+        pub handle: File,
+        pub metadata: std::fs::Metadata,
+        pub replacement_header: Option<String>,
+        pub marker_parent: Option<(String, String)>,
+    }
+
     fn journal_dir(agent: &Path) -> Result<File, Failure> {
         let path = agent.join("session-deletion-journal");
         use std::os::unix::fs::DirBuilderExt;
@@ -118,8 +143,8 @@ mod linux {
         if fd < 0 { return Err(io(std::io::Error::last_os_error())); }
         let file = unsafe { File::from_raw_fd(fd) };
         if !file.metadata().map_err(io)?.is_file() { return Err(fail("io", "Invalid deletion journal file")); }
-        let mut bytes = Vec::new(); file.take(65537).read_to_end(&mut bytes).map_err(io)?;
-        if bytes.len() > 65536 { return Err(fail("io", "Deletion journal too large")); }
+        let mut bytes = Vec::new(); file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(io)?;
+        if bytes.len() > 4 * 1024 * 1024 { return Err(fail("io", "Deletion journal too large")); }
         Ok(bytes)
     }
     fn valid_token(token: &str) -> bool { token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) }
@@ -136,6 +161,161 @@ mod linux {
     fn original_is_expected(parent: &File, name: &str, journal: &Journal) -> Result<bool, Failure> {
         Ok(stat(parent, name)?.is_some_and(|value| matches_expected(&value, journal)))
     }
+    fn group_stage_name(token: &str, index: usize) -> String { format!(".pi-deletion-{token}-{index}") }
+    fn version_from_stat(value: &libc::stat) -> FileVersion {
+        FileVersion { device: value.st_dev as u64, inode: value.st_ino as u64, size: value.st_size as u64, mtime: value.st_mtime, mtime_nsec: value.st_mtime_nsec }
+    }
+    fn matches_version(value: &libc::stat, expected: &FileVersion) -> bool {
+        value.st_mode & libc::S_IFMT == libc::S_IFREG && value.st_dev as u64 == expected.device && value.st_ino as u64 == expected.inode
+            && value.st_size as u64 == expected.size && value.st_mtime == expected.mtime && value.st_mtime_nsec == expected.mtime_nsec
+    }
+    fn item_version(item: &GroupItem) -> FileVersion {
+        FileVersion { device: item.device, inode: item.inode, size: item.size, mtime: item.mtime, mtime_nsec: item.mtime_nsec }
+    }
+    fn verify_group(root: &Path, token: &str, group: &GroupJournal) -> Result<(), Failure> {
+        use std::collections::HashSet;
+        if !valid_token(token) || group.version != 2 || group.items.is_empty() { return Err(fail("io", "Invalid deletion group journal")); }
+        let mut paths = HashSet::new(); let mut ids = HashSet::new();
+        for item in &group.items {
+            if item.session.is_empty() || !ids.insert(&item.session) || !paths.insert(&item.source)
+                || (item.marker_parent.is_some() && item.replacement_header.is_none()) {
+                return Err(fail("io", "Invalid deletion group member"));
+            }
+            if let Some(header) = &item.replacement_header {
+                let value: serde_json::Value = serde_json::from_str(header).map_err(io)?;
+                if value.get("type").and_then(serde_json::Value::as_str) != Some("session") || value.get("id").and_then(serde_json::Value::as_str) != Some(item.session.as_str()) {
+                    return Err(fail("io", "Invalid deletion replacement header"));
+                }
+            }
+            parent_and_name(root, &item.source)?;
+        }
+        Ok(())
+    }
+    fn make_replacement(stage: &File, item: &GroupItem) -> Result<FileVersion, Failure> {
+        use std::io::BufRead;
+        let fd = unsafe { libc::openat(stage.as_raw_fd(), c("original")?.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 { return Err(io(std::io::Error::last_os_error())); }
+        let input = unsafe { File::from_raw_fd(fd) };
+        let mode = input.metadata().map_err(io)?.mode() & 0o777;
+        let fd = unsafe { libc::openat(stage.as_raw_fd(), c("replacement")?.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode) };
+        if fd < 0 { return Err(io(std::io::Error::last_os_error())); }
+        let mut output = unsafe { File::from_raw_fd(fd) };
+        if unsafe { libc::fchmod(output.as_raw_fd(), mode) } != 0 { return Err(io(std::io::Error::last_os_error())); }
+        let mut reader = std::io::BufReader::new(input);
+        let mut line = Vec::new(); reader.by_ref().take(65537).read_until(b'\n', &mut line).map_err(io)?;
+        if line.is_empty() || line.len() > 65536 { return Err(fail("io", "Invalid session header while staging rewrite")); }
+        output.write_all(item.replacement_header.as_ref().ok_or_else(|| fail("io", "Missing replacement header"))?.as_bytes()).map_err(io)?;
+        if line.ends_with(b"\n") { output.write_all(b"\n").map_err(io)?; }
+        if let Some((parent_id, parent_path)) = &item.marker_parent {
+            loop {
+                line.clear(); reader.by_ref().take(16 * 1024 * 1024 + 1).read_until(b'\n', &mut line).map_err(io)?;
+                if line.is_empty() { break; }
+                if line.len() > 16 * 1024 * 1024 { return Err(fail("io", "Oversized session entry while staging rewrite")); }
+                let mut value: serde_json::Value = serde_json::from_slice(&line).map_err(io)?;
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("custom") && value.get("customType").and_then(serde_json::Value::as_str) == Some("pi-web:subagent") {
+                    let data = value.get_mut("data").and_then(serde_json::Value::as_object_mut).ok_or_else(|| fail("io", "Invalid subagent metadata"))?;
+                    data.insert("parentSessionId".into(), serde_json::json!(parent_id));
+                    data.insert("parentSessionPath".into(), serde_json::json!(parent_path));
+                    output.write_all(serde_json::to_string(&value).map_err(io)?.as_bytes()).map_err(io)?;
+                    if line.ends_with(b"\n") { output.write_all(b"\n").map_err(io)?; }
+                    break;
+                }
+                output.write_all(&line).map_err(io)?;
+            }
+        }
+        std::io::copy(&mut reader, &mut output).map_err(io)?;
+        output.sync_all().map_err(io)?;
+        let value = stat(stage, "replacement")?.ok_or_else(|| fail("io", "Staged replacement disappeared"))?;
+        Ok(version_from_stat(&value))
+    }
+    fn finish_group(agent: &Path, root: &Path, token: &str, group: &GroupJournal) -> Result<(), Failure> {
+        finish_group_with_hook(agent, root, token, group, |_| Ok(()))
+    }
+    fn finish_group_with_hook(agent: &Path, root: &Path, token: &str, group: &GroupJournal, hook: impl Fn(&str) -> Result<(), Failure>) -> Result<(), Failure> {
+        verify_group(root, token, group)?;
+        let journal_root = journal_dir(agent)?;
+        let transaction = open_directory(&journal_root, token)?;
+        let committed = stat(&transaction, "commit")?.is_some();
+        if committed && read_file(&transaction, "commit")? != b"commit\n" { return Err(fail("io", "Invalid deletion commit marker")); }
+        let ready = match stat(&transaction, "ready")? {
+            Some(_) => Some(serde_json::from_slice::<GroupReady>(&read_file(&transaction, "ready")?).map_err(io)?),
+            None => None,
+        };
+        if ready.as_ref().is_some_and(|ready| ready.replacements.len() != group.items.len()) || (committed && ready.is_none()) {
+            return Err(fail("io", "Invalid deletion group readiness"));
+        }
+        if committed && group.items.iter().zip(&ready.as_ref().unwrap().replacements).any(|(item, replacement)| item.replacement_header.is_some() != replacement.is_some()) {
+            return Err(fail("io", "Invalid group replacement readiness"));
+        }
+        for (index, item) in group.items.iter().enumerate() {
+            let (parent, original) = parent_and_name(root, &item.source)?;
+            let stage_name = group_stage_name(token, index);
+            let stage = match open_directory(&parent, &stage_name) {
+                Ok(stage) => Some(stage),
+                Err(_) if stat(&parent, &stage_name)?.is_none() => None,
+                Err(error) => return Err(error),
+            };
+            let expected = item_version(item);
+            if let Some(stage) = stage {
+                for entry in std::fs::read_dir(format!("/proc/self/fd/{}", stage.as_raw_fd())).map_err(io)? {
+                    let entry = entry.map_err(io)?;
+                    let name = entry.file_name();
+                    if !(name == "original" || name == "replacement") || !entry.file_type().map_err(io)?.is_file() {
+                        return Err(fail("io", "Invalid deletion group staging entry"));
+                    }
+                }
+                let staged_original = stat(&stage, "original")?;
+                let staged_replacement = stat(&stage, "replacement")?;
+                if !committed {
+                    if let Some(original_stat) = staged_original {
+                        // Even an unexpected replacement isolated from the source
+                        // is returned without overwriting a newer source file.
+                        let _ = original_stat;
+                        rename_no_replace(&stage, "original", &parent, &original)
+                            .map_err(|_| fail("busy", "Group recovery cannot restore without replacing a file"))?;
+                        parent.sync_all().map_err(io)?;
+                    } else if !stat(&parent, &original)?.is_some_and(|value| matches_version(&value, &expected)) {
+                        return Err(fail("busy", "Group recovery cannot verify the original session"));
+                    }
+                    if staged_replacement.is_some() { unlink(&stage, "replacement", 0)?; }
+                } else {
+                    let replacement = ready.as_ref().and_then(|ready| ready.replacements[index].as_ref());
+                    if item.replacement_header.is_some() != replacement.is_some() { return Err(fail("io", "Invalid group replacement readiness")); }
+                    if let Some(replacement) = replacement {
+                        if let Some(staged) = staged_replacement {
+                            if !matches_version(&staged, replacement) { return Err(fail("busy", "Staged replacement changed")); }
+                            rename_no_replace(&stage, "replacement", &parent, &original)
+                                .map_err(|_| fail("busy", "Group recovery cannot publish without replacing a file"))?;
+                            parent.sync_all().map_err(io)?;
+                        } else if !stat(&parent, &original)?.is_some_and(|value| matches_version(&value, replacement)) {
+                            return Err(fail("busy", "Group recovery cannot verify the published replacement"));
+                        }
+                    } else if staged_replacement.is_some() { return Err(fail("io", "Unexpected group replacement")); }
+                    if let Some(original_stat) = staged_original {
+                        if !matches_version(&original_stat, &expected) { return Err(fail("busy", "Staged original changed")); }
+                        unlink(&stage, "original", 0)?;
+                    }
+                }
+                stage.sync_all().map_err(io)?;
+                unlink(&parent, &stage_name, libc::AT_REMOVEDIR)?;
+                parent.sync_all().map_err(io)?;
+            } else if !committed {
+                if !stat(&parent, &original)?.is_some_and(|value| matches_version(&value, &expected)) {
+                    return Err(fail("busy", "Group recovery cannot verify the original session"));
+                }
+            } else if let Some(replacement) = ready.as_ref().and_then(|ready| ready.replacements[index].as_ref()) {
+                if !stat(&parent, &original)?.is_some_and(|value| matches_version(&value, replacement)) {
+                    return Err(fail("busy", "Group recovery cannot verify the published replacement"));
+                }
+            }
+            hook(&format!("applied:{index}"))?;
+        }
+        let done = format!("{token}.done");
+        rename_no_replace(&journal_root, token, &journal_root, &done)?;
+        journal_root.sync_all().map_err(io)?;
+        cleanup_done(&journal_root, &done)
+    }
+
     fn finish(agent: &Path, root: &Path, token: &str, journal: &Journal) -> Result<(), Failure> {
         finish_with_hook(agent, root, token, journal, |_| Ok(()))
     }
@@ -192,7 +372,7 @@ mod linux {
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", transaction.as_raw_fd())).map_err(io)? {
             let entry = entry.map_err(io)?;
             let name = entry.file_name().into_string().map_err(|_| fail("io", "Invalid deletion tombstone entry"))?;
-            if !matches!(name.as_str(), "journal" | "commit") || !entry.file_type().map_err(io)?.is_file() {
+            if !matches!(name.as_str(), "journal" | "commit" | "ready") || !entry.file_type().map_err(io)?.is_file() {
                 return Err(fail("io", "Invalid deletion tombstone entry"));
             }
             unlink(&transaction, &name, 0)?;
@@ -216,7 +396,7 @@ mod linux {
         if !state.deletion_recovery_permitted() {
             return Err(fail("busy", "Session deletion recovery is pending exclusive maintenance"));
         }
-        enum Pending { Preparation(String, bool), Done(String), Active(String, Journal) }
+        enum Pending { Preparation(String, bool), Done(String), Active(String, Journal), Group(String, GroupJournal) }
         let mut pending = Vec::new();
         let mut ids = Vec::new();
         for entry in std::iter::once(first).chain(entries) {
@@ -230,6 +410,7 @@ mod linux {
             let transaction = open_directory(&journal_root, &token)?;
             let mut has_journal = false;
             let mut has_commit = false;
+            let mut has_ready = false;
             for child in std::fs::read_dir(format!("/proc/self/fd/{}", transaction.as_raw_fd())).map_err(io)? {
                 let child = child.map_err(io)?;
                 let name = child.file_name().into_string().map_err(|_| fail("io", "Invalid deletion journal entry"))?;
@@ -237,21 +418,45 @@ mod linux {
                 match name.as_str() {
                     "journal" => has_journal = true,
                     "commit" if kind != 0 => has_commit = true,
+                    "ready" if kind != 0 => has_ready = true,
                     _ => return Err(fail("io", "Invalid deletion journal entry")),
                 }
             }
             if has_commit && read_file(&transaction, "commit")? != b"commit\n" { return Err(fail("io", "Invalid deletion commit marker")); }
-            let journal = if has_journal {
-                let journal: Journal = serde_json::from_slice(&read_file(&transaction, "journal")?).map_err(io)?;
-                verify_journal(&journal, id)?;
-                parent_and_name(root, &journal.source)?;
-                ids.push(journal.session.clone());
-                Some(journal)
-            } else { None };
+            let mut single = None;
+            let mut group = None;
+            if has_journal {
+                let value: serde_json::Value = serde_json::from_slice(&read_file(&transaction, "journal")?).map_err(io)?;
+                match value.get("version").and_then(serde_json::Value::as_u64) {
+                    Some(1) => {
+                        if has_ready { return Err(fail("io", "Unexpected deletion readiness file")); }
+                        let journal: Journal = serde_json::from_value(value).map_err(io)?;
+                        verify_journal(&journal, id)?;
+                        parent_and_name(root, &journal.source)?;
+                        ids.push(journal.session.clone()); single = Some(journal);
+                    }
+                    Some(2) => {
+                        let journal: GroupJournal = serde_json::from_value(value).map_err(io)?;
+                        verify_group(root, id, &journal)?;
+                        ids.extend(journal.items.iter().map(|item| item.session.clone()));
+                        if has_ready {
+                            let ready: GroupReady = serde_json::from_slice(&read_file(&transaction, "ready")?).map_err(io)?;
+                            if ready.replacements.len() != journal.items.len() || (has_commit && journal.items.iter().zip(&ready.replacements).any(|(item, replacement)| item.replacement_header.is_some() != replacement.is_some())) {
+                                return Err(fail("io", "Invalid deletion group readiness"));
+                            }
+                        } else if has_commit { return Err(fail("io", "Missing deletion group readiness")); }
+                        group = Some(journal);
+                    }
+                    _ => return Err(fail("io", "Invalid deletion journal version")),
+                }
+            } else if kind == 2 || (has_ready && kind != 1) {
+                return Err(fail("io", "Missing deletion journal"));
+            }
             match kind {
                 0 => pending.push(Pending::Preparation(token, has_journal)),
                 1 => pending.push(Pending::Done(token)),
-                _ => pending.push(Pending::Active(token, journal.ok_or_else(|| fail("io", "Missing deletion journal"))?)),
+                _ if group.is_some() => pending.push(Pending::Group(token, group.unwrap())),
+                _ => pending.push(Pending::Active(token, single.ok_or_else(|| fail("io", "Missing deletion journal"))?)),
             }
         }
         state.registry.with_idle_session_writers(&ids, |_| {
@@ -268,6 +473,7 @@ mod linux {
                     }
                     Pending::Done(token) => cleanup_done(&journal_root, &token)?,
                     Pending::Active(token, journal) => finish(&agent, root, &token, &journal)?,
+                    Pending::Group(token, journal) => finish_group(&agent, root, &token, &journal)?,
                 }
             }
             Ok(())
@@ -275,6 +481,75 @@ mod linux {
             session_host::SessionWriterError::Busy(message) => fail("busy", message),
             session_host::SessionWriterError::Operation(error) => error,
         })
+    }
+
+    pub(crate) fn remove_group(root: &Path, agent: &Path, mutations: Vec<GroupMutation>) -> Result<(), Failure> {
+        remove_group_with_hook(root, agent, mutations, |_| Ok(()))
+    }
+    fn remove_group_with_hook(root: &Path, agent: &Path, mutations: Vec<GroupMutation>, hook: impl Fn(&str) -> Result<(), Failure>) -> Result<(), Failure> {
+        let mut items = Vec::with_capacity(mutations.len());
+        for mutation in &mutations {
+            let current = mutation.handle.metadata().map_err(io)?;
+            if current.dev() != mutation.metadata.dev() || current.ino() != mutation.metadata.ino() || current.len() != mutation.metadata.len()
+                || current.mtime() != mutation.metadata.mtime() || current.mtime_nsec() != mutation.metadata.mtime_nsec() {
+                return Err(fail("busy", "Session changed before group staging"));
+            }
+            let source = mutation.path.strip_prefix(root).map_err(io)?.to_str().ok_or_else(|| fail("io", "Invalid session path encoding"))?.to_string();
+            items.push(GroupItem { session: mutation.session.clone(), source, device: mutation.metadata.dev(), inode: mutation.metadata.ino(),
+                size: mutation.metadata.len(), mtime: mutation.metadata.mtime(), mtime_nsec: mutation.metadata.mtime_nsec(),
+                replacement_header: mutation.replacement_header.clone(), marker_parent: mutation.marker_parent.clone() });
+        }
+        let mut random = [0u8; 16]; getrandom::fill(&mut random).map_err(io)?;
+        let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let group = GroupJournal { version: 2, items };
+        verify_group(root, &token, &group)?;
+        let bytes = serde_json::to_vec(&group).map_err(io)?;
+        if bytes.len() > 4 * 1024 * 1024 { return Err(fail("io", "Deletion group journal exceeds its size budget")); }
+        let journal_root = journal_dir(agent)?;
+        let preparation = format!(".prepare-{token}");
+        if unsafe { libc::mkdirat(journal_root.as_raw_fd(), c(&preparation)?.as_ptr(), 0o700) } != 0 { return Err(io(std::io::Error::last_os_error())); }
+        journal_root.sync_all().map_err(io)?;
+        let transaction = open_directory(&journal_root, &preparation)?;
+        create_file(&transaction, "journal", &bytes)?;
+        transaction.sync_all().map_err(io)?;
+        rename_no_replace(&journal_root, &preparation, &journal_root, &token)?;
+        journal_root.sync_all().map_err(io)?;
+        hook("prepared")?;
+        let mut replacements = Vec::with_capacity(group.items.len());
+        for (index, item) in group.items.iter().enumerate() {
+            let staged = (|| {
+                let (parent, original) = parent_and_name(root, &item.source)?;
+                let stage_name = group_stage_name(&token, index);
+                if unsafe { libc::mkdirat(parent.as_raw_fd(), c(&stage_name)?.as_ptr(), 0o700) } != 0 { return Err(io(std::io::Error::last_os_error())); }
+                parent.sync_all().map_err(io)?;
+                let stage = open_directory(&parent, &stage_name)?;
+                rename_no_replace(&parent, &original, &stage, "original")?;
+                parent.sync_all().map_err(io)?; stage.sync_all().map_err(io)?;
+                let actual = stat(&stage, "original")?.ok_or_else(|| fail("busy", "Isolated group session disappeared"))?;
+                if !matches_version(&actual, &item_version(item)) { return Err(fail("busy", "Session changed during group isolation")); }
+                let replacement = if item.replacement_header.is_some() { Some(make_replacement(&stage, item)?) } else { None };
+                stage.sync_all().map_err(io)?;
+                Ok(replacement)
+            })();
+            match staged {
+                Ok(replacement) => replacements.push(replacement),
+                Err(error) => {
+                    if let Err(rollback) = finish_group(agent, root, &token, &group) {
+                        return Err(fail("busy", format!("{}; group rollback pending: {}", error.1, rollback.1)));
+                    }
+                    return Err(error);
+                }
+            }
+            hook(&format!("isolated:{index}"))?;
+        }
+        let ready = serde_json::to_vec(&GroupReady { replacements }).map_err(io)?;
+        create_file(&transaction, "ready", &ready)?;
+        transaction.sync_all().map_err(io)?;
+        hook("ready")?;
+        create_file(&transaction, "commit", b"commit\n")?;
+        transaction.sync_all().map_err(io)?;
+        hook("committed")?;
+        finish_group_with_hook(agent, root, &token, &group, hook)
     }
 
     pub(crate) fn remove(root: &Path, agent: &Path, session: &str, target: &Path, expected: &std::fs::Metadata) -> Result<(), Failure> {
@@ -329,6 +604,101 @@ mod linux {
             *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
             state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
             (dir, state, root, source)
+        }
+        fn group_fixture() -> (tempfile::TempDir, crate::pi_ipc::IpcHostState, std::path::PathBuf, Vec<GroupMutation>) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("sessions"); std::fs::create_dir_all(root.join("p")).unwrap();
+            let state = crate::pi_ipc::IpcHostState::new();
+            *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+            state.deletion_recovery_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut mutations = Vec::new();
+            for id in ["root", "sub", "fork"] {
+                let path = root.join(format!("p/{id}.jsonl"));
+                let header = json!({"type":"session","id":id,"cwd":"/tmp","parentSession":"old-parent"});
+                std::fs::write(&path, format!("{header}\n{}\n", json!({"type":"message","message":{"role":"user","content":"keep body"}}))).unwrap();
+                let handle = File::open(&path).unwrap(); let metadata = handle.metadata().unwrap();
+                let replacement_header = (id == "fork").then(|| json!({"type":"session","id":"fork","cwd":"/tmp","parentSession":"new-parent"}).to_string());
+                mutations.push(GroupMutation { session: id.into(), path, handle, metadata, replacement_header, marker_parent: None });
+            }
+            (dir, state, root, mutations)
+        }
+        #[test]
+        fn group_commit_and_rollback_are_recoverable_at_key_phases() {
+            for phase in ["prepared", "isolated:0", "isolated:1", "isolated:2", "ready", "committed", "applied:0", "applied:1", "applied:2"] {
+                let (dir, state, root, mutations) = group_fixture();
+                assert!(remove_group_with_hook(&root, dir.path(), mutations, |at| if at == phase { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+                let _policy = state.policy_gate.try_read().unwrap();
+                let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+                recover(&state, &root).unwrap();
+                let target = root.join("p/root.jsonl"); let sub = root.join("p/sub.jsonl"); let fork = root.join("p/fork.jsonl");
+                if phase == "committed" || phase.starts_with("applied:") {
+                    assert!(!target.exists() && !sub.exists());
+                    let data = std::fs::read_to_string(fork).unwrap();
+                    assert!(data.contains("new-parent") && data.contains("keep body"));
+                } else {
+                    assert!(target.exists() && sub.exists());
+                    assert!(std::fs::read_to_string(fork).unwrap().contains("old-parent"));
+                }
+                recover(&state, &root).unwrap();
+            }
+        }
+        #[test]
+        fn group_process_crash_requires_explicit_fixture_lock_recovery() {
+            if let Ok(agent) = std::env::var("PI_TEST_GROUP_CRASH_AGENT") {
+                let agent = std::path::PathBuf::from(agent); let root = agent.join("sessions");
+                let mut mutations = Vec::new();
+                for id in ["root", "sub", "fork"] {
+                    let path = root.join(format!("p/{id}.jsonl"));
+                    let handle = File::open(&path).unwrap(); let metadata = handle.metadata().unwrap();
+                    let replacement_header = (id == "fork").then(|| json!({"type":"session","id":"fork","cwd":"/tmp","parentSession":"new-parent"}).to_string());
+                    mutations.push(GroupMutation { session: id.into(), path, handle, metadata, replacement_header, marker_parent: None });
+                }
+                let _guard = task_scheduler::transaction_lock::TransactionLock::acquire(&agent).unwrap();
+                let phase = std::env::var("PI_TEST_GROUP_CRASH_PHASE").unwrap();
+                let _ = remove_group_with_hook(&root, &agent, mutations, |at| {
+                    if at == phase { std::process::exit(73); }
+                    Ok(())
+                });
+                panic!("group fixture phase not reached");
+            }
+            for phase in ["isolated:1", "committed", "applied:2"] {
+                let (dir, state, root, mutations) = group_fixture(); drop(mutations);
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "session_deletion_journal::linux::tests::group_process_crash_requires_explicit_fixture_lock_recovery"])
+                    .env("PI_TEST_GROUP_CRASH_AGENT", dir.path()).env("PI_TEST_GROUP_CRASH_PHASE", phase).status().unwrap();
+                assert_eq!(status.code(), Some(73));
+                let gate = dir.path().join("scheduled-tasks/transaction.lock"); assert!(gate.is_dir());
+                // Only this reaped child's isolated fixture lock is removed.
+                std::fs::remove_file(gate.join("owner")).unwrap(); std::fs::remove_dir(&gate).unwrap();
+                let _policy = state.policy_gate.try_read().unwrap();
+                let _exclusive = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+                recover(&state, &root).unwrap();
+                let committed = phase != "isolated:1";
+                assert_eq!(root.join("p/root.jsonl").exists(), !committed);
+                let fork = std::fs::read_to_string(root.join("p/fork.jsonl")).unwrap();
+                assert!(fork.contains(if committed { "new-parent" } else { "old-parent" }));
+            }
+        }
+        #[test]
+        fn group_recovery_never_overwrites_a_new_source() {
+            let (dir, state, root, mutations) = group_fixture();
+            assert!(remove_group_with_hook(&root, dir.path(), mutations, |at| if at == "isolated:0" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            let target = root.join("p/root.jsonl"); std::fs::write(&target, "new user file").unwrap();
+            let _policy = state.policy_gate.try_read().unwrap();
+            let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+            assert_eq!(recover(&state, &root).unwrap_err().0, "busy");
+            assert_eq!(std::fs::read_to_string(target).unwrap(), "new user file");
+        }
+        #[test]
+        fn committed_group_refuses_to_overwrite_new_child_file() {
+            let (dir, state, root, mutations) = group_fixture();
+            assert!(remove_group_with_hook(&root, dir.path(), mutations, |at| if at == "committed" { Err(fail("fixture", "crash")) } else { Ok(()) }).is_err());
+            let fork = root.join("p/fork.jsonl"); std::fs::write(&fork, "new user file").unwrap();
+            let _policy = state.policy_gate.try_read().unwrap();
+            let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(dir.path()).unwrap();
+            assert_eq!(recover(&state, &root).unwrap_err().0, "busy");
+            assert_eq!(std::fs::read_to_string(fork).unwrap(), "new user file");
+            assert!(crate::session_deletion_journal::has_pending(dir.path()).unwrap());
         }
         #[test]
         fn process_crash_requires_explicit_fixture_lock_recovery() {
@@ -543,7 +913,21 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{recover, remove};
+pub(crate) use linux::{recover, remove, remove_group, GroupMutation};
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct GroupMutation {
+    pub session: String,
+    pub path: std::path::PathBuf,
+    pub handle: std::fs::File,
+    pub metadata: std::fs::Metadata,
+    pub replacement_header: Option<String>,
+    pub marker_parent: Option<(String, String)>,
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn remove_group(_root: &std::path::Path, _agent: &std::path::Path, _mutations: Vec<GroupMutation>) -> Result<(), (String, String)> {
+    Err(("not_supported".into(), "Safe session deletion is unavailable on this platform.".into()))
+}
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn recover(state: &crate::pi_ipc::IpcHostState, _root: &std::path::Path) -> Result<(), (String, String)> {
