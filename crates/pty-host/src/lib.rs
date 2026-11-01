@@ -640,6 +640,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shutdown_empty_registry_confirms_no_tracked_leaders() {
+        let host = PtyHost::new();
+        let result = host.shutdown_until(Instant::now());
+        assert!(result.leader_exited.is_empty());
+        assert!(result.unknown.is_empty());
+        assert!(host.create("later", None, PtyOptions::default()).is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_reports_real_leader_exits_and_closes_admission() {
