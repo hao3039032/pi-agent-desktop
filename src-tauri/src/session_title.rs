@@ -41,6 +41,7 @@ pub(crate) fn start(state: &IpcHostState, args: &Value) -> Result<Value, (String
     let mut tasks = state.title_tasks.lock().unwrap();
     tasks.retain(|_, task| task.lock().unwrap().expires > Instant::now());
     if tasks.contains_key(id) { return Err(err("busy", "Title generation is already in progress")); }
+    if tasks.len() >= 32 { return Err(err("busy", "Too many title requests are in progress")); }
     let guard = session.try_branch_activity().map_err(|e| err("busy", e))?;
     if session.run_state().is_running() || !session.composer_outbox.snapshot().0.is_empty() { return Err(err("busy", "Wait for the current response and queued messages before generating a title")); }
     session.bridge_request("tree.assertIdle", None, Some(Duration::from_secs(30))).map_err(|e| err("busy", e))?;
