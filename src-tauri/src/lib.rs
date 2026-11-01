@@ -43,6 +43,7 @@ mod provider_auth;
 // bridge instead of the Tauri WebView plumbing. No other module needs the
 // exposure.
 pub mod pi_ipc;
+mod mcp_oauth_callback;
 mod session_view;
 pub mod settings_extras;
 mod session_search;
@@ -57,6 +58,9 @@ mod session_writer_fence;
 mod session_deletion;
 mod session_deletion_journal;
 mod terminal_host;
+mod host_ownership;
+pub mod host_lifecycle;
+pub mod recovery_evidence;
 mod scheduler_host;
 mod scheduler_tick;
 mod scheduled_runner;

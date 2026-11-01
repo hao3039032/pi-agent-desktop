@@ -149,7 +149,7 @@ export interface McpSignInDeps {
   /** The connection's store must call `guard` before each write (`guardedCredentialStore()`). */
   open(target: McpSignInTarget, guard: McpSignInWriteGuard): McpSignInConnection;
   /** The SDK's `signInMcpServer()`. */
-  signIn(options: McpSignInOptions): Promise<void>;
+  signIn(options: McpSignInOptions, signal: AbortSignal): Promise<void>;
   /** The server's part of `mcp-auth.json`, from the SDK's credential store, by its name and URL. */
   store(name: string, url: string): McpOAuthStateStore;
   /** Whether `error` is the SDK's McpSignInCancelledError: the prompt was answered with "". */
@@ -496,7 +496,7 @@ async function runFlow(flow: Flow, deps: McpSignInDeps): Promise<void> {
           showAuthorizationUrl: (url) => showAuthorizationUrl(flow, url),
           promptForRedirectUrl: (signal) => askForRedirect(flow, signal),
         },
-      });
+      }, flow.controller.signal);
     } catch (error) {
       if (isEnded(flow)) return;
       if (deps.isCancelled(error) || error instanceof McpSignedOutError) end(flow, "cancelled");
