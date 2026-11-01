@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,15 @@ try {
   zip.file("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
   zip.file("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>DOCX fixture content</w:t></w:r></w:p></w:body></w:document>');
   await writeFile(join(project, "document.docx"), await zip.generateAsync({ type: "nodebuffer" }));
+  // A valid, sparse >16 MiB PCM WAV; only its 44-byte header consumes disk.
+  const audioBytes = 40 * 1024 * 1024;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0); header.writeUInt32LE(audioBytes + 36, 4); header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(44100, 24); header.writeUInt32LE(88200, 28);
+  header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34); header.write("data", 36); header.writeUInt32LE(audioBytes, 40);
+  const wav = await open(join(project, "large.wav"), "w");
+  try { await wav.write(header); await wav.truncate(audioBytes + 44); } finally { await wav.close(); }
   await build({ configFile: join(root, "static-frontend/vite.config.ts"), logLevel: "error", build: { outDir: dist, emptyOutDir: true, rollupOptions: { input: join(root, "scripts/migration/resource-fixture.html") } } });
   async function findHtml(dir) {
     for (const entry of await readdir(dir, { withFileTypes: true })) {
@@ -53,6 +62,10 @@ try {
   browser = await chromium.launch({ headless: true, executablePath: join(process.env.HOME || "", ".cache/ms-playwright/chromium-1234/chrome-linux64/chrome") });
   page = await browser.newPage();
   const errors = []; page.on("pageerror", error => errors.push(error.message));
+  const mediaResponses = [];
+  page.on("response", response => {
+    if (response.request().resourceType() === "media") mediaResponses.push({ status: response.status(), range: response.headers()["content-range"] });
+  });
   const polyfill = await readFile(join(root, "scripts/migration/static-ui-harness-polyfill.js"), "utf8");
   await page.addInitScript(`window.__STATIC_UI_HARNESS_TOKEN__ = ${JSON.stringify(token)}; ${polyfill}`);
   await page.goto(`${url}${html.slice(dist.length)}?cwd=${encodeURIComponent(project)}`);
@@ -66,6 +79,11 @@ try {
   await page.waitForFunction(() => { const f = document.querySelector('.file-viewer-content iframe'); return f?.contentDocument?.querySelector('#fixture') && getComputedStyle(f.contentDocument.querySelector('#fixture')).color === 'rgb(12, 34, 56)'; });
   assert.equal(await page.evaluate(() => window.__previewScriptRan), undefined);
   await page.frameLocator('.file-viewer-document-stage iframe').getByText('DOCX fixture content').waitFor({ timeout: 30_000 });
+  await page.waitForFunction(() => { const audio = document.querySelector('audio'); return audio && Number.isFinite(audio.duration) && audio.duration > 400; }, null, { timeout: 30_000 });
+  await page.locator('audio').evaluate(audio => { audio.currentTime = 300; });
+  await page.waitForFunction(() => { const audio = document.querySelector('audio'); return audio && !audio.seeking && Math.abs(audio.currentTime - 300) < 1; }, null, { timeout: 30_000 });
+  assert.ok(mediaResponses.some(response => response.status === 206 && response.range?.startsWith('bytes 0-')), JSON.stringify(mediaResponses));
+  assert.ok(mediaResponses.some(response => response.status === 206 && Number(response.range?.match(/^bytes (\d+)-/)?.[1]) > 16 * 1024 * 1024), JSON.stringify(mediaResponses));
   await writeFile(join(project, "index.html"), '<!doctype html><link rel="stylesheet" href="style.css"><p id="fixture">updated preview</p>');
   await frame.getByText("updated preview").waitFor({ timeout: 10_000 });
   await page.locator('input[type="file"]').setInputFiles({ name: "uploaded.txt", mimeType: "text/plain", buffer: Buffer.from("browser fixture") });
@@ -77,6 +95,13 @@ try {
   const checks = await page.evaluate(async ({ project, outside }) => {
     const call = async (id, op, args) => window.__TAURI_INTERNALS__.invoke("pi_ipc", { request: { v: 1, id, op, args } });
     const denied = await call("outside", "resources.grantFile", { path: outside });
+    const largeGrant = await call("large", "resources.grantFile", { path: `${project}/large.wav` });
+    const largeUrl = `/__harness__/resource/${largeGrant.data.handle}`;
+    const noRange = await fetch(largeUrl);
+    const firstChunk = await fetch(largeUrl, { headers: { range: "bytes=0-" } });
+    const firstLength = (await firstChunk.arrayBuffer()).byteLength;
+    const firstRange = firstChunk.headers.get("content-range");
+    await call("large-revoke", "resources.revoke", { handle: largeGrant.data.handle });
     const grant = await call("file", "resources.grantFile", { path: `${project}/style.css` });
     const resource = `/__harness__/resource/${grant.data.handle}`;
     const ranged = await fetch(resource, { headers: { range: "bytes=0-6" } });
@@ -84,11 +109,11 @@ try {
     const contentRange = ranged.headers.get("content-range");
     await call("revoke", "resources.revoke", { handle: grant.data.handle });
     const revoked = await fetch(resource);
-    return { denied: denied.error.code, status: ranged.status, text, contentRange, revoked: revoked.status };
+    return { denied: denied.error.code, status: ranged.status, text, contentRange, revoked: revoked.status, noRange: noRange.status, firstStatus: firstChunk.status, firstLength, firstRange };
   }, { project, outside: join(sandbox, "secret.txt") });
-  assert.deepEqual(checks, { denied: "unauthorized_scope", status: 206, text: "#fixtur", contentRange: "bytes 0-6/35", revoked: 404 });
+  assert.deepEqual(checks, { denied: "unauthorized_scope", status: 206, text: "#fixtur", contentRange: "bytes 0-6/35", revoked: 404, noRange: 413, firstStatus: 206, firstLength: 16 * 1024 * 1024, firstRange: `bytes 0-${16 * 1024 * 1024 - 1}/${40 * 1024 * 1024 + 44}` });
   assert.deepEqual(errors, []);
-  console.log("resource static UI: Markdown image, live HTML/CSS preview, DOCX via real pi, upload, range/revoke and script blocking passed (browser bridge, not native ACL)");
+  console.log("resource static UI: large WAV seek, Markdown image, live HTML/CSS preview, DOCX via real pi, upload, range/revoke and script blocking passed (browser bridge, not native ACL)");
 } catch (error) {
   if (page) console.error("resource fixture:", await page.locator("body").innerHTML().catch(() => "unavailable"), await page.evaluate(() => window.__harnessInvokes).catch(() => []));
   throw error;

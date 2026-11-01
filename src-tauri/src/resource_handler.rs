@@ -1,5 +1,5 @@
 //! Capability-free, token-only media responses for the desktop WebView.
-use resource_protocol::{ResourceRegistry, ResourceResponse};
+use resource_protocol::{DenyReason, ResourceRegistry, ResourceResponse};
 use tauri::http::{Request, Response, StatusCode};
 
 #[cfg(test)]
@@ -41,6 +41,13 @@ pub fn respond(registry: &ResourceRegistry, request: Request<Vec<u8>>) -> Respon
         }
     };
     match registry.read(token, &subpath, range) {
+        ResourceResponse::Denied(DenyReason::TooLarge) => Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-store")
+            .body(b"Resource exceeds the preview limit. Use Download or a range-capable viewer.".to_vec()).unwrap(),
+        ResourceResponse::Denied(DenyReason::Busy) => empty(StatusCode::SERVICE_UNAVAILABLE),
         ResourceResponse::Denied(_) => empty(StatusCode::NOT_FOUND),
         ResourceResponse::Ok { mime, bytes, total_len, range_applied } => {
             if range_applied && bytes.is_empty() {
@@ -54,7 +61,8 @@ pub fn respond(registry: &ResourceRegistry, request: Request<Vec<u8>>) -> Respon
                 .header("X-Content-Type-Options", "nosniff")
                 .header("Referrer-Policy", "no-referrer")
                 .header("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; sandbox allow-same-origin");
-            if let Some((start, _)) = range.filter(|_| range_applied) {
+            if range_applied {
+                let start = range.map(|(start, _)| start).unwrap_or(0);
                 response = response.header("Content-Range", format!("bytes {start}-{}/{total_len}", start + bytes.len() as u64 - 1));
             }
             response.body(bytes).unwrap()

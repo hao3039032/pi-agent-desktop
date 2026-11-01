@@ -989,6 +989,8 @@ fn denied_code(reason: resource_protocol::DenyReason) -> &'static str {
         resource_protocol::DenyReason::InvalidPath => "invalid_args",
         resource_protocol::DenyReason::NotFound => "not_found",
         resource_protocol::DenyReason::IoError => "io",
+        resource_protocol::DenyReason::TooLarge => "payload_too_large",
+        resource_protocol::DenyReason::Busy => "busy",
     }
 }
 
