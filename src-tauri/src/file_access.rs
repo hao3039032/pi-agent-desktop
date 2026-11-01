@@ -129,7 +129,7 @@ impl AllowedRoots {
 
     /// Open an already-authorized directory without following swapped path
     /// components. The returned descriptor pins the directory across spawn.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn open_terminal_directory(&self, target: &Path) -> Option<(PathBuf, std::fs::File)> {
         let (resolved, _) = self.resolved_write_parent_with_root(&target.join(".terminal-anchor"))?;
         let mut directory = openat_directory_no_follow_by_path(Path::new("/")).ok()?;
@@ -483,6 +483,32 @@ mod tests {
             roots.add(Path::new(item));
         }
         roots
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_directory_handle_remains_pinned_after_rename() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let cwd = root.join("cwd");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root);
+        assert!(roots.open_terminal_directory(&outside).is_none());
+        assert!(roots.open_terminal_directory(&root.join("../outside")).is_none());
+        let expected = cwd.canonicalize().unwrap();
+        let (resolved, handle) = roots.open_terminal_directory(&cwd).unwrap();
+        assert_eq!(resolved, expected);
+        let identity = handle.metadata().unwrap();
+        std::fs::rename(&cwd, root.join("old-cwd")).unwrap();
+        std::os::unix::fs::symlink(&outside, &cwd).unwrap();
+        let pinned = std::fs::metadata(root.join("old-cwd")).unwrap();
+        assert_eq!((identity.dev(), identity.ino()), (pinned.dev(), pinned.ino()));
+        assert_ne!(identity.ino(), std::fs::metadata(&cwd).unwrap().ino());
+        assert!(roots.open_terminal_directory(&cwd).is_none());
     }
 
     #[cfg(unix)]
