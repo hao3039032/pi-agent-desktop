@@ -112,7 +112,11 @@ impl HostLifecycle {
 
     pub fn state(&self) -> LifecycleState {
         if let Some(state) = self.completed.get() { return state.clone(); }
-        self.inner.try_lock().map(|inner| inner.state.clone()).unwrap_or_else(|_| LifecycleState::Failed(vec![ShutdownFailure {
+        self.inner.try_lock().map(|inner| {
+            if self.closing.load(Ordering::SeqCst) && inner.state == LifecycleState::Running {
+                LifecycleState::ShuttingDown
+            } else { inner.state.clone() }
+        }).unwrap_or_else(|_| LifecycleState::Failed(vec![ShutdownFailure {
             stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; outcome unknown".into(),
         }]))
     }
@@ -133,12 +137,23 @@ impl HostLifecycle {
     /// All callbacks receive the same absolute deadline, including callbacks
     /// after an earlier phase consumed the remaining time.
     pub fn shutdown_until(&self, deadline: std::time::Instant) -> Result<(), Vec<ShutdownFailure>> {
-        self.closing.store(true, Ordering::SeqCst);
-        if let Some(state) = self.completed.get() {
-            return match state { LifecycleState::Stopped => Ok(()), LifecycleState::Failed(failures) => Err(failures.clone()), _ => unreachable!() };
+        if self.closing.swap(true, Ordering::SeqCst) {
+            return match self.completed.get() {
+                Some(LifecycleState::Stopped) => Ok(()),
+                Some(LifecycleState::Failed(failures)) => Err(failures.clone()),
+                Some(_) => unreachable!(),
+                None => Err(vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Shutdown already in progress; outcome unknown".into() }]),
+            };
         }
         let mut services = {
-            let mut inner = self.inner.try_lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; callbacks not claimed".into() }])?;
+            let mut inner = match self.inner.try_lock() {
+                Ok(inner) => inner,
+                Err(_) => {
+                    let failures = vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; callbacks not claimed".into() }];
+                    let _ = self.completed.set(LifecycleState::Failed(failures.clone()));
+                    return Err(failures);
+                }
+            };
             match &inner.state {
                 LifecycleState::Stopped => return Ok(()),
                 LifecycleState::Failed(failures) => return Err(failures.clone()),
@@ -218,6 +233,44 @@ mod tests {
             }).unwrap();
         }
         host.shutdown_until(deadline).unwrap();
+    }
+
+    #[test]
+    fn busy_final_publication_preserves_failure_and_never_replays_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(HostLifecycle::init(dir.path()).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        host.register(ShutdownStage::Management, "fixture", move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            Err("original failure".into())
+        }).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_host = Arc::clone(&host);
+        let worker = std::thread::spawn(move || { let _ = result_tx.send(worker_host.shutdown_until(std::time::Instant::now() + std::time::Duration::from_millis(100))); });
+        entered_rx.recv().unwrap();
+        let concurrent = host.shutdown_until(std::time::Instant::now()).unwrap_err();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_host = Arc::clone(&host);
+        let holder = std::thread::spawn(move || holder_host.hold_inner_for_test(ready_tx, release_rx));
+        ready_rx.recv().unwrap();
+        continue_tx.send(()).unwrap();
+        let result = result_rx.recv_timeout(std::time::Duration::from_millis(500));
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        worker.join().unwrap();
+        let failures = result.expect("shutdown blocked publishing lifecycle state").unwrap_err();
+        assert!(concurrent[0].error.contains("in progress"));
+        assert!(failures.iter().any(|f| f.error == "original failure"));
+        assert!(failures.iter().any(|f| f.error.contains("publication unavailable")));
+        assert_eq!(host.shutdown_until(std::time::Instant::now()).unwrap_err(), failures);
+        assert_eq!(host.state(), LifecycleState::Failed(failures));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

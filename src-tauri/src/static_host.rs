@@ -107,6 +107,63 @@ impl IsolatedStaticHost {
 mod tests {
     use super::*;
     use std::time::Duration;
+    fn assert_admission_closed(host: &IsolatedStaticHost, dir: &Path) {
+        let response = tauri::async_runtime::block_on(crate::pi_ipc::dispatch_envelope_gated(
+            Arc::clone(&host.state), serde_json::json!({"v":1,"id":"after","op":"desktop.identity"}),
+        ));
+        assert_ne!(response["ok"], true);
+        assert!(host.state.session_writers.admit("late").is_err());
+        assert!(host.state.scheduled_lifecycle.admit("late").is_err());
+        assert!(host.state.registry.start_with_plan("late", dir, "late", dir, || panic!("spawn plan must not run")).is_err());
+        let config = management_host::ManagementSpawnConfig { executable: "unused".into(), agent_dir: None, extensions: vec![], env: vec![] };
+        assert!(host.state.management.instance("late", &config).is_err());
+    }
+
+    #[test]
+    fn held_report_guard_does_not_block_shutdown_or_erase_unknowns() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(IsolatedStaticHost::init(dir.path()).unwrap());
+        let mut run = host.state.scheduled_lifecycle.admit("unknown-run").unwrap();
+        run.claimed();
+        drop(run);
+        let guard = host.tracked().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_host = Arc::clone(&host);
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(worker_host.shutdown_until(Instant::now() + Duration::from_millis(100)));
+        });
+        let result = rx.recv_timeout(Duration::from_millis(500));
+        drop(guard); // Always release before joining, including on timeout.
+        worker.join().unwrap();
+        let failures = result.expect("shutdown blocked on report guard").unwrap_err();
+        assert!(failures.iter().any(|f| f.name == "scheduler-final-shutdown" && f.error.contains("scheduler unknown") && f.error.contains("report publication")));
+        assert!(failures.iter().any(|f| f.name == "session-writers" && f.error.contains("report publication")));
+        assert_eq!(host.shutdown_until(Instant::now()).unwrap_err(), failures);
+        assert_admission_closed(&host, dir.path());
+    }
+
+    #[test]
+    fn held_lifecycle_lock_closes_admission_before_returning_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(IsolatedStaticHost::init(dir.path()).unwrap());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_host = Arc::clone(&host);
+        let holder = std::thread::spawn(move || holder_host.lifecycle.hold_inner_for_test(ready_tx, release_rx));
+        ready_rx.recv().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_host = Arc::clone(&host);
+        let worker = std::thread::spawn(move || { let _ = tx.send(worker_host.shutdown_until(Instant::now() + Duration::from_millis(100))); });
+        let result = rx.recv_timeout(Duration::from_millis(500));
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        worker.join().unwrap();
+        let failures = result.expect("shutdown blocked on lifecycle lock").unwrap_err();
+        assert!(failures[0].error.contains("callbacks not claimed"));
+        assert_eq!(host.shutdown_until(Instant::now()).unwrap_err(), failures);
+        assert_admission_closed(&host, dir.path());
+    }
+
     #[test]
     fn isolated_bootstrap_closes_admission_and_tracks_empty_registries() {
         let dir = tempfile::tempdir().unwrap();
