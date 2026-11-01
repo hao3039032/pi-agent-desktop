@@ -3,7 +3,8 @@ use anyhow::Context as _;
 use std::io::{Error as IoError, Result as IoResult};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use winapi::um::jobapi2::TerminateJobObject;
 use std::task::{Context, Poll};
 use winapi::shared::minwindef::DWORD;
 use winapi::um::minwinbase::STILL_ACTIVE;
@@ -20,6 +21,7 @@ use filedescriptor::OwnedHandle;
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,
+    job: Option<Arc<OwnedHandle>>,
 }
 
 impl WinChild {
@@ -40,47 +42,43 @@ impl WinChild {
 
     fn do_kill(&mut self) -> IoResult<()> {
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
-        let err = IoError::last_os_error();
-        if res != 0 {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        let res = unsafe { match &self.job {
+            Some(job) => TerminateJobObject(job.as_raw_handle() as _, 1),
+            None => TerminateProcess(proc.as_raw_handle() as _, 1),
+        }};
+        if res == 0 { Err(IoError::last_os_error()) } else { Ok(()) }
     }
 }
 
 impl ChildKiller for WinChild {
     fn kill(&mut self) -> IoResult<()> {
-        self.do_kill().ok();
-        Ok(())
+        self.do_kill()
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        Box::new(WinChildKiller { proc })
+        Box::new(WinChildKiller { proc, job: self.job.clone() })
     }
 }
 
 #[derive(Debug)]
 pub struct WinChildKiller {
     proc: OwnedHandle,
+    job: Option<Arc<OwnedHandle>>,
 }
 
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
-        let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
-        let err = IoError::last_os_error();
-        if res != 0 {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        let res = unsafe { match &self.job {
+            Some(job) => TerminateJobObject(job.as_raw_handle() as _, 1),
+            None => TerminateProcess(self.proc.as_raw_handle() as _, 1),
+        }};
+        if res == 0 { Err(IoError::last_os_error()) } else { Ok(()) }
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
         let proc = self.proc.try_clone().unwrap();
-        Box::new(WinChildKiller { proc })
+        Box::new(WinChildKiller { proc, job: self.job.clone() })
     }
 }
 

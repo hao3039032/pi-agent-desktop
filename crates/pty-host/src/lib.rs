@@ -709,6 +709,19 @@ mod tests {
         assert!(host.get("invalid-anchor").is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn conpty_contained_spawn_and_wait() {
+        let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
+            rows: 24, cols: 80, pixel_width: 0, pixel_height: 0,
+        }).unwrap();
+        let shell = std::env::var_os("COMSPEC").expect("COMSPEC");
+        let mut command = portable_pty::CommandBuilder::new(shell);
+        command.args(["/C", "exit", "0"]);
+        let mut child = pair.slave.spawn_command_contained(command).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
     #[cfg(unix)]
     #[test]
     fn host_shutdown_forces_stubborn_shell_immediately() {

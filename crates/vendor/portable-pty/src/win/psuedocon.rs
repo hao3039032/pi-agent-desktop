@@ -10,17 +10,19 @@ use std::io::Error as IoError;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject};
+use winapi::um::synchapi::WaitForSingleObject;
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::{HRESULT, S_OK};
 use winapi::um::handleapi::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::winbase::{
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTF_USESTDHANDLES, STARTUPINFOEXW, WAIT_OBJECT_0,
 };
 use winapi::um::wincon::COORD;
-use winapi::um::winnt::HANDLE;
+use winapi::um::winnt::{HANDLE, JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
 
 pub type HPCON = HANDLE;
 
@@ -111,6 +113,26 @@ impl PsuedoCon {
     }
 
     pub fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
+        self.spawn_impl(cmd, false)
+    }
+
+    pub fn spawn_command_contained(&self, cmd: CommandBuilder) -> anyhow::Result<WinChild> {
+        self.spawn_impl(cmd, true)
+    }
+
+    fn spawn_impl(&self, cmd: CommandBuilder, contained: bool) -> anyhow::Result<WinChild> {
+        let job = if contained {
+            let raw = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
+            if raw.is_null() { return Err(IoError::last_os_error().into()); }
+            let handle = Arc::new(unsafe { OwnedHandle::from_raw_handle(raw as _) });
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if unsafe { SetInformationJobObject(handle.as_raw_handle() as _, JobObjectExtendedLimitInformation,
+                &mut limits as *mut _ as _, mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as _) } == 0 {
+                return Err(IoError::last_os_error().into());
+            }
+            Some(handle)
+        } else { None };
         let mut si: STARTUPINFOEXW = unsafe { mem::zeroed() };
         si.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
         // Explicitly set the stdio handles as invalid handles otherwise
@@ -142,7 +164,7 @@ impl PsuedoCon {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | if contained { CREATE_SUSPENDED } else { 0 },
                 cmd.environment_block().as_mut_slice().as_mut_ptr() as *mut _,
                 cwd.as_ref()
                     .map(|c| c.as_slice().as_ptr())
@@ -165,11 +187,28 @@ impl PsuedoCon {
 
         // Make sure we close out the thread handle so we don't leak it;
         // we do this simply by making it owned
-        let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
+        let main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
+        if let Some(ref job) = job {
+            let assigned = unsafe { AssignProcessToJobObject(job.as_raw_handle() as _, proc.as_raw_handle() as _) } != 0;
+            let failure = if !assigned {
+                Some(format!("cannot assign suspended PTY process to job: {}", IoError::last_os_error()))
+            } else {
+                let previous = unsafe { ResumeThread(main_thread.as_raw_handle() as _) };
+                if previous != 1 { Some(format!("cannot safely resume PTY process (previous suspend count {previous}): {}", IoError::last_os_error())) } else { None }
+            };
+            if let Some(failure) = failure {
+                let terminated = unsafe { if assigned {
+                    TerminateJobObject(job.as_raw_handle() as _, 1)
+                } else { TerminateProcess(proc.as_raw_handle() as _, 1) } };
+                let waited = unsafe { WaitForSingleObject(proc.as_raw_handle() as _, 5000) };
+                if terminated == 0 || waited != WAIT_OBJECT_0 {
+                    bail!("{failure}; process cleanup is unconfirmed");
+                }
+                bail!("{failure}; process termination confirmed");
+            }
+        }
 
-        Ok(WinChild {
-            proc: Mutex::new(proc),
-        })
+        Ok(WinChild { proc: Mutex::new(proc), job })
     }
 }

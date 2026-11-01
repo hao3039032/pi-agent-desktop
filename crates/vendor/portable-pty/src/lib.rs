@@ -164,6 +164,13 @@ pub trait SlavePty {
     /// Spawns the command specified by the provided CommandBuilder
     fn spawn_command(&self, cmd: CommandBuilder) -> Result<Box<dyn Child + Send + Sync>, Error>;
 
+    /// Start suspended, assign a private job, then resume. The caller must
+    /// independently keep the command's cwd path stable through process creation.
+    #[cfg(windows)]
+    fn spawn_command_contained(&self, _cmd: CommandBuilder) -> Result<Box<dyn Child + Send + Sync>, Error> {
+        anyhow::bail!("job-contained spawn is not supported by this PTY")
+    }
+
     /// Spawn in an already-authorized directory, without resolving its path again.
     #[cfg(unix)]
     fn spawn_command_in_directory(&self, _cmd: CommandBuilder, _directory: std::fs::File) -> Result<Box<dyn Child + Send + Sync>, Error> {
