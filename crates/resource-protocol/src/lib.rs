@@ -19,20 +19,29 @@
 //! - MIME by extension, scriptless defaults (`.html` is served as data for
 //!   an opaque sandbox; scripts never execute because the consuming iframe
 //!   never gets both `allow-scripts` and `allow-same-origin`);
-//! - HTTP-style Range support for media seeking;
-//! - grants expire (TTL) and can be revoked explicitly;
+//! - HTTP-style Range support for media seeking: at most 16 MiB per response;
+//!   large requests without Range are refused rather than silently truncated;
+//! - at most four reads construct responses concurrently; the budget ends
+//!   when `read` returns, not when Tauri/WebView finishes consuming its body;
+//! - grants expire (TTL) and can be revoked explicitly; a read admitted
+//!   before revocation may finish, and new requests are refused;
 //! - unknown/malformed handles, expired grants and out-of-scope paths are
 //!   plain rejections with stable reasons.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The deferred image route's 10 MiB cap and a registry-wide decoded-memory budget.
 pub const MAX_RESOURCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_RESOURCE_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RESOURCE_HANDLES: usize = 1024;
+/// Per-response and concurrent construction bounds. Native WebView buffering
+/// after the handler returns is outside this budget.
+pub const MAX_RESOURCE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CONCURRENT_RESOURCE_READS: usize = 4;
 
 /// A random 128-bit handle token (hex, 32 chars).
 pub type Handle = String;
@@ -46,6 +55,8 @@ pub enum DenyReason {
     InvalidPath,
     NotFound,
     IoError,
+    TooLarge,
+    Busy,
 }
 
 /// The outcome of one resource read.
@@ -84,7 +95,8 @@ struct Grant {
 
 /// The registry of grants. `create` picks the handle; nothing else does.
 pub struct ResourceRegistry {
-    grants: Arc<Mutex<HashMap<Handle, Grant>>>,
+    grants: Arc<Mutex<HashMap<Handle, Arc<Grant>>>>,
+    active_reads: AtomicUsize,
 }
 
 impl Default for ResourceRegistry {
@@ -95,14 +107,14 @@ impl Default for ResourceRegistry {
 
 impl ResourceRegistry {
     pub fn new() -> Self {
-        let grants: Arc<Mutex<HashMap<Handle, Grant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let grants: Arc<Mutex<HashMap<Handle, Arc<Grant>>>> = Arc::new(Mutex::new(HashMap::new()));
         let weak = Arc::downgrade(&grants);
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(1));
             let Some(grants) = weak.upgrade() else { break };
             grants.lock().unwrap().retain(|_, grant| grant.expires_at > Instant::now());
         });
-        Self { grants }
+        Self { grants, active_reads: AtomicUsize::new(0) }
     }
 
     fn random_handle(&self) -> Result<Handle, DenyReason> {
@@ -138,7 +150,7 @@ impl ResourceRegistry {
         if grants.len() >= MAX_RESOURCE_HANDLES { return Err(DenyReason::IoError); }
         grants.insert(
             handle.clone(),
-            Grant {
+            Arc::new(Grant {
                 canonical: canonical.clone(),
                 scope,
                 original_target: canonical,
@@ -146,7 +158,7 @@ impl ResourceRegistry {
                 pinned_file: None,
                 pinned_directory: None,
                 image_bytes: None,
-            },
+            }),
         );
         Ok(handle)
     }
@@ -160,11 +172,11 @@ impl ResourceRegistry {
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, grant| grant.expires_at > Instant::now());
         if grants.len() >= MAX_RESOURCE_HANDLES { return Err(DenyReason::IoError); }
-        grants.insert(handle.clone(), Grant {
+        grants.insert(handle.clone(), Arc::new(Grant {
             canonical: name.to_path_buf(), scope: Scope::File,
             original_target: name.to_path_buf(), expires_at: Instant::now() + ttl,
             pinned_file: Some(file), pinned_directory: None, image_bytes: None,
-        });
+        }));
         Ok(handle)
     }
 
@@ -183,19 +195,29 @@ impl ResourceRegistry {
         grants.retain(|_, grant| grant.expires_at > Instant::now());
         let used: usize = grants.values().filter_map(|grant| grant.image_bytes.as_ref()).map(|(bytes, _)| bytes.len()).sum();
         if grants.len() >= MAX_RESOURCE_HANDLES || used + bytes.len() > MAX_RESOURCE_IMAGE_TOTAL_BYTES { return Err(DenyReason::IoError); }
-        grants.insert(handle.clone(), Grant {
+        grants.insert(handle.clone(), Arc::new(Grant {
             canonical: PathBuf::new(), original_target: PathBuf::new(), scope: Scope::File,
             expires_at: Instant::now() + ttl, pinned_file: None, pinned_directory: None,
             image_bytes: Some((bytes.into(), mime)),
-        });
+        }));
         Ok(handle)
+    }
+
+    fn snapshot(&self, handle: &str) -> Result<Arc<Grant>, DenyReason> {
+        let mut grants = self.grants.lock().unwrap();
+        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
+        if Instant::now() >= grant.expires_at {
+            let expired = grants.remove(handle);
+            drop(grants);
+            drop(expired);
+            return Err(DenyReason::Expired);
+        }
+        Ok(Arc::clone(grant))
     }
 
     /// Metadata of a pinned file for explicit live-change polling.
     pub fn file_metadata(&self, handle: &str) -> Result<(u64, String), DenyReason> {
-        let grants = self.grants.lock().unwrap();
-        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
-        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        let grant = self.snapshot(handle)?;
         let file = grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?;
         let meta = file.metadata().map_err(|_| DenyReason::IoError)?;
         let modified = meta.modified().ok().and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|time| time.as_nanos()).unwrap_or(0);
@@ -208,18 +230,14 @@ impl ResourceRegistry {
 
     /// Share a live bounded raster grant for native save without copying bytes.
     pub fn clone_image_bytes(&self, handle: &str) -> Result<std::sync::Arc<[u8]>, DenyReason> {
-        let grants = self.grants.lock().unwrap();
-        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
-        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        let grant = self.snapshot(handle)?;
         let (bytes, _) = grant.image_bytes.as_ref().ok_or(DenyReason::InvalidPath)?;
         Ok(std::sync::Arc::clone(bytes))
     }
 
     /// Duplicate a live single-file descriptor for an authorized native save.
     pub fn clone_open_file(&self, handle: &str) -> Result<std::fs::File, DenyReason> {
-        let grants = self.grants.lock().unwrap();
-        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
-        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        let grant = self.snapshot(handle)?;
         grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?.try_clone().map_err(|_| DenyReason::IoError)
     }
 
@@ -231,16 +249,17 @@ impl ResourceRegistry {
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, grant| grant.expires_at > Instant::now());
         if grants.len() >= MAX_RESOURCE_HANDLES { return Err(DenyReason::IoError); }
-        grants.insert(handle.clone(), Grant {
+        grants.insert(handle.clone(), Arc::new(Grant {
             canonical: PathBuf::new(), original_target: PathBuf::new(), scope: Scope::Directory,
             expires_at: Instant::now() + ttl, pinned_file: None, pinned_directory: Some(directory), image_bytes: None,
-        });
+        }));
         Ok(handle)
     }
 
     /// Revoke a grant (the preview closed, the window went away).
     pub fn revoke(&self, handle: &str) -> bool {
-        self.grants.lock().unwrap().remove(handle).is_some()
+        let removed = self.grants.lock().unwrap().remove(handle);
+        removed.is_some()
     }
 
     /// Drop expired grants; returns how many were removed.
@@ -260,33 +279,43 @@ impl ResourceRegistry {
         subpath: &str,
         range: Option<(u64, u64)>,
     ) -> ResourceResponse {
-        let mut grants = self.grants.lock().unwrap();
-        let Some(grant) = grants.get(handle) else {
-            return ResourceResponse::Denied(DenyReason::UnknownHandle);
+        self.read_inner(handle, subpath, range, || {})
+    }
+
+    // Snapshot first: a read admitted before revoke may finish, while every
+    // later request observes revoke/expiry. No filesystem IO holds grants.
+    fn read_inner(&self, handle: &str, subpath: &str, range: Option<(u64, u64)>, after_snapshot: impl FnOnce()) -> ResourceResponse {
+        let grant = match self.snapshot(handle) {
+            Ok(grant) => grant,
+            Err(reason) => return ResourceResponse::Denied(reason),
         };
-        if Instant::now() >= grant.expires_at {
-            grants.remove(handle);
-            return ResourceResponse::Denied(DenyReason::Expired);
+        let mut count = self.active_reads.load(Ordering::Acquire);
+        loop {
+            if count >= MAX_CONCURRENT_RESOURCE_READS { return ResourceResponse::Denied(DenyReason::Busy); }
+            match self.active_reads.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => count = actual,
+            }
         }
-        let grant = grants.get_mut(handle).unwrap();
+        let _permit = ReadPermit(&self.active_reads);
+        after_snapshot();
         if let Some((bytes, mime)) = &grant.image_bytes {
             if !subpath.is_empty() { return ResourceResponse::Denied(DenyReason::InvalidPath); }
             let total_len = bytes.len() as u64;
-            let (body, range_applied) = match range {
-                Some((start, end)) if start <= end && start < total_len => (bytes[start as usize..=end.min(total_len - 1) as usize].to_vec(), true),
-                Some((start, _)) if start >= total_len => (Vec::new(), true),
-                _ => (bytes.to_vec(), false),
+            let (start, length, range_applied) = match bounded_range(total_len, range, mime) {
+                Ok(bounds) => bounds,
+                Err(reason) => return ResourceResponse::Denied(reason),
             };
-            return ResourceResponse::Ok { mime, bytes: body, total_len, range_applied };
+            return ResourceResponse::Ok { mime, bytes: bytes[start as usize..(start + length) as usize].to_vec(), total_len, range_applied };
         }
-        if let Some(file) = grant.pinned_file.as_mut() {
+        if let Some(file) = grant.pinned_file.as_ref() {
             if !subpath.is_empty() { return ResourceResponse::Denied(DenyReason::InvalidPath); }
             return read_open_file(file, &grant.canonical, range);
         }
         #[cfg(unix)]
         if let Some(directory) = grant.pinned_directory.as_ref() {
             return match open_beneath_directory(directory, subpath) {
-                Ok(mut file) => read_open_file(&mut file, Path::new(subpath), range),
+                Ok(file) => read_open_file(&file, Path::new(subpath), range),
                 Err(_) => ResourceResponse::Denied(DenyReason::OutOfScope),
             };
         }
@@ -335,39 +364,55 @@ impl ResourceRegistry {
         // containment check above and this read refuses instead of reading
         // outside the granted tree (the same hardening the files domain's
         // write/read/list paths carry).
-        let bytes = match read_beneath_anchor(&grant.canonical, &target) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ResourceResponse::Denied(DenyReason::NotFound)
-            }
-            Err(_) => return ResourceResponse::Denied(DenyReason::OutOfScope),
-        };
-        let mime = mime_for(&target);
-        let total_len = bytes.len() as u64;
-        let (bytes, range_applied) = match range {
-            Some((start, end)) if start <= end && start < total_len => {
-                let end = end.min(total_len - 1);
-                (bytes[start as usize..=end as usize].to_vec(), true)
-            }
-            Some((start, _)) if start >= total_len => (Vec::new(), true),
-            Some(_) | None => (bytes, false),
-        };
-        ResourceResponse::Ok { mime, bytes, total_len, range_applied }
+        match open_beneath_anchor(&grant.canonical, &target) {
+            Ok(file) => read_open_file(&file, &target, range),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ResourceResponse::Denied(DenyReason::NotFound),
+            Err(_) => ResourceResponse::Denied(DenyReason::OutOfScope),
+        }
     }
 }
 
-fn read_open_file(file: &mut std::fs::File, name: &Path, range: Option<(u64, u64)>) -> ResourceResponse {
-    use std::io::{Read, Seek, SeekFrom};
+struct ReadPermit<'a>(&'a AtomicUsize);
+impl Drop for ReadPermit<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+
+fn bounded_range(total: u64, range: Option<(u64, u64)>, _mime: &str) -> Result<(u64, u64, bool), DenyReason> {
+    let cap = MAX_RESOURCE_RESPONSE_BYTES as u64;
+    match range {
+        Some((start, end)) if start > end => Err(DenyReason::InvalidPath),
+        Some((start, _)) if start >= total => Ok((0, 0, true)),
+        Some((start, end)) => Ok((start, (end.min(total - 1) - start + 1).min(cap), true)),
+        None if total <= cap => Ok((0, total, false)),
+        None => Err(DenyReason::TooLarge),
+    }
+}
+
+#[cfg(unix)]
+fn read_open_file(file: &std::fs::File, name: &Path, range: Option<(u64, u64)>) -> ResourceResponse {
+    use std::os::unix::fs::FileExt;
     let Ok(total_len) = file.metadata().map(|m| m.len()) else { return ResourceResponse::Denied(DenyReason::IoError) };
-    let (start, length, applied) = match range {
-        Some((start, end)) if start <= end && start < total_len => (start, end.min(total_len - 1) - start + 1, true),
-        Some((start, _)) if start >= total_len => (0, 0, true),
-        _ => (0, total_len, false),
+    let mime = mime_for(name);
+    let (start, length, applied) = match bounded_range(total_len, range, mime) {
+        Ok(bounds) => bounds,
+        Err(reason) => return ResourceResponse::Denied(reason),
     };
-    if file.seek(SeekFrom::Start(start)).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
-    let mut bytes = Vec::new();
-    if file.take(length).read_to_end(&mut bytes).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
-    ResourceResponse::Ok { mime: mime_for(name), bytes, total_len, range_applied: applied }
+    let mut bytes = vec![0; length as usize];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match file.read_at(&mut bytes[offset..], start + offset as u64) {
+            Ok(0) => return ResourceResponse::Denied(DenyReason::IoError),
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return ResourceResponse::Denied(DenyReason::IoError),
+        }
+    }
+    ResourceResponse::Ok { mime, bytes, total_len, range_applied: applied }
+}
+
+#[cfg(not(unix))]
+fn read_open_file(_file: &std::fs::File, _name: &Path, _range: Option<(u64, u64)>) -> ResourceResponse {
+    ResourceResponse::Denied(DenyReason::OutOfScope)
 }
 
 #[cfg(unix)]
@@ -427,6 +472,113 @@ mod tests {
 
     fn setup_dir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn bounded_sparse_file_responses_apply_to_pinned_directory_and_legacy() {
+        let dir = setup_dir();
+        let video = dir.path().join("large.mp4");
+        let file = fs::File::create(&video).unwrap();
+        let total = MAX_RESOURCE_RESPONSE_BYTES as u64 * 2 + 17;
+        file.set_len(total).unwrap();
+        let registry = ResourceRegistry::new();
+        let pinned = registry.grant_open_file(fs::File::open(&video).unwrap(), &video, TTL).unwrap();
+        let directory = registry.grant_open_directory(fs::File::open(dir.path()).unwrap(), TTL).unwrap();
+        let legacy = registry.grant_file(&video, TTL).unwrap();
+        let legacy_directory = registry.grant_directory(dir.path(), TTL).unwrap();
+        for (handle, subpath) in [(&pinned, ""), (&directory, "large.mp4"), (&legacy, ""), (&legacy_directory, "large.mp4")] {
+            assert!(matches!(registry.read(handle, subpath, None), ResourceResponse::Denied(DenyReason::TooLarge)));
+            for range in [Some((0, u64::MAX)), Some((7, u64::MAX))] {
+                match registry.read(handle, subpath, range) {
+                    ResourceResponse::Ok { bytes, total_len, range_applied, .. } => {
+                        assert_eq!(bytes.len(), MAX_RESOURCE_RESPONSE_BYTES);
+                        assert_eq!(total_len, total);
+                        assert!(range_applied);
+                    }
+                    _ => panic!("bounded media response expected"),
+                }
+            }
+            match registry.read(handle, subpath, Some((total - 3, u64::MAX))) {
+                ResourceResponse::Ok { bytes, .. } => assert_eq!(bytes.len(), 3),
+                _ => panic!("short final range expected"),
+            }
+        }
+        let text = dir.path().join("large.html");
+        fs::File::create(&text).unwrap().set_len(total).unwrap();
+        let text_handle = registry.grant_open_file(fs::File::open(&text).unwrap(), &text, TTL).unwrap();
+        assert!(matches!(registry.read(&text_handle, "", None), ResourceResponse::Denied(DenyReason::TooLarge)));
+    }
+
+    #[test]
+    fn simultaneous_ranges_use_independent_file_offsets() {
+        let dir = setup_dir();
+        let path = dir.path().join("x.bin");
+        let content: Vec<u8> = (0..65536).map(|n| ((n / 256) % 251) as u8).collect();
+        fs::write(&path, &content).unwrap();
+        let registry = Arc::new(ResourceRegistry::new());
+        let handle = registry.grant_open_file(fs::File::open(&path).unwrap(), &path, TTL).unwrap();
+        let mut workers = Vec::new();
+        for n in 0..4 {
+            let registry = Arc::clone(&registry); let handle = handle.clone(); let expected = content.clone();
+            workers.push(std::thread::spawn(move || {
+                let start = n * 4096;
+                for _ in 0..40 {
+                    match registry.read(&handle, "", Some((start, start + 2047))) {
+                        ResourceResponse::Ok { bytes, .. } => assert_eq!(bytes, expected[start as usize..(start + 2048) as usize]),
+                        _ => panic!("concurrent read failed"),
+                    }
+                }
+            }));
+        }
+        for worker in workers { worker.join().unwrap(); }
+    }
+
+    #[test]
+    fn blocked_read_does_not_lock_registry_and_admitted_read_survives_revoke() {
+        let dir = setup_dir(); let path = dir.path().join("x.txt"); fs::write(&path, b"fixture").unwrap();
+        let registry = Arc::new(ResourceRegistry::new());
+        let handle = registry.grant_open_file(fs::File::open(&path).unwrap(), &path, TTL).unwrap();
+        let other = registry.grant_open_file(fs::File::open(&path).unwrap(), &path, TTL).unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2)); let resume = Arc::new(std::sync::Barrier::new(2));
+        let worker = { let registry = Arc::clone(&registry); let handle = handle.clone(); let entered = Arc::clone(&entered); let resume = Arc::clone(&resume);
+            std::thread::spawn(move || registry.read_inner(&handle, "", None, || { entered.wait(); resume.wait(); })) };
+        entered.wait();
+        assert!(registry.revoke(&handle));
+        assert!(matches!(registry.read(&handle, "", None), ResourceResponse::Denied(DenyReason::UnknownHandle)));
+        assert!(matches!(registry.read(&other, "", None), ResourceResponse::Ok { .. }));
+        resume.wait();
+        assert!(matches!(worker.join().unwrap(), ResourceResponse::Ok { .. }));
+    }
+
+    #[test]
+    fn concurrent_read_budget_refuses_excess_and_releases_after_completion() {
+        let dir = setup_dir(); let path = dir.path().join("x.txt"); fs::write(&path, b"x").unwrap();
+        let registry = Arc::new(ResourceRegistry::new());
+        let handle = registry.grant_open_file(fs::File::open(&path).unwrap(), &path, TTL).unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(MAX_CONCURRENT_RESOURCE_READS + 1));
+        let resume = Arc::new(std::sync::Barrier::new(MAX_CONCURRENT_RESOURCE_READS + 1));
+        let mut workers = Vec::new();
+        for _ in 0..MAX_CONCURRENT_RESOURCE_READS {
+            let registry = Arc::clone(&registry); let handle = handle.clone(); let entered = Arc::clone(&entered); let resume = Arc::clone(&resume);
+            workers.push(std::thread::spawn(move || registry.read_inner(&handle, "", None, || { entered.wait(); resume.wait(); })));
+        }
+        entered.wait();
+        assert!(matches!(registry.read(&handle, "", None), ResourceResponse::Denied(DenyReason::Busy)));
+        resume.wait();
+        for worker in workers { assert!(matches!(worker.join().unwrap(), ResourceResponse::Ok { .. })); }
+        assert!(matches!(registry.read(&handle, "", None), ResourceResponse::Ok { .. }));
+    }
+
+    #[test]
+    fn read_budget_is_released_on_expiry_and_unwind() {
+        let dir = setup_dir(); let path = dir.path().join("x.txt"); fs::write(&path, b"x").unwrap();
+        let registry = ResourceRegistry::new();
+        let expired = registry.grant_open_file(fs::File::open(&path).unwrap(), &path, Duration::ZERO).unwrap();
+        assert!(matches!(registry.read(&expired, "", None), ResourceResponse::Denied(DenyReason::Expired)));
+        let handle = registry.grant_open_file(fs::File::open(&path).unwrap(), &path, TTL).unwrap();
+        let _ = std::panic::catch_unwind(|| registry.read_inner(&handle, "", None, || panic!("cancelled fixture")));
+        assert_eq!(registry.active_reads.load(Ordering::Acquire), 0);
+        assert!(matches!(registry.read(&handle, "", None), ResourceResponse::Ok { .. }));
     }
 
     #[test]
@@ -686,9 +838,8 @@ mod tests {
 /// component below the anchor refuses to be a symlink; a swapped component
 /// is ELOOP/ENOTDIR-refused, never followed.
 #[cfg(unix)]
-fn read_beneath_anchor(anchor: &Path, target: &Path) -> std::io::Result<Vec<u8>> {
+fn open_beneath_anchor(anchor: &Path, target: &Path) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
-    use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
 
     fn open_dir_no_follow(parent: Option<&std::fs::File>, path: &str) -> std::io::Result<std::fs::File> {
@@ -712,16 +863,15 @@ fn read_beneath_anchor(anchor: &Path, target: &Path) -> std::io::Result<Vec<u8>>
     if target == anchor {
         let c_path = CString::new(anchor.as_os_str().as_encoded_bytes())
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
-        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: fd from a successful open; File owns and closes it.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        return Ok(data);
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a regular file")); }
+        return Ok(file);
     }
     let mut current = open_dir_no_follow(None, &anchor.to_string_lossy())?;
     let relative = target
@@ -743,25 +893,21 @@ fn read_beneath_anchor(anchor: &Path, target: &Path) -> std::io::Result<Vec<u8>>
     }
     let c_name = CString::new(name.as_str())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     let fd = unsafe { libc::openat(current.as_raw_fd(), c_name.as_ptr(), flags) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fd from a successful openat; File owns and closes it.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-    Ok(data)
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "not a regular file")); }
+    Ok(file)
 }
 
-/// Windows until a handle-based implementation ships: the granted read
-/// falls back to the plain path read (the anchor's identity was just
-/// re-validated); the component-swap race is documented in the migration
-/// README and closes with the Windows files work.
-#[cfg(windows)]
-fn read_beneath_anchor(_anchor: &Path, target: &Path) -> std::io::Result<Vec<u8>> {
-    std::fs::read(target)
+/// No path-based fallback on platforms without a safe handle walk.
+#[cfg(not(unix))]
+fn open_beneath_anchor(_anchor: &Path, _target: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "safe handle walk unavailable"))
 }
 
 
@@ -813,7 +959,7 @@ mod race_tests {
         std::fs::remove_file(&stale_target).expect("remove");
         std::os::unix::fs::symlink(&secret, &stale_target).expect("swap again");
         if let Some(stale) = walked {
-            let outcome = read_beneath_anchor(&tree.canonicalize().unwrap(), &stale);
+            let outcome = open_beneath_anchor(&tree.canonicalize().unwrap(), &stale);
             assert!(outcome.is_err(), "the stale in-tree target must refuse: {outcome:?}");
         }
     }

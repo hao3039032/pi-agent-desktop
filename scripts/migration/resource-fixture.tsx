@@ -17,5 +17,6 @@ createRoot(document.getElementById("root")!).render(<I18nProvider>
   <MarkdownBody cwd={cwd} onOpenFile={(path) => { document.body.dataset.openedFile = path; }}>{"![fixture](image.png) [local](style.css)"}</MarkdownBody>
   <div style={{ height: 600 }}><FileViewer filePath={`${cwd}/index.html`} cwd={cwd} initialDisplayMode="preview" /></div>
   <div style={{ height: 300 }}><FileViewer filePath={`${cwd}/document.docx`} cwd={cwd} watchEnabled={false} /></div>
+  <div style={{ height: 200 }}><FileViewer filePath={`${cwd}/large.wav`} cwd={cwd} watchEnabled={false} /></div>
   <div style={{ height: 300 }}><FileExplorer cwd={cwd} onOpenFile={() => {}} changesCollapsed={true} /></div>
 </I18nProvider>);

@@ -29,6 +29,57 @@ fn token_range_revoke_and_expiry() {
 }
 
 #[test]
+fn large_media_and_document_responses_are_bounded_and_never_truncated_200() {
+    use resource_protocol::MAX_RESOURCE_RESPONSE_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("large.mp4");
+    let size = MAX_RESOURCE_RESPONSE_BYTES as u64 * 2 + 23;
+    std::fs::File::create(&video).unwrap().set_len(size).unwrap();
+    let registry = ResourceRegistry::new();
+    let handle = registry.grant_open_file(std::fs::File::open(&video).unwrap(), &video, Duration::from_secs(30)).unwrap();
+    let request = || Request::builder().uri(format!("pi-resource://localhost/{handle}"));
+    let no_range = respond(&registry, request().body(vec![]).unwrap());
+    assert_eq!(no_range.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(std::str::from_utf8(no_range.body()).unwrap().contains("Use Download"));
+    let open = respond(&registry, request().header("Range", "bytes=0-").body(vec![]).unwrap());
+    assert_eq!(open.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(open.body().len(), MAX_RESOURCE_RESPONSE_BYTES);
+    assert_eq!(open.headers()["content-range"], format!("bytes 0-{}/{size}", MAX_RESOURCE_RESPONSE_BYTES - 1));
+    assert_eq!(open.headers()["content-length"], MAX_RESOURCE_RESPONSE_BYTES.to_string());
+    let offset = MAX_RESOURCE_RESPONSE_BYTES as u64;
+    let large = respond(&registry, request().header("Range", format!("bytes={offset}-{}", u64::MAX)).body(vec![]).unwrap());
+    assert_eq!(large.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(large.body().len(), MAX_RESOURCE_RESPONSE_BYTES);
+    assert_eq!(large.headers()["content-range"], format!("bytes {offset}-{}/{size}", offset * 2 - 1));
+    let last = respond(&registry, request().header("Range", format!("bytes={}-", size - 23)).body(vec![]).unwrap());
+    assert_eq!(last.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(last.body().len(), 23);
+    let pdf = dir.path().join("large.pdf");
+    std::fs::File::create(&pdf).unwrap().set_len(size).unwrap();
+    let pdf_handle = registry.grant_open_file(std::fs::File::open(&pdf).unwrap(), &pdf, Duration::from_secs(30)).unwrap();
+    let pdf_range = respond(&registry, Request::builder().uri(format!("pi-resource://localhost/{pdf_handle}")).header("Range", "bytes=100-199").body(vec![]).unwrap());
+    assert_eq!(pdf_range.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(pdf_range.headers()["content-type"], "application/pdf");
+    assert_eq!(pdf_range.headers()["content-range"], format!("bytes 100-199/{size}"));
+    assert_eq!(pdf_range.body().len(), 100);
+    let html = dir.path().join("large.html");
+    std::fs::File::create(&html).unwrap().set_len(size).unwrap();
+    let html_handle = registry.grant_open_file(std::fs::File::open(&html).unwrap(), &html, Duration::from_secs(30)).unwrap();
+    assert_eq!(respond(&registry, Request::builder().uri(format!("pi-resource://localhost/{html_handle}")).body(vec![]).unwrap()).status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[test]
+fn ten_mebibyte_raster_still_returns_a_complete_response() {
+    let registry = ResourceRegistry::new();
+    let image = vec![0x42; resource_protocol::MAX_RESOURCE_IMAGE_BYTES];
+    let handle = registry.grant_image_bytes(image, "image/png", Duration::from_secs(30)).unwrap();
+    let response = respond(&registry, Request::builder().uri(format!("pi-resource://localhost/{handle}")).body(vec![]).unwrap());
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body().len(), resource_protocol::MAX_RESOURCE_IMAGE_BYTES);
+    assert_eq!(response.headers()["content-length"], resource_protocol::MAX_RESOURCE_IMAGE_BYTES.to_string());
+}
+
+#[test]
 fn raster_image_handle_uses_the_same_protocol_and_ranges() {
     let registry = ResourceRegistry::new();
     let handle = registry.grant_image_bytes(b"012345".to_vec(), "image/png", Duration::from_secs(30)).unwrap();
