@@ -51,7 +51,12 @@ test("isolated static host drains IPC and reports tracked shutdown coverage", { 
     assert.ok(report.uncovered.includes("cross-restart writer durability"));
     assert.ok(report.uncovered.includes("scheduler prompt correlation and lease recovery"));
     assert.ok(report.uncovered.includes("detached descendants"));
-    assert.ok(report.uncovered.includes("stream relay shutdown and in-flight Channel delivery"));
+    assert.equal(report.relayReportStatus, "available");
+    for (const kind of ["session", "running", "scheduled"]) {
+      assert.deepEqual(report.relays[kind], { inFlight: 0, registryBusy: false });
+    }
+    assert.ok(report.uncovered.includes("auth stream relay shutdown"));
+    assert.ok(report.uncovered.includes("Tauri/WebView internal delivery"));
     assert.equal(await exited, 0, stderr);
   } finally {
     if (child.exitCode === null) { child.kill("SIGKILL"); await exited; }

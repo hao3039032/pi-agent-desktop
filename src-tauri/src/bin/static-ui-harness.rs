@@ -421,7 +421,8 @@ fn main() {
                             let _ = reply.send(json!({ "harness": "shutdown", "ok": false,
                                 "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
                                 "reportError": error, "sessionReportStatus": "unknown",
-                                "sessionExited": null, "sessionUnknown": null, "sessionDiagnostics": null }));
+                                "sessionExited": null, "sessionUnknown": null, "sessionDiagnostics": null,
+                                "relayReportStatus": "unknown", "relays": null }));
                             continue;
                         }
                     };
@@ -440,7 +441,9 @@ fn main() {
                         "managementExited": report.management.as_ref().map(|r| &r.exited),
                         "managementUnknown": report.management.as_ref().map(|r| &r.unknown),
                         "indexChildren": report.index_children.as_ref(),
-                        "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability", "stream relay shutdown and in-flight Channel delivery"]
+                        "relayReportStatus": if report.relays.is_some() { "available" } else { "unknown" },
+                        "relays": report.relays.as_ref(),
+                        "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability", "auth stream relay shutdown", "upstream pi listeners", "Tauri/WebView internal delivery"]
                     })
                 }
                 HostCall::Shutdown => {

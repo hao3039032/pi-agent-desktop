@@ -443,8 +443,8 @@ before the operation executes. An admitted call abandoned by its WebView is
 not cancelled and may have an unknown outcome. The separate control budget
 prevents ordinary saturation starving cleanup, but can itself saturate; neither
 budget bounds messages already buffered by Tauri or the WebView, request bytes,
-child queues, or unacknowledged channels. Session event relay threads have a
-separate 32-slot immediate admission cap, held until each relay really exits.
+child queues, or unacknowledged channels. Session event relays have a
+separate 32-slot immediate admission cap, held through tracked relay cleanup.
 Each session relay ingress has 16 frames of at most 256 KiB serialized event
 payload; overflow or an oversized event disconnects that ingress and emits a
 `reset` so the client must reconcile. A relay sends one frame at a time and
@@ -456,10 +456,19 @@ or downstream Channel/Tauri buffers. Other
 direct stream subscription commands are not covered. These remain M5 work, not
 an end-to-end backpressure claim.
 
+The isolated static-host shutdown closes session, running and scheduled relay
+admission before draining, including reservations still starting. ACK and quiet
+waits check a shutdown signal independently of registry locks. Its shared-deadline
+report records each kind's `inFlight` reservations and `registryBusy`; a blocked
+Channel send or lock remains unknown, not proof of cancellation. The reservation
+covers tracked application cleanup, not OS thread teardown, upstream listeners,
+or Tauri/WebView internal delivery. Auth relays and production shutdown are not
+covered; stopping an observer does not prove its session writer stopped.
+
 | Layer | Enforced budget | Boundary of the claim |
 |---|---|---|
 | Envelope dispatcher | 16 ordinary + 4 cleanup/ACK/Stop slots; no semaphore queue | After Tauri has decoded the request; not a request-byte bound |
-| Session event relay | 32 live threads; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
+| Session event relay | 32 reservations; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
 | Session Channel delivery | One frame awaiting client ACK, plus at most one terminal reset on failure | ACK means the JS callback ran, not rendering or WebView buffer release |
 | Management task registry | 128 retained tasks per instance | Not a global bound on instances, task-input requests or child buffers |
 | Management ledger | At most 128 records; pending and locally revoked evidence are not evicted | Agent-directory-local evidence, not a cross-process lock or recovery permission |
