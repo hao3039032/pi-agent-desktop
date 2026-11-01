@@ -101,10 +101,30 @@ export function revokeMcpCredentialWriters(name: string, url: string): { canonic
   return { canonicalKey, generation: noteMcpSignOut(canonicalKey) };
 }
 
-/** A guard for a run of server `name` at `url` starting now: it throws once the server is signed out after this call. */
-export function mcpSignOutGuard(name: string, url: string): McpSignInWriteGuard {
+/** Host-only preflight; canonicalKey may contain URL secrets. */
+export interface McpCredentialAdmission {
+  schema: 1;
+  canonicalKey: string;
+  configKey: string;
+  generation: number;
+}
+
+/** A stale or malformed host preflight must never capture a newer generation. */
+export class McpCredentialAdmissionError extends Error {
+  constructor() { super("MCP credential admission is invalid or stale"); this.name = "McpCredentialAdmissionError"; }
+}
+
+/** Validate and capture in the same synchronous turn, before any store is opened. */
+export function mcpSignOutGuard(name: string, url: string, configKey?: string, admission?: unknown): McpSignInWriteGuard {
   const key = mcpSignInKey(name, url);
   const atStart = mcpSignOutCount(key);
+  if (admission !== undefined) {
+    if (!isRecord(admission) || admission.schema !== 1 || admission.canonicalKey !== key ||
+        typeof configKey !== "string" || !configKey || admission.configKey !== configKey || !Number.isSafeInteger(admission.generation) ||
+        (admission.generation as number) < 0 || admission.generation !== atStart) {
+      throw new McpCredentialAdmissionError();
+    }
+  }
   return () => {
     if (mcpSignOutCount(key) !== atStart) throw new McpSignedOutError();
   };

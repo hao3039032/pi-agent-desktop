@@ -8,8 +8,10 @@ import {
   mcpOAuthUrl,
   McpSignedOutError,
   mcpSignInKey,
-  mcpSignOutCount,
+  mcpSignOutGuard,
+  McpCredentialAdmissionError,
   revokeMcpCredentialWriters,
+  type McpCredentialAdmission,
   type McpSignInWriteGuard,
 } from "./mcp-sign-out";
 import { recordMcpStatus } from "./mcp-status";
@@ -254,8 +256,9 @@ interface Flow {
   /** `mcpSignInKey()` of the target's name and URL. */
   key: string;
   target: McpSignInTarget;
-  /** The server's sign-out count when the flow started; its run writes nothing once that moved. */
-  signOutsAtStart: number;
+  /** Captured synchronously before the flow can open a credential store. */
+  credentialGuard: McpSignInWriteGuard;
+  admission?: McpCredentialAdmission;
   phase: McpSignInPhase;
   expiresAt: number;
   keepMs: number;
@@ -298,13 +301,6 @@ const REGISTRY_KEY: symbol = Symbol.for("pi-web:mcp-sign-in");
 function registry(): Registry {
   const store = globalThis as Record<symbol, Registry | undefined>;
   return (store[REGISTRY_KEY] ??= { flows: new Map(), active: new Map(), tails: new Map() });
-}
-
-/** The guard of a flow's run: its server must not have been signed out since the flow started. */
-function writeGuard(flow: Flow): McpSignInWriteGuard {
-  return () => {
-    if (mcpSignOutCount(flow.key) !== flow.signOutsAtStart) throw new McpSignedOutError();
-  };
 }
 
 function isEnded(flow: Flow): boolean {
@@ -457,7 +453,7 @@ async function runFlow(flow: Flow, deps: McpSignInDeps): Promise<void> {
   tails.set(flow.key, tail);
   let connection: McpSignInConnection | undefined;
   const redact = (text: string) => (connection ? connection.redact(text) : text);
-  const guard = writeGuard(flow);
+  const guard = flow.credentialGuard;
   let pendingRefreshes = 0;
   let refreshesDone: (() => void) | undefined;
   const notePendingRefresh = (active: boolean) => {
@@ -572,6 +568,8 @@ export interface McpSignInStartOptions {
   keepMs?: number;
   /** `MCP_SIGN_IN_FINISH_GRACE_MS` by default. */
   finishGraceMs?: number;
+  /** Host-only credential preflight, never forwarded to the UI. */
+  credentialAdmission?: unknown;
 }
 
 /**
@@ -586,16 +584,25 @@ export function startMcpSignIn(
 ): { flow: McpSignInFlowInfo; joined: boolean } {
   const { flows, active } = registry();
   const key = mcpSignInKey(target.name, target.url);
+  const credentialGuard = mcpSignOutGuard(target.name, target.url, target.configKey, options.credentialAdmission);
+  const admission = options.credentialAdmission as McpCredentialAdmission | undefined;
   const activeId = active.get(key);
   const existing = activeId === undefined ? undefined : flows.get(activeId);
-  if (existing && !isEnded(existing)) return { flow: describeFlow(existing), joined: true };
+  if (existing && !isEnded(existing)) {
+    if (admission && (!existing.admission || existing.admission.canonicalKey !== admission.canonicalKey ||
+        existing.admission.configKey !== admission.configKey || existing.admission.generation !== admission.generation)) {
+      throw new McpCredentialAdmissionError();
+    }
+    return { flow: describeFlow(existing), joined: true };
+  }
 
   const ttlMs = options.ttlMs ?? MCP_SIGN_IN_TTL_MS;
   const flow: Flow = {
     id: randomUUID(),
     key,
     target,
-    signOutsAtStart: mcpSignOutCount(key),
+    credentialGuard,
+    ...(admission ? { admission: { ...admission } } : {}),
     phase: "connecting",
     expiresAt: Date.now() + ttlMs,
     keepMs: options.keepMs ?? MCP_SIGN_IN_KEEP_MS,

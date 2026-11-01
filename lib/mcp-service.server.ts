@@ -376,7 +376,7 @@ export async function managedMcpCredentialTarget(options: PrivateCredentialReque
   const { agentDir, project, internals, server } = await privateCredentialContext(options);
   const entry = resolveSignOutEntry(agentDir, project, internals, server);
   const canonicalKey = mcpSignInKey(server.name, entry.url);
-  return { schema: 1 as const, canonicalKey, configKey: entry.configKey, generation: mcpSignOutCount(canonicalKey) };
+  return { schema: 1 as const, admissionSchema: 1 as const, canonicalKey, configKey: entry.configKey, generation: mcpSignOutCount(canonicalKey) };
 }
 
 /** Host-only: the caller holds same-target admission until this operation is known complete. */
