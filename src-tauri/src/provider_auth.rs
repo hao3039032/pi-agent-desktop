@@ -17,7 +17,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
@@ -58,6 +58,11 @@ const LOGIN_POLL_MAX_FAILURES: u32 = 3;
 /// The whole flow's backstop deadline (the old SSE stream lived as long as
 /// the login did; a stuck provider flow still ends).
 const LOGIN_FLOW_DEADLINE: Duration = Duration::from_secs(600);
+const LOGIN_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const LOGIN_HEARTBEAT: Duration = Duration::from_secs(10);
+const LOGIN_MAX_RELAYS: usize = 8;
+const LOGIN_MAX_TASKS: usize = 128;
+const LOGIN_MAX_FRAME_BYTES: usize = 64 * 1024;
 
 /// Host-side login-flow + subscription ids (correlation keys, not security
 /// tokens — the handshake tokens are crypto-random inside the extension).
@@ -66,11 +71,63 @@ static LOGIN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Handle that ends one login-stream relay on unsubscribe.
 pub(crate) struct LoginRelayHandle {
     pub stop: Arc<AtomicBool>,
-    /// The flow this relay drives (unsubscribe cancels it host-side too).
+    /// The flow this observer follows.
     pub flow_id: String,
-    /// The management task handle for cooperative cancellation and activity guard.
+    /// The management task handle for explicit cancellation and input.
     pub task_handle: String,
     pub tokens: std::collections::HashSet<String>,
+    ack: Arc<crate::pi_ipc::SessionRelayAck>,
+}
+
+struct LoginTask {
+    provider: String,
+    task_handle: String,
+    instance: Arc<management_host::ManagementInstance>,
+}
+
+struct FrameSize(usize);
+impl std::io::Write for FrameSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).filter(|size| *size <= LOGIN_MAX_FRAME_BYTES)
+            .ok_or_else(|| std::io::Error::other("login frame too large"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn recovery_interactions(snapshot: &Value) -> Option<(Vec<Value>, std::collections::HashSet<String>, u64)> {
+    let events = snapshot.get("currentInteraction")?.as_array()?;
+    let last = snapshot.get("lastSeq")?.as_u64()?;
+    if events.len() > 16 { return None; }
+    let payload = json!({ "events": events });
+    let mut counter = FrameSize(4 * 1024);
+    if serde_json::to_writer(&mut counter, &payload).is_err() { return None; }
+    let mut tokens = std::collections::HashSet::new();
+    for event in events {
+        match event.get("type")?.as_str()? {
+            "auth" | "prompt_request" | "select_request" => {
+                let token = event.get("token")?.as_str()?;
+                if token.is_empty() || token.len() > 512 { return None; }
+                let shape_ok = match event["type"].as_str()? {
+                    "auth" => event.get("url").is_some_and(Value::is_string) && event.get("instructions").is_some_and(|v| v.is_null() || v.is_string()),
+                    "prompt_request" => event.get("message").is_some_and(Value::is_string) && event.get("placeholder").is_some_and(|v| v.is_null() || v.is_string()),
+                    "select_request" => event.get("message").is_some_and(Value::is_string) && event.get("options").and_then(Value::as_array)
+                        .is_some_and(|options| options.iter().all(|option| option.get("id").is_some_and(Value::is_string) && option.get("label").is_some_and(Value::is_string))),
+                    _ => false,
+                };
+                if !shape_ok { return None; }
+                tokens.insert(token.to_string());
+            }
+            "device_code" if event.get("userCode").is_some_and(Value::is_string) && event.get("verificationUri").is_some_and(Value::is_string) => {}
+            _ => return None,
+        }
+    }
+    Some((events.clone(), tokens, last))
+}
+
+struct RelaySlot(Arc<AtomicUsize>);
+impl Drop for RelaySlot {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
 }
 
 /// The login-stream relays by subscription id (pi_ipc's event_relays
@@ -78,6 +135,8 @@ pub(crate) struct LoginRelayHandle {
 #[derive(Default)]
 pub(crate) struct LoginRelays {
     pub(crate) relays: Mutex<BTreeMap<String, LoginRelayHandle>>,
+    tasks: Mutex<BTreeMap<String, LoginTask>>,
+    alive: Arc<AtomicUsize>,
 }
 
 impl LoginRelays {
@@ -91,6 +150,11 @@ impl LoginRelays {
 
     fn remove(&self, subscription_id: &str) {
         self.relays.lock().unwrap().remove(subscription_id);
+    }
+
+    pub fn acknowledge(&self, id: &str, epoch: u64, seq: u64) -> bool {
+        epoch == 1 && self.relays.lock().unwrap().get(id)
+            .is_some_and(|relay| relay.ack.acknowledge(seq))
     }
 }
 
@@ -298,25 +362,26 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
                 },
             )
         }
-        // Cancel a login flow (the user closed the panel / the stream
-        // unsubscribed): a cooperative, extension-side abort — the shared
-        // instance is never killed, and a request is not a confirmation.
+        // Explicit user cancellation requests cooperative abort; observer
+        // detach does not call this operation. It is not a completion proof.
         "auth.loginCancel" => {
             if let Some(subscription_id) = args.get("subscriptionId").and_then(Value::as_str) {
                 if !subscription_id.is_empty() {
-                    let cancelled = unsubscribe_login_stream(state, subscription_id);
+                    let task = state.login_relays.relays.lock().unwrap().get(subscription_id).map(|h| h.task_handle.clone());
+                    let cancelled = task.and_then(|task| state.management_config.lock().unwrap().clone()
+                        .and_then(|config| state.management.instance("global", &config).ok())
+                        .map(|instance| instance.cancel_task(&task).is_ok())).unwrap_or(false);
                     return Some(crate::pi_ipc::protocol_ok(id, json!({ "cancelled": cancelled })));
                 }
             }
             if let Some(task_handle) = args.get("taskHandle").and_then(Value::as_str) {
                 if !task_handle.is_empty() {
-                    let config = state.management_config.lock().unwrap().clone();
-                    if let Some(config) = config {
-                        if let Ok(instance) = state.management.instance("global", &config) {
-                            let res = instance.cancel_task(task_handle);
-                            return Some(crate::pi_ipc::protocol_ok(id, json!({ "cancelled": res.is_ok() })));
-                        }
+                    let tasks = state.login_relays.tasks.lock().unwrap();
+                    if let Some(entry) = tasks.values().find(|entry| entry.task_handle == task_handle) {
+                        let res = entry.instance.cancel_task(task_handle);
+                        return Some(crate::pi_ipc::protocol_ok(id, json!({ "cancelled": res.is_ok() })));
                     }
+                    return Some(crate::pi_ipc::protocol_error(id, "not_found", "original login task unavailable"));
                 }
             }
             let flow_id = match string_arg(args, "flowId") {
@@ -354,48 +419,50 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
 
 // --- the OAuth login stream (the pi_ipc_login_stream command) -------------
 
-/// The login-stream relay: polls the flow's buffered events out of the
-/// management instance and forwards each as a Channel frame.
-/// The task holds a real management activity guard for the flow's lifetime;
-/// unsubscription or WebView exit triggers cooperative cancel_task host-side.
-fn login_relay(
+/// Reserve the observer thread before starting a mutation. It waits for a
+/// task binding, then polls and forwards one acknowledged frame at a time.
+fn reserve_login_relay(
     state: &Arc<IpcHostState>,
     subscription_id: String,
-    flow_id: String,
-    task_handle: String,
-    instance: Arc<management_host::ManagementInstance>,
     on_event: Channel<Value>,
-) {
-    let stop = Arc::new(AtomicBool::new(false));
-    state.login_relays.insert(
-        &subscription_id,
-        LoginRelayHandle {
-            stop: Arc::clone(&stop),
-            flow_id: flow_id.clone(),
-            task_handle: task_handle.clone(),
-            tokens: Default::default(),
-        },
-    );
+) -> Result<std::sync::mpsc::SyncSender<(String, String, Arc<management_host::ManagementInstance>)>, String> {
     let relays = Arc::clone(&state.login_relays);
-    let th = task_handle.clone();
+    relays.alive.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < LOGIN_MAX_RELAYS).then_some(n + 1))
+        .map_err(|_| "login observer capacity exhausted".to_string())?;
+    let slot = RelaySlot(Arc::clone(&relays.alive));
+    let stop = Arc::new(AtomicBool::new(false));
+    let ack = Arc::new(crate::pi_ipc::SessionRelayAck::default());
+    relays.insert(&subscription_id, LoginRelayHandle {
+        stop: Arc::clone(&stop), flow_id: String::new(), task_handle: String::new(),
+        tokens: Default::default(), ack: Arc::clone(&ack),
+    });
+    let thread_relays = Arc::clone(&relays);
+    let thread_id = subscription_id.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(String, String, Arc<management_host::ManagementInstance>)>(1);
     std::thread::Builder::new()
         .name(format!("ipc-login-{subscription_id}"))
         .spawn(move || {
+            let _slot = slot;
+            let relays = thread_relays;
+            let subscription_id = thread_id;
+            let Ok((flow_id, th, instance)) = rx.recv() else {
+                relays.remove(&subscription_id);
+                return;
+            };
             let mut frame_seq: u64 = 0;
             let mut since: u64 = 0;
             let mut failures: u32 = 0;
             let send = |frame_seq: &mut u64, kind: &str, payload: Value| -> bool {
                 *frame_seq += 1;
-                on_event
-                    .send(crate::pi_ipc::stream_frame(
-                        &subscription_id,
-                        1,
-                        *frame_seq,
-                        kind,
-                        payload,
-                    ))
-                    .is_ok()
+                let frame = crate::pi_ipc::stream_frame(&subscription_id, 1, *frame_seq, kind, payload);
+                if serde_json::to_writer(&mut FrameSize(0), &frame).is_err() { return false; }
+                ack.forward(&on_event, frame, *frame_seq, &stop, LOGIN_ACK_TIMEOUT)
             };
+            let mut heartbeat = std::time::Instant::now();
+            if !send(&mut frame_seq, "snapshot", json!({ "flowId": flow_id, "taskHandle": th })) {
+                relays.remove(&subscription_id);
+                return;
+            }
             loop {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -419,24 +486,46 @@ fn login_relay(
                     management_host::TaskKind::ReadOnly,
                 );
                 match poll {
-                    Ok(snapshot) => {
+                    Ok(poll_snapshot) => {
                         failures = 0;
-                        if let Some(events) = snapshot.get("events").and_then(Value::as_array) {
+                        if poll_snapshot.get("missing").and_then(Value::as_bool) == Some(true)
+                            && snapshot.status == management_host::TaskStatus::Running && snapshot.progress.is_some() {
+                            let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": "Login observation lost; outcome unknown" }));
+                            break;
+                        }
+                        if poll_snapshot.get("truncated").and_then(Value::as_bool) == Some(true)
+                            && snapshot.status == management_host::TaskStatus::Running {
+                            let Some((events, tokens, last)) = recovery_interactions(&poll_snapshot) else {
+                                let _ = send(&mut frame_seq, "unknown", json!({ "type": "error", "message": "Login recovery unavailable; outcome unknown" }));
+                                break;
+                            };
+                            if let Some(relay) = relays.relays.lock().unwrap().get_mut(&subscription_id) { relay.tokens = tokens; }
+                            if !send(&mut frame_seq, "reset", json!({ "events": events })) { break; }
+                            since = last;
+                            continue;
+                        }
+                        if let Some(events) = poll_snapshot.get("events").and_then(Value::as_array) {
                             for queued in events {
                                 let Some(event) = queued.get("event") else { continue };
                                 if let Some(token) = event.get("token").and_then(Value::as_str) {
                                     if let Some(relay) = relays.relays.lock().unwrap().get_mut(&subscription_id) {
+                                        if token.len() > 512 || (relay.tokens.len() >= 512 && !relay.tokens.contains(token)) {
+                                            stop.store(true, Ordering::SeqCst);
+                                            break;
+                                        }
                                         relay.tokens.insert(token.to_string());
                                     }
                                 }
+                                // Terminal truth comes only from the task snapshot.
+                                if matches!(event.get("type").and_then(Value::as_str), Some("success" | "error" | "cancelled")) { continue; }
                                 if !send(&mut frame_seq, "event", event.clone()) {
-                                    // The WebView is gone: cancel and detach.
+                                    // The WebView is gone: detach observation only.
                                     stop.store(true, Ordering::SeqCst);
                                     break;
                                 }
                             }
                         }
-                        if let Some(last) = snapshot.get("lastSeq").and_then(Value::as_u64) {
+                        if let Some(last) = poll_snapshot.get("lastSeq").and_then(Value::as_u64) {
                             since = last;
                         }
                     }
@@ -453,43 +542,48 @@ fn login_relay(
                     }
                 }
 
+                if stop.load(Ordering::SeqCst) { break; }
+                if heartbeat.elapsed() >= LOGIN_HEARTBEAT {
+                    if !send(&mut frame_seq, "heartbeat", Value::Null) { break; }
+                    heartbeat = std::time::Instant::now();
+                }
                 // 3. Act on task terminal state from management host:
                 match snapshot.status {
                     management_host::TaskStatus::Unknown => {
-                        let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": "Login timed out; outcome unknown" }));
+                        let _ = send(&mut frame_seq, "unknown", json!({ "type": "error", "message": "Login timed out; outcome unknown" }));
                         break;
                     }
                     management_host::TaskStatus::Cancelled => {
-                        let _ = send(&mut frame_seq, "event", json!({ "type": "cancelled" }));
+                        let _ = send(&mut frame_seq, "terminal", json!({ "type": "cancelled" }));
                         break;
                     }
                     management_host::TaskStatus::Failed => {
-                        let msg = snapshot.error.unwrap_or_else(|| "Login failed".to_string());
-                        let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": msg }));
+                        let _ = send(&mut frame_seq, "terminal", json!({ "type": "error", "message": "Login failed" }));
                         break;
                     }
                     management_host::TaskStatus::Succeeded => {
                         if let Some(res) = snapshot.result.as_ref() {
                             if res.get("started").and_then(Value::as_bool) == Some(false) {
                                 let msg = res.get("message").and_then(Value::as_str).unwrap_or("Unknown provider");
-                                let _ = send(&mut frame_seq, "event", json!({ "type": "error", "message": msg }));
+                                let _ = send(&mut frame_seq, "terminal", json!({ "type": "error", "message": msg }));
                                 break;
                             }
                         }
-                        let _ = send(&mut frame_seq, "event", json!({ "type": "success" }));
+                        let _ = send(&mut frame_seq, "terminal", json!({ "type": "success" }));
                         break;
                     }
                     management_host::TaskStatus::Running => {}
                 }
             }
 
-            // If relay is ending because of stop or unsubscription, cancel the task cooperatively:
-            if stop.load(Ordering::SeqCst) {
-                let _ = instance.cancel_task(&th);
-            }
+            // Observer loss is not evidence that the credential writer stopped.
             relays.remove(&subscription_id);
         })
-        .expect("the login relay thread spawns");
+        .map_err(|_| {
+            relays.remove(&subscription_id);
+            "could not start login observer".to_string()
+        })?;
+    Ok(tx)
 }
 
 /// Open the OAuth login stream (the static transport's auth.loginStream):
@@ -500,7 +594,15 @@ fn login_relay(
 pub fn pi_ipc_login_stream(
     state: State<'_, Arc<IpcHostState>>,
     provider: String,
+    flow_id: Option<String>,
+    task_handle: Option<String>,
     on_event: Channel<Value>,
+) -> Value {
+    open_login_stream(&state, provider, flow_id, task_handle, on_event)
+}
+
+fn open_login_stream(
+    state: &Arc<IpcHostState>, provider: String, flow_id: Option<String>, task_handle: Option<String>, on_event: Channel<Value>,
 ) -> Value {
     if provider.is_empty() || provider.len() > 200 {
         return crate::pi_ipc::protocol_error("?", "invalid_args", "provider is required");
@@ -521,46 +623,77 @@ pub fn pi_ipc_login_stream(
     };
     let number = LOGIN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let subscription_id = format!("login-{number}");
-    let flow_id = format!("loginflow-{number}");
-
-    // Start the flow with a 10-minute hard deadline, holding an activity guard:
-    let task_start = instance.start_task(
-        "auth.loginStart",
-        json!({ "flowId": flow_id, "provider": provider }),
-        LOGIN_FLOW_DEADLINE,
-        management_host::TaskKind::Mutation,
-    );
-    match task_start {
-        Ok(task_handle) => {
-            login_relay(
-                &state,
-                subscription_id.clone(),
-                flow_id.clone(),
-                task_handle.clone(),
-                instance,
-                on_event,
-            );
-            json!({ "subscriptionId": subscription_id, "flowId": flow_id, "taskHandle": task_handle })
+    let sender = match reserve_login_relay(state, subscription_id.clone(), on_event) {
+        Ok(sender) => sender,
+        Err(message) => return crate::pi_ipc::protocol_error("?", "busy", &message),
+    };
+    let mut tasks = state.login_relays.tasks.lock().unwrap();
+    let (flow_id, task_handle) = match (flow_id, task_handle) {
+        (Some(flow), Some(task)) => {
+            let valid = tasks.get(&flow).is_some_and(|entry| entry.provider == provider
+                && entry.task_handle == task && Arc::ptr_eq(&entry.instance, &instance)
+                && instance.task_snapshot(&task).is_ok());
+            if !valid {
+                return crate::pi_ipc::protocol_error("?", "not_found", "original login task unavailable");
+            }
+            (flow, task)
         }
-        Err(error) => {
-            let (code, message) = crate::pi_ipc::management_error_code(&error);
-            crate::pi_ipc::protocol_error("?", &code, &message)
+        (None, None) => {
+            let active = tasks.values().filter(|entry| {
+                match entry.instance.task_snapshot(&entry.task_handle) {
+                    Ok(snapshot) => matches!(snapshot.status, management_host::TaskStatus::Running | management_host::TaskStatus::Unknown),
+                    Err(_) => true,
+                }
+            }).count();
+            if active >= LOGIN_MAX_RELAYS {
+                return crate::pi_ipc::protocol_error("?", "busy", "login task capacity exhausted");
+            }
+            if tasks.len() >= LOGIN_MAX_TASKS {
+                let completed = tasks.iter().find_map(|(flow, entry)| {
+                    entry.instance.task_snapshot(&entry.task_handle).ok().and_then(|snapshot| {
+                        matches!(snapshot.status, management_host::TaskStatus::Succeeded | management_host::TaskStatus::Failed | management_host::TaskStatus::Cancelled).then(|| flow.clone())
+                    })
+                });
+                if let Some(flow) = completed { tasks.remove(&flow); }
+            }
+            if tasks.len() >= LOGIN_MAX_TASKS {
+                return crate::pi_ipc::protocol_error("?", "busy", "login task registry capacity exhausted");
+            }
+            let flow = format!("loginflow-{number}");
+            let task = match instance.start_task("auth.loginStart", json!({ "flowId": flow, "provider": provider }),
+                LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation) {
+                Ok(task) => task,
+                Err(error) => {
+                    let (code, message) = crate::pi_ipc::management_error_code(&error);
+                    return crate::pi_ipc::protocol_error("?", &code, &message);
+                }
+            };
+            tasks.insert(flow.clone(), LoginTask { provider, task_handle: task.clone(), instance: Arc::clone(&instance) });
+            (flow, task)
         }
+        _ => return crate::pi_ipc::protocol_error("?", "invalid_args", "both original task identifiers are required"),
+    };
+    drop(tasks);
+    if let Some(relay) = state.login_relays.relays.lock().unwrap().get_mut(&subscription_id) {
+        relay.flow_id = flow_id.clone();
+        relay.task_handle = task_handle.clone();
     }
+    if sender.send((flow_id.clone(), task_handle.clone(), instance)).is_err() {
+        let mut error = crate::pi_ipc::protocol_error("?", "io", "login observer could not bind; task outcome is independent");
+        error["error"]["details"] = json!({ "subscriptionId": subscription_id, "flowId": flow_id, "taskHandle": task_handle });
+        return error;
+    }
+    json!({ "subscriptionId": subscription_id, "flowId": flow_id, "taskHandle": task_handle })
 }
 
 /// The unsubscribe half for login streams (pi_ipc's agent.unsubscribeEvents
-/// arm delegates here): stop the relay and cancel the flow host-side via cancel_task.
+/// arm delegates here): stop observation without cancelling the task.
 pub(crate) fn unsubscribe_login_stream(state: &IpcHostState, subscription_id: &str) -> bool {
     let Some(handle) = state.login_relays.cancel(subscription_id) else {
         return false;
     };
     handle.stop.store(true, Ordering::SeqCst);
-    if let Some(config) = state.management_config.lock().unwrap().clone() {
-        if let Ok(instance) = state.management.instance("global", &config) {
-            let _ = instance.cancel_task(&handle.task_handle);
-        }
-    }
+    handle.ack.wake();
     true
 }
 
@@ -569,6 +702,283 @@ pub(crate) fn unsubscribe_login_stream(state: &IpcHostState, subscription_id: &s
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_admission_reconnect_ack_and_task_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("fake-provider.py");
+        std::fs::write(&child, r##"#!/usr/bin/python3
+import sys,json,base64,os
+pending=None
+root=os.environ['PI_CODING_AGENT_DIR']
+def emit(rid,nonce,result):
+    body={'rid':rid,'nonce':nonce,'ok':True,'result':result}
+    print(json.dumps({'type':'extension_ui_request','id':'notify','method':'notify','message':'PI_WEB_MGMT_V1 '+json.dumps(body)}),flush=True)
+for line in sys.stdin:
+    r=json.loads(line)
+    if r.get('type')!='prompt': continue
+    p=r['message'].split(' '); rid=p[1]
+    d=json.loads(base64.urlsafe_b64decode(p[2]+'='*((-len(p[2]))%4)))
+    print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
+    if d['op']=='auth.loginStart':
+        open(os.path.join(root,'started'),'a').write('start\n'); pending=(rid,d['nonce'])
+    elif d['op']=='auth.loginPoll':
+        event={'type':'progress','message':'x'*70000} if os.path.exists(os.path.join(root,'oversize')) else {'type':'auth','url':'https://example.invalid','instructions':None,'token':'fake-token'}
+        emit(rid,d['nonce'],{'events':[{'seq':1,'event':event}] if d['args']['since']==0 else [],'lastSeq':1,'done':False})
+        if pending and os.path.exists(os.path.join(root,'finish')):
+            emit(pending[0],pending[1],{} if os.path.exists(os.path.join(root,'unknown')) else {'success':True}); pending=None
+"##).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(IpcHostState::new());
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: child.to_string_lossy().into_owned(), agent_dir: Some(dir.path().to_path_buf()), extensions: vec![], env: vec![],
+        });
+        let mut reservations = Vec::new();
+        for i in 0..LOGIN_MAX_RELAYS {
+            reservations.push(reserve_login_relay(&state, format!("held-{i}"), Channel::new(|_| Ok(()))).unwrap());
+        }
+        let denied = open_login_stream(&state, "fixture".into(), None, None, Channel::new(|_| Ok(())));
+        assert_eq!(denied["error"]["code"], "busy");
+        assert!(!dir.path().join("started").exists(), "saturation must precede mutation");
+        drop(reservations);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while state.login_relays.alive.load(Ordering::SeqCst) != 0 { assert!(std::time::Instant::now() < until); std::thread::sleep(Duration::from_millis(10)); }
+        let (tx, rx) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let first = open_login_stream(&state, "fixture".into(), None, None, channel);
+        let sub = first["subscriptionId"].as_str().unwrap();
+        let flow = first["flowId"].as_str().unwrap();
+        let task = first["taskHandle"].as_str().unwrap();
+        let snapshot = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert!(!state.login_relays.acknowledge(sub, 2, 1));
+        assert!(!state.login_relays.acknowledge(sub, 1, 2));
+        assert!(state.login_relays.acknowledge(sub, 1, 1));
+        let event = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(event["payload"]["type"], "auth");
+        // Leave this observer's event unacknowledged while a second observer
+        // attaches to the same task; its single-frame window is independent.
+        let config = state.management_config.lock().unwrap().clone().unwrap();
+        let instance = state.management.instance("global", &config).unwrap();
+        assert_eq!(instance.task_snapshot(task).unwrap().status, management_host::TaskStatus::Running);
+        {
+            let mut tasks = state.login_relays.tasks.lock().unwrap();
+            for i in 0..7 {
+                tasks.insert(format!("fixture-active-{i}"), LoginTask { provider: "fixture".into(), task_handle: task.into(), instance: Arc::clone(&instance) });
+            }
+        }
+        let denied = open_login_stream(&state, "fixture".into(), None, None, Channel::new(|_| Ok(())));
+        assert_eq!(denied["error"]["code"], "busy");
+        assert_eq!(std::fs::read_to_string(dir.path().join("started")).unwrap(), "start\n");
+        state.login_relays.tasks.lock().unwrap().retain(|flow, _| !flow.starts_with("fixture-active-"));
+        let (tx2, rx2) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx2.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let reconnected = open_login_stream(&state, "fixture".into(), Some(flow.into()), Some(task.into()), channel);
+        assert_eq!(reconnected["taskHandle"], task);
+        let sub2 = reconnected["subscriptionId"].as_str().unwrap();
+        let second = rx2.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(second["payload"]["flowId"], flow);
+        assert!(state.login_relays.acknowledge(sub2, 1, 1));
+        let replay = rx2.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(replay["payload"]["type"], "auth");
+        assert!(state.login_relays.acknowledge(sub2, 1, 2));
+        assert!(unsubscribe_login_stream(&state, sub));
+        assert!(!state.login_relays.acknowledge(sub, 1, 2));
+        assert_eq!(instance.task_snapshot(task).unwrap().status, management_host::TaskStatus::Running);
+        // An oversized frame detaches only its observer, not the writer or the
+        // already-acknowledging observer.
+        std::fs::write(dir.path().join("oversize"), "ok").unwrap();
+        let (big_tx, big_rx) = mpsc::channel();
+        let big_channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { big_tx.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let big = open_login_stream(&state, "fixture".into(), Some(flow.into()), Some(task.into()), big_channel);
+        let big_id = big["subscriptionId"].as_str().unwrap();
+        big_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.login_relays.acknowledge(big_id, 1, 1));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while state.login_relays.relays.lock().unwrap().contains_key(big_id) { assert!(std::time::Instant::now() < until); std::thread::sleep(Duration::from_millis(10)); }
+        assert_eq!(instance.task_snapshot(task).unwrap().status, management_host::TaskStatus::Running);
+        std::fs::remove_file(dir.path().join("oversize")).unwrap();
+        let (silent_tx, silent_rx) = mpsc::channel();
+        let silent_channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { silent_tx.send(s).unwrap(); } Ok(()) });
+        let silent = open_login_stream(&state, "fixture".into(), Some(flow.into()), Some(task.into()), silent_channel);
+        let silent_id = silent["subscriptionId"].as_str().unwrap();
+        silent_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let until = std::time::Instant::now() + LOGIN_ACK_TIMEOUT + Duration::from_secs(5);
+        while state.login_relays.relays.lock().unwrap().contains_key(silent_id) { assert!(std::time::Instant::now() < until); std::thread::sleep(Duration::from_millis(20)); }
+        assert_eq!(instance.task_snapshot(task).unwrap().status, management_host::TaskStatus::Running);
+        // The active observer must ACK its 10-second heartbeat during this wait.
+        let heartbeat = rx2.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(heartbeat["kind"], "heartbeat");
+        assert!(state.login_relays.acknowledge(sub2, 1, 3));
+        std::fs::write(dir.path().join("finish"), "ok").unwrap();
+        let terminal = rx2.recv_timeout(Duration::from_secs(8)).unwrap();
+        assert_eq!(terminal["kind"], "terminal");
+        assert_eq!(terminal["payload"]["type"], "success");
+        assert!(state.login_relays.acknowledge(sub2, 1, 4));
+        assert_eq!(std::fs::read_to_string(dir.path().join("started")).unwrap(), "start\n");
+        std::fs::remove_file(dir.path().join("finish")).unwrap();
+        let (tx3, rx3) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx3.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let third = open_login_stream(&state, "fixture".into(), None, None, channel);
+        let sub3 = third["subscriptionId"].as_str().unwrap();
+        rx3.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.login_relays.acknowledge(sub3, 1, 1));
+        rx3.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.login_relays.acknowledge(sub3, 1, 2));
+        std::fs::write(dir.path().join("unknown"), "ok").unwrap();
+        std::fs::write(dir.path().join("finish"), "ok").unwrap();
+        let unknown = rx3.recv_timeout(Duration::from_secs(8)).unwrap();
+        assert_eq!(unknown["kind"], "unknown");
+        assert!(unknown["payload"]["message"].as_str().unwrap().contains("unknown"));
+        assert!(state.login_relays.acknowledge(sub3, 1, 3));
+        state.management.shutdown_all(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncated_login_snapshot_rebinds_live_token_and_resumes_after_cursor() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("recovery-child.py");
+        std::fs::write(&child, r##"#!/usr/bin/python3
+import sys,json,base64
+used=False
+def emit(rid,nonce,result):
+    body={'rid':rid,'nonce':nonce,'ok':True,'result':result}
+    print(json.dumps({'type':'extension_ui_request','id':'notify','method':'notify','message':'PI_WEB_MGMT_V1 '+json.dumps(body)}),flush=True)
+for line in sys.stdin:
+    r=json.loads(line)
+    if r.get('type')!='prompt': continue
+    p=r['message'].split(' '); rid=p[1]
+    d=json.loads(base64.urlsafe_b64decode(p[2]+'='*((-len(p[2]))%4)))
+    print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
+    if d['op']=='auth.loginPoll':
+        if d['args']['since']==0:
+            emit(rid,d['nonce'],{'truncated':True,'lastSeq':520,'events':[],'currentInteraction':[{'type':'prompt_request','message':'Enter fake code','placeholder':None,'token':'fixture-live'}]})
+        else:
+            emit(rid,d['nonce'],{'truncated':False,'lastSeq':521,'events':[{'seq':521,'event':{'type':'progress','message':'Signing in'}}] if d['args']['since']==520 else []})
+    elif d['op']=='__input':
+        token=d['args']['data']['token']; ok=token=='fixture-live' and not used
+        if ok: used=True
+        emit(rid,d['nonce'],{'status':'accepted' if ok else 'no_pending','message':'No pending login for token'})
+"##).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = Arc::new(IpcHostState::new());
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: child.to_string_lossy().into_owned(), agent_dir: Some(dir.path().to_path_buf()), extensions: vec![], env: vec![],
+        });
+        let (tx, rx) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let opened = open_login_stream(&state, "fixture".into(), None, None, channel);
+        let id = opened["subscriptionId"].as_str().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap()["kind"], "snapshot");
+        assert!(state.login_relays.acknowledge(id, 1, 1));
+        let recovered = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(recovered["kind"], "reset");
+        assert_eq!(recovered["payload"]["events"][0]["token"], "fixture-live");
+        assert!(state.login_relays.acknowledge(id, 1, 2));
+        let progress = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(progress["payload"]["type"], "progress");
+        assert!(state.login_relays.acknowledge(id, 1, 3));
+        let submit = |token| dispatch(&state, "auth.loginManualCode", "input", &json!({"provider":"fixture","token":token,"code":"fake-code"})).unwrap();
+        assert_eq!(submit("fixture-live")["ok"], true);
+        assert_eq!(submit("fixture-live")["error"]["code"], "not_found");
+        assert_eq!(submit("fixture-old")["error"]["code"], "not_found");
+        assert!(unsubscribe_login_stream(&state, id));
+        state.management.shutdown_all(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_node_login_snapshot_reaches_channel_and_accepts_fake_code() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(agent.join("extensions")).unwrap();
+        std::fs::write(agent.join("extensions/fake-provider.js"), r#"
+export default function(pi) {
+  pi.registerProvider({ id: 'relay-fake', name: 'Relay fake', auth: { oauth: {
+    name: 'Fake', login: async (interaction) => {
+      interaction.notify({type:'auth_url', url:'https://example.invalid/authorize', instructions:'fixture'});
+      for (let i=0; i<520; i++) interaction.notify({type:'progress', message:'fixture'});
+      const code = await interaction.prompt({type:'manual_code', message:'Fake code'});
+      if (code !== 'fake-code') throw new Error('fake refusal');
+      return {type:'oauth', access:'fake-access', refresh:'fake-refresh', expires:4102444800000};
+    }, refresh: async () => ({access:'fake-access',refresh:'fake-refresh',expires:4102444800000}),
+    toAuth: async (credential) => ({apiKey:credential.access})
+  } }, getModels: () => [{id:'fake',name:'Fake'}], models: [{id:'fake',name:'Fake'}] });
+}
+"#).unwrap();
+        let state = Arc::new(IpcHostState::new());
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: std::path::Path::new("../lib/__fixtures__/provider-login-relay-child.mjs").canonicalize().unwrap().to_string_lossy().into_owned(),
+            agent_dir: Some(agent), extensions: vec![], env: vec![("PI_OFFLINE".into(), "1".into())],
+        });
+        let mut client = Command::new("node")
+            .arg("../static-frontend/src/data/provider-login-client-child.mjs")
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut client_in = client.stdin.take().unwrap();
+        let client_out = BufReader::new(client.stdout.take().unwrap());
+        let (client_tx, client_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in client_out.lines() {
+                let Ok(line) = line else { break };
+                if client_tx.send(line).is_err() { break; }
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let channel = Channel::new(move |body| { if let tauri::ipc::InvokeResponseBody::Json(s) = body { tx.send(serde_json::from_str::<Value>(&s).unwrap()).unwrap(); } Ok(()) });
+        let opened = open_login_stream(&state, "relay-fake".into(), None, None, channel);
+        let id = opened["subscriptionId"].as_str().unwrap();
+        let first = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(first["kind"], "snapshot");
+        writeln!(client_in, "{first}").unwrap();
+        client_in.flush().unwrap();
+        assert!(state.login_relays.acknowledge(id, 1, 1));
+        let recovered = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(recovered["kind"], "reset", "{recovered}");
+        writeln!(client_in, "{recovered}").unwrap();
+        client_in.flush().unwrap();
+        let mut token = None;
+        for _ in recovered["payload"]["events"].as_array().unwrap() {
+            let line = match client_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(line) => line,
+                Err(error) => { let _ = client.kill(); let _ = client.wait(); panic!("fake client did not receive recovery: {error}"); }
+            };
+            let event: Value = serde_json::from_str(&line).unwrap();
+            if event["type"] == "prompt_request" { token = event["token"].as_str().map(str::to_string); }
+        }
+        let token = token.expect("static login service rendered the recovered prompt");
+        assert!(state.login_relays.acknowledge(id, 1, 2));
+        let submitted = dispatch(&state, "auth.loginManualCode", "submit", &json!({"provider":"relay-fake", "token":token, "code":"fake-code"})).unwrap();
+        assert_eq!(submitted["ok"], true, "{submitted}");
+        let terminal = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(terminal["kind"], "terminal", "{terminal}");
+        assert_eq!(terminal["payload"]["type"], "success");
+        assert!(state.login_relays.acknowledge(id, 1, 3));
+        drop(client_in);
+        assert!(client.wait().unwrap().success());
+        reader.join().unwrap();
+        state.management.shutdown_all(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn recovery_rejects_noninteractive_and_oversized_payloads() {
+        let good = json!({"lastSeq":7,"currentInteraction":[{"type":"auth","token":"live","url":"https://example.invalid","instructions":null}]});
+        assert!(recovery_interactions(&good).is_some());
+        assert!(recovery_interactions(&json!({"lastSeq":7,"currentInteraction":[{"type":"success"}]})).is_none());
+        assert!(recovery_interactions(&json!({"lastSeq":7,"currentInteraction":[{"type":"auth","token":"live","url":"x".repeat(70_000)}]})).is_none());
+        assert!(recovery_interactions(&json!({"lastSeq":7,"currentInteraction":null})).is_none());
+    }
 
     #[test]
     fn provider_argument_gate() {
@@ -902,6 +1312,7 @@ export default function(pi) {
                 flow_id: "flow-input-test-1".to_string(),
                 task_handle: login_task.clone(),
                 tokens: Default::default(),
+                ack: Arc::new(crate::pi_ipc::SessionRelayAck::default()),
             },
         );
 

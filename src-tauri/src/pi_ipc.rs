@@ -82,7 +82,7 @@ pub struct IpcHostState {
     running_relay_gate: Arc<tokio::sync::Semaphore>,
     relay_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// The provider-auth domain's login-stream relays (the same release
-    /// contract: unsubscribe cancels the flow host-side). Kept in the
+    /// contract: unsubscribe detaches only the observer). Kept in the
     /// domain's own map so the shared one stays untouched.
     pub(crate) login_relays: Arc<crate::provider_auth::LoginRelays>,
     /// Running relay work, distinct from registrations removed by unsubscribe.
@@ -1959,6 +1959,13 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             if epoch == 1 && ack.is_some_and(|ack| ack.acknowledge(seq)) { protocol_ok(&id, json!({"acknowledged":seq})) }
             else { protocol_error(&id, "invalid_args", "invalid running stream acknowledgement") }
         }
+        "auth.ackLogin" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            if state.login_relays.acknowledge(subscription, epoch, seq) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid login stream acknowledgement") }
+        }
         "tasks.ackEvents" => {
             let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
             let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
@@ -1980,8 +1987,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         "agent.unsubscribeEvents" => {
             let subscription_id = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
             // The provider-auth login streams unsubscribe through the same
-            // op (their relays live in the domain's own map): stop the relay
-            // and cancel the flow host-side.
+            // op (their relays live in the domain's own map): stop only
+            // the observer, not the credential writer.
             if crate::provider_auth::unsubscribe_login_stream(state, subscription_id) {
                 protocol_ok(&id, json!({ "unsubscribed": subscription_id }))
             } else {
@@ -3005,7 +3012,7 @@ pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -
     let id = envelope_id(&request);
     let op = request.get("op").and_then(Value::as_str);
     let control = matches!(op,
-        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "agent.ackRunning" | "tasks.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
+        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "agent.ackRunning" | "auth.ackLogin" | "tasks.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
              "agent.interrupt" | "auth.loginCancel" | "mcp.signInCancel" |
              "plugins.mutation.cancel" | "plugins.install.cancel" | "skills.mutation.cancel"))
         || (op == Some("agent.command") && matches!(request.pointer("/args/type").and_then(Value::as_str),

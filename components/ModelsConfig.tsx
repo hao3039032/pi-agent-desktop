@@ -1376,7 +1376,7 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
   const [loginState, setLoginState] = useState<OAuthLoginState>({ phase: "idle" });
   const { t } = useI18n();
   const [inputValue, setInputValue] = useState("");
-  const unsubscribeRef = useRef<(() => void) | null>(null);
+  const unsubscribeRef = useRef<((() => void) & { cancel?: () => void }) | null>(null);
   const submittedTokensRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -1517,6 +1517,7 @@ function OAuthDetail({ provider, onRefresh, enabledModels }: {
             <ConfigButton
               size="small"
               onClick={() => {
+                unsubscribeRef.current?.cancel?.();
                 unsubscribeRef.current?.();
                 unsubscribeRef.current = null;
                 setLoginState({ phase: "idle" });

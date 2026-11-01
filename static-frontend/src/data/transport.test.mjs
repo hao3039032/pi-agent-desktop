@@ -328,6 +328,40 @@ test("scheduled Channel frames ACK with epoch after delivery and unsubscribe", a
   }
 });
 
+test("provider login Channel ACKs snapshots and heartbeats and detach does not cancel", async () => {
+  let callback;
+  const calls = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 45; }, unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_login_stream") {
+        callback({ index: 0, message: { subscriptionId: "login-1", epoch: 1, seq: 1, kind: "snapshot", payload: { flowId: "f", taskHandle: "t" } } });
+        return Promise.resolve({ subscriptionId: "login-1", flowId: "f", taskHandle: "t" });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    const close = detectTransport().transport.subscribe("auth.loginStream", { provider: "fixture", flowId: "f", taskHandle: "t" }, () => {}, () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "auth.ackLogin"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(calls.find((call) => call.args?.request?.op === "auth.ackLogin").args.request.args, { subscriptionId: "login-1", epoch: 1, seq: 1 });
+    assert.equal(calls.find((call) => call.command === "pi_ipc_login_stream").args.taskHandle, "t");
+    callback({ index: 1, message: { subscriptionId: "login-1", epoch: 1, seq: 2, kind: "heartbeat", payload: null } });
+    for (let n = 0; n < 20 && calls.filter((call) => call.args?.request?.op === "auth.ackLogin").length < 2; n++) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(calls.filter((call) => call.args?.request?.op === "auth.ackLogin").map((call) => call.args.request.args.seq), [1, 2]);
+    close();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(calls.some((call) => call.args?.request?.op === "agent.unsubscribeEvents"));
+    assert.ok(!calls.some((call) => call.args?.request?.op === "auth.loginCancel"));
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
+});
+
 test("running Channel acknowledges with epoch and unsubscribes after delivery", async () => {
   let callback;
   const calls = [];

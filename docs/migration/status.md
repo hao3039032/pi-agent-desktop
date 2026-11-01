@@ -43,6 +43,10 @@
 
 ## 集成验证记录（不是全量/跨平台验收）
 
+- Provider-auth relay 已整合 `f9e30118` / `0f86cc39` / `d0193e75`，保留 `36b5d027` 的输入关闭门禁。真实 invoke ACK 保存原 flow/task 身份；首 snapshot / subscription / epoch / 连续 seq 验证后才 ACK 与续命；截断历史用最多 16 个、≤60 KiB 的当前交互恢复，Node 再检查 token 活性。observer detach 不取消写任务；显式 Cancel 保留最佳努力 abort，但 SDK `Models.login` 的 abort race 不能证明底层 provider 已退出，未决 flow 不释放容量，**SDK取消闭环及 auth 最终 shutdown accounting 仍未完成**。
+  - 父级合并树 JS 首轮 **56 pass / 1 fail**（旧断言要求原始 provider 错误）；改为明确验证脱敏错误及伪凭据不泄漏后 **57 pass / 0 fail / 0 skip**。静态及 source-only TypeScript、API inventory 检查通过。Next auth service/routes 无改动。
+  - 父级 Linux Rust 定向输出为 9 pass，但其中 `login_input_bypasses_scope_mutation_isolation_and_enforces_task_guards` 内部因缺少 `PI_CLI_BIN` 返回，故只计 **8 项实际通过 + 1 内部跳过**；包含 Node login composition → fake RPC → Rust Channel → static service fixture，不是 native WebView/standalone。显式提供本地 CLI 单独运行该旧测试后 **1 fail**：`management agent directory differs from host agent directory`，未进入输入行为。其旧夹具还使用整树 staging，后续须改为预算内夹具，不再重复整树复制；不能把该失败称为通过。另两项 `real_pi_*` 测试本轮未运行。两个 deprecated atomic warnings 保留。
+
 - 父代理补齐 task-input 关闭门禁：`submit_task_input` 原先未读取共享 host-closing fence；现在在同一个实例状态临界区检查关闭并登记 activity，覆盖验证、派发及响应等待。使用独立 **4 槽/实例** 输入准入，避免 128 个普通 activity 饱和时阻断任务完成所需的输入；关闭前已准入但未发送的输入仍进入 unknown 统计，不把输入返回当凭据 writer 停止。新增真实 Rust→fake management child 定向回归 **4 passed / 0 failed / 0 ignored**，覆盖旧引用、锁等待后关闭、发送前在途及普通饱和/输入饱和；不是真实认证或跨平台验收。
 
 - `09029072` 三类 relay 关闭整合：父代理检查了准入先关闭、共享绝对 deadline、预留跨登记/启动/清理保留、独立于 registry 的 shutdown 检查、阻塞 Channel 与锁忙 unknown，以及可选报告缺失时的 null/unknown。代码树与 lane 测试提交一致；lane 定向 Rust **23 passed**、harness JS **1 passed**，不重复称作父代理测试。父代理另跑合并树 running 回归 **12 passed / 0 failed / 0 ignored**，其中两项使用真实本地 pi 与隔离假模型端点；Tauri `--locked` 测试构建通过（1 条 deprecated warning），target **3.6 GiB**。报告仅覆盖受跟踪应用工作清理，不证明 OS 线程或 WebView 内部队列回收；auth relay、上游监听器及生产关闭仍不在覆盖内。
