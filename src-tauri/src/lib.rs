@@ -59,6 +59,7 @@ mod session_deletion_journal;
 mod terminal_host;
 mod host_ownership;
 pub mod host_lifecycle;
+pub mod recovery_evidence;
 mod scheduler_host;
 mod scheduler_tick;
 mod scheduled_runner;
