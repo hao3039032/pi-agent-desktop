@@ -20,6 +20,9 @@ use std::path::{Component, Path, PathBuf};
 mod file_directory_unix;
 #[cfg(unix)]
 use file_directory_unix::{directory_entries, directory_entry_info, git_directory};
+#[cfg(unix)]
+#[path = "pinned_root_unix.rs"]
+mod pinned_root_unix;
 #[cfg(windows)]
 #[path = "file_handle_windows.rs"]
 mod file_handle_windows;
