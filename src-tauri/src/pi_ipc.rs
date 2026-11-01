@@ -2818,10 +2818,15 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
         let mut payload = args.clone();
         payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
         payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
+        payload["hostedOAuth"] = json!(true);
         let handle = match instance.start_task("mcp.signInStart", payload, Duration::from_secs(600), management_host::TaskKind::Mutation) {
             Ok(handle) => handle,
             Err(error) => return protocol_error(id, "io", &error),
         };
+        if let Err(error) = crate::mcp_oauth_callback::start(instance.clone(), handle.clone()) {
+            let _ = instance.cancel_task(&handle);
+            return protocol_error(id, "io", &format!("Could not start callback monitor: {error}"));
+        }
         {
             let mut handles = state.mcp_signin_tasks.lock().unwrap();
             handles.retain(|handle| instance.task_snapshot(handle).is_ok());
@@ -2892,6 +2897,7 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
 }
 
 fn mcp_signin_flow_response(id: &str, handle: &str, mut flow: Value) -> Value {
+    if let Some(object) = flow.as_object_mut() { object.remove("_hostCallback"); }
     if flow.get("mcpRefusal").is_some() { return mcp_management_response(id, flow); }
     if !flow.is_object() || flow.get("phase").and_then(Value::as_str).is_none() {
         return protocol_error(id, "io", "Invalid MCP sign-in response");
@@ -6856,7 +6862,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&managed).unwrap();
         symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
-        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"cancel":{"url":url},"signout":{"url":url}}}).to_string()).unwrap();
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"signout":{"url":url},"exit":{"url":url}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable, agent_dir: Some(agent.clone()),
@@ -6881,12 +6887,39 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let redirect = String::from_utf8(result.stdout).unwrap();
         let invalid = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":"http://localhost/?code=x&state=wrong"}));
         assert_eq!(invalid["error"]["reason"], "redirect-state-mismatch", "{invalid}");
-        let submitted = call("mcp.signInSubmit", json!({"flowId":handle,"redirectUrl":redirect.trim()}));
-        assert_eq!(submitted["ok"], true, "{submitted}");
+        assert!(waiting["data"].get("_hostCallback").is_none());
+        let wrong = Command::new("node").arg("-e").arg("let u=new URL(process.argv[1]);u.searchParams.set('state','wrong');fetch(u).then(r=>{if(r.status!==400)throw Error(String(r.status))})").arg(redirect.trim()).output().unwrap();
+        assert!(wrong.status.success(), "{}", String::from_utf8_lossy(&wrong.stderr));
+        let callback = Command::new("node").arg("-e").arg("fetch(process.argv[1]).then(async r=>{if(!r.ok)throw Error(String(r.status)); console.log(await r.text())})").arg(redirect.trim()).output().unwrap();
+        assert!(callback.status.success(), "{}", String::from_utf8_lossy(&callback.stderr));
         loop {
             let status = call("mcp.signInStatus", json!({"flowId":handle}));
             assert_eq!(status["ok"], true, "{status}");
             if status["data"]["phase"] == "done" { assert_eq!(status["data"]["result"]["state"], "connected", "{status}"); break; }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let callback_url = url::Url::parse(redirect.trim()).unwrap();
+        let address: std::net::SocketAddr = ([127, 0, 0, 1], callback_url.port().unwrap()).into();
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
+            assert!(std::time::Instant::now() < close_deadline, "completed callback listener remained open");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let manual_start = call("mcp.signInStart", json!({"scope":"global","name":"manual"}));
+        let manual_handle = manual_start["data"]["flowId"].as_str().unwrap();
+        let manual_page = loop {
+            let status = call("mcp.signInStatus", json!({"flowId":manual_handle}));
+            if status["data"]["phase"] == "authorize" { break status["data"]["authorizationUrl"].as_str().unwrap().to_owned(); }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let manual_redirect = Command::new("node").arg("-e").arg("fetch(process.argv[1],{redirect:'manual'}).then(r=>console.log(r.headers.get('location')))").arg(manual_page).output().unwrap();
+        let submitted = call("mcp.signInSubmit", json!({"flowId":manual_handle,"redirectUrl":String::from_utf8(manual_redirect.stdout).unwrap().trim()}));
+        assert_eq!(submitted["ok"], true, "{submitted}");
+        loop {
+            let status = call("mcp.signInStatus", json!({"flowId":manual_handle}));
+            if status["data"]["phase"] == "done" { assert_eq!(status["data"]["result"]["state"], "connected"); break; }
             assert!(std::time::Instant::now() < deadline, "{status}");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -6911,6 +6944,23 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             if status["data"]["phase"] == "cancelled" { break; }
             assert!(std::time::Instant::now() < deadline, "{status}");
             std::thread::sleep(Duration::from_millis(50));
+        }
+        let exit = call("mcp.signInStart", json!({"scope":"global","name":"exit"}));
+        let exit_handle = exit["data"]["flowId"].as_str().unwrap();
+        let exit_redirect = loop {
+            let status = call("mcp.signInStatus", json!({"flowId":exit_handle}));
+            if status["data"]["phase"] == "authorize" { break status["data"]["redirectUrl"].as_str().unwrap().to_owned(); }
+            assert!(std::time::Instant::now() < deadline, "{status}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let exit_address: std::net::SocketAddr = ([127, 0, 0, 1], url::Url::parse(&exit_redirect).unwrap().port().unwrap()).into();
+        let config = state.management_config.lock().unwrap().clone().unwrap();
+        let instance = state.management.instance("global", &config).unwrap();
+        instance.force_stop(Duration::from_secs(5)).unwrap();
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::net::TcpStream::connect_timeout(&exit_address, Duration::from_millis(50)).is_ok() {
+            assert!(std::time::Instant::now() < close_deadline, "callback listener survived child shutdown");
+            std::thread::sleep(Duration::from_millis(20));
         }
         state.management.shutdown_all(Duration::from_secs(5));
     }

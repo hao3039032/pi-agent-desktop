@@ -21,6 +21,7 @@ tauri-build = { version = "2.5.5", features = [] }
 pi-host = { path = "../crates/pi-host" }
 pty-host = { path = "../crates/pty-host" }
 management-host = { path = "../crates/management-host" }
+oauth-loopback = { path = "../crates/oauth-loopback" }
 task-scheduler = { path = "../crates/task-scheduler" }
 resource-protocol = { path = "../crates/resource-protocol" }
 session-host = { path = "../crates/session-host" }
