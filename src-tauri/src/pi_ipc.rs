@@ -1074,6 +1074,8 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 "protocol": IPC_PROTOCOL_VERSION,
             }),
         ),
+        // Read-only diagnosis only: never grants recovery or removes markers.
+        "desktop.recoveryStatus" => protocol_ok(&id, json!(crate::host_lifecycle::recovery_status(&state.agent_dir()))),
         // The transition-version state mirror (plan §七): the static app
         // READS the mirror the legacy version wrote, before React mounts.
         // The mirror lives under the host's agent dir; a missing or corrupt
@@ -5228,6 +5230,22 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(response["data"]["host"], "tauri");
         assert_eq!(response["data"]["protocol"], 1);
         assert_eq!(response["data"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn recovery_status_is_read_only_and_uses_host_agent_directory() {
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        std::fs::create_dir(dir.path().join("pi-web")).unwrap();
+        let marker = dir.path().join("pi-web/trust-policy-pending.json");
+        std::fs::write(&marker, b"unknown").unwrap();
+        let response = send(&state, json!({"v": 1, "id": "recovery", "op": "desktop.recoveryStatus", "args": {"agentDir": other.path()}}));
+        assert_eq!(response["data"]["trustPolicy"], "pending");
+        assert_eq!(response["data"]["sessionWriters"], "clear");
+        assert_eq!(response["data"]["deletionJournal"], "clear");
+        assert_eq!(std::fs::read(marker).unwrap(), b"unknown");
     }
 
     #[test]
