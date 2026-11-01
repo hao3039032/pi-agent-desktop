@@ -167,6 +167,9 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
             let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
                 .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
             crate::session_deletion_journal::recover_pending(state, &agent)?;
+            if !state.deletion_fork_writer_proven_stopped() {
+                return Err(error("busy", "Session deletion is blocked until prior fork or clone writers are confirmed stopped"));
+            }
             let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
                 .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
             match delete_with_index(state, args, &index, true, None)? {
@@ -183,6 +186,9 @@ pub(crate) fn delete(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
     let _transaction = task_scheduler::transaction_lock::TransactionLock::acquire(&agent)
         .map_err(|e| error("busy", format!("Scheduler transaction unavailable: {e}")))?;
     crate::session_deletion_journal::recover_pending(state, &agent)?;
+    if !state.deletion_fork_writer_proven_stopped() {
+        return Err(error("busy", "Session deletion is blocked until prior fork or clone writers are confirmed stopped"));
+    }
     let index = crate::scheduled_session_index::ScheduledSessionIndex::load_for_deletion(&agent)
         .map_err(|e| error("io", format!("Cannot verify scheduled session references: {e}")))?;
     match delete_with_index(state, args, &index, false, preflight_proof.as_ref())? {
@@ -404,6 +410,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let state = IpcHostState::new();
         *state.task_agent_dir.lock().unwrap() = Some(dir.path().to_path_buf());
+        state.deletion_fork_writer_exclusive.store(true, std::sync::atomic::Ordering::SeqCst);
         (dir, state, root)
     }
     fn session(root: &Path, id: &str, parent: Option<&Path>) -> PathBuf {
@@ -572,6 +579,17 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         writeln!(std::fs::OpenOptions::new().append(true).open(&target).unwrap(), "{}", json!({"type":"custom","customType":"new"})).unwrap();
         assert_eq!(delete_with_index(&state, &args, &index, false, Some(&proof)).unwrap_err().0, "busy");
         assert!(std::fs::read_to_string(&target).unwrap().contains("new"));
+    }
+    #[test]
+    fn unknown_prior_fork_writer_blocks_deletion_before_side_effects() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        state.deletion_fork_writer_exclusive.store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = super::delete(&state, &json!({"session":"target"})).unwrap_err();
+        assert_eq!(result.0, "busy");
+        assert!(result.1.contains("fork or clone writers"));
+        assert!(target.exists());
+        assert!(!crate::session_deletion_journal::has_pending(&state.agent_dir()).unwrap());
     }
     #[test]
     fn production_delete_rejects_policy_and_unresolved_writer_fences() {

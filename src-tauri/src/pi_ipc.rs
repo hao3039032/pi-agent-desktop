@@ -36,6 +36,8 @@ pub struct IpcHostState {
     pub(crate) policy_gate: Arc<std::sync::RwLock<()>>,
     #[cfg(test)]
     pub(crate) deletion_recovery_exclusive: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) deletion_fork_writer_exclusive: std::sync::atomic::AtomicBool,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -129,6 +131,13 @@ impl IpcHostState {
         { false }
     }
 
+    pub(crate) fn deletion_fork_writer_proven_stopped(&self) -> bool {
+        #[cfg(test)]
+        { return self.deletion_fork_writer_exclusive.load(std::sync::atomic::Ordering::SeqCst); }
+        #[cfg(not(test))]
+        { false }
+    }
+
     pub(crate) fn chat_unlock_permitted(&self) -> bool {
         self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
     }
@@ -162,6 +171,8 @@ impl IpcHostState {
             policy_gate,
             #[cfg(test)]
             deletion_recovery_exclusive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            deletion_fork_writer_exclusive: std::sync::atomic::AtomicBool::new(false),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
