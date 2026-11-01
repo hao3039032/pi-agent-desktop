@@ -39,12 +39,20 @@ pub struct MutationDescriptor {
     operation: &'static str,
     scope: OperationScope,
     target: OperationTarget,
+    mcp_target: Option<McpCredentialTarget>,
 }
 impl MutationDescriptor {
     pub fn new(operation: &str, scope: OperationScope) -> Result<Self, String> {
         let (operation, target) = operation_descriptor(operation).ok_or("unclassified management mutation")?;
-        Ok(Self { operation, scope, target })
+        Ok(Self { operation, scope, target, mcp_target: None })
     }
+    /// Only call with the nonce-bound target resolved from trusted MCP configuration.
+    pub fn with_mcp_target(mut self, target: McpCredentialTarget) -> Result<Self, String> {
+        if !matches!(self.operation, "mcp.signInStart" | "mcp.configAction" | "mcp.test") { return Err("operation has no MCP credential target".into()); }
+        self.mcp_target = Some(target);
+        Ok(self)
+    }
+    pub fn mcp_target(&self) -> Option<&McpCredentialTarget> { self.mcp_target.as_ref() }
     pub fn operation(&self) -> &'static str { self.operation }
     pub fn scope(&self) -> &OperationScope { &self.scope }
     pub fn target(&self) -> OperationTarget { self.target }
@@ -56,6 +64,7 @@ pub struct PendingOperation {
     pub operation: String,
     pub scope: OperationScope,
     pub target: OperationTarget,
+    pub mcp_target: Option<McpCredentialTarget>,
     pub created_at_ms: u64,
 }
 
@@ -145,18 +154,27 @@ impl OperationLedger {
             if bytes.len() as u64 > MAX_RECORD_BYTES { return Err("management ledger record too large".into()); }
             let v: Value = serde_json::from_slice(&bytes).map_err(|_| "corrupt management ledger record")?;
             let obj = v.as_object().ok_or("corrupt management ledger record")?;
+            let mcp_target = match obj.get("mcpTarget") {
+                None => None,
+                Some(Value::Object(target)) if target.len() == 2 => Some(McpCredentialTarget::new(
+                    target.get("primaryDigest").and_then(Value::as_str).ok_or("invalid MCP target")?.to_string(),
+                    target.get("legacyDigest").and_then(Value::as_str).ok_or("invalid MCP target")?.to_string(),
+                )?),
+                _ => return Err("invalid MCP target".into()),
+            };
+            let fields = 7 + usize::from(mcp_target.is_some());
             let pending = match v["phase"].as_str() {
-                Some("pending") if obj.len() == 7 => true,
-                Some("succeeded") if obj.len() == 8 && v["completedAtMs"].as_u64().is_some() => false,
+                Some("pending") if obj.len() == fields => true,
+                Some("succeeded") if obj.len() == fields + 1 && v["completedAtMs"].as_u64().is_some() => false,
                 _ => return Err("invalid management ledger phase".into()),
             };
             if v["version"] != 1 || v["operationId"] != uuid.to_string() { return Err("invalid management ledger record".into()); }
             let operation = v["operation"].as_str().ok_or("invalid operation")?;
             let target = target_for(operation).ok_or("unknown ledger operation")?;
-            if v["target"] != target_name(target) { return Err("invalid ledger target".into()); }
+            if v["target"] != target_name(target) || (mcp_target.is_some() && !matches!(operation, "mcp.signInStart" | "mcp.configAction" | "mcp.test")) { return Err("invalid ledger target".into()); }
             let scope = match v["scope"].as_str() { Some("global") => OperationScope::Global, Some(p) if p.starts_with('/') && p.len() <= 4096 => OperationScope::Project { path: p.to_string() }, _ => return Err("invalid ledger scope".into()) };
             let created_at_ms = v["createdAtMs"].as_u64().ok_or("invalid ledger timestamp")?;
-            records.push((PendingOperation { operation_id: uuid.to_string(), operation: operation.into(), scope, target, created_at_ms }, pending));
+            records.push((PendingOperation { operation_id: uuid.to_string(), operation: operation.into(), scope, target, mcp_target, created_at_ms }, pending));
         }
         Ok(records)
     }
@@ -180,7 +198,10 @@ impl OperationLedger {
         let scope_text = match &descriptor.scope { OperationScope::Global => "global", OperationScope::Project { path } if path.starts_with('/') && path.len() <= 4096 => path, _ => return Err("invalid management scope".into()) };
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
-        let v = json!({"version":1,"operationId":id,"operation":operation,"scope":scope_text,"target":target_name(target),"phase":"pending","createdAtMs":timestamp});
+        let mut v = json!({"version":1,"operationId":id,"operation":operation,"scope":scope_text,"target":target_name(target),"phase":"pending","createdAtMs":timestamp});
+        if let Some(target) = &descriptor.mcp_target {
+            v["mcpTarget"] = json!({"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()});
+        }
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(self.path.join(format!("{id}.json"))).map_err(|e| e.to_string())?;
         file.write_all(v.to_string().as_bytes()).and_then(|_| file.sync_all()).and_then(|_| self.directory.sync_all()).map_err(|e| format!("cannot persist management ledger: {e}"))?;
         Ok(id)
@@ -203,7 +224,10 @@ impl OperationLedger {
         let record = records.into_iter().find(|(r, pending)| r.operation_id == id && *pending).map(|(r, _)| r).ok_or("management ledger operation missing")?;
         let scope = match &record.scope { OperationScope::Global => "global", OperationScope::Project { path } => path };
         let completed_at_ms: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
-        let value = json!({"version":1,"operationId":record.operation_id,"operation":record.operation,"scope":scope,"target":target_name(record.target),"phase":"succeeded","createdAtMs":record.created_at_ms,"completedAtMs":completed_at_ms});
+        let mut value = json!({"version":1,"operationId":record.operation_id,"operation":record.operation,"scope":scope,"target":target_name(record.target),"phase":"succeeded","createdAtMs":record.created_at_ms,"completedAtMs":completed_at_ms});
+        if let Some(target) = &record.mcp_target {
+            value["mcpTarget"] = json!({"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()});
+        }
         let temp = self.path.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&temp).map_err(|e| e.to_string())?;
         file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).and_then(|_| std::fs::rename(&temp, self.path.join(format!("{id}.json")))).and_then(|_| self.directory.sync_all()).map_err(|e| e.to_string())
@@ -213,20 +237,20 @@ impl OperationLedger {
 fn target_name(target: OperationTarget) -> &'static str { match target { OperationTarget::Settings => "settings", OperationTarget::Credentials => "credentials", OperationTarget::Packages => "packages", OperationTarget::Mcp => "mcp", OperationTarget::Trust => "trust" } }
 fn operation_descriptor(op: &str) -> Option<(&'static str, OperationTarget)> {
     let name = match op {
-        "models.setDefault" => "models.setDefault", "models.enabledSet" => "models.enabledSet", "modelsConfig.put" => "modelsConfig.put", "terminal.settingsSet" => "terminal.settingsSet", "distro.configure" => "distro.configure", "distro.seed" => "distro.seed",
+        "models.setDefault" => "models.setDefault", "models.enabledSet" => "models.enabledSet", "models.refreshCatalog" => "models.refreshCatalog", "modelsConfig.put" => "modelsConfig.put", "terminal.settingsSet" => "terminal.settingsSet", "distro.configure" => "distro.configure", "distro.seed" => "distro.seed",
         "auth.apiKeyStore" => "auth.apiKeyStore", "auth.apiKeyDelete" => "auth.apiKeyDelete", "auth.logout" => "auth.logout", "auth.loginStart" => "auth.loginStart",
         "plugins.install" => "plugins.install", "plugins.remove" => "plugins.remove", "plugins.update" => "plugins.update", "plugins.setEnabled" => "plugins.setEnabled", "skills.install" => "skills.install", "skills.update" => "skills.update", "skills.setDisabled" => "skills.setDisabled",
-        "mcp.configAction" => "mcp.configAction", "mcp.signInStart" => "mcp.signInStart", "trust.setFenced" => "trust.setFenced", "mcp.trustFolderAdd" => "mcp.trustFolderAdd",
+        "mcp.configAction" => "mcp.configAction", "mcp.signInStart" => "mcp.signInStart", "mcp.test" => "mcp.test", "trust.setFenced" => "trust.setFenced", "mcp.trustFolderAdd" => "mcp.trustFolderAdd",
         _ => return None,
     };
     Some((name, target_for(name)?))
 }
 pub(crate) fn target_for(op: &str) -> Option<OperationTarget> {
     Some(match op {
-        "models.setDefault" | "models.enabledSet" | "modelsConfig.put" | "terminal.settingsSet" | "distro.configure" | "distro.seed" => OperationTarget::Settings,
+        "models.setDefault" | "models.enabledSet" | "models.refreshCatalog" | "modelsConfig.put" | "terminal.settingsSet" | "distro.configure" | "distro.seed" => OperationTarget::Settings,
         "auth.apiKeyStore" | "auth.apiKeyDelete" | "auth.logout" | "auth.loginStart" => OperationTarget::Credentials,
         "plugins.install" | "plugins.remove" | "plugins.update" | "plugins.setEnabled" | "skills.install" | "skills.update" | "skills.setDisabled" => OperationTarget::Packages,
-        "mcp.configAction" | "mcp.signInStart" => OperationTarget::Mcp,
+        "mcp.configAction" | "mcp.signInStart" | "mcp.test" => OperationTarget::Mcp,
         "trust.setFenced" | "mcp.trustFolderAdd" => OperationTarget::Trust,
         _ => return None,
     })

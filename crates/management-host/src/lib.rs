@@ -93,15 +93,15 @@ fn operation_policy(op: &str, session_writer: bool) -> Result<OperationPolicy, S
         "tasks.validateCreate" | "tasks.validateUpdate" | "tasks.nextRun" | "tasks.decideSlot" | "tasks.previewCron" => Ok(ReadOnly),
         // These can call a network service or write an explicitly temporary
         // projection. They are not pure reads and are never auto-retried.
-        "modelsConfig.catalog" | "modelsConfig.discover" | "modelsConfig.test" | "models.refreshCatalog" |
-        "models.providerUsage" | "skills.search" | "skills.check" | "plugins.check" | "mcp.test" |
+        "modelsConfig.catalog" | "modelsConfig.discover" | "modelsConfig.test" |
+        "models.providerUsage" | "skills.search" | "skills.check" | "plugins.check" |
         "session.export" | "session.extractToolResultImage" | "auth.loginCancel" => Ok(Ephemeral),
         _ => Err(format!("unclassified management operation: {op}")),
     }
 }
 
 fn mutation_scope(op: &str, args: &Value) -> Result<ledger::OperationScope, String> {
-    if op == "trust.setFenced" || (matches!(op, "plugins.install" | "plugins.remove" | "plugins.update" | "skills.install" | "skills.update" | "mcp.configAction" | "mcp.signInStart")
+    if op == "trust.setFenced" || (matches!(op, "plugins.install" | "plugins.remove" | "plugins.update" | "skills.install" | "skills.update" | "mcp.configAction" | "mcp.signInStart" | "mcp.test")
         && args.get("scope").and_then(Value::as_str) == Some("project")) {
         let cwd = args.get("cwd").and_then(Value::as_str).ok_or("project mutation lacks a physical scope")?;
         let canonical = std::fs::canonicalize(cwd).map_err(|e| format!("cannot identify project mutation scope: {e}"))?;
@@ -124,6 +124,10 @@ fn confirmed_success(op: &str, value: &Value) -> bool {
     if value.get("mcpRefusal").is_some() { return false; }
     match op {
         "plugins.setEnabled" | "skills.setDisabled" => !contains_failure(value),
+        "models.refreshCatalog" => value.get("completed").and_then(Value::as_bool) == Some(true),
+        // Probe uses bounded Promise.race/close waits: an answered probe does
+        // not prove an in-flight credential refresh can no longer write.
+        "mcp.test" => false,
         // These asynchronous flows encode failure/cancellation in successful
         // envelopes, so only their explicitly successful terminal phase counts.
         "mcp.signInStart" => value.get("phase").and_then(Value::as_str) == Some("done"),

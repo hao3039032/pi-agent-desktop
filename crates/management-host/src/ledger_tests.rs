@@ -15,6 +15,14 @@ fn mcp_credential_target_rejects_raw_keys_and_detects_legacy_aliases() {
     assert!(!a.conflicts(&other));
     assert!(McpCredentialTarget::new("https://user:secret@example.test".into(), "c".repeat(64)).is_err());
     assert!(McpCredentialTarget::new("A".repeat(64), "c".repeat(64)).is_err());
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = OperationLedger::open(temp.path()).unwrap();
+    let descriptor = MutationDescriptor::new("mcp.signInStart", OperationScope::Global).unwrap().with_mcp_target(a.clone()).unwrap();
+    let id = ledger.begin(&descriptor).unwrap();
+    assert_eq!(OperationLedger::inspect(temp.path()).unwrap()[0].mcp_target, Some(a));
+    ledger.finish(&id).unwrap();
+    assert!(OperationLedger::inspect(temp.path()).unwrap().is_empty());
+    assert!(MutationDescriptor::new("auth.logout", OperationScope::Global).unwrap().with_mcp_target(alias).is_err());
 }
 
 #[test]
@@ -120,6 +128,14 @@ fn host_rejects_changed_agent_directory_even_with_an_existing_instance() {
     assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
     assert!(OperationLedger::open(temp.path()).unwrap().list_pending().unwrap().is_empty());
     host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn catalog_partial_and_probe_completion_are_not_mutation_completion_proof() {
+    assert!(!super::confirmed_success("models.refreshCatalog", &serde_json::json!({"completed": false, "changed": true})));
+    assert!(super::confirmed_success("models.refreshCatalog", &serde_json::json!({"completed": true})));
+    assert!(!super::confirmed_success("mcp.test", &serde_json::json!({"result":{"state":"connected"}})));
+    assert!(!super::confirmed_success("trust.setFenced", &serde_json::json!({"result":{"mcpRefusal":{}}})));
 }
 
 #[test]
