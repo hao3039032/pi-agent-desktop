@@ -340,7 +340,7 @@ impl Session {
     /// The activity owner may dispatch only its own persistently fenced title rename.
     pub fn title_rename_with_owned_fence(
         &self, guard: &SessionActivityGuard<'_>, operation_id: &str,
-        name: &str, timeout: Option<Duration>,
+        task_id: &str, name: &str, timeout: Option<Duration>,
     ) -> Result<Value, pi_host::bridge::BridgeError> {
         if !std::ptr::eq(guard.owner, self) {
             return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
@@ -350,7 +350,7 @@ impl Session {
         (self.fence_checker)(&self.id, Some(operation_id)).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
             op: "title.rename".into(), message, code: Some("fence_refused".into()),
         }))?;
-        self.bridge.request("title.rename", Some(json!({"name": name})), timeout)
+        self.bridge.request("title.rename", Some(json!({"id":task_id, "name": name})), timeout)
     }
 
     /// The exact custom base passed at spawn, not the composed run prompt.
