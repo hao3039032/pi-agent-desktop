@@ -54,8 +54,9 @@ pub(crate) fn writer_config(state: &IpcHostState) -> Result<management_host::Man
 /// these operations do not spawn subprocesses or external commands. Their pi
 /// process has a private process group. This proof is not valid for other ops.
 #[cfg(unix)]
-pub(crate) fn run_writer(state: &IpcHostState, op: &str, args: Value) -> Result<Value, (String, String)> {
+pub(crate) fn run_writer(state: &IpcHostState, guard: &mut crate::session_writer_lifecycle::WriterGuard, op: &str, args: Value) -> Result<Value, (String, String)> {
     let config = writer_config(state).map_err(|e| error("outcome_unknown", format!("Session writer outcome unknown; do not retry: {}", e.1)))?;
+    guard.before_spawn().map_err(|e| error("outcome_unknown", e))?;
     let writer = management_host::spawn_session_file_writer(&config).map_err(|e| error("outcome_unknown", e))?;
     let pid = writer.pid();
     #[cfg(test)]
@@ -77,7 +78,7 @@ pub(crate) fn run_writer(state: &IpcHostState, op: &str, args: Value) -> Result<
 }
 
 #[cfg(not(unix))]
-pub(crate) fn run_writer(_state: &IpcHostState, _op: &str, _args: Value) -> Result<Value, (String, String)> {
+pub(crate) fn run_writer(_state: &IpcHostState, _guard: &mut crate::session_writer_lifecycle::WriterGuard, _op: &str, _args: Value) -> Result<Value, (String, String)> {
     Err(error("not_supported", "Session file mutations are not supported on this platform"))
 }
 
@@ -136,14 +137,16 @@ pub(crate) fn set_access(state: &IpcHostState, args: &Value) -> Result<Value, (S
         if !is_owned_chat_folder(Path::new(&summary.cwd), &agent) { return Err(error("invalid_args", "Only a chat with its own folder can use the computer")); }
         if !has_assistant(&summary.file)? { return Err(error("invalid_args", "Send a message first, then this chat can use the computer")); }
         let operation = random_id()?;
+        let mut writer = state.session_writers.admit(&operation).map_err(|e| error("busy", e))?;
         crate::session_writer_fence::begin(&agent, id, &operation, "chat-access", &summary.file, None, None).map_err(|e| error("outcome_unknown", e))?;
-        let answer = run_writer(state, "session.setOfflineChatUnlock", json!({"file":summary.file,"unlocked":unlocked}))?;
+        let answer = run_writer(state, &mut writer, "session.setOfflineChatUnlock", json!({"file":summary.file,"unlocked":unlocked}))?;
         if !answer.get("changed").is_some_and(Value::is_boolean)
             || !has_assistant(&summary.file).map_err(|e| error("outcome_unknown", format!("Access change could not be verified; do not retry: {}", e.1)))?
             || session_host::spawn_plan::read_chat_unlocked(&summary.file) != unlocked {
             return Err(error("outcome_unknown", "Access change could not be verified; do not retry"));
         }
         crate::session_writer_fence::finish(&agent, id, &operation).map_err(|e| error("partial_success", format!("Chat access was saved, but its completion record could not be cleared; do not retry: {e}")))?;
+        writer.complete();
         Ok(())
     });
     match result {
@@ -172,11 +175,12 @@ pub(crate) fn continue_in_project(state: &IpcHostState, args: &Value) -> Result<
         let summary = source(state, id)?;
         let before = digest(&summary.file)?;
         let operation = random_id()?;
+        let mut writer = state.session_writers.admit(&operation).map_err(|e| error("busy", e))?;
         let target_id = random_id()?;
         if session_host::history::find_session_by_id(&agent, &target_id).is_some() { return Err(error("busy", "Generated session identity already exists")); }
         crate::session_writer_fence::begin(&agent, id, &operation, "continue", &summary.file, Some(&cwd), Some(&target_id)).map_err(|e| error("outcome_unknown", e))?;
         crate::session_writer_fence::begin(&agent, &target_id, &operation, "continue-target", &summary.file, Some(&cwd), Some(&target_id)).map_err(|e| error("outcome_unknown", e))?;
-        let answer = run_writer(state, "session.continueChat", json!({"file":summary.file,"cwd":cwd,"targetId":target_id}))?;
+        let answer = run_writer(state, &mut writer, "session.continueChat", json!({"file":summary.file,"cwd":cwd,"targetId":target_id}))?;
         let copied = answer.get("path").and_then(Value::as_str).ok_or_else(|| error("outcome_unknown", "Copy result missing path; do not retry"))?;
         let copied = Path::new(copied).canonicalize().map_err(|e| error("outcome_unknown", e))?;
         let target_root = crate::session_view::default_session_dir(&agent, &cwd).canonicalize().map_err(|e| error("outcome_unknown", e))?;
@@ -188,6 +192,7 @@ pub(crate) fn continue_in_project(state: &IpcHostState, args: &Value) -> Result<
         }
         crate::session_writer_fence::finish(&agent, &target_id, &operation).map_err(|e| error("partial_success", format!("Project copy was created, but its completion record could not be cleared; do not retry: {e}")))?;
         crate::session_writer_fence::finish(&agent, id, &operation).map_err(|e| error("partial_success", format!("Project copy was created, but its completion record could not be cleared; do not retry: {e}")))?;
+        writer.complete();
         Ok(json!({"sessionId":target_id,"path":copied,"cwd":cwd,"chatFolder":if crate::session_view::is_chat_folder_path(Path::new(&summary.cwd), &agent) { Some(summary.cwd) } else { None }}))
     });
     match result {
@@ -300,6 +305,32 @@ mod tests {
             assert_eq!(session_host::spawn_plan::read_chat_unlocked(&file), unlocked);
             assert_eq!(get_access(&state, &json!({"session":"source"})).unwrap()["unlocked"], unlocked);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_writer_refuses_spawn_after_shutdown_and_preserves_fence() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("agent"); std::fs::create_dir_all(&agent).unwrap();
+        let source = agent.join("source.jsonl"); std::fs::write(&source, b"fixture").unwrap();
+        let marker = temp.path().join("spawned");
+        let executable = temp.path().join("fake-writer");
+        std::fs::write(&executable, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state = IpcHostState::new();
+        *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
+            executable: executable.to_string_lossy().into_owned(), agent_dir: Some(agent.clone()),
+            extensions: vec![Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), temp.path().to_string_lossy().into_owned())],
+        });
+        let mut guard = state.session_writers.admit("op").unwrap();
+        crate::session_writer_fence::begin(&agent, "session", "op", "chat-access", &source, None, None).unwrap();
+        state.session_writers.begin_shutdown();
+        assert_eq!(run_writer(&state, &mut guard, "session.setOfflineChatUnlock", json!({})).unwrap_err().0, "outcome_unknown");
+        assert!(!marker.exists());
+        assert!(crate::session_writer_fence::assert_session_writable(&agent, "session").is_err());
     }
 
     #[test]

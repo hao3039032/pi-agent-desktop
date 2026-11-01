@@ -69,6 +69,7 @@ pub struct IpcHostState {
     /// resolved at startup; until then the models ops answer
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
+    pub session_writers: Arc<crate::session_writer_lifecycle::SessionWriterLifecycle>,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     mcp_signin_tasks: Mutex<BTreeSet<String>>,
     /// The scheduled-task store root (the agent dir the host runs against).
@@ -215,6 +216,7 @@ impl IpcHostState {
             #[cfg(test)]
             title_rename_timeout: Mutex::new(Duration::from_secs(30)),
             management: ManagementHost::new(),
+            session_writers: Arc::new(Default::default()),
             management_config: Mutex::new(resolve_management_config()),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir,
