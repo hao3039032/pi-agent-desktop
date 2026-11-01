@@ -51,12 +51,14 @@ fn close_before_registration_and_binding_preserves_reservation() {
     let worker_state = Arc::clone(&state);
     let worker = std::thread::spawn(move || reserve_login_relay(&worker_state, "starting".into(), channel().0));
     let until = Instant::now() + Duration::from_secs(2);
-    while state.login_relays.gate.available_permits() == LOGIN_MAX_RELAYS && Instant::now() < until { std::thread::yield_now(); }
+    while state.login_relays.alive.load(Ordering::SeqCst) == 0 && Instant::now() < until { std::thread::yield_now(); }
+    let passed_shutdown_check = state.login_relays.alive.load(Ordering::SeqCst) == 1;
     let result = host.shutdown_until(Instant::now() + Duration::from_millis(80));
     let report = host.tracked().unwrap().relays.clone().unwrap();
     drop(guard);
-    let sender = worker.join().unwrap().unwrap();
-    drop(sender);
+    let sender = worker.join().unwrap();
+    assert!(passed_shutdown_check, "observer did not reach registration before deadline");
+    drop(sender.unwrap());
     assert_eq!(report.auth.in_flight, 1);
     assert!(report.auth.registry_busy);
     assert!(result.is_err());
@@ -119,6 +121,65 @@ fn close_wakes_ack_and_quiet_observers_even_with_busy_registry() {
     assert_eq!(report.auth.in_flight, 2);
     assert!(host.state.drain_stream_relays_until(Instant::now() + Duration::from_secs(2)).is_complete());
     assert_eq!(host.tracked().unwrap().relays.as_ref().unwrap().auth.in_flight, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn panicking_observer_retains_reservation_until_registration_cleanup() {
+    struct Unwinding(mpsc::Sender<()>);
+    impl Drop for Unwinding { fn drop(&mut self) { let _ = self.0.send(()); } }
+    let dir = tempfile::tempdir().unwrap();
+    let host = IsolatedStaticHost::init(dir.path()).unwrap();
+    let instance = fake_instance(&host.state, dir.path());
+    let task = instance.start_task("auth.loginStart", json!({}), LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation).unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (panic_tx, panic_rx) = mpsc::channel();
+    let (unwound_tx, unwound_rx) = mpsc::channel();
+    let panic_rx = Mutex::new(panic_rx);
+    let ch = Channel::new(move |_| {
+        let _unwinding = Unwinding(unwound_tx.clone());
+        entered_tx.send(()).unwrap();
+        panic_rx.lock().unwrap().recv().unwrap();
+        panic!("controlled observer panic");
+    });
+    let sender = reserve_login_relay(&host.state, "panic".into(), ch).unwrap();
+    sender.send(("flow".into(), task.clone(), Arc::clone(&instance))).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let guard = host.state.login_relays.relays.lock().unwrap();
+    panic_tx.send(()).unwrap();
+    let unwound = unwound_rx.recv_timeout(Duration::from_secs(2));
+    let result = host.shutdown_until(Instant::now() + Duration::from_millis(100));
+    let report = host.tracked().unwrap().relays.clone().unwrap();
+    drop(guard);
+    unwound.unwrap();
+    assert!(result.is_err());
+    assert!(report.auth.registry_busy);
+    assert_eq!(report.auth.in_flight, 1);
+    assert!(host.state.drain_stream_relays_until(Instant::now() + Duration::from_secs(2)).is_complete());
+    assert!(!host.state.login_relays.relays.lock().unwrap().contains_key("panic"));
+    assert_eq!(host.tracked().unwrap().relays.as_ref().unwrap().auth.in_flight, 1);
+}
+
+#[test]
+fn poisoned_registration_cleanup_never_reports_complete_or_panics_again() {
+    let state = Arc::new(IpcHostState::new());
+    let sender = reserve_login_relay(&state, "poison".into(), channel().0).unwrap();
+    let relays = Arc::clone(&state.login_relays);
+    assert!(std::thread::spawn(move || {
+        let _guard = relays.relays.lock().unwrap();
+        panic!("controlled registry poison");
+    }).join().is_err());
+    drop(sender);
+    let until = Instant::now() + Duration::from_secs(2);
+    while state.login_relays.alive.load(Ordering::SeqCst) != 0 && Instant::now() < until { std::thread::yield_now(); }
+    assert_eq!(state.login_relays.alive.load(Ordering::SeqCst), 0);
+    let poisoned = match state.login_relays.relays.lock() { Ok(_) => panic!("registry was not poisoned"), Err(error) => error.into_inner() };
+    assert!(!poisoned.contains_key("poison"));
+    drop(poisoned);
+    let report = state.drain_stream_relays_until(Instant::now());
+    assert_eq!(report.auth.in_flight, 0);
+    assert!(report.auth.registry_busy);
+    assert!(!report.is_complete());
 }
 
 #[cfg(unix)]

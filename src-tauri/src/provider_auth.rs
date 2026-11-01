@@ -130,6 +130,24 @@ impl Drop for RelaySlot {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
 }
 
+// Retain the reservation through registration cleanup, including unwinding and
+// failed thread creation. A poisoned registry remains uninspectable to reports.
+struct LoginRegistration {
+    relays: Arc<LoginRelays>,
+    id: String,
+    _slot: RelaySlot,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+impl Drop for LoginRegistration {
+    fn drop(&mut self) {
+        let mut relays = match self.relays.relays.lock() {
+            Ok(relays) => relays,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        relays.remove(&self.id);
+    }
+}
+
 /// The login-stream relays by subscription id (pi_ipc's event_relays
 /// pattern, this domain's own map so the shared one stays untouched).
 pub(crate) struct LoginRelays {
@@ -169,10 +187,6 @@ impl LoginRelays {
 
     fn insert(&self, subscription_id: &str, handle: LoginRelayHandle) {
         self.relays.lock().unwrap().insert(subscription_id.to_string(), handle);
-    }
-
-    fn remove(&self, subscription_id: &str) {
-        self.relays.lock().unwrap().remove(subscription_id);
     }
 
     pub fn acknowledge(&self, id: &str, epoch: u64, seq: u64) -> bool {
@@ -471,23 +485,20 @@ fn reserve_login_relay_with_permit(
     });
     let thread_relays = Arc::clone(&relays);
     let thread_id = subscription_id.clone();
+    let registration = LoginRegistration { relays: Arc::clone(&relays), id: subscription_id.clone(), _slot: slot, _permit: permit };
     let (tx, rx) = std::sync::mpsc::sync_channel::<(String, String, Arc<management_host::ManagementInstance>)>(1);
     std::thread::Builder::new()
         .name(format!("ipc-login-{subscription_id}"))
         .spawn(move || {
-            let _slot = slot;
-            let _permit = permit;
+            let _registration = registration;
             let relays = thread_relays;
             let subscription_id = thread_id;
             let (flow_id, th, instance) = loop {
-                if relays.shutdown.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
-                    relays.remove(&subscription_id);
-                    return;
-                }
+                if relays.shutdown.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) { return; }
                 match rx.recv_timeout(crate::pi_ipc::RELAY_SHUTDOWN_POLL) {
                     Ok(binding) => break binding,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { relays.remove(&subscription_id); return; }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             };
             let mut frame_seq: u64 = 0;
@@ -500,10 +511,7 @@ fn reserve_login_relay_with_permit(
                 ack.forward(&on_event, frame, *frame_seq, &stop, LOGIN_ACK_TIMEOUT)
             };
             let mut heartbeat = std::time::Instant::now();
-            if !send(&mut frame_seq, "snapshot", json!({ "flowId": flow_id, "taskHandle": th })) {
-                relays.remove(&subscription_id);
-                return;
-            }
+            if !send(&mut frame_seq, "snapshot", json!({ "flowId": flow_id, "taskHandle": th })) { return; }
             loop {
                 let wake = std::time::Instant::now() + LOGIN_POLL_INTERVAL;
                 while std::time::Instant::now() < wake && !stop.load(Ordering::SeqCst) && !relays.shutdown.load(Ordering::SeqCst) {
@@ -616,12 +624,8 @@ fn reserve_login_relay_with_permit(
             }
 
             // Observer loss is not evidence that the credential writer stopped.
-            relays.remove(&subscription_id);
         })
-        .map_err(|_| {
-            relays.remove(&subscription_id);
-            "could not start login observer".to_string()
-        })?;
+        .map_err(|_| "could not start login observer".to_string())?;
     Ok(tx)
 }
 
