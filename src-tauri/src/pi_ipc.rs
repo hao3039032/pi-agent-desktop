@@ -320,10 +320,7 @@ impl IpcHostState {
     }
 
     pub(crate) fn reauthorize_selected_path(&self, path: &Path) -> std::io::Result<()> {
-        #[cfg(unix)]
         self.file_roots.lock().unwrap().reauthorize(path)?;
-        #[cfg(windows)]
-        self.file_roots.lock().unwrap().add(path)?;
         self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
         Ok(())
     }
@@ -2569,11 +2566,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             };
             #[cfg(windows)]
             let outcome: Option<Result<Vec<u8>, std::io::Error>> = {
-                // Fail-closed until the handle-based implementation ships:
-                // the naive read re-opens by path and re-introduces the
-                // check→open race the Unix side closed.
-                let _ = &target;
-                None
+                use std::io::Read;
+                let roots = state.file_roots.lock().unwrap();
+                Some(roots.open_file(&target).and_then(|mut file| { let mut bytes = Vec::new(); file.read_to_end(&mut bytes)?; Ok(bytes) }))
             };
             match outcome {
                 None => protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots"),
@@ -2588,7 +2583,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     protocol_error(&id, "not_found", "no such file")
                 }
                 #[cfg(windows)]
-                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                Some(Err(error)) => protocol_error(&id, if error.kind() == std::io::ErrorKind::PermissionDenied { "unauthorized_scope" } else { "io" }, &error.to_string()),
                 #[cfg(unix)]
                 Some(Err(error)) => protocol_error(
                     &id,
@@ -4919,7 +4914,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             let result = send(&state, json!({"v":1,"id":"denied","op":op,"args":{"cwd":outside}}));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
         }
-        state.propose_path(&chat);
+        state.propose_path(&chat).expect("fixture root");
         for op in ["git.status", "worktrees.list", "worktrees.fetch"] {
             let result = send(&state, json!({"v":1,"id":"chat","op":op,"args":{"cwd":chat}}));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
@@ -5163,7 +5158,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&folder).expect("folder");
         std::fs::create_dir_all(dir.path().join("elsewhere")).expect("elsewhere");
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
-        state.propose_path(&folder);
+        state.propose_path(&folder).expect("fixture root");
 
         let dotted = format!(
             "{}/../chats/20260101-120000-abcd",
@@ -5188,7 +5183,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("project");
         std::fs::create_dir_all(&target).expect("target");
-        state.propose_path(&target);
+        state.propose_path(&target).expect("fixture root");
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv1", "op": "cwd.validate", "args": { "cwd": target.to_string_lossy() } }),
@@ -5743,7 +5738,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(&png, vec![1u8; 300]).expect("write");
 
         // The host authorizes the directory; the handle is opaque.
-        state.file_roots.lock().unwrap().add(dir.path());
+        state.file_roots.lock().unwrap().add(dir.path()).expect("fixture root");
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -5820,7 +5815,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
 
         // The HOST grants the project root (the sessions.list path); reads
         // inside pass, outside stays refused even with traversal tricks.
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let read = send(
             &state,
             json!({ "v": 1, "id": "f3", "op": "files.read", "args": { "path": project.join("a.txt").display().to_string() } }),
@@ -5879,7 +5874,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // project/leak → outside/created-by-attack.txt (dangling: the victim
         // does not exist yet).
         std::os::unix::fs::symlink(&victim, project.join("leak")).expect("leak");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let evil = send(
             &state,
@@ -5986,7 +5981,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::fs::write(outside.join("secret.txt"), b"s").expect("secret");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
         let (resolved, root) = crate::file_access::resolved_read_target_with_root(&roots, &sub)
             .expect("the honest directory authorizes");
@@ -6021,7 +6016,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(project.join("doc.txt"), b"inside").expect("doc");
         let secret = dir.path().join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").expect("secret");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
         let (resolved, root) = crate::file_access::resolved_read_target_with_root(
             &roots,
@@ -6126,7 +6121,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).expect("proj");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let write = |name: &str, data: &str| {
             send(
                 &state,
@@ -6167,7 +6162,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // new-path rule authorizes through the resolved parent, so the
         // resolved link target's parent (outside) fails containment.
         std::os::unix::fs::symlink(&outside, project.join("leak")).expect("leak");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let evil = send(
             &state,
@@ -6207,7 +6202,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(denied["error"]["code"], "unauthorized_scope", "{denied}");
 
         // A host-authorized root permits its files, but never a symlink escape.
-        state.file_roots.lock().unwrap().add(dir.path());
+        state.file_roots.lock().unwrap().add(dir.path()).expect("fixture root");
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -9610,7 +9605,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&other).expect("other");
         let link = project.join("linked");
         std::os::unix::fs::symlink(&outside, &link).expect("linked");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let send_allow = |id: &str, target: &std::path::Path| {
             send(
                 &state,
@@ -9675,7 +9670,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, project.join("linked")).expect("linked");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "sl1", "op": "files.list", "args": { "path": project.display().to_string() } }),
