@@ -515,9 +515,27 @@ fn shutdown_until_closes_tracked_fake_leader_and_rejects_new_work() {
     let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
     let report = registry.shutdown_until(std::time::Instant::now() + Duration::from_secs(2));
     assert_eq!(report.exited, vec![id.clone()]);
-    assert!(report.unknown.iter().any(|item| item.contains("operation quiescence unconfirmed")), "{report:?}");
+    assert!(report.unknown.is_empty(), "{report:?}");
     assert!(session.command("prompt", json!({"message":"late"}), Some(Duration::from_millis(100))).is_err());
     assert!(registry.start(&id, &file, &id, &cwd, &config).is_err());
+}
+
+#[test]
+fn shutdown_until_distinguishes_handled_and_ack_without_terminal() {
+    for disposition in ["handled", "started"] {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work"); std::fs::create_dir_all(&cwd).unwrap();
+        let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+        let commands = b64(&commands_for(&bridge_asset(), None, false));
+        let config = mock_config(dir.path(), &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-prompt-disposition", disposition]);
+        let registry = SessionRegistry::new();
+        let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+        session.command("prompt", json!({"message":"fixture"}), Some(Duration::from_secs(2))).unwrap();
+        let report = registry.shutdown_until(std::time::Instant::now() + Duration::from_secs(2));
+        assert_eq!(report.exited, vec![id]);
+        if disposition == "handled" { assert!(report.unknown.is_empty(), "{report:?}"); }
+        else { assert!(report.unknown.iter().any(|entry| entry.contains("acknowledged started")), "{report:?}"); }
+    }
 }
 
 #[test]
@@ -534,6 +552,57 @@ fn shutdown_until_reports_in_flight_session_activity_even_after_leader_exit() {
     assert_eq!(report.exited, vec![id]);
     assert!(report.unknown.iter().any(|entry| entry.contains("activity in flight")), "{report:?}");
     drop(guard);
+}
+
+#[test]
+fn shutdown_sees_prompt_submitted_before_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("work"); std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let log = dir.path().join("prompt-log");
+    let config = mock_config(dir.path(), &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-prompt-hold", "--mock-prompt-log", log.to_str().unwrap()]);
+    let registry = SessionRegistry::new();
+    let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let worker = { let session = session.clone(); std::thread::spawn(move || session.command("prompt", json!({"message":"fixture"}), Some(Duration::from_secs(3)))) };
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while !log.exists() { assert!(std::time::Instant::now() < until); std::thread::sleep(Duration::from_millis(2)); }
+    let report = registry.shutdown_until(std::time::Instant::now() + Duration::from_secs(2));
+    assert!(report.unknown.iter().any(|entry| entry.contains("prompt") && (entry.contains("submitting") || entry.contains("outcome unknown"))), "{report:?}");
+    assert!(worker.join().unwrap().is_err());
+}
+
+#[test]
+fn outbox_delivery_keeps_uncorrelated_terminal_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("work"); std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let events = b64(&json!([{"type":"agent_start"}, {"type":"agent_settled"}]));
+    let config = mock_config(dir.path(), &["--mock-session-id", &id, "--mock-commands", &commands, "--mock-prompt-events", &events]);
+    let registry = SessionRegistry::new();
+    let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let message = session.composer_outbox.enqueue("fixture", None).unwrap();
+    session.composer_send_now(&message.id).unwrap();
+    let report = registry.shutdown_until(std::time::Instant::now() + Duration::from_secs(2));
+    assert!(report.unknown.iter().any(|entry| entry.contains("acknowledged started")), "{report:?}");
+}
+
+#[test]
+fn shutdown_keeps_unknown_prompt_after_replacement_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("work"); std::fs::create_dir_all(&cwd).unwrap();
+    let (file, id) = create_session_file(&dir.path().join("sessions"), &cwd).unwrap();
+    let commands = b64(&commands_for(&bridge_asset(), None, false));
+    let config = mock_config(dir.path(), &["--mock-session-id", &id, "--mock-commands", &commands]);
+    let registry = SessionRegistry::new();
+    let old = registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    old.command("prompt", json!({"message":"fixture"}), Some(Duration::from_secs(2))).unwrap();
+    registry.remove(&id, Duration::from_secs(2));
+    registry.start(&id, &file, &id, &cwd, &config).unwrap();
+    let report = registry.shutdown_until(std::time::Instant::now() + Duration::from_secs(2));
+    assert!(report.unknown.iter().any(|entry| entry.contains("acknowledged started")), "{report:?}");
+    assert!(old.command("prompt", json!({"message":"late"}), Some(Duration::from_millis(100))).is_err());
 }
 
 #[test]
