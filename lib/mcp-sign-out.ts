@@ -80,9 +80,25 @@ export function mcpSignOutCount(key: string): number {
 }
 
 /** Counts a sign-out of the sign-in key: every guard made before it throws from now on. */
-export function noteMcpSignOut(key: string): void {
+export function noteMcpSignOut(key: string): number {
   const counts = signOutCounts();
-  counts.set(key, (counts.get(key) ?? 0) + 1);
+  const next = (counts.get(key) ?? 0) + 1;
+  if (!Number.isSafeInteger(next)) throw new Error("MCP credential revocation generation exhausted");
+  counts.set(key, next);
+  return next;
+}
+
+/**
+ * Revoke guards already created for this SDK credential key in this process.
+ * The key can contain URL secrets: return it only over the private management
+ * channel, never in progress, UI output or logs. This is not evidence about
+ * other processes, previous instances or requests at the remote server. The
+ * host must hold target admission through credential deletion; new guards
+ * created after this call belong to a new generation.
+ */
+export function revokeMcpCredentialWriters(name: string, url: string): { canonicalKey: string; generation: number } {
+  const canonicalKey = mcpSignInKey(name, url);
+  return { canonicalKey, generation: noteMcpSignOut(canonicalKey) };
 }
 
 /** A guard for a run of server `name` at `url` starting now: it throws once the server is signed out after this call. */
@@ -99,8 +115,8 @@ export function mcpSignOutGuard(name: string, url: string): McpSignInWriteGuard 
  * `guard` first: the store a connection reads and refreshes tokens through, so
  * a refresh that is still on its way when the server is signed out cannot
  * store the renewed tokens after they were removed. `guard` runs in the same
- * synchronous step as the SDK's write, so no removal fits between. A load that
- * takes over legacy state moves what is already stored and is not guarded.
+ * synchronous step as the SDK's write, so no removal fits between. Loads are
+ * guarded too: the SDK may move legacy state to the server key during load.
  */
 export function guardedCredentialStore(
   internals: Pick<PiSdkInternals, "McpOAuthCredentialStore">,
@@ -110,7 +126,10 @@ export function guardedCredentialStore(
     forServer(name: string, serverUrl: string): McpOAuthServerStore {
       const store = super.forServer(name, serverUrl);
       return {
-        load: () => store.load(),
+        load: () => {
+          guard();
+          return store.load();
+        },
         save: (state) => {
           guard();
           return store.save(state);

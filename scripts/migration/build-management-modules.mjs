@@ -122,6 +122,8 @@ export {
   McpServiceError,
   getMcpConfig,
   executeMcpAction,
+  managedMcpCredentialTarget,
+  signOutMcpCooperative,
   getProjectMcpListing,
   trustProjectFolder,
 } from "${ROOT}/lib/mcp-service.server.ts";

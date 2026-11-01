@@ -8,7 +8,7 @@ import {
   McpSignedOutError,
   mcpSignInKey,
   mcpSignOutCount,
-  noteMcpSignOut,
+  revokeMcpCredentialWriters,
   type McpSignInWriteGuard,
 } from "./mcp-sign-out";
 import { recordMcpStatus } from "./mcp-status";
@@ -380,6 +380,7 @@ function watchedStore(store: McpOAuthStateStore, flow: Flow, guard: McpSignInWri
   };
   return {
     load: async () => {
+      guard();
       const state = await store.load();
       note(state);
       return state;
@@ -685,7 +686,7 @@ export function signOutMcpServer(
   agentDir: string,
   internals: Pick<PiSdkInternals, "McpOAuthCredentialStore">,
 ): boolean {
-  noteMcpSignOut(mcpSignInKey(name, url));
+  revokeMcpCredentialWriters(name, url);
   cancelMcpSignInsFor(name, url);
   if (!existsSync(join(agentDir, "mcp-auth.json"))) return false;
   return new internals.McpOAuthCredentialStore().remove(name, url);
