@@ -394,7 +394,7 @@ mod tests {
         std::fs::write(&file, &initial).unwrap();
         let mut state = IpcHostState::new();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
-        state.file_roots.lock().unwrap().add(&project);
+        state.file_roots.lock().unwrap().add(&project).expect("fixture root");
         *state.spawn_base.lock().unwrap() = Some(SpawnBase {
             executable: executable.clone(),
             bridge_asset: Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap(),
@@ -482,7 +482,7 @@ mod tests {
         for dir in [&project, &chat, &legacy] { std::fs::create_dir_all(dir).unwrap(); }
         let mut roots = AllowedRoots::new();
         assert_eq!(project_destination(&roots, &agent, project.to_str().unwrap()).unwrap_err().0, "access_denied");
-        roots.add(temp.path());
+        roots.add(temp.path()).expect("fixture root");
         assert_eq!(project_destination(&roots, &agent, project.to_str().unwrap()).unwrap(), project.canonicalize().unwrap());
         for dir in [&chat, &legacy] {
             assert_eq!(project_destination(&roots, &agent, dir.to_str().unwrap()).unwrap_err().0, "invalid_args");

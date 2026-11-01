@@ -12,10 +12,9 @@
 //! - a grant names ONE file or directory (resolved and canonicalized at
 //!   GRANT time; re-validated at REQUEST time — a symlink that changed
 //!   target in between is refused);
-//! - directory grants serve only files strictly below the granted directory
-//!   (canonical containment), refusing parent traversal, absolute escapes
-//!   and UNC tricks (Windows normalization is enforced by the caller via
-//!   the same canonicalize step);
+//! - pinned directory grants serve only files opened component-by-component
+//!   beneath the directory handle, refusing reparse points, parent traversal,
+//!   absolute escapes and UNC tricks;
 //! - MIME by extension, scriptless defaults (`.html` is served as data for
 //!   an opaque sandbox; scripts never execute because the consuming iframe
 //!   never gets both `allow-scripts` and `allow-same-origin`);
@@ -33,6 +32,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+pub mod windows_handle;
+#[cfg(all(test, windows))]
+#[path = "windows_tests.rs"]
+mod windows_tests;
 
 /// The deferred image route's 10 MiB cap and a registry-wide decoded-memory budget.
 pub const MAX_RESOURCE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -60,6 +65,7 @@ pub enum DenyReason {
 }
 
 /// The outcome of one resource read.
+#[derive(Debug)]
 pub enum ResourceResponse {
     /// Bytes with content info; `range_applied` tells whether the requested
     /// range was applied (206-style) or the whole body was returned.
@@ -165,8 +171,13 @@ impl ResourceRegistry {
 
     /// Grant an already authorized and opened regular file, pinning its inode.
     pub fn grant_open_file(&self, file: std::fs::File, name: &Path, ttl: Duration) -> Result<Handle, DenyReason> {
-        if !file.metadata().map_err(|_| DenyReason::IoError)?.is_file() {
-            return Err(DenyReason::InvalidPath);
+        let metadata = file.metadata().map_err(|_| DenyReason::IoError)?;
+        if !metadata.is_file() { return Err(DenyReason::InvalidPath); }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return Err(DenyReason::InvalidPath); }
         }
         let handle = self.random_handle()?;
         let mut grants = self.grants.lock().unwrap();
@@ -238,13 +249,24 @@ impl ResourceRegistry {
     /// Duplicate a live single-file descriptor for an authorized native save.
     pub fn clone_open_file(&self, handle: &str) -> Result<std::fs::File, DenyReason> {
         let grant = self.snapshot(handle)?;
-        grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?.try_clone().map_err(|_| DenyReason::IoError)
+        let file = grant.pinned_file.as_ref().ok_or(DenyReason::InvalidPath)?;
+        #[cfg(windows)]
+        { windows_handle::reopen_file(file).map_err(|_| DenyReason::IoError) }
+        #[cfg(not(windows))]
+        { file.try_clone().map_err(|_| DenyReason::IoError) }
     }
 
     /// Grant a directory descriptor opened beneath an authorized root.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn grant_open_directory(&self, directory: std::fs::File, ttl: Duration) -> Result<Handle, DenyReason> {
-        if !directory.metadata().map_err(|_| DenyReason::IoError)?.is_dir() { return Err(DenyReason::InvalidPath); }
+        let metadata = directory.metadata().map_err(|_| DenyReason::IoError)?;
+        if !metadata.is_dir() { return Err(DenyReason::InvalidPath); }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return Err(DenyReason::InvalidPath); }
+        }
         let handle = self.random_handle()?;
         let mut grants = self.grants.lock().unwrap();
         grants.retain(|_, grant| grant.expires_at > Instant::now());
@@ -312,7 +334,7 @@ impl ResourceRegistry {
             if !subpath.is_empty() { return ResourceResponse::Denied(DenyReason::InvalidPath); }
             return read_open_file(file, &grant.canonical, range);
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(directory) = grant.pinned_directory.as_ref() {
             return match open_beneath_directory(directory, subpath) {
                 Ok(file) => read_open_file(&file, Path::new(subpath), range),
@@ -410,7 +432,23 @@ fn read_open_file(file: &std::fs::File, name: &Path, range: Option<(u64, u64)>) 
     ResourceResponse::Ok { mime, bytes, total_len, range_applied: applied }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_open_file(file: &std::fs::File, name: &Path, range: Option<(u64, u64)>) -> ResourceResponse {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = windows_handle::reopen_file(file) else { return ResourceResponse::Denied(DenyReason::IoError) };
+    let Ok(total_len) = file.metadata().map(|m| m.len()) else { return ResourceResponse::Denied(DenyReason::IoError) };
+    let mime = mime_for(name);
+    let (start, length, applied) = match bounded_range(total_len, range, mime) {
+        Ok(bounds) => bounds,
+        Err(reason) => return ResourceResponse::Denied(reason),
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
+    let mut bytes = vec![0; length as usize];
+    if file.read_exact(&mut bytes).is_err() { return ResourceResponse::Denied(DenyReason::IoError); }
+    ResourceResponse::Ok { mime, bytes, total_len, range_applied: applied }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn read_open_file(_file: &std::fs::File, _name: &Path, _range: Option<(u64, u64)>) -> ResourceResponse {
     ResourceResponse::Denied(DenyReason::OutOfScope)
 }
@@ -431,6 +469,18 @@ fn open_beneath_directory(directory: &std::fs::File, path: &str) -> std::io::Res
         current = unsafe { std::fs::File::from_raw_fd(fd) };
     }
     if !current.metadata()?.is_file() { return Err(invalid()); }
+    Ok(current)
+}
+
+#[cfg(windows)]
+fn open_beneath_directory(directory: &std::fs::File, path: &str) -> std::io::Result<std::fs::File> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "invalid resource path");
+    if path.is_empty() || path.contains('\\') || path.split('/').any(|p| p.is_empty() || p == "." || p == "..") { return Err(invalid()); }
+    let parts: Vec<_> = path.split('/').collect();
+    let mut current = directory.try_clone()?;
+    for (i, part) in parts.iter().enumerate() {
+        current = windows_handle::open_child(&current, std::ffi::OsStr::new(part), i + 1 < parts.len())?;
+    }
     Ok(current)
 }
 
