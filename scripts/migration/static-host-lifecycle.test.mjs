@@ -33,12 +33,16 @@ test("isolated static host drains IPC and reports tracked shutdown coverage", { 
     assert.equal(shutdown.status, 200);
     const report = await shutdown.json();
     assert.equal(report.ok, true);
+    assert.equal(report.scheduler.stopped, true);
+    assert.deepEqual(report.scheduler.activeUnknown, []);
+    assert.equal(report.schedulerMayRepeatSessionDiagnostics, true);
     assert.deepEqual(report.sessionUnknown, []);
     assert.deepEqual(report.managementUnknown, []);
     assert.deepEqual(report.writerUnknown, []);
     assert.deepEqual(report.writerCompleted, []);
     assert.ok(report.uncovered.includes("unregistered writers"));
     assert.ok(report.uncovered.includes("cross-restart writer durability"));
+    assert.ok(report.uncovered.includes("scheduler prompt correlation and lease recovery"));
     assert.ok(report.uncovered.includes("detached descendants"));
     assert.equal(await exited, 0, stderr);
   } finally {

@@ -419,13 +419,15 @@ fn main() {
                     json!({
                         "harness": "shutdown", "ok": result.is_ok(),
                         "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
+                        "scheduler": report.scheduler.as_ref(),
+                        "schedulerMayRepeatSessionDiagnostics": true,
                         "sessionExited": report.sessions.as_ref().map(|r| &r.exited),
                         "sessionUnknown": report.sessions.as_ref().map(|r| &r.unknown),
                         "writerCompleted": report.session_writers.as_ref().map(|r| &r.exited),
                         "writerUnknown": report.session_writers.as_ref().map(|r| &r.unknown),
                         "managementExited": report.management.as_ref().map(|r| &r.exited),
                         "managementUnknown": report.management.as_ref().map(|r| &r.unknown),
-                        "uncovered": ["unregistered writers", "scheduler", "terminals", "detached descendants", "cross-restart writer durability"]
+                        "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability"]
                     })
                 }
                 HostCall::Shutdown => {

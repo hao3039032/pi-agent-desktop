@@ -257,7 +257,7 @@ impl IpcHostState {
     pub(crate) fn begin_static_shutdown(&self) {
         self.dispatch_gate.close();
         self.dispatch_control_gate.close();
-        self.registry.begin_shutdown();
+        self.begin_scheduler_shutdown();
         self.management.begin_shutdown();
         self.session_writers.begin_shutdown();
     }

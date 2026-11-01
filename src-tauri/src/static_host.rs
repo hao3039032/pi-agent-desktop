@@ -8,6 +8,7 @@ use crate::pi_ipc::IpcHostState;
 
 #[derive(Default)]
 pub struct TrackedShutdown {
+    pub scheduler: Option<crate::pi_ipc::SchedulerShutdownReport>,
     pub sessions: Option<session_host::SessionShutdownReport>,
     pub session_writers: Option<crate::session_writer_lifecycle::SessionWriterShutdownReport>,
     pub management: Option<management_host::ManagementShutdownReport>,
@@ -39,6 +40,15 @@ impl IsolatedStaticHost {
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
+        lifecycle.register_until(ShutdownStage::Scheduler, "scheduler-final-shutdown", move |deadline| {
+            let result = host.shutdown_scheduler_until(deadline);
+            let stopped = result.stopped;
+            let unknown = result.active_unknown.clone();
+            report.lock().map_err(|_| "scheduler report lock poisoned")?.scheduler = Some(result);
+            if stopped { Ok(()) } else { Err(format!("scheduler unknown: {}", unknown.join(", "))) }
+        })?;
+        let host = Arc::clone(&state);
+        let report = Arc::clone(&tracked);
         lifecycle.register_until(ShutdownStage::SessionChild, "session-writers", move |deadline| {
             let result = host.session_writers.shutdown_until(deadline);
             let unknown = result.unknown.clone();
@@ -66,8 +76,9 @@ impl IsolatedStaticHost {
 
     pub fn recovery_status(&self) -> RecoveryStatus { self.lifecycle.recovery_status() }
 
-    /// Reports cover only registered operations and leaders. PTYs, detached
-    /// descendants, unregistered writers and scheduler runs are not covered.
+    /// Reports cover registered operations and leaders. Scheduler unknowns may
+    /// repeat session diagnostics; they are not additive process counts. PTYs,
+    /// detached descendants and unregistered writers remain uncovered.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), Vec<ShutdownFailure>> {
         self.lifecycle.shutdown_until(deadline)
     }
@@ -88,6 +99,7 @@ mod tests {
         assert!(host.recovery_status().is_clear());
         host.shutdown_until(Instant::now() + Duration::from_secs(1)).unwrap();
         let tracked = host.tracked().unwrap();
+        assert!(tracked.scheduler.as_ref().unwrap().stopped);
         assert!(tracked.sessions.as_ref().unwrap().unknown.is_empty());
         assert!(tracked.session_writers.as_ref().unwrap().unknown.is_empty());
         assert!(tracked.management.as_ref().unwrap().unknown.is_empty());
@@ -96,6 +108,43 @@ mod tests {
             Arc::clone(&host.state), serde_json::json!({"v":1,"id":"after","op":"desktop.identity"}),
         ));
         assert_ne!(response["ok"], true);
+    }
+
+    #[test]
+    fn final_shutdown_stops_fixture_scheduler_without_releasing_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = IsolatedStaticHost::init(dir.path()).unwrap();
+        // Explicit test-only start; the bootstrap itself never starts a loop.
+        host.state.start_scheduler().unwrap();
+        let lease = dir.path().join("scheduled-tasks/scheduler.lock");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !lease.exists() {
+            assert!(Instant::now() < deadline, "fixture scheduler did not acquire lease");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        host.shutdown_until(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(host.tracked().unwrap().scheduler.as_ref().unwrap().stopped);
+        assert!(lease.exists(), "final shutdown is not lease recovery");
+        assert!(host.state.start_scheduler().is_err());
+    }
+
+    #[test]
+    fn unresolved_scheduled_run_is_preserved_in_shutdown_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = IsolatedStaticHost::init(dir.path()).unwrap();
+        let mut run = host.state.scheduled_lifecycle.admit("fixture-run").unwrap();
+        run.claimed();
+        drop(run);
+        let failures = host.shutdown_until(Instant::now() + Duration::from_millis(20)).unwrap_err();
+        assert!(failures.iter().any(|failure| failure.name == "scheduler-final-shutdown"));
+        let tracked = host.tracked().unwrap();
+        let report = tracked.scheduler.as_ref().unwrap();
+        assert!(!report.stopped);
+        assert!(!report.active_unknown.is_empty());
+        assert!(tracked.sessions.as_ref().unwrap().exited.is_empty());
+        drop(tracked);
+        assert!(host.state.scheduled_lifecycle.admit("late").is_err());
+        assert!(host.state.start_scheduler().is_err());
     }
 
     #[test]
