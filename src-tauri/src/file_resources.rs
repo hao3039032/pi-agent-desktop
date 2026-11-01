@@ -28,6 +28,8 @@ pub const MAX_WALK_DEPTH: usize = 8;
 pub const MAX_QUERY_LENGTH: usize = 500;
 pub const CACHE_TTL: Duration = Duration::from_secs(10);
 pub const CACHE_MAX_ENTRIES: usize = 20;
+/// Maximum retained allocation for cached index keys and file paths.
+const CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_MATCH_LIMIT: usize = 20;
 pub const MAX_MATCH_LIMIT: usize = 200;
 
@@ -55,6 +57,14 @@ pub struct CachedFileIndex {
     pub files: Vec<String>,
     pub hard_truncated: bool,
     pub expires_at: Instant,
+}
+
+// Include Vec and String backing allocations and conservative per-entry map
+// overhead. Search-derived directory entries are not stored in this cache.
+fn cached_index_bytes(key: &String, entry: &CachedFileIndex) -> usize {
+    key.capacity().saturating_add(128)
+        .saturating_add(entry.files.capacity().saturating_mul(std::mem::size_of::<String>()))
+        .saturating_add(entry.files.iter().map(String::capacity).sum::<usize>())
 }
 
 /// MIME by extension for images (lib/file-types.ts IMAGE_EXT_TO_MIME).
@@ -350,30 +360,32 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
         .map(|l| (l as usize).clamp(1, MAX_MATCH_LIMIT))
         .unwrap_or(DEFAULT_MATCH_LIMIT);
 
-    // Retrieve or populate cache.
-    let listing = {
-        let mut cache = state.file_index_cache.lock().unwrap();
-        let now = Instant::now();
-        cache.retain(|_, v| v.expires_at > now);
-        use std::os::unix::fs::MetadataExt;
-        let metadata = match cwd_handle.metadata() { Ok(meta) => meta, Err(error) => return protocol_error(id, "io", &error.to_string()) };
-        let cache_key = format!("{}:{}:{}", cwd_str, metadata.dev(), metadata.ino());
-        if let Some(entry) = cache.get(&cache_key) {
-            entry.clone()
-        } else {
-            let (files, hard_truncated) = collect_files_with_git(&cwd_handle)
-                .unwrap_or_else(|| collect_files_with_walk(&cwd_handle));
-            if cache.len() >= CACHE_MAX_ENTRIES {
-                cache.clear();
+    // Identify the opened directory, not just the user-provided spelling. Never
+    // hold the cache mutex across Git or filesystem enumeration.
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match cwd_handle.metadata() { Ok(meta) => meta, Err(error) => return protocol_error(id, "io", &error.to_string()) };
+    let cache_key = format!("{}:{}:{}", cwd_str, metadata.dev(), metadata.ino());
+    let cached = state.file_index_cache.try_lock().ok().and_then(|cache| {
+        cache.get(&cache_key).filter(|entry| entry.expires_at > Instant::now()).cloned()
+    });
+    let listing = if let Some(entry) = cached {
+        entry
+    } else {
+        let (files, hard_truncated) = collect_files_with_git(&cwd_handle)
+            .unwrap_or_else(|| collect_files_with_walk(&cwd_handle));
+        let entry = CachedFileIndex { files, hard_truncated, expires_at: Instant::now() + CACHE_TTL };
+        if let Ok(mut cache) = state.file_index_cache.try_lock() {
+            cache.retain(|_, value| value.expires_at > Instant::now());
+            let cost = cached_index_bytes(&cache_key, &entry);
+            if cost <= CACHE_MAX_BYTES {
+                let total = cache.iter().fold(0usize, |sum, (key, value)| sum.saturating_add(cached_index_bytes(key, value)));
+                if cache.len() >= CACHE_MAX_ENTRIES || total.saturating_add(cost) > CACHE_MAX_BYTES {
+                    cache.clear();
+                }
+                cache.insert(cache_key, entry.clone());
             }
-            let entry = CachedFileIndex {
-                files,
-                hard_truncated,
-                expires_at: now + CACHE_TTL,
-            };
-            cache.insert(cache_key, entry.clone());
-            entry
         }
+        entry
     };
 
     if let Some(q) = query {
@@ -822,6 +834,28 @@ pub fn handle_chats_reveal_download(id: &str, args: &Value) -> Value {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn cached_index_bytes_counts_allocated_capacity() {
+        let key = String::with_capacity(100);
+        let mut files = Vec::with_capacity(10);
+        files.push(String::with_capacity(200));
+        let entry = CachedFileIndex { files, hard_truncated: false, expires_at: Instant::now() };
+        assert!(cached_index_bytes(&key, &entry) >= 100 + 200 + 10 * std::mem::size_of::<String>());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_index_scans_when_cache_lock_is_busy() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("fixture.txt"), b"fixture").unwrap();
+        let state = setup_state(tmp.path());
+        let guard = state.file_index_cache.lock().unwrap();
+        let response = handle_files_index(&state, "busy", &json!({"cwd": tmp.path()}));
+        assert_eq!(response["ok"], true, "{response}");
+        assert!(response["data"]["files"].as_array().unwrap().iter().any(|file| file == "fixture.txt"));
+        drop(guard);
+    }
 
     #[test]
     fn file_walk_budget_bounds_wide_empty_directories_and_drops_handles() {
