@@ -111,6 +111,11 @@ impl ComposerOutbox {
         self.in_flight.load(std::sync::atomic::Ordering::SeqCst) != 0 || self.has_items()
     }
 
+    pub(crate) fn try_has_pending_or_in_flight(&self) -> Option<bool> {
+        if self.in_flight.load(std::sync::atomic::Ordering::SeqCst) != 0 { return Some(true); }
+        self.state.try_lock().ok().map(|state| !state.items.is_empty())
+    }
+
     /// `queue_composer`: enqueue one message (empty refused, 100 max).
     /// Returns the queued item; the caller notifies and wakes delivery.
     pub fn enqueue(&self, message: &str, images: Option<Value>) -> Result<PendingComposerMessage, String> {
@@ -272,6 +277,7 @@ impl Session {
     pub fn composer_enqueue(self: &Arc<Self>, message: &str, images: Option<Value>) -> Result<Value, String> {
         let _policy = self.policy_gate.try_read().map_err(|_| "session policy change is in progress".to_string())?;
         let _admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err("session host is shutting down".into()); }
         (self.fence_checker)(&self.id)?;
         let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
@@ -304,6 +310,7 @@ impl Session {
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
         let policy = self.policy_gate.try_read().map_err(|_| "session policy change is in progress".to_string())?;
         let admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err("session host is shutting down".into()); }
         (self.fence_checker)(&self.id)?;
         let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
@@ -361,6 +368,9 @@ impl Session {
         let mut payload = json!({ "message": item.message, "streamingBehavior": behavior });
         if let Some(images) = item.images.as_ref().and_then(Value::as_array).filter(|items| !items.is_empty()) {
             payload["images"] = json!(images);
+        }
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(pi_host::PiRpcError::invalid("session host is shutting down"));
         }
         let epoch_at_send = self.machine.lock().unwrap().epoch();
         let response = self.client.command("prompt", payload, Some(std::time::Duration::from_secs(120)))?;
