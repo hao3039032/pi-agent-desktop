@@ -79,7 +79,7 @@ struct Grant {
     expires_at: Instant,
     pinned_file: Option<std::fs::File>,
     pinned_directory: Option<std::fs::File>,
-    image_bytes: Option<(Vec<u8>, &'static str)>,
+    image_bytes: Option<(std::sync::Arc<[u8]>, &'static str)>,
 }
 
 /// The registry of grants. `create` picks the handle; nothing else does.
@@ -186,7 +186,7 @@ impl ResourceRegistry {
         grants.insert(handle.clone(), Grant {
             canonical: PathBuf::new(), original_target: PathBuf::new(), scope: Scope::File,
             expires_at: Instant::now() + ttl, pinned_file: None, pinned_directory: None,
-            image_bytes: Some((bytes, mime)),
+            image_bytes: Some((bytes.into(), mime)),
         });
         Ok(handle)
     }
@@ -204,6 +204,15 @@ impl ResourceRegistry {
         #[cfg(not(unix))]
         let identity = modified.to_string();
         Ok((meta.len(), format!("{identity}:{}", meta.len())))
+    }
+
+    /// Share a live bounded raster grant for native save without copying bytes.
+    pub fn clone_image_bytes(&self, handle: &str) -> Result<std::sync::Arc<[u8]>, DenyReason> {
+        let grants = self.grants.lock().unwrap();
+        let grant = grants.get(handle).ok_or(DenyReason::UnknownHandle)?;
+        if Instant::now() >= grant.expires_at { return Err(DenyReason::Expired); }
+        let (bytes, _) = grant.image_bytes.as_ref().ok_or(DenyReason::InvalidPath)?;
+        Ok(std::sync::Arc::clone(bytes))
     }
 
     /// Duplicate a live single-file descriptor for an authorized native save.
@@ -266,7 +275,7 @@ impl ResourceRegistry {
             let (body, range_applied) = match range {
                 Some((start, end)) if start <= end && start < total_len => (bytes[start as usize..=end.min(total_len - 1) as usize].to_vec(), true),
                 Some((start, _)) if start >= total_len => (Vec::new(), true),
-                _ => (bytes.clone(), false),
+                _ => (bytes.to_vec(), false),
             };
             return ResourceResponse::Ok { mime, bytes: body, total_len, range_applied };
         }
