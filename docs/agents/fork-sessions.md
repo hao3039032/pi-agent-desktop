@@ -427,6 +427,14 @@ or downstream Channel/Tauri buffers. Other
 direct stream subscription commands are not covered. These remain M5 work, not
 an end-to-end backpressure claim.
 
+| Layer | Enforced budget | Boundary of the claim |
+|---|---|---|
+| Envelope dispatcher | 16 ordinary + 4 cleanup/ACK/Stop slots; no semaphore queue | After Tauri has decoded the request; not a request-byte bound |
+| Session event relay | 32 live threads; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
+| Session Channel delivery | One frame awaiting client ACK, plus at most one terminal reset on failure | ACK means the JS callback ran, not rendering or WebView buffer release |
+| Management task registry | 128 retained tasks per instance | Not a global bound on instances, task-input requests or child buffers |
+| Management ledger | At most 128 records; pending and locally revoked evidence are not evicted | Agent-directory-local evidence, not a cross-process lock or recovery permission |
+
 ## Static desktop session deletion — gated pending M5
 
 The Rust deletion implementation is **not enabled in production**: the host
