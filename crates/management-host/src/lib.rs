@@ -68,6 +68,7 @@ pub struct ManagementInstance {
     agent_dir: PathBuf,
     session_file_writer: bool,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
+    admission: Arc<Mutex<ManagementAdmission>>,
     _notify_subscription: Arc<pi_host::client::UiSubscription>,
 }
 
@@ -170,6 +171,8 @@ struct TaskRecord {
     serial_scope: bool,
     exclusive: bool,
     operation: String,
+    ledger_operation_id: Option<String>,
+    mcp_target: Option<ledger::McpCredentialTarget>,
     runner: Option<Arc<ManagementInstance>>,
 }
 
@@ -185,6 +188,43 @@ struct InstanceState {
     active: usize,
     closing: bool,
     tasks: HashMap<String, Arc<Mutex<TaskRecord>>>,
+}
+
+#[derive(Default)]
+struct ManagementAdmission {
+    starting_instances: usize,
+    reservation: Option<uuid::Uuid>,
+}
+
+/// A host-local reservation, not maintenance or recovery authority. Dropping
+/// it releases only in-memory exclusion and never alters pending evidence.
+pub struct McpCooperativeReservation {
+    admission: Arc<Mutex<ManagementAdmission>>,
+    reservation_id: uuid::Uuid,
+    instance_id: uuid::Uuid,
+    target: ledger::McpCredentialTarget,
+}
+impl McpCooperativeReservation {
+    /// Checks a routed ACK against this live reservation; never clears a ledger.
+    pub fn matches_revocation(&self, proof: &VerifiedMcpRevocation) -> bool {
+        let Ok(admission) = self.admission.try_lock() else { return false };
+        admission.reservation == Some(self.reservation_id) && self.instance_id == proof.instance_id
+            && self.target.primary_digest() == proof.target_fingerprint
+    }
+}
+impl Drop for McpCooperativeReservation {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.admission.lock() {
+            if admission.reservation == Some(self.reservation_id) { admission.reservation = None; }
+        }
+    }
+}
+
+struct StartingInstance(Arc<Mutex<ManagementAdmission>>);
+impl Drop for StartingInstance {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.0.lock() { admission.starting_instances -= 1; }
+    }
 }
 
 struct Activity(Arc<Mutex<InstanceState>>);
@@ -306,15 +346,26 @@ impl ManagementInstance {
     fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>) -> Result<String, String> {
         if deadline.is_zero() || deadline > Duration::from_secs(600) { return Err("invalid management task deadline".into()); }
         if let Some(check) = &self.agent_dir_check { check(&self.agent_dir)?; }
+        if shared_runner.as_ref().is_some_and(|runner| runner.agent_dir != self.agent_dir || !Arc::ptr_eq(&runner.admission, &self.admission))
+            || exclusive_config.as_ref().is_some_and(|config| config.agent_dir.as_ref() != Some(&self.agent_dir)) {
+            return Err("management runner does not share the pinned host identity".into());
+        }
         let policy = operation_policy(op, self.session_file_writer)?;
         if kind == TaskKind::ReadOnly && policy != OperationPolicy::ReadOnly {
             return Err("operation is not approved as read-only".into());
         }
         let kind = if matches!(policy, OperationPolicy::ReadOnly | OperationPolicy::Ephemeral) { TaskKind::ReadOnly } else { TaskKind::Mutation };
+        // Short critical section only: never retain this mutex across child
+        // RPC or task callbacks. Reservations block before any side effect.
+        let _admission = if kind == TaskKind::Mutation {
+            let admission = self.admission.try_lock().map_err(|_| "management admission busy")?;
+            if admission.reservation.is_some() { return Err("management cooperative reservation is active".into()); }
+            Some(admission)
+        } else { None };
         let handle = format!("task-{}", uuid::Uuid::new_v4());
         let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
             status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
-        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), runner: None }));
+        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, runner: None }));
         let (activity, evidence) = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
@@ -336,12 +387,18 @@ impl ManagementInstance {
                 let ledger = ledger::OperationLedger::open(&self.agent_dir)?;
                 let descriptor = ledger::MutationDescriptor::new(op, mutation_scope(op, &args)?)?;
                 let id = ledger.begin(&descriptor)?;
+                {
+                    let mut record = task.lock().unwrap();
+                    record.ledger_operation_id = Some(id.clone());
+                    record.mcp_target = descriptor.mcp_target().cloned();
+                }
                 Some((ledger, id))
             } else { None };
             state.active += 1;
             state.tasks.insert(handle.clone(), Arc::clone(&task));
             (Activity(Arc::clone(&self.state)), evidence)
         };
+        drop(_admission);
         let instance = self.clone();
         let id = handle.clone();
         let operation = op.to_string();
@@ -350,7 +407,7 @@ impl ManagementInstance {
             let mut exclusive_clean_exit = false;
             let result = if let Some(mut config) = exclusive_config {
                 config.env.push(("PI_WEB_EXCLUSIVE_MUTATION".into(), "1".into()));
-                match spawn_management(&instance.scope, &config, instance.agent_dir_check.clone()) {
+                match spawn_management(&instance.scope, &config, instance.agent_dir_check.clone(), Arc::clone(&instance.admission)) {
                     Ok(runner) => {
                         let cancelled = {
                             let mut record = worker_task.lock().unwrap();
@@ -459,6 +516,35 @@ impl ManagementInstance {
     pub fn cancel_exclusive_task(&self, handle: &str, domain: &str) -> Result<(), String> {
         self.exclusive_task_snapshot(handle, domain)?;
         self.cancel_task(handle)
+    }
+
+    /// Reserve a cooperative sign-out only while every unresolved writer is
+    /// a known task of this exact live instance and credential identity.
+    /// No RPC is performed and the admission mutex is released before return.
+    pub fn reserve_mcp_cooperation(&self, target: &ledger::McpCredentialTarget) -> Result<McpCooperativeReservation, String> {
+        if let Some(check) = &self.agent_dir_check { check(&self.agent_dir)?; }
+        let mut admission = self.admission.try_lock().map_err(|_| "management admission busy")?;
+        if admission.reservation.is_some() || admission.starting_instances != 0 { return Err("management admission busy".into()); }
+        let state = self.state.try_lock().map_err(|_| "management instance busy")?;
+        if state.closing || self.client.has_exited() { return Err("management instance is closing".into()); }
+        if !target_key::ManagementTargetKey::inspect(&self.agent_dir)? { return Err("management target key is missing".into()); }
+        let pending = ledger::OperationLedger::inspect(&self.agent_dir)?;
+        if pending.is_empty() { return Err("no MCP operation requires cooperation".into()); }
+        for record in &pending {
+            if !matches!(record.operation.as_str(), "mcp.signInStart" | "mcp.test") || record.mcp_target.as_ref() != Some(target) {
+                return Err("unrelated or unidentified management outcome is unresolved".into());
+            }
+            let found = state.tasks.values().any(|task| {
+                let Ok(task) = task.try_lock() else { return false };
+                task.ledger_operation_id.as_deref() == Some(record.operation_id.as_str())
+                    && task.operation == record.operation && task.mcp_target.as_ref() == Some(target)
+                    && task.finished_at.is_none() && matches!(task.snapshot.status, TaskStatus::Running | TaskStatus::Unknown)
+            });
+            if !found { return Err("MCP writer is not owned by this management instance".into()); }
+        }
+        let reservation_id = uuid::Uuid::new_v4();
+        admission.reservation = Some(reservation_id);
+        Ok(McpCooperativeReservation { admission: Arc::clone(&self.admission), reservation_id, instance_id: self.instance_id, target: target.clone() })
     }
 
     /// Interpret only a nonce-routed terminal response for the named private
@@ -742,6 +828,7 @@ pub struct ManagementHost {
     shutting_down: std::sync::atomic::AtomicBool,
     agent_dir: Mutex<Option<PathBuf>>,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
+    admission: Arc<Mutex<ManagementAdmission>>,
 }
 
 impl Default for ManagementHost {
@@ -758,6 +845,7 @@ impl ManagementHost {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             agent_dir: Mutex::new(None),
             agent_dir_check: None,
+            admission: Arc::new(Mutex::new(ManagementAdmission::default())),
         }
     }
 
@@ -796,7 +884,13 @@ impl ManagementHost {
         if let Some(existing) = self.live_instance(&scope) {
             return Ok(existing);
         }
-        let instance = spawn_management(&scope, config, self.agent_dir_check.clone())?;
+        let starting = {
+            let mut admission = self.admission.try_lock().map_err(|_| "management admission busy")?;
+            if admission.reservation.is_some() { return Err("management cooperative reservation is active".into()); }
+            admission.starting_instances += 1;
+            StartingInstance(Arc::clone(&self.admission))
+        };
+        let instance = spawn_management(&scope, config, self.agent_dir_check.clone(), Arc::clone(&self.admission))?;
         let mut instances = self.instances.lock().unwrap();
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             drop(instances);
@@ -807,6 +901,7 @@ impl ManagementHost {
             drop(instances);
             old.shutdown(Duration::from_secs(5));
         }
+        drop(starting);
         Ok(instance)
     }
 
@@ -934,8 +1029,9 @@ fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
     check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
+    admission: Arc<Mutex<ManagementAdmission>>,
 ) -> Result<Arc<ManagementInstance>, String> {
-    spawn_management_with_environment(scope, config, false, check)
+    spawn_management_with_environment(scope, config, false, check, admission)
 }
 
 /// Dedicated host-owned process for the synchronous session-file operations.
@@ -960,7 +1056,7 @@ pub fn spawn_session_file_writer(config: &ManagementSpawnConfig) -> Result<Sessi
         || config.env.len() != 1 || config.env[0].0 != "PI_WEB_MANAGED_MODULES" {
         return Err("invalid session writer configuration".into());
     }
-    spawn_management_with_environment("session-file-writer", config, true, None).map(SessionFileWriter)
+    spawn_management_with_environment("session-file-writer", config, true, None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
 }
 
 fn spawn_management_with_environment(
@@ -968,6 +1064,7 @@ fn spawn_management_with_environment(
     config: &ManagementSpawnConfig,
     restricted: bool,
     check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
+    admission: Arc<Mutex<ManagementAdmission>>,
 ) -> Result<Arc<ManagementInstance>, String> {
     let mut args: Vec<String> = vec![
         // The management shape: no session files, no discovery — only the
@@ -1016,6 +1113,7 @@ fn spawn_management_with_environment(
         agent_dir: config.agent_dir.clone().ok_or("management agent directory is not pinned")?,
         session_file_writer: restricted,
         agent_dir_check: check,
+        admission,
         nonce,
         client,
         pending,
@@ -1166,7 +1264,7 @@ mod tests {
         let pending = Mutex::new(HashMap::new());
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), runner: None }));
+        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, runner: None }));
         let task_a = task();
         pending.lock().unwrap().insert("a".to_string(), PendingTask { tx: a_tx, task: Arc::clone(&task_a), nonce: "good".into() });
         pending.lock().unwrap().insert("b".to_string(), PendingTask { tx: b_tx, task: task(), nonce: "good".into() });

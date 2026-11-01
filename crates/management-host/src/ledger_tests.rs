@@ -186,7 +186,7 @@ fn cooperative_revocation_evidence_is_instance_and_target_bound() {
             result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"configKey":"trusted-config","generation":3}})),
             error: None, cancel_requested: false },
         finished_at: Some(Instant::now()), serial_scope: false, exclusive: false,
-        operation: "mcp.signOutCooperative".into(), runner: None,
+        operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, runner: None,
     }));
     instance.state.lock().unwrap().tasks.insert("fake-routed".into(), Arc::clone(&task));
     let proof = instance.verified_mcp_revocation("fake-routed", &fingerprint, "trusted-config").unwrap();
