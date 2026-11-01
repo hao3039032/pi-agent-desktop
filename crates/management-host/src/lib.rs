@@ -159,10 +159,17 @@ pub enum TaskStatus { Running, Unknown, Succeeded, Failed, Cancelled }
 pub struct VerifiedMcpRevocation {
     instance_id: uuid::Uuid,
     target_fingerprint: String,
+    config_fingerprint: String,
     generation: u64,
 }
 impl VerifiedMcpRevocation {
     pub fn generation(&self) -> u64 { self.generation }
+}
+
+struct McpGuardAdmission {
+    target: ledger::McpCredentialTarget,
+    generation: u64,
+    config_fingerprint: String,
 }
 
 struct TaskRecord {
@@ -173,6 +180,7 @@ struct TaskRecord {
     operation: String,
     ledger_operation_id: Option<String>,
     mcp_target: Option<ledger::McpCredentialTarget>,
+    mcp_guard: Option<McpGuardAdmission>,
     runner: Option<Arc<ManagementInstance>>,
 }
 
@@ -203,13 +211,22 @@ pub struct McpCooperativeReservation {
     reservation_id: uuid::Uuid,
     instance_id: uuid::Uuid,
     target: ledger::McpCredentialTarget,
+    config_fingerprint: String,
+    previous_generation: u64,
+    state: Arc<Mutex<InstanceState>>,
+    client: Arc<PiRpcClient>,
+    agent_dir: PathBuf,
+    agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
 }
 impl McpCooperativeReservation {
     /// Checks a routed ACK against this live reservation; never clears a ledger.
     pub fn matches_revocation(&self, proof: &VerifiedMcpRevocation) -> bool {
         let Ok(admission) = self.admission.try_lock() else { return false };
+        let Ok(state) = self.state.try_lock() else { return false };
+        if state.closing || self.client.has_exited() || self.agent_dir_check.as_ref().is_some_and(|check| check(&self.agent_dir).is_err()) { return false; }
         admission.reservation == Some(self.reservation_id) && self.instance_id == proof.instance_id
             && self.target.primary_digest() == proof.target_fingerprint
+            && self.config_fingerprint == proof.config_fingerprint && proof.generation > self.previous_generation
     }
 }
 impl Drop for McpCooperativeReservation {
@@ -365,7 +382,7 @@ impl ManagementInstance {
         let handle = format!("task-{}", uuid::Uuid::new_v4());
         let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
             status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
-        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, runner: None }));
+        }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, runner: None }));
         let (activity, evidence) = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
@@ -530,21 +547,31 @@ impl ManagementInstance {
         if !target_key::ManagementTargetKey::inspect(&self.agent_dir)? { return Err("management target key is missing".into()); }
         let pending = ledger::OperationLedger::inspect(&self.agent_dir)?;
         if pending.is_empty() { return Err("no MCP operation requires cooperation".into()); }
+        let mut guard_context: Option<(String, u64)> = None;
         for record in &pending {
             if !matches!(record.operation.as_str(), "mcp.signInStart" | "mcp.test") || record.mcp_target.as_ref() != Some(target) {
                 return Err("unrelated or unidentified management outcome is unresolved".into());
             }
-            let found = state.tasks.values().any(|task| {
-                let Ok(task) = task.try_lock() else { return false };
-                task.ledger_operation_id.as_deref() == Some(record.operation_id.as_str())
-                    && task.operation == record.operation && task.mcp_target.as_ref() == Some(target)
-                    && task.finished_at.is_none() && matches!(task.snapshot.status, TaskStatus::Running | TaskStatus::Unknown)
-            });
-            if !found { return Err("MCP writer is not owned by this management instance".into()); }
+            let guard = state.tasks.values().find_map(|task| {
+                let task = task.try_lock().ok()?;
+                if task.ledger_operation_id.as_deref() != Some(record.operation_id.as_str())
+                    || task.operation != record.operation || task.mcp_target.as_ref() != Some(target)
+                    || task.finished_at.is_some() || !matches!(task.snapshot.status, TaskStatus::Running | TaskStatus::Unknown) { return None; }
+                let guard = task.mcp_guard.as_ref()?;
+                if guard.target != *target || guard.config_fingerprint.is_empty() || guard.generation > 9_007_199_254_740_991 { return None; }
+                Some((guard.config_fingerprint.clone(), guard.generation))
+            }).ok_or("MCP writer is not owned by this management instance")?;
+            match &mut guard_context {
+                Some((config, generation)) if *config == guard.0 => *generation = (*generation).max(guard.1),
+                Some(_) => return Err("MCP writer configuration changed".into()),
+                None => guard_context = Some(guard),
+            }
         }
+        let (config_fingerprint, previous_generation) = guard_context.ok_or("MCP guard evidence is missing")?;
         let reservation_id = uuid::Uuid::new_v4();
         admission.reservation = Some(reservation_id);
-        Ok(McpCooperativeReservation { admission: Arc::clone(&self.admission), reservation_id, instance_id: self.instance_id, target: target.clone() })
+        Ok(McpCooperativeReservation { admission: Arc::clone(&self.admission), reservation_id, instance_id: self.instance_id, target: target.clone(), config_fingerprint, previous_generation,
+            state: Arc::clone(&self.state), client: Arc::clone(&self.client), agent_dir: self.agent_dir.clone(), agent_dir_check: self.agent_dir_check.clone() })
     }
 
     /// Interpret only a nonce-routed terminal response for the named private
@@ -563,7 +590,9 @@ impl ManagementInstance {
             || target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?.fingerprint(canonical)? != expected_fingerprint {
             return Err("MCP revocation identity mismatch".into());
         }
-        Ok(VerifiedMcpRevocation { instance_id: self.instance_id, target_fingerprint: expected_fingerprint.to_string(), generation })
+        let key = target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?;
+        let config_fingerprint = key.fingerprint(&format!("config:{expected_config_key}"))?;
+        Ok(VerifiedMcpRevocation { instance_id: self.instance_id, target_fingerprint: expected_fingerprint.to_string(), config_fingerprint, generation })
     }
 
     pub fn revocation_matches(&self, proof: &VerifiedMcpRevocation, target_fingerprint: &str) -> bool {
@@ -1264,7 +1293,7 @@ mod tests {
         let pending = Mutex::new(HashMap::new());
         let (a_tx, a_rx) = std::sync::mpsc::channel();
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, runner: None }));
+        let task = || Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false }, finished_at: None, serial_scope: false, exclusive: false, operation: String::new(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, runner: None }));
         let task_a = task();
         pending.lock().unwrap().insert("a".to_string(), PendingTask { tx: a_tx, task: Arc::clone(&task_a), nonce: "good".into() });
         pending.lock().unwrap().insert("b".to_string(), PendingTask { tx: b_tx, task: task(), nonce: "good".into() });

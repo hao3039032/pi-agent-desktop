@@ -172,6 +172,54 @@ fn catalog_partial_and_probe_completion_are_not_mutation_completion_proof() {
 }
 
 #[test]
+fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
+    use std::sync::{Arc, Mutex};
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "ok");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let _key = super::target_key::ManagementTargetKey::load_or_create(temp.path()).unwrap();
+    let ledger = OperationLedger::open(temp.path()).unwrap();
+    let target = McpCredentialTarget::new("a".repeat(64), "b".repeat(64)).unwrap();
+    let other = McpCredentialTarget::new("c".repeat(64), "d".repeat(64)).unwrap();
+    let descriptor = MutationDescriptor::new("mcp.signInStart", OperationScope::Global).unwrap().with_mcp_target(target.clone()).unwrap();
+    let id = ledger.begin(&descriptor).unwrap();
+    let task = Arc::new(Mutex::new(super::TaskRecord {
+        snapshot: super::TaskSnapshot { status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false },
+        finished_at: None, serial_scope: false, exclusive: false, operation: "mcp.signInStart".into(),
+        ledger_operation_id: Some(id.clone()), mcp_target: Some(target.clone()),
+        mcp_guard: Some(super::McpGuardAdmission { target: target.clone(), generation: 2, config_fingerprint: "e".repeat(64) }), runner: None,
+    }));
+    instance.state.lock().unwrap().tasks.insert("active".into(), Arc::clone(&task));
+    assert!(instance.reserve_mcp_cooperation(&other).is_err());
+    let guard = task.lock().unwrap().mcp_guard.take();
+    assert!(instance.reserve_mcp_cooperation(&target).is_err(), "preflight target alone is not a guard receipt");
+    task.lock().unwrap().mcp_guard = guard;
+    let reservation = instance.reserve_mcp_cooperation(&target).unwrap();
+    let mut proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
+    assert!(reservation.matches_revocation(&proof));
+    proof.generation = 2;
+    assert!(!reservation.matches_revocation(&proof), "revocation must advance the guard generation");
+    proof.generation = 3;
+    proof.config_fingerprint = "f".repeat(64);
+    assert!(!reservation.matches_revocation(&proof), "configuration changes invalidate the receipt");
+    assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+    assert!(host.instance(temp.path().to_str().unwrap(), &config).is_err(), "new scope cannot spawn while reserved");
+    assert!(instance.task_snapshot("active").is_ok(), "reservation must not hold state mutex across RPC");
+    assert_eq!(ledger.list_pending().unwrap().len(), 1);
+    proof.config_fingerprint = "e".repeat(64);
+    instance.shutdown(Duration::from_secs(1));
+    assert!(!reservation.matches_revocation(&proof), "a closing instance cannot authorize a receipt");
+    drop(reservation);
+    assert!(instance.start_task("auth.logout", serde_json::json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err(), "dropping reservation must not clear pending");
+    let restarted = ManagementHost::new();
+    let fresh = restarted.instance("global", &config).unwrap();
+    assert!(fresh.reserve_mcp_cooperation(&target).is_err(), "restart cannot claim old task ownership");
+    restarted.shutdown_all(Duration::from_secs(1));
+    host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
 fn cooperative_revocation_evidence_is_instance_and_target_bound() {
     use std::sync::{Arc, Mutex};
     let temp = tempfile::tempdir().unwrap();
@@ -186,7 +234,7 @@ fn cooperative_revocation_evidence_is_instance_and_target_bound() {
             result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"configKey":"trusted-config","generation":3}})),
             error: None, cancel_requested: false },
         finished_at: Some(Instant::now()), serial_scope: false, exclusive: false,
-        operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, runner: None,
+        operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, runner: None,
     }));
     instance.state.lock().unwrap().tasks.insert("fake-routed".into(), Arc::clone(&task));
     let proof = instance.verified_mcp_revocation("fake-routed", &fingerprint, "trusted-config").unwrap();
