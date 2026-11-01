@@ -53,6 +53,33 @@ impl ManagementTargetKey {
     #[cfg(not(target_os = "linux"))]
     pub fn load_or_create(_agent_dir: &Path) -> Result<Self, String> { Err("safe management target key is unavailable on this platform".into()) }
 
+    /// Inspect an existing key without creating or changing anything.
+    #[cfg(target_os = "linux")]
+    pub fn inspect(agent_dir: &Path) -> Result<bool, String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let root = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(agent_dir).map_err(|e| e.to_string())?;
+        let base_path = format!("/proc/self/fd/{}/pi-web", root.as_raw_fd());
+        let base = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(base_path) {
+            Ok(base) => base,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+        let m = base.metadata().map_err(|e| e.to_string())?;
+        if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 { return Err("unsafe management key directory".into()); }
+        let path = format!("/proc/self/fd/{}/management-target-key.v1", base.as_raw_fd());
+        let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK).open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+        let m = file.metadata().map_err(|e| e.to_string())?;
+        if !m.is_file() || m.len() != 32 || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 || m.nlink() != 1 { return Err("unsafe or corrupt management target key".into()); }
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn inspect(_agent_dir: &Path) -> Result<bool, String> { Err("safe management target key is unavailable on this platform".into()) }
+
     pub fn fingerprint(&self, canonical_key: &str) -> Result<String, String> {
         if canonical_key.is_empty() || canonical_key.len() > 8192 { return Err("invalid MCP credential key".into()); }
         let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.0).map_err(|_| "invalid management key")?;

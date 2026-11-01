@@ -15,12 +15,13 @@ pub struct RecoveryStatus {
     pub trust_policy: PendingState,
     pub session_writers: PendingState,
     pub deletion_journal: PendingState,
+    pub management_operations: PendingState,
 }
 
 impl RecoveryStatus {
     pub fn is_clear(&self) -> bool {
         self.trust_policy == PendingState::Clear && self.session_writers == PendingState::Clear
-            && self.deletion_journal == PendingState::Clear
+            && self.deletion_journal == PendingState::Clear && self.management_operations == PendingState::Clear
     }
 }
 
@@ -58,7 +59,23 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
         Ok(false) => PendingState::Clear,
         Err(_) => PendingState::Uninspectable,
     };
-    RecoveryStatus { trust_policy: trust, session_writers: writers, deletion_journal: journal }
+    let management = match management_host::target_key::ManagementTargetKey::inspect(agent) {
+        Err(_) => PendingState::Uninspectable,
+        Ok(key_exists) => {
+            let ledger_path = base.join("management-operations");
+            match std::fs::symlink_metadata(&ledger_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingState::Clear,
+                Err(_) => PendingState::Uninspectable,
+                Ok(_) if !key_exists => PendingState::Uninspectable,
+                Ok(_) => match management_host::ledger::OperationLedger::inspect(agent) {
+                    Ok(records) if records.is_empty() => PendingState::Clear,
+                    Ok(_) => PendingState::Pending,
+                    Err(_) => PendingState::Uninspectable,
+                },
+            }
+        }
+    };
+    RecoveryStatus { trust_policy: trust, session_writers: writers, deletion_journal: journal, management_operations: management }
 }
 
 /// Ordered shutdown phases. Register each actual service/controlled child
@@ -180,8 +197,41 @@ mod tests {
         std::fs::create_dir(dir.path().join("session-deletion-journal")).unwrap();
         std::fs::write(dir.path().join("session-deletion-journal/pending"), "journal").unwrap();
         let status = host.require_clean_start().unwrap_err();
-        assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, deletion_journal: PendingState::Pending });
+        assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, deletion_journal: PendingState::Pending, management_operations: PendingState::Clear });
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "unresolved");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn management_recovery_is_read_only_and_rejects_bad_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(recovery_status(dir.path()).management_operations, PendingState::Clear);
+        assert!(!dir.path().join("pi-web").exists(), "diagnostics create nothing");
+        let _key = management_host::target_key::ManagementTargetKey::load_or_create(dir.path()).unwrap();
+        let _ledger = management_host::ledger::OperationLedger::open(dir.path()).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let file = dir.path().join("pi-web/management-operations").join(format!("{id}.json"));
+        let record = serde_json::json!({"version":1,"operationId":id,"operation":"auth.logout","scope":"global","target":"credentials","phase":"pending","createdAtMs":1}).to_string();
+        std::fs::write(&file, &record).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let status = recovery_status(dir.path());
+        assert_eq!(status.management_operations, PendingState::Pending);
+        assert!(!status.is_clear());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), record);
+        let mut bad: serde_json::Value = serde_json::from_str(&record).unwrap();
+        bad["version"] = serde_json::json!(2);
+        std::fs::write(&file, bad.to_string()).unwrap();
+        assert_eq!(recovery_status(dir.path()).management_operations, PendingState::Uninspectable);
+        std::fs::write(&file, &record).unwrap();
+        std::fs::remove_file(dir.path().join("pi-web/management-target-key.v1")).unwrap();
+        assert_eq!(recovery_status(dir.path()).management_operations, PendingState::Uninspectable);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), record);
+        let key_path = dir.path().join("pi-web/management-target-key.v1");
+        assert!(!key_path.exists());
+        std::fs::write(&key_path, b"broken").unwrap();
+        assert_eq!(recovery_status(dir.path()).management_operations, PendingState::Uninspectable);
+        assert_eq!(std::fs::read(key_path).unwrap(), b"broken");
     }
 
     #[test]
