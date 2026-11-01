@@ -6,20 +6,23 @@ export function bindSessionActionsService(bound: IpcClient): void { client = bou
 export async function autoNameSession(sessionId: string, signal?: AbortSignal): Promise<{ title?: string; error?: string }> {
   if (!client) throw new Error("the session-actions IPC bridge is not configured");
   if (signal?.aborted) throw signal.reason;
-  let abort: (() => void) | undefined;
-  const cancelled = new Promise<never>((_, reject) => {
-    if (signal) {
-      abort = () => reject(signal.reason ?? new Error("The request was aborted"));
-      signal.addEventListener("abort", abort, { once: true });
-    }
-  });
   try {
-    return await Promise.race([client.request<{ title?: string; error?: string }>("sessions.autoName", { session: sessionId }, { timeoutMs: 105_000 }), cancelled]);
+    const { task } = await client.request<{ task: string }>("sessions.autoName", { session: sessionId }, { timeoutMs: 70_000 });
+    for (;;) {
+      if (signal?.aborted) {
+        await client.request("sessions.autoNameCancel", { session: sessionId, task }, { timeoutMs: 15_000 });
+        throw new Error("Session title generation cancelled");
+      }
+      // A status request can perform the rename. Await its answer even after
+      // cancellation: abandoning it could misreport a completed rename.
+      const result = await client.request<{ status?: string; title?: string }>("sessions.autoNameStatus", { session: sessionId, task }, { timeoutMs: 100_000 });
+      if (result.title) return result;
+      if (result.status !== "running") throw new Error("Invalid title task status");
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    }
   } catch (error) {
     if (error instanceof IpcFailure) throw new Error(error.error.message);
     throw error;
-  } finally {
-    if (signal && abort) signal.removeEventListener("abort", abort);
   }
 }
 
