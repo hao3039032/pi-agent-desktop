@@ -62,6 +62,8 @@ export interface QueuedLoginEvent {
 const MAX_FLOWS = 8;
 /** A bounded buffer: a real login is a few dozen events at most. */
 const MAX_EVENTS = 512;
+const MAX_EVENT_BYTES = 60 * 1024;
+const MAX_HISTORY_BYTES = 1024 * 1024;
 /** Finished flows kept for late polls (bounded; the terminal event survives). */
 const MAX_FINISHED = 16;
 
@@ -79,6 +81,8 @@ interface LoginFlow {
   /** Monotonic per-flow sequence; the host resumes polls with the last it saw. */
   seq: number;
   events: QueuedLoginEvent[];
+  eventBytes: number;
+  truncatedThrough: number;
   done: boolean;
   /** One manual-code handshake at a time, reused across auth_url events. */
   pendingManual: { pending: PendingPrompt; answer: Promise<string> } | undefined;
@@ -97,21 +101,28 @@ const tokens = new Map<string, PendingPrompt>();
 function enqueue(flow: LoginFlow, event: OAuthLoginEvent): void {
   if (flow.done) return;
   flow.seq += 1;
-  flow.events.push({ seq: flow.seq, event });
-  if (flow.events.length > MAX_EVENTS) {
-    // Overflow ends the flow with the old stream's error shape; the buffer
-    // keeps the newest MAX_EVENTS entries for the poller's post-mortem.
-    flow.events.splice(0, flow.events.length - MAX_EVENTS);
-    finishFlow(flow, { type: "error", message: "Login event buffer overflow" });
+  const queued = { seq: flow.seq, event };
+  const size = Buffer.byteLength(JSON.stringify(queued));
+  if (size > MAX_EVENT_BYTES) {
+    flow.truncatedThrough = flow.seq;
+    flow.events = [];
+    flow.eventBytes = 0;
+    return;
+  }
+  flow.events.push(queued);
+  flow.eventBytes += size;
+  while (flow.events.length > MAX_EVENTS || flow.eventBytes > MAX_HISTORY_BYTES) {
+    const removed = flow.events.shift()!;
+    flow.eventBytes -= Buffer.byteLength(JSON.stringify(removed));
+    flow.truncatedThrough = removed.seq;
   }
 }
 
 /** Record the terminal event, abort the login, reject every token still owed. */
 function finishFlow(flow: LoginFlow, terminal: OAuthLoginEvent): void {
   if (flow.done) return;
+  enqueue(flow, terminal);
   flow.done = true;
-  flow.seq += 1;
-  flow.events.push({ seq: flow.seq, event: terminal });
   flow.abort.abort();
   if (flow.inputCleaner) {
     flow.inputCleaner();
@@ -232,6 +243,8 @@ export async function startLoginFlow(
     provider,
     seq: 0,
     events: [],
+    eventBytes: 0,
+    truncatedThrough: 0,
     done: false,
     pendingManual: undefined,
     liveTokens: new Set(),
@@ -339,7 +352,8 @@ export async function startLoginFlow(
             enqueue(flow, devEvt);
             opContext?.progress?.(desensitizeProgress(devEvt, provider));
           } else {
-            const progEvt: OAuthLoginEvent = { type: "progress", message: event.message };
+            // Provider-written progress can contain credential material.
+            const progEvt: OAuthLoginEvent = { type: "progress", message: "Signing in" };
             enqueue(flow, progEvt);
             opContext?.progress?.(desensitizeProgress(progEvt, provider));
           }
@@ -354,7 +368,7 @@ export async function startLoginFlow(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const isCancelled = message === "Login cancelled" || flow.abort.signal.aborted || opContext?.signal?.aborted;
-      finishFlow(flow, isCancelled ? { type: "cancelled" } : { type: "error", message });
+      finishFlow(flow, isCancelled ? { type: "cancelled" } : { type: "error", message: "Login failed" });
       opContext?.progress?.(desensitizeProgress(isCancelled ? { type: "cancelled" } : { type: "error", message }, provider));
       if (isCancelled) {
         const err = new Error("Login cancelled");
@@ -382,12 +396,12 @@ export async function startLoginFlow(
 export function pollLoginFlow(
   flowId: string,
   since: number,
-): { events: QueuedLoginEvent[]; lastSeq: number; done: boolean } {
+): { events: QueuedLoginEvent[]; lastSeq: number; done: boolean; missing?: boolean; truncated?: boolean } {
   const flow = flows.get(flowId) ?? finishedFlows.get(flowId);
-  if (!flow) return { events: [], lastSeq: since, done: true };
+  if (!flow) return { events: [], lastSeq: since, done: true, missing: true };
   flow.lastPolled = Date.now();
   const events = flow.events.filter((queued) => queued.seq > since);
-  return { events, lastSeq: flow.seq, done: flow.done };
+  return { events, lastSeq: flow.seq, done: flow.done, truncated: since < flow.truncatedThrough };
 }
 
 /**

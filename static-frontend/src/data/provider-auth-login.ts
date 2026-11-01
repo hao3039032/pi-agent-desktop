@@ -11,6 +11,32 @@ import type { OAuthLoginEvent } from "../../../lib/provider-auth-login";
 export type { OAuthLoginEvent };
 
 let client: IpcClient | null = null;
+type LoginTask = { flowId: string; taskHandle: string };
+const tasks = new Map<string, LoginTask>();
+
+function taskFor(provider: string): LoginTask | undefined {
+  const cached = tasks.get(provider);
+  if (cached) return cached;
+  try {
+    const raw = sessionStorage.getItem(`pi:provider-login:${provider}`);
+    const value: unknown = raw ? JSON.parse(raw) : null;
+    if (typeof value === "object" && value !== null && "flowId" in value && "taskHandle" in value
+      && typeof value.flowId === "string" && typeof value.taskHandle === "string") {
+      const task = { flowId: value.flowId, taskHandle: value.taskHandle };
+      tasks.set(provider, task);
+      return task;
+    }
+  } catch { /* storage is optional */ }
+  return undefined;
+}
+
+function rememberTask(provider: string, task: LoginTask | undefined): void {
+  if (task) tasks.set(provider, task); else tasks.delete(provider);
+  try {
+    if (task) sessionStorage.setItem(`pi:provider-login:${provider}`, JSON.stringify(task));
+    else sessionStorage.removeItem(`pi:provider-login:${provider}`);
+  } catch { /* storage is optional */ }
+}
 
 export function bindProviderAuthLogin(bound: IpcClient): void {
   client = bound;
@@ -25,25 +51,63 @@ function ensureClient(): IpcClient {
 
 /**
  * Open the OAuth login stream for a provider over IPC (auth.loginStream).
- * Returns a teardown function that cancels the stream and flow.
+ * Returns a teardown function that ends observation, not the credential writer.
  */
 export function subscribeOAuthLogin(
   provider: string,
   onEvent: (event: OAuthLoginEvent) => void,
   onError: (error: Error) => void,
-): () => void {
-  return ensureClient().subscribe<OAuthLoginEvent>(
+): (() => void) & { cancel?: () => void } {
+  const bound = ensureClient();
+  let cancelPending = false;
+  let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+  const requestCancel = (task: LoginTask) => {
+    void bound.request("auth.loginCancel", { taskHandle: task.taskHandle }).catch(() => {});
+  };
+  const dispose = bound.subscribe<OAuthLoginEvent>(
     "auth.loginStream",
-    { provider },
+    { provider, ...taskFor(provider) },
     (message) => {
-      if (message.payload) {
-        onEvent(message.payload);
+      if (message.kind === "snapshot") {
+        const payload: unknown = message.payload;
+        if (typeof payload === "object" && payload !== null && "flowId" in payload && "taskHandle" in payload
+          && typeof payload.flowId === "string" && typeof payload.taskHandle === "string") {
+          const task = { flowId: payload.flowId, taskHandle: payload.taskHandle };
+          rememberTask(provider, task);
+          if (cancelPending) {
+            cancelPending = false;
+            clearTimeout(cancelTimer);
+            requestCancel(task);
+            dispose();
+          }
+        }
+        return;
       }
+      if (cancelPending || message.kind === "heartbeat") return;
+      if (message.kind === "terminal") rememberTask(provider, undefined);
+      if (message.payload) onEvent(message.payload);
     },
     (err) => {
+      const details = err.details;
+      if (details && typeof details.flowId === "string" && typeof details.taskHandle === "string") {
+        const task = { flowId: details.flowId, taskHandle: details.taskHandle };
+        rememberTask(provider, task);
+        if (cancelPending) { cancelPending = false; clearTimeout(cancelTimer); requestCancel(task); }
+      }
       onError(new Error(err.message || "Connection lost"));
     },
   );
+  return Object.assign(() => {
+    if (cancelPending) {
+      cancelTimer = setTimeout(dispose, 35_000);
+    } else {
+      clearTimeout(cancelTimer);
+      dispose();
+    }
+  }, { cancel: () => {
+    const task = taskFor(provider);
+    if (task) requestCancel(task); else cancelPending = true;
+  } });
 }
 
 /**

@@ -90,6 +90,7 @@ export function parseSubscribeAck(ack: unknown): { subscriptionId: string } | { 
           ? ack.error.message
           : "the stream was refused by the host",
         retryable: ack.error.retryable === true,
+        ...(isRecord(ack.error.details) ? { details: ack.error.details } : {}),
       },
     };
   }
@@ -147,12 +148,24 @@ class HostBridgeTransport implements IpcTransport {
     let closed = false;
     let boundedAckInFlight = false;
     let pendingBoundedAck: { subscriptionId: string; epoch: number; seq: number } | null = null;
+    let loginLiveness: ReturnType<typeof setTimeout> | undefined;
+    const armLoginLiveness = () => {
+      if (op !== "auth.loginStream") return;
+      clearTimeout(loginLiveness);
+      loginLiveness = setTimeout(() => {
+        if (closed) return;
+        closed = true;
+        pendingBoundedAck = null;
+        void subscription?.unsubscribe();
+        onError({ code: "io", message: "Login observation lost; outcome unknown", retryable: false });
+      }, 35_000);
+    };
     const flushBoundedAck = () => {
       if (closed || boundedAckInFlight || !pendingBoundedAck) return;
       const ack = pendingBoundedAck;
       pendingBoundedAck = null;
       boundedAckInFlight = true;
-      void invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `ack-${ack.subscriptionId}-${ack.seq}`, op: op === "tasks.subscribeEvents" ? "tasks.ackEvents" : "agent.ackRunning", args: ack } })
+      void invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `ack-${ack.subscriptionId}-${ack.seq}`, op: op === "tasks.subscribeEvents" ? "tasks.ackEvents" : op === "auth.loginStream" ? "auth.ackLogin" : "agent.ackRunning", args: ack } })
         .catch(() => {})
         .finally(() => { boundedAckInFlight = false; flushBoundedAck(); });
     };
@@ -162,10 +175,11 @@ class HostBridgeTransport implements IpcTransport {
       try {
         const handle = await tauriHostChannel((message) => {
           if (closed) return;
+          armLoginLiveness();
           onMessage(message as IpcStreamMessage);
-          if (!closed && (op === "agent.subscribeEvents" || op === "tasks.subscribeEvents" || op === "agent.subscribeRunning") && isRecord(message)
+          if (!closed && (op === "agent.subscribeEvents" || op === "tasks.subscribeEvents" || op === "agent.subscribeRunning" || op === "auth.loginStream") && isRecord(message)
               && typeof message.subscriptionId === "string" && Number.isSafeInteger(message.seq)
-              && typeof message.seq === "number" && message.seq > 0 && message.kind !== "reset"
+              && typeof message.seq === "number" && message.seq > 0 && (message.kind !== "reset" || op === "auth.loginStream")
               && (op === "agent.subscribeEvents" || (typeof message.epoch === "number" && Number.isSafeInteger(message.epoch)))) {
             // ACK only after local delivery; the frame can precede the subscribe response.
             if (op === "agent.subscribeEvents") {
@@ -205,10 +219,11 @@ class HostBridgeTransport implements IpcTransport {
             : command === "pi_ipc_subscribe_running"
               ? { onFrame: handle.channel }
               : command === "pi_ipc_login_stream"
-                ? { provider: args?.provider, onEvent: handle.channel }
+                ? { provider: args?.provider, flowId: args?.flowId ?? null, taskHandle: args?.taskHandle ?? null, onEvent: handle.channel }
               : command === "pi_ipc_subscribe_scheduled"
                 ? { onEvent: handle.channel }
                 : { id: args?.id, cursor: args?.cursor ?? 0, onOutput: handle.channel };
+        armLoginLiveness();
         const ack = await invoke(command, payload);
         if (closed) {
           handle.stopLocalDelivery();
@@ -223,10 +238,12 @@ class HostBridgeTransport implements IpcTransport {
         const parsed = parseSubscribeAck(ack);
         if ("error" in parsed) {
           handle.stopLocalDelivery();
+          clearTimeout(loginLiveness);
           if (!closed) onError(parsed.error);
           return;
         }
         const subscriptionId = parsed.subscriptionId;
+        armLoginLiveness();
         subscription = {
           stopLocalDelivery: () => handle.stopLocalDelivery(),
           unsubscribe: async () => {
@@ -257,6 +274,7 @@ class HostBridgeTransport implements IpcTransport {
           subscription = null;
         }
       } catch (error) {
+        clearTimeout(loginLiveness);
         if (!closed) {
           onError({
             code: "no_host",
@@ -269,6 +287,7 @@ class HostBridgeTransport implements IpcTransport {
     return () => {
       closed = true;
       pendingBoundedAck = null;
+      clearTimeout(loginLiveness);
       subscription?.stopLocalDelivery();
       void subscription?.unsubscribe();
       subscription = null;
