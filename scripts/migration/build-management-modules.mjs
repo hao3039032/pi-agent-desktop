@@ -132,7 +132,7 @@ export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, ca
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
 
 /** Bundle the projection entry; returns the output contents. */
-export async function bundleProjectionModules() {
+export async function bundleProjectionModules({ packaged = false } = {}) {
   const result = await build({
     stdin: {
       contents: ENTRY,
@@ -141,14 +141,18 @@ export async function bundleProjectionModules() {
       sourcefile: "management-projection-entry.ts",
     },
     bundle: true,
-    // Jiti resolves its Babel transformer relative to its own package; bundling
-    // it relocates that lookup into the projection and breaks extensions.
-    external: ["jiti"],
+    // In the packaged tree the SDK entry is next to this generated module.
+    // The standalone pi loader does not resolve the bare specifier there.
+    plugins: packaged ? [{ name: "packaged-sdk-entry", setup(build) {
+      build.onResolve({ filter: /^@earendil-works\/pi-coding-agent$/ }, () => ({
+        path: "./node_modules/@earendil-works/pi-coding-agent/dist/index.js", external: true,
+      }));
+    } }] : [],
     format: "esm",
     platform: "node",
     target: "node20",
     // MCP internals and the public SDK must resolve from the same managed tree.
-    external: ["@earendil-works/pi-coding-agent"],
+    external: packaged ? ["jiti"] : ["jiti", "@earendil-works/pi-coding-agent"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph
@@ -166,8 +170,8 @@ export async function bundleProjectionModules() {
 }
 
 /** Build into a directory (creates it). Returns the written path. */
-export async function buildProjectionInto(outDir) {
-  const contents = await bundleProjectionModules();
+export async function buildProjectionInto(outDir, options) {
+  const contents = await bundleProjectionModules(options);
   await mkdir(outDir, { recursive: true });
   const target = resolve(outDir, PROJECTION_MODULE_NAME);
   await writeFile(target, contents, "utf8");

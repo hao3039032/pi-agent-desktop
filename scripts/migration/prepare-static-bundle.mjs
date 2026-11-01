@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { stagePiDistribution } from "../pi-cli-distribution.mjs";
 import { stageManagedTree } from "./stage-managed-tree.mjs";
+import { buildProjectionInto } from "./build-management-modules.mjs";
 import { bundleFiles, verifyBundle } from "./static-bundle-manifest.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -32,10 +33,12 @@ if (process.platform !== "win32") chmodSync(nodeDest, 0o755);
 cpSync(npm, join(out, "node/node_modules/npm"), { recursive: true, dereference: false });
 cpSync(frontend, join(out, "frontend"), { recursive: true, dereference: false });
 cpSync(join(root, "lib/pi-rpc/assets"), join(out, "server/lib/pi-rpc/assets"), { recursive: true, dereference: false });
-await stageManagedTree(join(out, "managed"));
+await stageManagedTree(join(out, "managed/node_modules"));
+unlinkSync(join(out, "managed/node_modules/pi-web-session-projection.mjs"));
+await buildProjectionInto(join(out, "managed"), { packaged: true });
 // npm's installation-time .bin link is not a module dependency. In this
 // checkout cpSync preserves it as an absolute link into the build machine.
-const yamlBin = join(out, "managed/@earendil-works/pi-coding-agent/node_modules/.bin/yaml");
+const yamlBin = join(out, "managed/node_modules/@earendil-works/pi-coding-agent/node_modules/.bin/yaml");
 if (existsSync(yamlBin) && lstatSync(yamlBin).isSymbolicLink()) unlinkSync(yamlBin);
 const files = bundleFiles(out);
 const manifest = { version: 1, piVersion: expected, files };
