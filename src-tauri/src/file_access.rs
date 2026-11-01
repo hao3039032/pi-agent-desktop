@@ -15,6 +15,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+#[path = "file_directory_unix.rs"]
+mod file_directory_unix;
+#[cfg(unix)]
+use file_directory_unix::{directory_entries, directory_entry_info, git_directory};
+
 /// The allowed-root set (normalized, forward-slash, trailing-slash-free).
 #[derive(Debug, Default, Clone)]
 pub struct AllowedRoots {
@@ -487,6 +493,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn directory_listing_uses_pinned_handle_after_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("inside"), b"ok").unwrap();
+        std::fs::write(outside.join("secret"), b"no").unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root);
+        let fd = open_directory_beneath_root(&root, &root).unwrap();
+        std::fs::rename(&root, temp.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let entries = list_open_directory(&roots, &fd).unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "inside"));
+        assert!(!entries.iter().any(|entry| entry.name == "secret"));
+        let again = list_open_directory(&roots, &fd).unwrap();
+        assert!(again.iter().any(|entry| entry.name == "inside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_reports_directory_links_from_pinned_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root);
+        let entries = list_directory(&roots, &root).unwrap();
+        let link = entries.iter().find(|entry| entry.name == "link").unwrap();
+        assert!(link.is_dir);
+        assert_eq!(link.outside_link_target.as_deref(), Some(outside.canonicalize().unwrap().to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn terminal_directory_handle_remains_pinned_after_rename() {
         use std::os::unix::fs::MetadataExt;
         let temp = tempfile::tempdir().unwrap();
@@ -594,10 +639,11 @@ pub(crate) fn is_hidden_outside_git(name: &str) -> bool {
 
 /// Run git in `directory`; None when it is missing, fails or times out (the
 /// TS rules: never stall the tree on a slow git, degrade to the name list).
-fn run_git(directory: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(directory)
+#[cfg(unix)]
+fn run_git(directory: &std::fs::File, args: &[&str]) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    git_directory(&mut command, directory);
+    let output = command
         // A repository-configured fsmonitor hook must not run (expanding a
         // folder must never execute repo-configured commands).
         .args(["-c", "core.fsmonitor=false"])
@@ -636,98 +682,33 @@ pub struct ListedEntry {
 /// tracked `build/` stays visible, #677), the name list otherwise; dirs
 /// first then files, both alphabetically; a directory symlink resolving
 /// outside the roots carries `outsideLinkTarget` for the confirmation flow.
+#[cfg(unix)]
 pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<ListedEntry>, String> {
-    // Authorize on the canonical form (a directory symlink inside the roots
-    // pointing inside the roots lists its target — the /api/files
-    // semantics), then LIST THROUGH THE WALKED DESCRIPTOR so a component
-    // swapped for a symlink after the check cannot redirect the listing
-    // outside the roots. On Linux the fd lists via /proc/self/fd; elsewhere
-    // the fd is (dev,ino)-verified against the canonical path and the
-    // listing re-opens that path (the rename race remains, documented with
-    // the write path).
-    let Some((resolved_dir, resolved_root)) = resolved_read_target_with_root(roots, directory)
-    else {
+    let Some((resolved_dir, resolved_root)) = resolved_read_target_with_root(roots, directory) else {
         return Err("the path is outside the allowed roots".to_string());
     };
-    #[cfg(unix)]
-    let dirents: Vec<std::fs::DirEntry> = {
-        let walked = open_directory_beneath_root(&resolved_root, &resolved_dir)
-            .map_err(|error| error.to_string())?;
-        if !walked.metadata().map_err(|error| error.to_string())?.is_dir() {
-            return Err("Not a directory".to_string());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let via_fd = format!("/proc/self/fd/{}", {
-                use std::os::fd::AsRawFd;
-                walked.as_raw_fd()
-            });
-            std::fs::read_dir(via_fd)
-                .map_err(|error| error.to_string())?
-                .flatten()
-                .collect()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Verify the walked fd IS the canonical directory, then read the
-            // canonical path (macOS has no /proc).
-            use std::os::unix::fs::MetadataExt;
-            let walked_meta = walked.metadata().map_err(|error| error.to_string())?;
-            let path_meta = std::fs::metadata(&resolved_dir).map_err(|error| error.to_string())?;
-            if walked_meta.dev() != path_meta.dev() || walked_meta.ino() != path_meta.ino() {
-                return Err("the path is outside the allowed roots".to_string());
-            }
-            std::fs::read_dir(&resolved_dir)
-                .map_err(|error| error.to_string())?
-                .flatten()
-                .collect()
-        }
-    };
-    #[cfg(windows)]
-    let dirents: Vec<std::fs::DirEntry> = {
-        let _ = (resolved_dir, resolved_root);
-        return Err("listing is not supported on this platform until the handle-based implementation ships".to_string());
-    };
-    let names: Vec<String> = dirents.iter().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
-    // Visibility: Git's view first (tracked wins over ignored), the fixed
-    // name list where git has no view (missing, outside a work tree, failed).
-    let visibility = directory_visibility(&resolved_dir, &names);
+    let walked = open_directory_beneath_root(&resolved_root, &resolved_dir).map_err(|e| e.to_string())?;
+    list_open_directory(roots, &walked)
+}
 
-    let mut entries: Vec<ListedEntry> = Vec::new();
+#[cfg(windows)]
+pub fn list_directory(_roots: &AllowedRoots, _directory: &Path) -> Result<Vec<ListedEntry>, String> {
+    Err("listing is not supported on this platform until the handle-based implementation ships".to_string())
+}
+
+#[cfg(unix)]
+fn list_open_directory(roots: &AllowedRoots, walked: &std::fs::File) -> Result<Vec<ListedEntry>, String> {
+    let dirents = directory_entries(walked).map_err(|e| e.to_string())?;
+    let names: Vec<String> = dirents.iter().map(|name| name.to_string_lossy().into_owned()).collect();
+    let visibility = directory_visibility(walked, &names);
+    let mut entries = Vec::new();
     for entry in &dirents {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !visibility(&name) {
-            continue;
-        }
-        // Every probe goes through the CANONONICAL directory path, never the
-        // /proc/self/fd listing path (stat through an fd link component is
-        // not portable); the fd only sourced the NAME list.
-        let entry_path = resolved_dir.join(&name);
-        // Avoid per-entry stat where the dirent type is known; symlinks and
-        // filesystems without type info fall back to metadata.
-        let file_type = entry.file_type().ok();
-        let is_dir = match file_type {
-            Some(kind) if kind.is_dir() => true,
-            Some(kind) if kind.is_file() => false,
-            _ => match std::fs::metadata(&entry_path) {
-                Ok(meta) => meta.is_dir(),
-                Err(_) => continue, // raced away: skip, not an error
-            },
-        };
-        // A directory whose dirent says "file" is a SYMLINK to a directory
-        // (the TS resolveDirentIsDirectory fallback): report it as a dir and
-        // resolve whether it lands outside the roots.
-        let mut outside_link_target = None;
-        let mut outside_link_encloses = false;
-        let is_symlink_dir = is_dir && file_type.map(|kind| !kind.is_dir()).unwrap_or(false);
-        if is_symlink_dir || (is_dir && std::fs::symlink_metadata(&entry_path).map(|m| m.file_type().is_symlink()).unwrap_or(false)) {
-            if let Ok(resolved) = std::fs::canonicalize(&entry_path) {
-                if !roots.is_existing_path_allowed(&resolved) {
-                    outside_link_target = Some(resolved.to_string_lossy().into_owned());
-                    outside_link_encloses = encloses_home_or_root(&resolved);
-                }
-            }
-        }
+        let name = entry.to_string_lossy().into_owned();
+        if !visibility(&name) { continue; }
+        let Some((is_dir, target)) = directory_entry_info(walked, entry) else { continue };
+        let outside_link_target = target.filter(|target| !roots.is_existing_path_allowed(target))
+            .map(|target| target.to_string_lossy().into_owned());
+        let outside_link_encloses = outside_link_target.as_deref().map(Path::new).map(encloses_home_or_root).unwrap_or(false);
         entries.push(ListedEntry {
             name,
             is_dir,
@@ -769,8 +750,9 @@ fn encloses_home_or_root(target: &Path) -> bool {
 /// Build the visibility predicate for one directory listing: Git's tracked
 /// set overrides its ignore matches (a tracked `build/` stays visible);
 /// outside a work tree the fixed name list applies.
+#[cfg(unix)]
 fn directory_visibility<'a>(
-    directory: &'a Path,
+    directory: &'a std::fs::File,
     names: &'a [String],
 ) -> impl Fn(&str) -> bool + 'a {
     let tracked = read_tracked_names(directory, names);
@@ -794,7 +776,8 @@ fn directory_visibility<'a>(
 
 /// Names Git tracks at or below (the first path segment of every ls-files
 /// record). None when git has no view of the directory.
-fn read_tracked_names(directory: &Path, names: &[String]) -> Option<std::collections::HashSet<String>> {
+#[cfg(unix)]
+fn read_tracked_names(directory: &std::fs::File, names: &[String]) -> Option<std::collections::HashSet<String>> {
     let mut tracked = std::collections::HashSet::new();
     // Pathspec batches keep the command line well inside the OS limit.
     let mut batch: Vec<&str> = Vec::new();
@@ -827,7 +810,8 @@ fn read_tracked_names(directory: &Path, names: &[String]) -> Option<std::collect
 
 /// Names Git ignores (check-ignore --no-index: one process for every name,
 /// no index read). None when git has no view.
-fn read_ignored_names(directory: &Path, names: &[String]) -> Option<std::collections::HashSet<String>> {
+#[cfg(unix)]
+fn read_ignored_names(directory: &std::fs::File, names: &[String]) -> Option<std::collections::HashSet<String>> {
     if names.is_empty() {
         return Some(std::collections::HashSet::new());
     }
@@ -839,9 +823,9 @@ fn read_ignored_names(directory: &Path, names: &[String]) -> Option<std::collect
         data.push('\u{0}');
         data
     };
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(directory)
+    let mut command = std::process::Command::new("git");
+    git_directory(&mut command, directory);
+    let output = command
         .args(["-c", "core.fsmonitor=false"])
         .args(["check-ignore", "--no-index", "-z", "--stdin"])
         .env("LC_ALL", "C")
