@@ -437,14 +437,32 @@ Session starts, tool-policy restarts and chat-unlock writes share the per-sessio
 ## Static desktop dispatch admission (partial M5)
 
 The shared product/harness envelope dispatcher admits at most 16 ordinary
-blocking tasks and 4 independent stream-cleanup/terminal-ACK tasks, with no
-semaphore wait queue. Saturation returns `busy` / `dispatch_not_admitted`
+blocking tasks and 4 independent stream-cleanup, terminal-ACK and explicitly
+identified Stop/cancel tasks, with no semaphore wait queue. Saturation returns `busy` / `dispatch_not_admitted`
 before the operation executes. An admitted call abandoned by its WebView is
 not cancelled and may have an unknown outcome. The separate control budget
 prevents ordinary saturation starving cleanup, but can itself saturate; neither
-budget bounds messages already buffered by Tauri or the WebView, direct stream
-subscription commands, request bytes, child queues, or unacknowledged channels.
-These remain M5 work, not an end-to-end backpressure claim.
+budget bounds messages already buffered by Tauri or the WebView, request bytes,
+child queues, or unacknowledged channels. Session event relay threads have a
+separate 32-slot immediate admission cap, held until each relay really exits.
+Each session relay ingress has 16 frames of at most 256 KiB serialized event
+payload; overflow or an oversized event disconnects that ingress and emits a
+`reset` so the client must reconcile. A relay sends one frame at a time and
+waits up to 15 seconds after Channel send returns for its sequence ACK after
+client delivery; an ACK loss
+ends the relay and may send one additional terminal reset (at most two frames
+outstanding). This does not bound the upstream pi listener, initial UI snapshot,
+or downstream Channel/Tauri buffers. Other
+direct stream subscription commands are not covered. These remain M5 work, not
+an end-to-end backpressure claim.
+
+| Layer | Enforced budget | Boundary of the claim |
+|---|---|---|
+| Envelope dispatcher | 16 ordinary + 4 cleanup/ACK/Stop slots; no semaphore queue | After Tauri has decoded the request; not a request-byte bound |
+| Session event relay | 32 live threads; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
+| Session Channel delivery | One frame awaiting client ACK, plus at most one terminal reset on failure | ACK means the JS callback ran, not rendering or WebView buffer release |
+| Management task registry | 128 retained tasks per instance | Not a global bound on instances, task-input requests or child buffers |
+| Management ledger | At most 128 records; pending and locally revoked evidence are not evicted | Agent-directory-local evidence, not a cross-process lock or recovery permission |
 
 ## Static desktop session deletion — gated pending M5
 

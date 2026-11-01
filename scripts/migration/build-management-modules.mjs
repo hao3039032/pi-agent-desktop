@@ -130,7 +130,7 @@ export {
   getProjectMcpListing,
   trustProjectFolder,
 } from "${ROOT}/lib/mcp-service.server.ts";
-export { probeMcpServer } from "${ROOT}/lib/mcp-probe-service.server.ts";
+export { probeMcpServer, managedMcpProbeTarget } from "${ROOT}/lib/mcp-probe-service.server.ts";
 export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn, McpOAuthBroker } from "${ROOT}/lib/mcp-sign-in-service.server.ts";
 `;
 

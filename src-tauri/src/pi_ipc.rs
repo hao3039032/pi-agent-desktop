@@ -54,6 +54,8 @@ pub struct IpcHostState {
     subscription_counter: AtomicU64,
     /// Live event-stream relays by subscription id (unsubscribe detaches).
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
+    session_relay_gate: Arc<tokio::sync::Semaphore>,
+    running_relay_gate: Arc<tokio::sync::Semaphore>,
     /// The provider-auth domain's login-stream relays (the same release
     /// contract: unsubscribe cancels the flow host-side). Kept in the
     /// domain's own map so the shared one stays untouched.
@@ -143,6 +145,33 @@ struct EventRelayHandle {
     /// The session subscriber id to detach (0 = none; snapshot-only relay).
     subscriber_id: u64,
     session_id: String,
+    ack: Option<Arc<SessionRelayAck>>,
+}
+
+#[derive(Default)]
+pub(crate) struct SessionRelayAck {
+    state: Mutex<(u64, u64)>, // sent, acknowledged
+    wake: std::sync::Condvar,
+}
+impl SessionRelayAck {
+    pub(crate) fn acknowledge(&self, seq: u64) -> bool {
+        let Ok(mut state) = self.state.lock() else { return false };
+        if seq == 0 || seq > state.0 { return false; }
+        state.1 = state.1.max(seq);
+        self.wake.notify_all();
+        true
+    }
+    pub(crate) fn wake(&self) { self.wake.notify_all(); }
+    pub(crate) fn forward(&self, channel: &Channel<Value>, frame: Value, seq: u64, stop: &std::sync::atomic::AtomicBool, timeout: Duration) -> bool {
+        {
+            let Ok(mut state) = self.state.lock() else { return false };
+            state.0 = seq;
+        }
+        if channel.send(frame).is_err() { return false; }
+        let Ok(state) = self.state.lock() else { return false };
+        let Ok((state, _)) = self.wake.wait_timeout_while(state, timeout, |state| state.1 < seq && !stop.load(Ordering::SeqCst)) else { return false };
+        state.1 >= seq && !stop.load(Ordering::SeqCst)
+    }
 }
 
 impl IpcHostState {
@@ -183,8 +212,10 @@ impl IpcHostState {
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
         let policy_gate = Arc::new(std::sync::RwLock::new(()));
-        let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
+        let agent_dir = default_agent_dir();
+        let task_agent_dir = Arc::new(Mutex::new(Some(agent_dir.clone())));
         let fence_agent_dir = Arc::clone(&task_agent_dir);
+        let management_agent_dir = Arc::clone(&task_agent_dir);
         let admitted_agent_dir = Mutex::new(None::<PathBuf>);
         let checker: session_host::SessionFenceChecker = Arc::new(move |id, owner| {
             let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
@@ -216,6 +247,8 @@ impl IpcHostState {
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
+            session_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_SESSION_RELAYS)),
+            running_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_RUNNING_RELAYS)),
             login_relays: Arc::new(Default::default()),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
@@ -226,9 +259,13 @@ impl IpcHostState {
             title_tasks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             title_rename_timeout: Mutex::new(Duration::from_secs(30)),
-            management: ManagementHost::new(),
             session_writers: Arc::new(Default::default()),
-            management_config: Mutex::new(resolve_management_config()),
+            management: ManagementHost::with_agent_dir_check(Arc::new(move |configured| {
+                let pinned = management_agent_dir.lock().map_err(|_| "agent directory unavailable")?;
+                if pinned.as_deref() != Some(configured) { return Err("management agent directory differs from host agent directory".into()); }
+                Ok(())
+            })),
+            management_config: Mutex::new(resolve_management_config(agent_dir)),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir,
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
@@ -625,13 +662,13 @@ fn resolve_managed_modules() -> Option<PathBuf> {
 /// The management spawn config (the vendored management extension; its
 /// managed module tree is wired with the M3 packaging — until then the
 /// config stays None and models ops answer management_unavailable).
-fn resolve_management_config() -> Option<ManagementSpawnConfig> {
+fn resolve_management_config(agent_dir: PathBuf) -> Option<ManagementSpawnConfig> {
     let executable = resolve_pi_executable()?;
     let extension = resolve_asset("pi-web-management.mjs", "PI_WEB_MANAGEMENT_EXTENSION")?;
     let managed = resolve_managed_modules()?;
     Some(ManagementSpawnConfig {
         executable: executable.to_string_lossy().into_owned(),
-        agent_dir: None,
+        agent_dir: Some(agent_dir),
         extensions: vec![extension],
         env: vec![(
             "PI_WEB_MANAGED_MODULES".to_string(),
@@ -688,6 +725,10 @@ pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event:
 /// when the receiver unsubscribes (`agent.unsubscribeEvents`, page reload,
 /// window close) or the session leaves the registry; the relay thread then
 /// detaches — a dropped channel alone must not leak a thread.
+/// Session relay threads remain counted until their actual exit, even after
+/// unsubscribe. This cap does not bound channel transport buffers.
+pub const IPC_MAX_SESSION_RELAYS: usize = 32;
+
 #[tauri::command]
 pub fn pi_ipc_subscribe_events(
     state: State<'_, Arc<IpcHostState>>,
@@ -695,6 +736,14 @@ pub fn pi_ipc_subscribe_events(
     on_event: Channel<Value>,
 ) -> Value {
     let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
+    subscribe_session_events(&state, session, on_event)
+}
+
+fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Channel<Value>) -> Value {
+    let permit = match Arc::clone(&state.session_relay_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"session stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
+    };
     let Some(session_handle) = state.registry.get(&session) else {
         return protocol_error("?", "not_found", &format!("no running session {session}"));
     };
@@ -704,10 +753,12 @@ pub fn pi_ipc_subscribe_events(
     );
     let subscription_id_for_relay = subscription_id.clone();
     let epoch = session_handle.epoch();
-    let (subscriber_id, events, pending_ui) = session_handle.subscribe_with_ui();
+    let (subscriber_id, events, pending_ui, gap) = session_handle.subscribe_with_ui_bounded();
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ack = Arc::new(SessionRelayAck::default());
+    let ack_for_relay = Arc::clone(&ack);
     let stop_for_relay = Arc::clone(&stop);
     let relays_for_thread = Arc::clone(&state.event_relays);
     let subscription_for_cleanup = subscription_id.clone();
@@ -717,15 +768,19 @@ pub fn pi_ipc_subscribe_events(
             stop: Arc::clone(&stop),
             subscriber_id,
             session_id: session.clone(),
+            ack: Some(ack),
         },
     );
 
     // The relay: snapshot first, then every record in order. A closed
     // channel (send error) or the unsubscribe flag ends the loop and
     // detaches the subscriber.
-    std::thread::Builder::new()
+    let relay_session = Arc::clone(&session_handle);
+    let spawn = std::thread::Builder::new()
         .name(format!("ipc-events-{subscription_id}"))
         .spawn(move || {
+            let _permit = permit;
+            let session_handle = relay_session;
             let subscription_id = subscription_id_for_relay;
             let detach = |subscriber_id| {
                 session_handle.unsubscribe(subscriber_id);
@@ -740,14 +795,18 @@ pub fn pi_ipc_subscribe_events(
                 // dialog queue against what the session still holds.
                 "pendingExtensionUiIds": pending_ui.iter().filter_map(|record| record.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
             });
+            let send = |seq, kind, payload| ack_for_relay.forward(&on_event, stream_frame(&subscription_id, epoch, seq, kind, payload), seq, &stop_for_relay, Duration::from_secs(15));
+            let reset = |seq| { if !stop_for_relay.load(Ordering::SeqCst) { let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"}))); } };
             seq += 1;
-            if on_event.send(stream_frame(&subscription_id, epoch, seq, "snapshot", snapshot)).is_err() {
+            if !send(seq, "snapshot", snapshot) {
+                reset(seq + 1);
                 detach(subscriber_id);
                 return;
             }
             for record in pending_ui {
                 seq += 1;
-                if on_event.send(stream_frame(&subscription_id, epoch, seq, "event", record)).is_err() {
+                if !send(seq, "event", record) {
+                    reset(seq + 1);
                     detach(subscriber_id);
                     return;
                 }
@@ -757,26 +816,38 @@ pub fn pi_ipc_subscribe_events(
                     detach(subscriber_id);
                     return;
                 }
+                if gap.load(Ordering::SeqCst) {
+                    seq += 1;
+                    let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                    detach(subscriber_id);
+                    return;
+                }
                 match events.recv_timeout(Duration::from_millis(500)) {
                     Ok(record) => {
                         seq += 1;
-                        if on_event
-                            .send(stream_frame(&subscription_id, epoch, seq, "event", record))
-                            .is_err()
-                        {
+                        if !send(seq, "event", record) {
+                            reset(seq + 1);
                             detach(subscriber_id);
                             return;
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if gap.load(Ordering::SeqCst) {
+                            seq += 1;
+                            let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                        }
                         detach(subscriber_id);
                         return;
                     }
                 }
             }
-        })
-        .ok();
+        });
+    if let Err(error) = spawn {
+        session_handle.unsubscribe(subscriber_id);
+        state.event_relays.lock().unwrap().remove(&subscription_id);
+        return protocol_error("?", "io", &format!("session relay could not start: {error}"));
+    }
 
     json!({ "subscriptionId": subscription_id, "epoch": epoch })
 }
@@ -819,7 +890,19 @@ fn derive_running_snapshot(registry: &SessionRegistry, version: &AtomicU64) -> R
 /// channel frees (Terra P2-1), never swallowed as "the net set did not
 /// change". A burst that overflows the ring (512 unseen transitions) is
 /// answered with ONE forced resync frame instead of a replay.
-const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(30);
+const RUNNING_CHANNEL_PROBE: Duration = Duration::from_secs(10);
+const IPC_MAX_RUNNING_RELAYS: usize = 32;
+const RUNNING_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+struct RunningFrameSize(usize);
+impl std::io::Write for RunningFrameSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).filter(|n| *n <= RUNNING_MAX_FRAME_BYTES)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "running frame too large"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
 
 /// Drops of this guard are the relay thread's LAST act (every exit path):
 /// the alive count in `IpcHostState::running_relay_threads` therefore
@@ -852,17 +935,28 @@ pub fn pi_ipc_subscribe_running(
 }
 
 fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after: Duration) -> Value {
-    let subscription_id = format!(
-        "run-{}",
-        state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1
-    );
+    subscribe_running_with_timeout(state, on_frame, probe_after, Duration::from_secs(15))
+}
+
+fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>, probe_after: Duration, ack_timeout: Duration) -> Value {
+    let permit = match Arc::clone(&state.running_relay_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"running stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
+    };
+    let mut nonce = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut nonce) {
+        return protocol_error("?", "io", &format!("running subscription identity unavailable: {error}"));
+    }
+    let subscription_id = format!("run-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ack = Arc::new(SessionRelayAck::default());
     state.event_relays.lock().unwrap().insert(
         subscription_id.clone(),
         EventRelayHandle {
             stop: Arc::clone(&stop),
             subscriber_id: 0,
             session_id: String::new(),
+            ack: Some(Arc::clone(&ack)),
         },
     );
     let registry = Arc::clone(&state.registry);
@@ -879,6 +973,21 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
         .spawn(move || {
             let subscription_id = subscription_for_relay;
             let _alive = RunningRelayAlive(relays_alive);
+            let _permit = permit;
+            // Preflight the set before constructing the JSON frame; the
+            // fixed envelope is substantially smaller than this reserve.
+            let fits = |running: &Vec<String>| serde_json::to_writer(&mut RunningFrameSize(512), running).is_ok();
+            let reset = |seq| {
+                if !stop.load(Ordering::SeqCst) {
+                    let _ = on_frame.send(stream_frame(&subscription_id, 1, seq, "reset", json!({"reason":"relay_gap"})));
+                }
+            };
+            let forward = |seq, frame: Value| {
+                let within_limit = serde_json::to_writer(&mut RunningFrameSize(0), &frame).is_ok();
+                if within_limit && ack.forward(&on_frame, frame, seq, &stop, ack_timeout) { return true; }
+                reset(seq + 1);
+                false
+            };
             let detach = || {
                 relays_for_thread.lock().unwrap().remove(&subscription_id);
             };
@@ -944,6 +1053,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                                 version: version_counter.load(Ordering::SeqCst),
                             };
                             seq += 1;
+                            if !fits(&observation.running) {
+                                reset(seq);
+                                detach();
+                                return;
+                            }
                             let frame = stream_frame(
                                 &subscription_id,
                                 // The host process is this stream's epoch: a
@@ -961,7 +1075,7 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                             );
                             last_sent = Some(observation);
                             last_sent_at = std::time::Instant::now();
-                            if on_frame.send(frame).is_err() {
+                            if !forward(seq, frame) {
                                 detach();
                                 return;
                             }
@@ -983,6 +1097,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                     last_sent_at = std::time::Instant::now();
                     seq += 1;
                     let kind = if seq == 1 { "snapshot" } else { "event" };
+                    if !fits(&snapshot.running) {
+                        reset(seq);
+                        detach();
+                        return;
+                    }
                     let frame = stream_frame(
                         &subscription_id,
                         1,
@@ -992,10 +1111,11 @@ fn subscribe_running(state: &IpcHostState, on_frame: Channel<Value>, probe_after
                             "type": "running",
                             "runningSessionIds": snapshot.running,
                             "sessionListVersion": snapshot.version,
+                            "resync": force_resync,
                         }),
                     );
-                    if on_frame.send(frame).is_err() {
-                        // The Channel died (page reload, window closed):
+                    if !forward(seq, frame) {
+                        // The Channel died or the ACK window expired:
                         // end the relay and free its registry entry.
                         detach();
                         return;
@@ -1758,6 +1878,30 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 Err((code, message)) => protocol_error(&id, &code, &message),
             }
         }
+        "agent.ackRunning" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let ack = state.event_relays.lock().unwrap().get(subscription)
+                .filter(|handle| handle.session_id.is_empty() && subscription.starts_with("run-"))
+                .and_then(|handle| handle.ack.clone());
+            if epoch == 1 && ack.is_some_and(|ack| ack.acknowledge(seq)) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid running stream acknowledgement") }
+        }
+        "tasks.ackEvents" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let epoch = args.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            if state.scheduled_events.acknowledge(subscription, epoch, seq) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid scheduled stream acknowledgement") }
+        }
+        "agent.ackEvents" => {
+            let subscription = args.get("subscriptionId").and_then(Value::as_str).unwrap_or_default();
+            let seq = args.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let ack = state.event_relays.lock().unwrap().get(subscription).filter(|handle| !handle.session_id.is_empty()).and_then(|handle| handle.ack.clone());
+            if ack.is_some_and(|ack| ack.acknowledge(seq)) { protocol_ok(&id, json!({"acknowledged":seq})) }
+            else { protocol_error(&id, "invalid_args", "invalid session stream acknowledgement") }
+        }
         // End one event-stream subscription (page hide, session switch):
         // detaches the session subscriber and ends the relay thread. The
         // client never re-subscribes blindly — a new subscription carries a
@@ -1774,11 +1918,12 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 match handle {
                     Some(handle) => {
                         handle.stop.store(true, Ordering::SeqCst);
+                        if let Some(ack) = &handle.ack { ack.wake.notify_all(); }
                         if let Some(session) = state.registry.get(&handle.session_id) {
                             session.unsubscribe(handle.subscriber_id);
                         }
                         // WAKE the running-set relay's waiter (Terra P2-2): it
-                        // sleeps on the registry's running signal with a 30 s
+                        // sleeps on the registry's running signal with a 10 s
                         // probe — without this bump a quiet unsubscribe leaves
                         // the relay thread (and its liveness count) alive until
                         // the probe. The bump is wake-only: no transition is
@@ -2333,10 +2478,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let mut payload = args.clone();
             payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
             payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
-            match management_call(state, "mcp.test", payload) {
-                Ok(result) => mcp_management_response(&id, result),
-                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
-            }
+            mcp_test_dispatch(state, &id, payload)
         }
         "mcp.configGet" => {
             let cwd = args.get("cwd").and_then(Value::as_str);
@@ -2382,6 +2524,11 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 if let Err(error) = validate_scoped_cwd(state, cwd) {
                     return mcp_cwd_error(&id, &error);
                 }
+            }
+            if args.get("action").and_then(Value::as_str) == Some("sign-out") {
+                return mcp_signout_dispatch(state, &id, payload);
+            }
+            if let Some(cwd) = cwd {
                 if args.get("action").and_then(Value::as_str) == Some("add")
                     && args.get("scope").and_then(Value::as_str) == Some("project")
                     && args.get("trustFolder").and_then(Value::as_bool) == Some(true) {
@@ -2785,8 +2932,13 @@ pub const IPC_MAX_CONCURRENT_CONTROL: usize = 4;
 /// blocks process exit.
 pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -> Value {
     let id = envelope_id(&request);
-    let control = matches!(request.get("op").and_then(Value::as_str),
-        Some("agent.unsubscribeEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe"));
+    let op = request.get("op").and_then(Value::as_str);
+    let control = matches!(op,
+        Some("agent.unsubscribeEvents" | "agent.ackEvents" | "agent.ackRunning" | "tasks.ackEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
+             "agent.interrupt" | "auth.loginCancel" | "mcp.signInCancel" |
+             "plugins.mutation.cancel" | "plugins.install.cancel" | "skills.mutation.cancel"))
+        || (op == Some("agent.command") && matches!(request.pointer("/args/type").and_then(Value::as_str),
+            Some("abort" | "abort_bash" | "abort_retry" | "abort_branch_summary")));
     let gate = Arc::clone(if control { &state.dispatch_control_gate } else { &state.dispatch_gate });
     let permit = match gate.try_acquire_owned() {
         Ok(permit) => permit,
@@ -2880,6 +3032,75 @@ pub(crate) fn management_call(
     instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
 }
 
+fn mcp_test_dispatch(state: &IpcHostState, id: &str, payload: Value) -> Value {
+    let Some(config) = state.management_config.lock().unwrap().clone() else {
+        return protocol_error(id, "management_unavailable", "Management instance is not configured");
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => return protocol_error(id, "management_unavailable", &error),
+    };
+    let admission = match instance.resolve_mcp_probe(payload) {
+        Ok(admission) => admission,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    let handle = match instance.start_mcp_probe(admission, Duration::from_secs(60)) {
+        Ok(result) => result,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    loop {
+        match instance.task_snapshot(&handle) {
+            Ok(snapshot) if snapshot.status == management_host::TaskStatus::Running => std::thread::sleep(Duration::from_millis(20)),
+            Ok(snapshot) if snapshot.status == management_host::TaskStatus::Unknown => {
+                if let Some(mut result) = snapshot.result {
+                    if result.is_object() {
+                        result["credentialOutcomeUnknown"] = json!(true);
+                        return mcp_management_response(id, result);
+                    }
+                }
+                return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("MCP test outcome unknown"));
+            }
+            Ok(snapshot) if snapshot.status == management_host::TaskStatus::Succeeded => {
+                return match snapshot.result { Some(result) => mcp_management_response(id, result), None => protocol_error(id, "io", "MCP test result unavailable") };
+            }
+            Ok(snapshot) => return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("MCP test outcome unavailable")),
+            Err(error) => return protocol_error(id, "io", &error),
+        }
+    }
+}
+
+fn mcp_signout_dispatch(state: &IpcHostState, id: &str, payload: Value) -> Value {
+    let Some(config) = state.management_config.lock().unwrap().clone() else {
+        return protocol_error(id, "management_unavailable", "Management instance is not configured");
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => return protocol_error(id, "management_unavailable", &error),
+    };
+    let admission = match instance.resolve_mcp_admission(payload.clone()) {
+        Ok(admission) => admission,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    let pending = match management_host::ledger::OperationLedger::inspect(&state.agent_dir()) {
+        Ok(pending) => pending,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    if pending.is_empty() {
+        return match management_call(state, "mcp.configAction", payload) {
+            Ok(result) => mcp_management_response(id, result),
+            Err((code, message)) => protocol_error(id, &code, &message),
+        };
+    }
+    let reservation = match instance.reserve_mcp_cooperation(admission.target()) {
+        Ok(reservation) => reservation,
+        Err(error) => return protocol_error(id, "busy", &error),
+    };
+    match instance.cooperative_mcp_sign_out(admission, &reservation, Duration::from_secs(60)) {
+        Ok(result) => mcp_management_response(id, result),
+        Err(error) => protocol_error(id, "io", &error),
+    }
+}
+
 fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Value {
     let Some(config) = state.management_config.lock().unwrap().clone() else {
         return protocol_error(id, "management_unavailable", "Management instance is not configured");
@@ -2902,13 +3123,19 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
         payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
         payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
         payload["hostedOAuth"] = json!(true);
-        let handle = match instance.start_task("mcp.signInStart", payload, Duration::from_secs(600), management_host::TaskKind::Mutation) {
-            Ok(handle) => handle,
+        let admission = match instance.resolve_mcp_admission(payload) {
+            Ok(admission) => admission,
             Err(error) => return protocol_error(id, "io", &error),
         };
-        if let Err(error) = crate::mcp_oauth_callback::start(instance.clone(), handle.clone()) {
-            let _ = instance.cancel_task(&handle);
-            return protocol_error(id, "io", &format!("Could not start callback monitor: {error}"));
+        let (handle, joined) = match instance.start_admitted_mcp("mcp.signInStart", admission, Duration::from_secs(600)) {
+            Ok(result) => result,
+            Err(error) => return protocol_error(id, "io", &error),
+        };
+        if !joined {
+            if let Err(error) = crate::mcp_oauth_callback::start(instance.clone(), handle.clone()) {
+                let _ = instance.cancel_task(&handle);
+                return protocol_error(id, "io", &format!("Could not start callback monitor: {error}"));
+            }
         }
         {
             let mut handles = state.mcp_signin_tasks.lock().unwrap();
@@ -2948,6 +3175,17 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
         return match instance.task_snapshot(handle) {
             Ok(snapshot) => {
                 if snapshot.status == management_host::TaskStatus::Unknown {
+                    // Interaction cancellation and mutation outcome are separate:
+                    // only a proven local revocation may expose the cancelled
+                    // flow, with the existing explicit remote-unknown warning.
+                    if instance.task_writes_revoked(handle) {
+                        if let Some(mut flow) = snapshot.progress {
+                            if matches!(flow.get("phase").and_then(Value::as_str), Some("cancelled" | "expired")) {
+                                flow["warning"] = json!("remote-outcome-unknown");
+                                return mcp_signin_flow_response(id, handle, flow);
+                            }
+                        }
+                    }
                     return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown; retry status"));
                 }
                 match snapshot.result.or(snapshot.progress) {
@@ -3093,7 +3331,8 @@ fn management_serial_inner(state: &IpcHostState, op: &str, args: Value, cwd: Opt
 fn management_read_scoped(state: &IpcHostState, op: &str, args: &Value, cwd: &Path) -> Result<Value, (String, String)> {
     let config = state.management_config.lock().unwrap().clone().ok_or_else(|| ("management_unavailable".into(), "management instance is not configured".into()))?;
     let instance = state.management.instance(&cwd.to_string_lossy(), &config).map_err(|e| ("management_unavailable".into(), e))?;
-    let handle = instance.start_task(op, args.clone(), std::time::Duration::from_secs(60), management_host::TaskKind::ReadOnly).map_err(|e| ("io".into(), e))?;
+    let kind = if matches!(op, "skills.search" | "skills.check" | "plugins.check") { management_host::TaskKind::Mutation } else { management_host::TaskKind::ReadOnly };
+    let handle = instance.start_task(op, args.clone(), std::time::Duration::from_secs(60), kind).map_err(|e| ("io".into(), e))?;
     loop {
         let snapshot = instance.task_snapshot(&handle).map_err(|e| ("io".into(), e))?;
         match snapshot.status {
@@ -5697,6 +5936,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             Ok(())
         });
         let subscription = state.scheduled_events.subscribe(channel).unwrap();
+        let snapshot: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert!(state.scheduled_events.acknowledge(&subscription, 1, snapshot["seq"].as_u64().unwrap()));
         let started = send(&state, json!({ "v": 1, "id": "run", "op": "tasks.run", "args": { "id": task_id } }));
         assert_eq!(started["ok"], true, "{started}");
         let run = &started["data"]["run"];
@@ -5713,6 +5954,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let mut types = Vec::new();
         while types.len() < 4 {
             let frame: Value = serde_json::from_str(&event_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+            assert!(state.scheduled_events.acknowledge(&subscription, 1, frame["seq"].as_u64().unwrap()));
             if let Some(kind) = frame["payload"]["type"].as_str() { types.push(kind.to_string()); }
         }
         assert!(types.iter().any(|kind| kind == "run_started"));
@@ -6571,6 +6813,75 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     }
 
     #[test]
+    fn session_relay_waits_for_ack_before_next_frame() {
+        let ack = Arc::new(SessionRelayAck::default());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |message| { tx.send(message).unwrap(); Ok(()) });
+        let worker_ack = Arc::clone(&ack);
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            assert!(worker_ack.forward(&channel, json!({"seq":1}), 1, &worker_stop, Duration::from_secs(2)));
+            assert!(worker_ack.forward(&channel, json!({"seq":2}), 2, &worker_stop, Duration::from_secs(2)));
+        });
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(30)).is_err(), "second frame must wait for ACK");
+        assert!(!ack.acknowledge(2));
+        assert!(ack.acknowledge(1));
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ack.acknowledge(2));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn session_relay_ack_handles_early_duplicate_future_loss_and_stop() {
+        let ack = Arc::new(SessionRelayAck::default());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let early = Arc::clone(&ack);
+        let channel = Channel::new(move |_| { assert!(early.acknowledge(1)); Ok(()) });
+        assert!(!ack.acknowledge(1), "future ACK cannot open the window");
+        assert!(ack.forward(&channel, json!({"seq":1}), 1, &stop, Duration::from_millis(100)));
+        assert!(ack.acknowledge(1), "duplicate ACK is harmless");
+        assert!(!ack.acknowledge(3), "future ACK is rejected");
+        let silent = Channel::new(|_| Ok(()));
+        assert!(!ack.forward(&silent, json!({"seq":2}), 2, &stop, Duration::from_millis(10)), "lost ACK closes the window");
+        stop.store(true, Ordering::SeqCst);
+        assert!(!ack.forward(&silent, json!({"seq":3}), 3, &stop, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn scheduled_channel_ack_through_dispatch_checks_epoch() {
+        let state = state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body| { let _ = tx.send(body); Ok(()) });
+        let subscription = state.scheduled_events.subscribe(channel).unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let request = |epoch, seq| json!({"v":1,"id":"ack","op":"tasks.ackEvents","args":{"subscriptionId":subscription,"epoch":epoch,"seq":seq}});
+        assert_eq!(send(&state, request(2, 1))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request(1, 2))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request(1, 1))["ok"], true);
+        state.scheduled_events.unsubscribe(&subscription);
+    }
+
+    #[test]
+    fn session_relay_capacity_rejects_before_subscription() {
+        let state = state();
+        let permits: Vec<_> = (0..IPC_MAX_SESSION_RELAYS)
+            .map(|_| Arc::clone(&state.session_relay_gate).try_acquire_owned().unwrap())
+            .collect();
+        let channel = Channel::new(|_| Ok(()));
+        for _ in 0..1000 {
+            let response = subscribe_session_events(&state, "missing".into(), channel.clone());
+            assert_eq!(response["error"]["reason"], "stream_not_admitted");
+        }
+        assert!(state.event_relays.lock().unwrap().is_empty());
+        drop(permits);
+        let response = subscribe_session_events(&state, "missing".into(), channel);
+        assert_eq!(response["error"]["code"], "not_found");
+        assert_eq!(state.session_relay_gate.available_permits(), IPC_MAX_SESSION_RELAYS);
+    }
+
+    #[test]
     fn dispatch_saturation_rejects_before_execution_and_recovers() {
         let state = Arc::new(state());
         let permits: Vec<_> = (0..IPC_MAX_CONCURRENT_DISPATCH)
@@ -6587,6 +6898,20 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             Arc::clone(&state), json!({"v":1,"id":"cleanup","op":"tasks.unsubscribe","args":{"subscriptionId":"missing"}}),
         ));
         assert_eq!(control["ok"], true, "cleanup has reserved capacity: {control}");
+        for (op, args) in [
+            ("agent.interrupt", json!({"session":"missing"})),
+            ("agent.command", json!({"session":"missing", "type":"abort"})),
+            ("mcp.signInCancel", json!({})),
+        ] {
+            let result = tauri::async_runtime::block_on(dispatch_envelope_gated(
+                Arc::clone(&state), json!({"v":1,"id":"stop","op":op,"args":args}),
+            ));
+            assert_ne!(result["error"]["reason"], "dispatch_not_admitted", "Stop used reserved capacity: {result}");
+        }
+        let prompt = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"prompt","op":"agent.command","args":{"session":"missing","type":"prompt"}}),
+        ));
+        assert_eq!(prompt["error"]["reason"], "dispatch_not_admitted");
         let control_permits: Vec<_> = (0..IPC_MAX_CONCURRENT_CONTROL)
             .map(|_| Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap())
             .collect();
@@ -6656,7 +6981,10 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         for path in [&agent, &project, &package] { std::fs::create_dir_all(path).unwrap(); }
         std::fs::write(package.join("package.json"), r#"{"name":"fixture","version":"1.0.0"}"#).unwrap();
         std::fs::write(agent.join("settings.json"), json!({"packages": [package]}).to_string()).unwrap();
-        let managed = dir.path().join("managed");
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&managed).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
@@ -6988,6 +7316,11 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         BufReader::new(fixture.0.stdout.take().unwrap()).read_line(&mut url).unwrap();
         let url = url.trim();
         assert!(url.starts_with("http://127.0.0.1:"));
+        let mut second_fixture = Fixture(Command::new("node").arg("../scripts/migration/mcp-oauth-fixture.mjs").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut second_url = String::new();
+        BufReader::new(second_fixture.0.stdout.take().unwrap()).read_line(&mut second_url).unwrap();
+        let second_url = second_url.trim();
+        assert_ne!(url, second_url);
         let state = state();
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
@@ -6996,7 +7329,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&managed).unwrap();
         symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
-        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"signout":{"url":url},"exit":{"url":url}}}).to_string()).unwrap();
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"alias":{"url":url},"plain":{"url":url,"headers":{"Authorization":"Bearer fixture"}},"signout":{"url":second_url},"exit":{"url":second_url}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable, agent_dir: Some(agent.clone()),
@@ -7004,9 +7337,15 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string())],
         });
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let plain = call("mcp.test", json!({"scope":"global","name":"plain"}));
+        assert_eq!(plain["ok"], true, "{plain}");
+        assert!(plain["data"].get("credentialOutcomeUnknown").is_none(), "settled non-OAuth probe: {plain}");
+        assert!(plain["data"].get("_probeReceipt").is_none(), "private receipt is never exposed");
         let start = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
         assert_eq!(start["ok"], true, "{start}");
         let handle = start["data"]["flowId"].as_str().unwrap().to_string();
+        let joined = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
+        assert_eq!(joined["data"]["flowId"], handle, "same guarded target joins the existing task: {joined}");
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let waiting = loop {
             let status = call("mcp.signInStatus", json!({"flowId":handle}));
@@ -7057,11 +7396,19 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             assert!(std::time::Instant::now() < deadline, "{status}");
             std::thread::sleep(Duration::from_millis(50));
         }
+        let probe = call("mcp.test", json!({"scope":"global","name":"fixture"}));
+        assert_eq!(probe["ok"], true, "{probe}");
+        assert!(probe["data"].get("credentialOutcomeUnknown").is_none(), "settled credential receipt should finish normally: {probe}");
+        assert!(probe["data"].get("_probeReceipt").is_none(), "private receipt is never exposed");
+        assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
         let out = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"fixture"}));
         assert_eq!(out["data"]["signedOut"]["removed"], true, "{out}");
         let start = call("mcp.signInStart", json!({"scope":"global","name":"cancel"}));
         let cancelled = call("mcp.signInCancel", json!({"flowId":start["data"]["flowId"]}));
         assert_eq!(cancelled["data"]["phase"], "cancelled", "{cancelled}");
+        let alias = call("mcp.signInStart", json!({"scope":"global","name":"alias"}));
+        assert_eq!(alias["ok"], false, "shared legacy URL cannot be treated as independent: {alias}");
+        assert!(alias["error"]["message"].as_str().unwrap_or("").contains("busy"), "{alias}");
         let start = call("mcp.signInStart", json!({"scope":"global","name":"signout"}));
         assert_eq!(start["ok"], true, "{start}");
         let handle = start["data"]["flowId"].as_str().unwrap();
@@ -7096,6 +7443,20 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             assert!(std::time::Instant::now() < close_deadline, "callback listener survived child shutdown");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let restarted = IpcHostState::new();
+        *restarted.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *restarted.management_config.lock().unwrap() = Some(config);
+        let refused = send(&restarted, json!({"v":1,"id":"restarted","op":"mcp.signInStart","args":{"scope":"global","name":"exit"}}));
+        assert_eq!(refused["ok"], false, "a new instance cannot claim the old writer: {refused}");
+        let pending = management_host::ledger::OperationLedger::inspect(&agent).unwrap();
+        assert!(!pending.is_empty());
+        for entry in std::fs::read_dir(agent.join("pi-web/management-operations")).unwrap() {
+            let record = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!record.contains("access-"));
+            assert!(!record.contains("refresh-"));
+            assert!(!record.contains("http://"));
+        }
+        restarted.management.shutdown_all(Duration::from_secs(5));
         state.management.shutdown_all(Duration::from_secs(5));
     }
 
@@ -7974,12 +8335,16 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     }
     /// A Channel that records every frame it is sent (the relay's own
     /// serialization path: InvokeResponseBody::Json).
-    fn recording_channel() -> (Channel<Value>, Arc<Mutex<Vec<Value>>>) {
+    fn recording_channel(state: &IpcHostState) -> (Channel<Value>, Arc<Mutex<Vec<Value>>>) {
+        let relays = Arc::clone(&state.event_relays);
         let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&frames);
         let channel = Channel::new(move |message| {
             if let tauri::ipc::InvokeResponseBody::Json(text) = message {
                 if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                    if let (Some(id), Some(seq)) = (frame["subscriptionId"].as_str(), frame["seq"].as_u64()) {
+                        if let Some(ack) = relays.lock().unwrap().get(id).and_then(|handle| handle.ack.clone()) { ack.acknowledge(seq); }
+                    }
                     sink.lock().unwrap().push(frame);
                 }
             }
@@ -8008,9 +8373,74 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     }
 
     #[test]
+    fn running_ack_window_isolated_and_rejects_invalid_generation() {
+        let state = state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slow = Channel::new(move |body| { let _ = tx.send(body); Ok(()) });
+        let slow_id = subscribe_running(&state, slow, Duration::from_secs(60))["subscriptionId"].as_str().unwrap().to_string();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (fast, frames) = recording_channel(&state);
+        let fast_id = subscribe_running(&state, fast, Duration::from_secs(60))["subscriptionId"].as_str().unwrap().to_string();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(2)));
+        let request = |id: &str, epoch, seq| json!({"v":1,"id":"ack","op":"agent.ackRunning","args":{"subscriptionId":id,"epoch":epoch,"seq":seq}});
+        assert_eq!(send(&state, request(&slow_id, 2, 1))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request(&slow_id, 1, 2))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, request("run-old-generation", 1, 1))["error"]["code"], "invalid_args");
+        assert_eq!(send(&state, json!({"v":1,"id":"old","op":"agent.ackEvents","args":{"subscriptionId":slow_id,"seq":1}}))["error"]["code"], "invalid_args");
+        bump_session_list_version(&state);
+        assert!(wait_for_frames(&frames, 2, Duration::from_secs(2)), "slow subscription cannot block the fast one");
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err(), "no second unacknowledged frame");
+        assert_eq!(send(&state, request(&slow_id, 1, 1))["ok"], true);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        unsubscribe_running(&state, &slow_id);
+        unsubscribe_running(&state, &fast_id);
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn running_relay_admission_and_ack_timeout_release() {
+        let state = state();
+        let mut ids = Vec::new();
+        for _ in 0..IPC_MAX_RUNNING_RELAYS {
+            let reply = subscribe_running(&state, Channel::new(|_| Ok(())), Duration::from_secs(60));
+            ids.push(reply["subscriptionId"].as_str().unwrap().to_string());
+        }
+        let refused = subscribe_running(&state, Channel::new(|_| Ok(())), Duration::from_secs(60));
+        assert_eq!(refused["error"]["reason"], "stream_not_admitted");
+        for id in ids { unsubscribe_running(&state, &id); }
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let channel = Channel::new(move |body| { let _ = tx.send(body); Ok(()) });
+        let reply = subscribe_running_with_timeout(&state, channel, Duration::from_secs(60), Duration::from_millis(30));
+        assert!(reply["subscriptionId"].is_string());
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reset = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let tauri::ipc::InvokeResponseBody::Json(text) = reset else { panic!("expected JSON") };
+        let reset: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(reset["kind"], "reset");
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+        assert_eq!(state.running_relay_gate.available_permits(), IPC_MAX_RUNNING_RELAYS);
+    }
+
+    #[test]
+    fn running_oversized_transition_forces_resync_without_sending_payload() {
+        let state = state();
+        let (channel, frames) = recording_channel(&state);
+        let reply = subscribe_running(&state, channel, Duration::from_secs(60));
+        let id = reply["subscriptionId"].as_str().unwrap();
+        assert!(wait_for_frames(&frames, 1, Duration::from_secs(2)));
+        state.registry.running_signal().notify_transition(&"x".repeat(RUNNING_MAX_FRAME_BYTES), true);
+        assert!(wait_for_frames(&frames, 2, Duration::from_secs(2)));
+        assert_eq!(frames.lock().unwrap()[1]["payload"]["resync"], true);
+        assert!(serde_json::to_writer(&mut RunningFrameSize(512), &vec!["x".repeat(RUNNING_MAX_FRAME_BYTES)]).is_err());
+        unsubscribe_running(&state, id);
+        assert!(wait_for_relay_threads(&state, 0, Duration::from_secs(2)));
+    }
+
+    #[test]
     fn subscribe_running_first_frame_is_the_observation_at_subscribe_time() {
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(
@@ -8037,7 +8467,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn subscribe_running_emits_one_frame_per_change_and_nothing_between() {
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8075,7 +8505,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // (a page reload never unsubscribes): without it the relay would
         // sleep forever holding its registry entry.
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_millis(1_200));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8100,10 +8530,16 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // (the WebView went away between two frames).
         let sends = Arc::new(Mutex::new(0usize));
         let counter = Arc::clone(&sends);
-        let channel = Channel::new(move |_| {
+        let relays = Arc::clone(&state.event_relays);
+        let channel = Channel::new(move |body| {
             let mut count = counter.lock().unwrap();
             *count += 1;
             if *count == 1 {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let id = frame["subscriptionId"].as_str().unwrap();
+                    if let Some(ack) = relays.lock().unwrap().get(id).and_then(|handle| handle.ack.clone()) { ack.acknowledge(1); }
+                }
                 Ok(())
             } else {
                 Err(tauri::Error::Io(std::io::Error::new(
@@ -8134,7 +8570,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn subscribe_running_unsubscribe_ends_the_relay_and_frees_the_entry() {
         let state = state();
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8173,7 +8609,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
     }
 
-    fn gated_channel(block_at: u64) -> GatedChannel {
+    fn gated_channel(state: &IpcHostState, block_at: u64) -> GatedChannel {
+        let relays = Arc::clone(&state.event_relays);
         let frames: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let sends_entered = Arc::new(AtomicU64::new(0));
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
@@ -8191,6 +8628,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             }
             if let tauri::ipc::InvokeResponseBody::Json(text) = message {
                 if let Ok(frame) = serde_json::from_str::<Value>(&text) {
+                    if let (Some(id), Some(seq)) = (frame["subscriptionId"].as_str(), frame["seq"].as_u64()) {
+                        if let Some(ack) = relays.lock().unwrap().get(id).and_then(|handle| handle.ack.clone()) { ack.acknowledge(seq); }
+                    }
                     sink.lock().unwrap().push(frame);
                 }
             }
@@ -8246,7 +8686,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn a_short_run_that_settled_while_a_send_was_blocked_is_replayed() {
         let state = state();
-        let gated = gated_channel(1);
+        let gated = gated_channel(&state, 1);
         let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         // The relay is now deterministically stuck INSIDE its first send.
@@ -8301,7 +8741,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn a_ring_gap_forces_one_resync_frame_instead_of_replaying_the_burst() {
         let state = state();
-        let gated = gated_channel(1);
+        let gated = gated_channel(&state, 1);
         let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(gated.wait_sends(1, Duration::from_secs(5)));
@@ -8331,6 +8771,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             "the resync frame is the current net observation (the fabricated sessions never existed): {:?}",
             frames[1]
         );
+        assert_eq!(frames[1]["payload"]["resync"], true);
         drop(frames);
         let done = unsubscribe_running(&state, &subscription_id);
         assert_eq!(done["ok"], true, "{done}");
@@ -8346,7 +8787,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn unsubscribing_a_quiet_running_relay_ends_its_thread_at_once() {
         let state = state();
         let baseline = state.running_relay_threads.load(Ordering::SeqCst);
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         assert!(wait_for_frames(&frames, 1, Duration::from_secs(5)));
@@ -8373,7 +8814,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     #[test]
     fn unsubscribing_with_replay_pending_delivers_at_most_one_more_frame() {
         let state = state();
-        let gated = gated_channel(2);
+        let gated = gated_channel(&state, 2);
         let ack = subscribe_running(&state, gated.channel.clone(), Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         // Frame 1 (the initial snapshot) passes the gate untouched.
@@ -9480,6 +9921,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
 
+        state.propose_path(&cwd).expect("host-authorized fixture root");
+
         // Two sessions, both prompted at the stalled endpoint: each holds
         // the running set while its model call hangs.
         let mut ids: Vec<String> = Vec::new();
@@ -9498,7 +9941,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         sorted_expected.sort();
 
         // Subscribe: the first frame lists both ids sorted.
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));
         let subscription_id = ack["subscriptionId"].as_str().expect("subscriptionId").to_string();
         let mut both_running = false;
@@ -9639,6 +10082,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
 
+        state.propose_path(&cwd).expect("host-authorized fixture root");
+
         // The session exists (and its child is up) BEFORE the subscription,
         // so the first frame is a settled observation and the ONLY later
         // changes are the prompt's start and settle transitions.
@@ -9651,7 +10096,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(created["ok"], true, "{created}");
         let session_id = created["data"]["sessionId"].as_str().expect("id").to_string();
 
-        let (channel, frames) = recording_channel();
+        let (channel, frames) = recording_channel(&state);
         // A 60 s probe: within the test window ONLY the running signal can
         // deliver a frame — this is exactly what the test asserts.
         let ack = subscribe_running(&state, channel, Duration::from_secs(60));

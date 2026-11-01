@@ -434,6 +434,8 @@ export interface McpTestResponse extends McpServerRef {
   /** The `configKey` of the entry the test read; the result belongs to that entry only. */
   configKey: string;
   result: McpTestResult;
+  /** The connection result is known, but credential side effects may remain unresolved. */
+  credentialOutcomeUnknown?: true;
 }
 
 export type McpUnavailableReason = "operator-disabled" | "internals-unavailable" | "builtin-disabled";

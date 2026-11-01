@@ -139,12 +139,11 @@ test("seq ordering, stale generations, and generation bumps", () => {
   const errors = [];
   source.onmessage = (message) => events.push(JSON.parse(message.data));
   source.onerror = () => errors.push("error");
-  // The FIRST frame establishes the generation (no error, no drop).
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 5, kind: "event", payload: { type: "a" } });
-  assert.equal(events.length, 1, "the first frame adopts its epoch");
+  // Every subscription starts with an atomic snapshot at seq 1.
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 1, kind: "snapshot", payload: { state: {} } });
+  assert.equal(events.length, 1, "the snapshot adopts its epoch");
   // Replayed/older seq within the generation never deliver.
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 5, kind: "event", payload: { type: "dup" } });
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 4, kind: "event", payload: { type: "old" } });
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 1, kind: "event", payload: { type: "dup" } });
   assert.equal(events.length, 1, "replayed/older seq frames never deliver");
   // A frame from an OLDER generation is stale: silently dropped.
   deliver({ subscriptionId: "sub", epoch: 1, seq: 99, kind: "event", payload: { type: "stale" } });
@@ -154,11 +153,34 @@ test("seq ordering, stale generations, and generation bumps", () => {
   // (error → reconnect), never quietly re-base and continue.
   deliver({ subscriptionId: "sub", epoch: 3, seq: 1, kind: "event", payload: { type: "fresh" } });
   assert.equal(errors.length, 1, "a generation bump surfaces as an error");
-  assert.equal(events.length, 1, "the bumped frame itself never delivers");
-  // A reset frame is an error → the connection layer reconnects.
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 6, kind: "reset", payload: null });
-  assert.equal(errors.length, 2);
+  assert.equal(events.length, 2, "the gap is surfaced for reconciliation");
+  assert.equal(events[1].type, "stream_gap");
+  // Once invalidated, stale delivery cannot resume this subscription.
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 2, kind: "event", payload: { type: "late" } });
+  assert.equal(errors.length, 1);
+  assert.equal(events.length, 2);
   source.close();
+});
+
+test("missing sequence, non-snapshot first frame, and reset require reconnect", () => {
+  for (const frames of [
+    [{ epoch: 1, seq: 1, kind: "snapshot", payload: { state: {} } }, { epoch: 1, seq: 3, kind: "event", payload: { type: "skipped" } }],
+    [{ epoch: 1, seq: 1, kind: "event", payload: { type: "before-snapshot" } }],
+    [{ epoch: 1, seq: 1, kind: "snapshot", payload: { state: {} } }, { epoch: 1, seq: 2, kind: "reset", payload: null }],
+  ]) {
+    const { source, deliver } = framedSource();
+    let errors = 0;
+    const events = [];
+    source.onmessage = (message) => events.push(JSON.parse(message.data));
+    source.onerror = () => { errors++; };
+    for (const frame of frames) deliver({ subscriptionId: "sub", ...frame });
+    assert.equal(errors, 1);
+    assert.equal(events.filter((event) => event.type === "stream_gap").length, 1);
+    assert.ok(!events.some((event) => event.type === "skipped" || event.type === "before-snapshot"));
+    deliver({ subscriptionId: "sub", epoch: 1, seq: 2, kind: "event", payload: { type: "late" } });
+    assert.ok(!events.some((event) => event.type === "late"));
+    source.close();
+  }
 });
 
 test("the connected event carries pendingExtensionUiIds (the SSE contract)", () => {
@@ -234,6 +256,138 @@ test("agent-client failures keep the HTTP-shaped error contract", async () => {
     .then(() => null, (caught) => caught);
   assert.ok(aborted instanceof AgentCommandError, String(aborted));
   assert.match(aborted.message, /aborted/);
+});
+
+test("session frames are acknowledged after delivery even before subscribe ACK; close detaches", async () => {
+  let callback;
+  let finishSubscribe;
+  const calls = [];
+  const events = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 41; },
+    unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_subscribe_events") {
+        callback({ index: 0, message: { subscriptionId: "sub-early", epoch: 1, seq: 1, kind: "snapshot", payload: {} } });
+        return new Promise((resolve) => { finishSubscribe = resolve; });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    const transport = detectTransport().transport;
+    const close = transport.subscribe("agent.subscribeEvents", { session: "s" }, () => events.push("delivered"), () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "agent.ackEvents"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.deepEqual(events, ["delivered"]);
+    const ack = calls.find((call) => call.args?.request?.op === "agent.ackEvents");
+    assert.deepEqual(ack?.args.request.args, { subscriptionId: "sub-early", seq: 1 });
+    close();
+    finishSubscribe({ subscriptionId: "sub-early" });
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "agent.unsubscribeEvents"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(calls.some((call) => call.args?.request?.op === "agent.unsubscribeEvents"));
+    callback({ index: 1, message: { subscriptionId: "sub-early", epoch: 1, seq: 2, kind: "event", payload: {} } });
+    assert.equal(events.length, 1, "late frame cannot deliver or create another ACK");
+    assert.equal(calls.filter((call) => call.args?.request?.op === "agent.ackEvents").length, 1);
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
+});
+
+test("scheduled Channel frames ACK with epoch after delivery and unsubscribe", async () => {
+  let callback;
+  const calls = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 42; }, unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_subscribe_scheduled") {
+        callback({ index: 0, message: { subscriptionId: "tasks-1", epoch: 1, seq: 1, kind: "snapshot", payload: {} } });
+        return Promise.resolve({ subscriptionId: "tasks-1", epoch: 1 });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    let delivered = false;
+    const close = detectTransport().transport.subscribe("tasks.subscribeEvents", undefined, () => { delivered = true; }, () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "tasks.ackEvents"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(delivered);
+    assert.deepEqual(calls.find((call) => call.args?.request?.op === "tasks.ackEvents").args.request.args, { subscriptionId: "tasks-1", epoch: 1, seq: 1 });
+    close();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(calls.some((call) => call.args?.request?.op === "tasks.unsubscribe"));
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
+});
+
+test("running Channel acknowledges with epoch and unsubscribes after delivery", async () => {
+  let callback;
+  const calls = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 43; }, unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_subscribe_running") {
+        callback({ index: 0, message: { subscriptionId: "run-nonce", epoch: 1, seq: 1, kind: "snapshot", payload: {} } });
+        return Promise.resolve({ subscriptionId: "run-nonce" });
+      }
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    let delivered = false;
+    const close = detectTransport().transport.subscribe("agent.subscribeRunning", undefined, () => { delivered = true; }, () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !calls.some((call) => call.args?.request?.op === "agent.ackRunning"); n++) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(delivered);
+    assert.deepEqual(calls.find((call) => call.args?.request?.op === "agent.ackRunning").args.request.args, { subscriptionId: "run-nonce", epoch: 1, seq: 1 });
+    close();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(calls.some((call) => call.args?.request?.op === "agent.unsubscribeEvents"));
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
+});
+
+test("running ACK control calls stay single-flight and coalesce pending frames", async () => {
+  let callback;
+  let finishAck;
+  const calls = [];
+  const previousWindow = globalThis.window;
+  globalThis.window = { __TAURI_INTERNALS__: {
+    transformCallback(fn) { callback = fn; return 44; }, unregisterCallback() {},
+    invoke(command, args) {
+      calls.push({ command, args });
+      if (command === "pi_ipc_subscribe_running") return Promise.resolve({ subscriptionId: "run-nonce" });
+      if (args?.request?.op === "agent.ackRunning" && !finishAck) return new Promise((resolve) => { finishAck = resolve; });
+      return Promise.resolve({ ok: true });
+    },
+  } };
+  try {
+    overrideTransportForTests(undefined);
+    const close = detectTransport().transport.subscribe("agent.subscribeRunning", undefined, () => {}, () => assert.fail("unexpected error"));
+    for (let n = 0; n < 20 && !callback; n++) await new Promise((r) => setTimeout(r, 5));
+    for (let n = 1; n <= 3; n++) callback({ index: n - 1, message: { subscriptionId: "run-nonce", epoch: 1, seq: n, kind: n === 1 ? "snapshot" : "event", payload: {} } });
+    for (let n = 0; n < 20 && !finishAck; n++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(calls.filter((call) => call.args?.request?.op === "agent.ackRunning").length, 1);
+    finishAck({ ok: true });
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(calls.filter((call) => call.args?.request?.op === "agent.ackRunning").map((call) => call.args.request.args.seq), [1, 3]);
+    close();
+  } finally {
+    globalThis.window = previousWindow;
+    overrideTransportForTests(undefined);
+  }
 });
 
 // --- the subscribe ACK contract (a refused stream must reach onError) ------

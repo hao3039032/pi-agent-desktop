@@ -57,6 +57,7 @@ function harness() {
     compactResult: null,
     liveThinkingLevel: null,
     loadedSessions: [],
+    sessionLoads: [],
   };
   const bashRunningRef = { current: true };
   const agentRunningRef = { current: false };
@@ -64,7 +65,7 @@ function harness() {
   const sessionIdRef = { current: "s1" };
   const setSummarizationRetry = (v) => { state.summarizationRetry = v; };
   const setPendingBash = (updater) => { state.pendingBash = updater(state.pendingBash); };
-  const loadSession = (sid) => { state.loadedSessions.push(sid); };
+  const loadSession = (sid, ...args) => { state.loadedSessions.push(sid); state.sessionLoads.push([sid, ...args]); };
   const forkHandler = handleForkAgentEvent.runInNewContext({
     sessionIdRef,
     agentRunningRef,
@@ -122,6 +123,12 @@ function harness() {
   });
   return { handler, state, bashRunningRef, agentRunningRef };
 }
+
+test("stream gap requests a fresh session and live-state reconciliation", () => {
+  const { handler, state } = harness();
+  handler({ type: "stream_gap" });
+  assert.deepEqual(JSON.parse(JSON.stringify(state.sessionLoads)), [["s1", false, true, { force: true, fresh: true }]]);
+});
 
 test("bash_execution_update accumulates live output into the pending bash bubble", () => {
   const { handler, state } = harness();

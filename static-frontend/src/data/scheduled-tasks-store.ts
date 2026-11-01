@@ -88,14 +88,39 @@ export function onScheduledTaskEvent(handler: (event: ScheduledTaskEvent) => voi
 }
 
 function connectScheduledStream(): void {
-    stopStream = clientForTasks().subscribe<ScheduledTaskEvent>("tasks.subscribeEvents", undefined, (frame) => {
-      if (frame.kind === "reset") {
-        streamError = "Scheduled task event stream overflowed; reload to reconnect";
-        setState({ error: streamError, runningTaskIds: new Set() });
-        void refreshScheduledTasks();
-        scheduleStreamReconnect();
+    let active = true;
+    let streamId: string | null = null;
+    let epoch = 0;
+    let seq = 0;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const invalidate = () => {
+      if (!active) return;
+      active = false;
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
+      streamError = "Scheduled task event stream interrupted; reconnecting";
+      setState({ error: streamError, runningTaskIds: new Set() });
+      void refreshScheduledTasks();
+      scheduleStreamReconnect();
+    };
+    const armWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(invalidate, 45_000);
+    };
+    armWatchdog();
+    const dispose = clientForTasks().subscribe<ScheduledTaskEvent>("tasks.subscribeEvents", undefined, (frame) => {
+      if (!active) return;
+      if ((frame.kind !== "snapshot" && frame.kind !== "event" && frame.kind !== "heartbeat") || typeof frame.subscriptionId !== "string" || !frame.subscriptionId
+          || !Number.isSafeInteger(frame.seq) || !Number.isSafeInteger(frame.epoch) || frame.epoch < 1
+          || (seq === 0 ? frame.kind !== "snapshot" || frame.seq !== 1
+            : frame.kind === "snapshot" || frame.subscriptionId !== streamId || frame.epoch !== epoch || frame.seq !== seq + 1)) {
+        invalidate();
         return;
       }
+      streamId = frame.subscriptionId;
+      epoch = frame.epoch;
+      seq = frame.seq;
+      armWatchdog();
       if (frame.kind === "snapshot") {
         streamError = null;
         setState({ error: null });
@@ -116,7 +141,8 @@ function connectScheduledStream(): void {
       setState({ runningTaskIds: running, ...(event.type === "scheduler_owner" ? { schedulerOwner: event.owner } : {}) });
       for (const handler of eventHandlers) handler(event);
       void refreshScheduledTasks();
-    }, (error) => { streamError = error.message; setState({ error: streamError }); scheduleStreamReconnect(); });
+    }, (error) => { if (active) { invalidate(); streamError = error.message; setState({ error: streamError }); } });
+    stopStream = () => { active = false; if (watchdog) clearTimeout(watchdog); watchdog = null; dispose(); };
 }
 
 function scheduleStreamReconnect(): void {

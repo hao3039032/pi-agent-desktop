@@ -51,31 +51,61 @@ export async function fetchSessionList(_options: {
  * stream error resubscribes after the same 1.5s the SSE version used (the
  * host relay ends on channel death; a fresh subscription re-snapshots).
  */
-export function subscribeRunningSessions(onFrame: (frame: RunningSetFrame) => void): () => void {
+export function subscribeRunningSessions(onFrame: (frame: RunningSetFrame) => void, onReset?: () => void): () => void {
   let disposed = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let unsubscribe: (() => void) | null = null;
 
   const subscribe = () => {
     if (disposed) return;
-    unsubscribe = ensureClient().subscribe<IpcStreamMessage>(
-      "agent.subscribeRunning",
-      undefined,
+    let active = true;
+    let streamId: string | null = null;
+    let epoch = 0;
+    let seq = 0;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const invalidate = () => {
+      if (!active || disposed) return;
+      active = false;
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
+      onReset?.();
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        unsubscribe?.();
+        unsubscribe = null;
+        subscribe();
+      }, 1_500);
+    };
+    const armWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(invalidate, 45_000);
+    };
+    armWatchdog();
+    const close = ensureClient().subscribe<IpcStreamMessage>(
+      "agent.subscribeRunning", undefined,
       (message) => {
-        const payload = message.payload as { type?: string; runningSessionIds?: string[]; sessionListVersion?: number } | undefined;
-        if (payload?.type === "running" && Array.isArray(payload.runningSessionIds)) {
-          onFrame({
-            runningSessionIds: payload.runningSessionIds,
-            sessionListVersion: typeof payload.sessionListVersion === "number" ? payload.sessionListVersion : 0,
-          });
+        if (!active) return;
+        const payload = message.payload as { type?: string; runningSessionIds?: string[]; sessionListVersion?: number; resync?: boolean } | undefined;
+        if ((message.kind !== "snapshot" && message.kind !== "event") || typeof message.subscriptionId !== "string" || !message.subscriptionId
+            || !Number.isSafeInteger(message.seq) || !Number.isSafeInteger(message.epoch) || message.epoch < 1
+            || (seq === 0 ? message.kind !== "snapshot" || message.seq !== 1
+              : message.kind === "snapshot" || message.subscriptionId !== streamId || message.epoch !== epoch || message.seq !== seq + 1)
+            || payload?.type !== "running" || !Array.isArray(payload.runningSessionIds)
+            || !payload.runningSessionIds.every((id) => typeof id === "string") || typeof payload.sessionListVersion !== "number") {
+          invalidate();
+          return;
         }
+        streamId = message.subscriptionId;
+        epoch = message.epoch;
+        seq = message.seq;
+        armWatchdog();
+        if (payload.resync) onReset?.();
+        onFrame({ runningSessionIds: payload.runningSessionIds, sessionListVersion: payload.sessionListVersion });
       },
-      (_error: IpcError) => {
-        if (disposed) return;
-        if (reconnectTimer) clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(subscribe, 1_500);
-      },
+      (_error: IpcError) => invalidate(),
     );
+    unsubscribe = () => { active = false; if (watchdog) clearTimeout(watchdog); watchdog = null; close(); };
+    if (!active) unsubscribe();
   };
 
   subscribe();

@@ -816,6 +816,7 @@ export const enLocale: LocalePlugin = {
     "mcp.test.readOnly": "read-only",
     "mcp.test.moreTools": "{count} more not shown.",
     "mcp.test.queueTimedOut": "Another test of a server that runs a shell command did not finish in time, so this one did not start. Try again.",
+    "mcp.test.credentialOutcomeUnknown": "The connection result is available, but a credential write may still be unresolved. Do not retry uncertain changes.",
     "mcp.test.requestFailed": "Could not test the server:",
     "mcp.test.requestTimedOut": "Pi Web did not answer in time. The test may still finish; press Refresh to see its result.",
     "mcp.state.connecting": "Connecting in a session",

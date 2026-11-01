@@ -42,6 +42,7 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
   let detach: (() => void) | null = null;
   let seenSeq = 0;
   let epoch = 0;
+  let invalidated = false;
 
   const source: AgentEventSourceLike = {
     get readyState() {
@@ -68,12 +69,18 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
       new MessageEvent("message", { data: JSON.stringify(event) }) as MessageEvent<string>,
     );
   };
+  const invalidate = () => {
+    invalidated = true;
+    // A reconnect snapshot alone does not contain the transcript.
+    deliver({ type: "stream_gap" });
+    source.onerror?.(new Event("error"));
+  };
 
   detach = client.subscribe<IpcStreamMessage>(
     "agent.subscribeEvents",
     { session: sessionId },
     (frame: IpcStreamMessage) => {
-      if (disposed) return;
+      if (disposed || invalidated) return;
       // The frame epoch is the STREAM GENERATION (protocol doc: 宿主纪元
       // ——宿主重启/重置后递增). Within one subscription the host never
       // changes it; a frame that does is a RESET signal, never a reason to
@@ -91,13 +98,17 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
           // A NEW generation mid-stream: the stream identity changed, the
           // incremental view is unreliable — surface as an error → close →
           // reconnect (the new subscription's snapshot re-synchronizes).
-          source.onerror?.(new Event("error"));
+          invalidate();
           return;
         }
       }
-      // Same generation: the seq is monotonic per subscription. A replayed
-      // or older seq is a hole/gap — never deliver out of order.
+      // Replays are harmless; a missing frame is not. Refuse the remainder
+      // until reconnect obtains a new snapshot instead of silently skipping it.
       if (frame.seq <= seenSeq) return;
+      if (frame.seq !== seenSeq + 1 || (seenSeq === 0 && frame.kind !== "snapshot")) {
+        invalidate();
+        return;
+      }
       seenSeq = frame.seq;
 
       if (frame.kind === "snapshot") {
@@ -123,7 +134,7 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
         // A reset means the consumer's incremental view is unreliable: the
         // connection layer models this as an error → close → reconnect with
         // a fresh subscription (whose snapshot re-synchronizes it).
-        source.onerror?.(new Event("error"));
+        invalidate();
         return;
       }
       readyState = OPEN;

@@ -1166,6 +1166,10 @@ test("a test request leaves its last answer standing when it fails or never left
   });
   const next = { ...response, result: testStatus("failed") };
   assert.deepEqual(mcpTestRunAfter(previous, { ok: true, data: next }, "k"), { running: false, response: next });
+  const unknown = { ...response, credentialOutcomeUnknown: true };
+  assert.deepEqual(mcpTestRunAfter(previous, { ok: true, data: unknown }, "k"), { running: false, response: unknown, credentialOutcomeUnknown: true });
+  const queuedUnknown = { ...response, credentialOutcomeUnknown: true, result: testStatus("failed", { queueTimedOut: true }) };
+  assert.equal(mcpTestRunAfter(previous, { ok: true, data: queuedUnknown }, "k").credentialOutcomeUnknown, true);
   assert.deepEqual(mcpTestRunAfter(undefined, { ok: false, error: { error: "x" } }), { running: false, error: { error: "x" } });
 });
 

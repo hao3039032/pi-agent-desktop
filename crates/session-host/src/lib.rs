@@ -85,12 +85,19 @@ pub struct RunningTransition {
 struct RunningSignalState {
     epoch: u64,
     next_seq: u64,
+    dropped_through: u64,
+    ring_bytes: usize,
     ring: std::collections::VecDeque<RunningTransition>,
 }
 
 /// How many transitions the replay ring keeps (bounded memory; beyond it
 /// consumers get a gap and re-derive from a full snapshot).
 const RUNNING_TRANSITION_RING: usize = 512;
+const RUNNING_TRANSITION_BYTES: usize = 1024 * 1024;
+
+fn running_transition_bytes(session: &str) -> usize {
+    std::mem::size_of::<RunningTransition>().saturating_add(session.len())
+}
 
 impl Default for RunningSignal {
     fn default() -> Self {
@@ -98,6 +105,8 @@ impl Default for RunningSignal {
             state: std::sync::Mutex::new(RunningSignalState {
                 epoch: 0,
                 next_seq: 0,
+                dropped_through: 0,
+                ring_bytes: 0,
                 ring: std::collections::VecDeque::new(),
             }),
             cv: std::sync::Condvar::new(),
@@ -122,13 +131,19 @@ impl RunningSignal {
         state.epoch += 1;
         state.next_seq += 1;
         let seq = state.next_seq;
-        state.ring.push_back(RunningTransition {
-            seq,
-            session: session.to_string(),
-            running,
-        });
-        while state.ring.len() > RUNNING_TRANSITION_RING {
-            state.ring.pop_front();
+        let size = running_transition_bytes(session);
+        if size > RUNNING_TRANSITION_BYTES {
+            state.ring.clear();
+            state.ring_bytes = 0;
+            state.dropped_through = seq;
+        } else {
+            while state.ring.len() >= RUNNING_TRANSITION_RING || state.ring_bytes + size > RUNNING_TRANSITION_BYTES {
+                let dropped = state.ring.pop_front().expect("the ring has an entry to evict");
+                state.ring_bytes -= running_transition_bytes(&dropped.session);
+                state.dropped_through = dropped.seq;
+            }
+            state.ring.push_back(RunningTransition { seq, session: session.to_string(), running });
+            state.ring_bytes += size;
         }
         drop(state);
         self.cv.notify_all();
@@ -161,12 +176,7 @@ impl RunningSignal {
     /// missed and must fall back to a full re-derivation (a resync).
     pub fn changes_since(&self, seen_seq: u64) -> (Vec<RunningTransition>, bool) {
         let state = self.state.lock().unwrap();
-        let Some(oldest) = state.ring.front() else {
-            // Empty = nothing was EVER recorded (overflow never empties
-            // the ring) — nothing to replay, no gap possible.
-            return (Vec::new(), false);
-        };
-        if oldest.seq > seen_seq + 1 {
+        if seen_seq < state.dropped_through {
             return (Vec::new(), true);
         }
         (
@@ -251,7 +261,39 @@ struct SessionState {
     started_at: Instant,
     last_active: Instant,
     subscribers: Vec<(u64, std::sync::mpsc::Sender<Value>)>,
+    bounded_subscribers: Vec<BoundedSubscriber>,
     ui: session_ui::SessionUi,
+}
+
+/// The IPC relay's own ingress queue; downstream Tauri buffers are separate.
+pub const SESSION_RELAY_QUEUE_FRAMES: usize = 16;
+pub const SESSION_RELAY_EVENT_BYTES: usize = 256 * 1024;
+struct BoundedSubscriber {
+    id: u64,
+    tx: std::sync::mpsc::SyncSender<Value>,
+    gap: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionState {
+    fn broadcast(&mut self, event: &Value) {
+        self.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        if self.bounded_subscribers.is_empty() { return; }
+        struct Count { remaining: usize }
+        impl std::io::Write for Count {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if data.len() > self.remaining { return Err(std::io::Error::other("event exceeds relay budget")); }
+                self.remaining -= data.len();
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let fits = serde_json::to_writer(Count { remaining: SESSION_RELAY_EVENT_BYTES }, event).is_ok();
+        self.bounded_subscribers.retain(|subscriber| {
+            if fits && subscriber.tx.try_send(event.clone()).is_ok() { return true; }
+            subscriber.gap.store(true, Ordering::SeqCst);
+            false
+        });
+    }
 }
 
 impl Session {
@@ -392,6 +434,19 @@ impl Session {
         (id, rx, pending)
     }
 
+    /// Subscribe with a bounded ingress and an explicit gap flag. The caller
+    /// must reset/reconcile when the flag is raised; events are never silently
+    /// discarded as if delivery were complete.
+    pub fn subscribe_with_ui_bounded(&self) -> (u64, std::sync::mpsc::Receiver<Value>, Vec<Value>, Arc<std::sync::atomic::AtomicBool>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(SESSION_RELAY_QUEUE_FRAMES);
+        let gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = self.state.lock().unwrap();
+        let id = self.next_subscriber_id();
+        let pending = state.ui.records();
+        state.bounded_subscribers.push(BoundedSubscriber { id, tx, gap: Arc::clone(&gap) });
+        (id, rx, pending, gap)
+    }
+
     pub fn pending_ui_ids(&self) -> Vec<String> {
         self.state.lock().unwrap().ui.ids()
     }
@@ -408,7 +463,7 @@ impl Session {
         let (child_id, payload) = state.ui.answer(id, response)?;
         if !self.client.respond_ui(&child_id, payload) { return Err("session process is closed") }
         let event = json!({"type":"extension_ui_closed", "id":id});
-        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        state.broadcast(&event);
         Ok(())
     }
 
@@ -418,10 +473,10 @@ impl Session {
         if let Some((child_id, id)) = cancel {
             self.client.respond_ui(&child_id, json!({"cancelled": true}));
             let closed = json!({"type":"extension_ui_closed", "id":id});
-            state.subscribers.retain(|(_, tx)| tx.send(closed.clone()).is_ok());
+            state.broadcast(&closed);
         }
         if let Some(record) = record {
-            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+            state.broadcast(&record);
         }
     }
 
@@ -431,7 +486,7 @@ impl Session {
         for child_id in state.ui.drain() { self.client.respond_ui(&child_id, json!({"cancelled": true})); }
         for id in ids {
             let event = json!({"type":"extension_ui_closed", "id":id});
-            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+            state.broadcast(&event);
         }
     }
 
@@ -440,7 +495,7 @@ impl Session {
         for (child_id, id) in state.ui.expire() {
             self.client.respond_ui(&child_id, json!({"cancelled": true}));
             let event = json!({"type":"extension_ui_closed", "id":id});
-            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+            state.broadcast(&event);
         }
     }
 
@@ -449,7 +504,8 @@ impl Session {
     pub fn unsubscribe(&self, subscriber_id: u64) {
         let mut state = self.state.lock().unwrap();
         state.subscribers.retain(|(id, _)| *id != subscriber_id);
-        if state.subscribers.is_empty() {
+        state.bounded_subscribers.retain(|subscriber| subscriber.id != subscriber_id);
+        if state.subscribers.is_empty() && state.bounded_subscribers.is_empty() {
             for id in state.ui.drain() { self.client.respond_ui(&id, json!({"cancelled": true})); }
         }
     }
@@ -502,7 +558,7 @@ impl Session {
     pub(crate) fn emit_host_event(&self, event: Value) {
         let mut state = self.state.lock().unwrap();
         state.last_active = Instant::now();
-        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        state.broadcast(&event);
     }
 
     fn fan_out(self: &Arc<Self>, record: Value) {
@@ -526,7 +582,7 @@ impl Session {
         // 2. Subscribers see the raw record in arrival order.
         {
             let mut state = self.state.lock().unwrap();
-            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+            state.broadcast(&record);
         }
         // 3. Follow-ups run off the dispatch path (a slow get_state must not
         //    stall the event thread): a settle refresh is epoch-guarded when
@@ -1518,6 +1574,7 @@ fn spawn_session(
             started_at: Instant::now(),
             last_active: Instant::now(),
             subscribers: Vec::new(),
+            bounded_subscribers: Vec::new(),
             ui: session_ui::SessionUi::default(),
         }),
         epoch: AtomicU64::new(1),
@@ -2253,6 +2310,24 @@ mod running_signal_tests {
         assert!(gap, "a cursor one entry before the surviving head lost that entry");
     }
 
+    #[test]
+    fn byte_budget_evicts_and_oversized_entry_marks_a_gap_even_when_empty() {
+        let signal = RunningSignal::default();
+        let large = "x".repeat(RUNNING_TRANSITION_BYTES / 2);
+        signal.notify_transition(&large, true);
+        signal.notify_transition(&large, false);
+        assert!(signal.changes_since(0).1);
+        assert!(!signal.changes_since(1).1);
+        assert!(signal.state.lock().unwrap().ring_bytes <= RUNNING_TRANSITION_BYTES);
+        signal.notify_transition(&"y".repeat(RUNNING_TRANSITION_BYTES), true);
+        assert!(signal.state.lock().unwrap().ring.is_empty());
+        assert!(signal.changes_since(2).1);
+        assert!(!signal.changes_since(3).1);
+        signal.notify_transition("small", true);
+        assert!(signal.changes_since(2).1);
+        assert_eq!(signal.changes_since(3).0[0].session, "small");
+    }
+
     /// Nothing recorded: no transitions, no gap, and a baseline cursor of 0.
     #[test]
     fn an_untouched_signal_has_nothing_to_replay() {
@@ -2296,6 +2371,28 @@ mod dispatch_tests {
         let report = registry.shutdown_until(Instant::now());
         assert!(!report.unknown.is_empty());
         assert!(report.diagnostics.contains(&SessionShutdownDiagnostic::ScopeUnknown { scope: ShutdownScope::Sessions, session_id: None, reason: ShutdownScopeReason::UnavailableOrBusy }));
+    }
+
+    #[test]
+    fn bounded_relay_ingress_signals_overflow_and_oversize() {
+        let now = Instant::now();
+        let mut state = SessionState { lease_until: now, started_at: now, last_active: now,
+            subscribers: Vec::new(), bounded_subscribers: Vec::new(), ui: session_ui::SessionUi::default() };
+        let (legacy_tx, legacy_rx) = std::sync::mpsc::channel();
+        state.subscribers.push((1, legacy_tx));
+        let (tx, rx) = std::sync::mpsc::sync_channel(SESSION_RELAY_QUEUE_FRAMES);
+        let gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.bounded_subscribers.push(BoundedSubscriber { id: 2, tx, gap: Arc::clone(&gap) });
+        for n in 0..=SESSION_RELAY_QUEUE_FRAMES { state.broadcast(&json!({"n":n})); }
+        assert!(gap.load(Ordering::SeqCst));
+        assert_eq!(rx.try_iter().count(), SESSION_RELAY_QUEUE_FRAMES);
+        assert_eq!(legacy_rx.try_iter().count(), SESSION_RELAY_QUEUE_FRAMES + 1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(SESSION_RELAY_QUEUE_FRAMES);
+        let gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.bounded_subscribers.push(BoundedSubscriber { id: 3, tx, gap: Arc::clone(&gap) });
+        state.broadcast(&json!({"text":"x".repeat(SESSION_RELAY_EVENT_BYTES)}));
+        assert!(gap.load(Ordering::SeqCst));
+        assert_eq!(rx.try_iter().count(), 0);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至 `c4b46e72` 索引预算及此前生命周期／结构化关闭报告增量整合的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至 `303da5bc` 账本／事件流受限 checkpoint 及 `c4b46e72` 索引预算整合的状态（真实 MCP 链路仍未通过）。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -42,6 +42,10 @@
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- `303da5bc` 及其管理账本/MCP admission/probe 依赖整合：保留共享 host-closing fence、in-flight operation 计数、Session 结构化诊断及 recovery 的 `sessionWriterCleanup`、`managementOperations` 两项。父代理管理 crate **31 passed / 0 failed / 0 ignored**（明确设置本地 `PI_CLI_BIN`，隔离 HOME）；session crate **49 passed / 0 failed / 1 ignored**（scan-report fixture）；Tauri 定向集最终 **40 passed、2 个 MCP 测试仍失败**。旧任意 operation-name 测试已换成正式只读操作；错误 nonce 注入仍必须不能消费 pending rid；持久 mutation uncertainty 的断言仍由 ledger tests 保留。两项真实 running 测试补宿主侧 fixture 根授权后通过，未放宽前端路径权限。
+- MCP 红门禁：真实 IPC config/OAuth 两项及 JS management 一项尚失败。JS 复现的明确原因为 `@earendil-works/pi-mcp resolved outside the managed tree`：旧 fixture 用依赖符号链接，不满足此前包装层新增的管理树边界。未删除该检查、SDK identity guard 或用第二 SDK 图绕过。不能沿用 lane 的历史通过结论宣称当前合并树 MCP 通过；安全边界/fixture 图与真正 standalone 的 SDK 实例问题需分开解决。JS 初轮 **159 passed / 0 failed / 1 skipped**，随后启用真实 pi 的那一项 **0 passed / 1 failed / 0 skipped**。初次直接运行 Rust test binary 的 4 项曾因 cwd 错误失败，改用 Cargo 对应 cwd 后才暴露上述实际问题。
+- static/source-only TypeScript 与 API inventory（90 routes / 126 methods）通过。Rust 单 crate 测试使用各自离线开发锁，正式 Tauri manifest 构建使用 `--locked`；没有 npm 安装或修改共享依赖。target **3.5 GiB**。新增 session/running/scheduled 长寿命 relay 尚未纳入 static-host 共用 deadline 的最终关闭统计（现有 IPC drain 只统计 invoke）；harness 明示该缺口，不能宣称全部服务已收束。provider-auth lane `0f86cc39` 已交付、待父代理审阅，并非已验收。
 
 - `c4b46e72` 索引预算整合：父代理保留 Session 结构化诊断和 index-child 独立报告，合并 harness 最小静态 fixture 冲突；index unknown 计数明确是预留槽而非精确进程数。合并后 Linux 定向 Rust **38 passed / 0 failed / 0 ignored**（文件资源 25、tracker 2、static-host 11）；harness 构建通过（7 条 dead-code warning），生命周期 HTTP 测试 **1 passed / 0 skipped**。使用空 Tauri resources 和临时 HTML，不是独立包/原生验收。复用已空闲 resource-ui target，完成后 **3.4 GiB**；临时 HOME 已清理。8 MiB stdout/路径/派生与响应预算、32 MiB cache 估算上限不涵盖 Tauri/WebView 内部队列；spawn 不可返回及 Git 路径重解析门禁保留。
 

@@ -31,6 +31,10 @@ pi-host = { path = "../pi-host" }
 task-scheduler = { path = "../task-scheduler" }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+getrandom = "0.4"
+hmac = "0.13"
+sha2 = "0.11"
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,6 +6,7 @@ export interface RecoveryStatus {
   sessionWriters: PendingState;
   sessionWriterCleanup: PendingState;
   deletionJournal: PendingState;
+  managementOperations: PendingState;
 }
 
 export async function readRecoveryStatus(client: IpcClient): Promise<RecoveryStatus> {
@@ -13,8 +14,8 @@ export async function readRecoveryStatus(client: IpcClient): Promise<RecoverySta
   if (value === null || typeof value !== "object") throw new Error("Invalid recovery status");
   const record = value as Record<string, unknown>;
   const valid = (item: unknown): item is PendingState => item === "clear" || item === "pending" || item === "uninspectable";
-  if (!valid(record.trustPolicy) || !valid(record.sessionWriters) || !valid(record.sessionWriterCleanup) || !valid(record.deletionJournal)) {
+  if (!valid(record.trustPolicy) || !valid(record.sessionWriters) || !valid(record.sessionWriterCleanup) || !valid(record.deletionJournal) || !valid(record.managementOperations)) {
     throw new Error("Invalid recovery status");
   }
-  return { trustPolicy: record.trustPolicy, sessionWriters: record.sessionWriters, sessionWriterCleanup: record.sessionWriterCleanup, deletionJournal: record.deletionJournal };
+  return { trustPolicy: record.trustPolicy, sessionWriters: record.sessionWriters, sessionWriterCleanup: record.sessionWriterCleanup, deletionJournal: record.deletionJournal, managementOperations: record.managementOperations };
 }

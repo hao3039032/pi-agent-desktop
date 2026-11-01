@@ -145,6 +145,17 @@ class HostBridgeTransport implements IpcTransport {
     }
     let subscription: HostSubscription | null = null;
     let closed = false;
+    let boundedAckInFlight = false;
+    let pendingBoundedAck: { subscriptionId: string; epoch: number; seq: number } | null = null;
+    const flushBoundedAck = () => {
+      if (closed || boundedAckInFlight || !pendingBoundedAck) return;
+      const ack = pendingBoundedAck;
+      pendingBoundedAck = null;
+      boundedAckInFlight = true;
+      void invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `ack-${ack.subscriptionId}-${ack.seq}`, op: op === "tasks.subscribeEvents" ? "tasks.ackEvents" : "agent.ackRunning", args: ack } })
+        .catch(() => {})
+        .finally(() => { boundedAckInFlight = false; flushBoundedAck(); });
+    };
     // The channel exists before the subscribe invoke fires (messages may
     // race the invoke's own response); the disposer works even mid-open.
     void (async () => {
@@ -152,6 +163,18 @@ class HostBridgeTransport implements IpcTransport {
         const handle = await tauriHostChannel((message) => {
           if (closed) return;
           onMessage(message as IpcStreamMessage);
+          if (!closed && (op === "agent.subscribeEvents" || op === "tasks.subscribeEvents" || op === "agent.subscribeRunning") && isRecord(message)
+              && typeof message.subscriptionId === "string" && Number.isSafeInteger(message.seq)
+              && typeof message.seq === "number" && message.seq > 0 && message.kind !== "reset"
+              && (op === "agent.subscribeEvents" || (typeof message.epoch === "number" && Number.isSafeInteger(message.epoch)))) {
+            // ACK only after local delivery; the frame can precede the subscribe response.
+            if (op === "agent.subscribeEvents") {
+              void invoke("pi_ipc", { request: { v: IPC_PROTOCOL_VERSION, id: `ack-${message.subscriptionId}-${message.seq}`, op: "agent.ackEvents", args: { subscriptionId: message.subscriptionId, seq: message.seq } } }).catch(() => {});
+            } else {
+              pendingBoundedAck = { subscriptionId: message.subscriptionId, epoch: message.epoch as number, seq: message.seq };
+              flushBoundedAck();
+            }
+          }
         });
         if (closed) {
           handle.stopLocalDelivery();
@@ -245,6 +268,7 @@ class HostBridgeTransport implements IpcTransport {
     })();
     return () => {
       closed = true;
+      pendingBoundedAck = null;
       subscription?.stopLocalDelivery();
       void subscription?.unsubscribe();
       subscription = null;

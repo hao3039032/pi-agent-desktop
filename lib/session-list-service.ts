@@ -67,6 +67,7 @@ export async function fetchSessionList(options: {
  */
 export function subscribeRunningSessions(
   onFrame: (frame: RunningSetFrame) => void,
+  _onReset?: () => void,
 ): () => void {
   let source: EventSource | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;

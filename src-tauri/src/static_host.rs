@@ -109,7 +109,8 @@ impl IsolatedStaticHost {
 
     /// Reports cover registered operations and leaders. Scheduler unknowns may
     /// repeat session diagnostics; they are not additive process counts. PTYs,
-    /// detached descendants and unregistered writers remain uncovered.
+    /// detached descendants, unregistered writers, and long-lived stream relay
+    /// shutdown/Channel delivery remain uncovered.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), Vec<ShutdownFailure>> {
         // Admission is fenced before the lifecycle state lock can be contended.
         self.state.begin_static_shutdown();
