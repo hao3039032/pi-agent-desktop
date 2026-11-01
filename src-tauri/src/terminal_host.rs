@@ -576,7 +576,7 @@ mod tests {
         std::fs::create_dir(&cwd).unwrap();
         std::fs::write(cwd.join("marker"), "HELD_DIRECTORY_MARKER\n").unwrap();
         let agent = dir.path().join("agent");
-        let mut roots = AllowedRoots::new(); roots.add(dir.path());
+        let mut roots = AllowedRoots::new(); roots.add(dir.path()).expect("fixture root");
         let authorized = authorize_cwd(&roots, &agent, cwd.to_str().unwrap()).unwrap();
         let handle = pin_cwd(&roots, &agent, &authorized).unwrap();
         std::fs::rename(&cwd, &moved).unwrap();

@@ -28,10 +28,10 @@ fn nested_git_cwd_stays_pinned_and_diff_uses_repository_relative_paths() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "initial"]);
     std::fs::write(nested.join("file"), "new\n").unwrap();
-    let mut roots = AllowedRoots::new(); roots.add(&repo);
+    let mut roots = AllowedRoots::new(); roots.add(&repo).expect("fixture root");
     assert_eq!(status(&roots, &nested).unwrap()["additions"], 1);
     assert_eq!(diff(&roots, &nested, &nested.join("file")).unwrap()["supported"], true);
-    let mut scoped = AllowedRoots::new(); scoped.add(&nested);
+    let mut scoped = AllowedRoots::new(); scoped.add(&nested).expect("fixture root");
     assert_eq!(status(&scoped, &nested).unwrap()["additions"], 1);
     assert_eq!(diff(&scoped, &nested, &nested.join("file")).unwrap()["supported"], true);
     assert!(!scoped.is_path_allowed(&repo));

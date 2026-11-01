@@ -115,12 +115,12 @@ fn pinned_view_derives_git_only_ancestor_and_linked_checkout() {
     git(&repo, &["config", "user.name", "Fixture"]); git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
     let linked = temp.path().join("linked");
     git(&repo, &["worktree", "add", "-b", "linked-test", linked.to_str().unwrap()]);
-    let mut roots = crate::file_access::AllowedRoots::new(); roots.add(&sub);
+    let mut roots = crate::file_access::AllowedRoots::new(); roots.add(&sub).expect("fixture root");
     let view = PinnedWorktreeView::open(&roots, &sub).unwrap();
     let (listed, grants) = view.list(&sub, &json!({"branches":true})).unwrap();
     assert_eq!(listed["worktrees"].as_array().unwrap().len(), 2);
     assert!(grants.is_empty()); assert!(!roots.is_path_allowed(&repo));
-    let mut linked_roots = crate::file_access::AllowedRoots::new(); linked_roots.add(&linked);
+    let mut linked_roots = crate::file_access::AllowedRoots::new(); linked_roots.add(&linked).expect("fixture root");
     assert!(PinnedWorktreeView::open(&linked_roots, &linked).err().unwrap().contains("metadata pointer"));
     let nested = sub.join("nested"); std::fs::create_dir(&nested).unwrap(); git(&nested, &["init"]);
     git(&nested, &["config", "user.email", "fixture@example.invalid"]); git(&nested, &["config", "user.name", "Fixture"]); git(&nested, &["commit", "--allow-empty", "-m", "initial"]);
@@ -138,7 +138,7 @@ fn pinned_view_rejects_replaced_git_metadata() {
     std::fs::create_dir(&repo).unwrap(); git(&repo, &["init"]);
     git(&repo, &["config", "user.email", "fixture@example.invalid"]); git(&repo, &["config", "user.name", "Fixture"]);
     git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
-    let mut roots = crate::file_access::AllowedRoots::new(); roots.add(&repo);
+    let mut roots = crate::file_access::AllowedRoots::new(); roots.add(&repo).expect("fixture root");
     let view = PinnedWorktreeView::open(&roots, &repo).unwrap();
     std::fs::rename(repo.join(".git"), repo.join(".old-git")).unwrap();
     git(&repo, &["init"]);
