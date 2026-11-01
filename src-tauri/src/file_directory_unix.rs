@@ -5,6 +5,11 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 pub(crate) fn directory_entries(directory: &std::fs::File) -> std::io::Result<Vec<OsString>> {
+    directory_entries_bounded(directory, usize::MAX).map(|(entries, _)| entries)
+}
+
+/// Limit materialized names, reporting whether another entry was present.
+pub(crate) fn directory_entries_bounded(directory: &std::fs::File, limit: usize) -> std::io::Result<(Vec<OsString>, bool)> {
     // Open a new file description: dup() would share the directory cursor.
     let fd = unsafe { libc::openat(directory.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
@@ -27,9 +32,12 @@ pub(crate) fn directory_entries(directory: &std::fs::File) -> std::io::Result<Ve
             break;
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if name != b"." && name != b".." { names.push(OsString::from_vec(name.to_vec())); }
+        if name != b"." && name != b".." {
+            if names.len() == limit { return Ok((names, true)); }
+            names.push(OsString::from_vec(name.to_vec()));
+        }
     }
-    Ok(names)
+    Ok((names, false))
 }
 
 #[cfg(target_os = "linux")]

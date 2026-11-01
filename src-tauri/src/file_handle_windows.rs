@@ -80,6 +80,13 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Enumerate a new handle to the same directory object, never a pathname.
 pub(crate) fn entries(directory: &std::fs::File) -> io::Result<Vec<(OsString, bool, bool)>> {
+    let (entries, truncated) = entries_bounded(directory, 50_000)?;
+    if truncated { return Err(io::Error::new(io::ErrorKind::OutOfMemory, "directory entry limit exceeded")); }
+    Ok(entries)
+}
+
+/// Limit materialized names, reporting whether another entry was present.
+pub(crate) fn entries_bounded(directory: &std::fs::File, limit: usize) -> io::Result<(Vec<(OsString, bool, bool)>, bool)> {
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReOpenFile, GetFileInformationByHandleEx, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FILE_ID_BOTH_DIR_INFO, FILE_ATTRIBUTE_DIRECTORY};
     let handle = unsafe { ReOpenFile(directory.as_raw_handle() as isize, FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -112,7 +119,7 @@ pub(crate) fn entries(directory: &std::fs::File) -> io::Result<Vec<(OsString, bo
             let units: Vec<u16> = (0..length / 2).map(|i| unsafe { std::ptr::read_unaligned(base.add(name_offset + i * 2).cast::<u16>()) }).collect();
             let name = OsString::from_wide(&units);
             if name != "." && name != ".." {
-                if output.len() >= 50_000 { return Err(io::Error::new(io::ErrorKind::OutOfMemory, "directory entry limit exceeded")); }
+                if output.len() == limit { return Ok((output, true)); }
                 output.push((name, record.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0, record.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0));
             }
             if record.NextEntryOffset == 0 { break; }
@@ -122,7 +129,7 @@ pub(crate) fn entries(directory: &std::fs::File) -> io::Result<Vec<(OsString, bo
             offset = next_offset;
         }
     }
-    Ok(output)
+    Ok((output, false))
 }
 
 #[cfg(test)]
