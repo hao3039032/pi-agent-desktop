@@ -66,7 +66,7 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ShutdownStage { Admission, Scheduler, SessionChild, Management }
 
-type Shutdown = Box<dyn FnOnce() -> Result<(), String> + Send>;
+type Shutdown = Box<dyn FnOnce(std::time::Instant) -> Result<(), String> + Send>;
 struct Service { stage: ShutdownStage, name: String, shutdown: Shutdown }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownFailure { pub stage: ShutdownStage, pub name: String, pub error: String }
@@ -101,6 +101,13 @@ impl HostLifecycle {
 
     pub fn register<F>(&self, stage: ShutdownStage, name: impl Into<String>, shutdown: F) -> Result<(), String>
     where F: FnOnce() -> Result<(), String> + Send + 'static {
+        self.register_until(stage, name, move |_| shutdown())
+    }
+
+    /// The callback must honor the supplied shared absolute deadline. The
+    /// lifecycle cannot bound an arbitrary callback that ignores it.
+    pub fn register_until<F>(&self, stage: ShutdownStage, name: impl Into<String>, shutdown: F) -> Result<(), String>
+    where F: FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static {
         let mut inner = self.inner.lock().map_err(|_| "Lifecycle lock poisoned")?;
         if inner.state != LifecycleState::Running { return Err("Host is shutting down".into()); }
         let name = name.into();
@@ -120,6 +127,12 @@ impl HostLifecycle {
     /// Execute every registered cleanup, even after a failure; failure remains
     /// explicit and never becomes proof of exit. Registration is closed first.
     pub fn shutdown(&self) -> Result<(), Vec<ShutdownFailure>> {
+        self.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(35))
+    }
+
+    /// All callbacks receive the same absolute deadline, including callbacks
+    /// after an earlier phase consumed the remaining time.
+    pub fn shutdown_until(&self, deadline: std::time::Instant) -> Result<(), Vec<ShutdownFailure>> {
         let mut services = {
             let mut inner = self.inner.lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into() }])?;
             match &inner.state {
@@ -134,7 +147,7 @@ impl HostLifecycle {
         services.sort_by_key(|service| service.stage);
         let mut failures = Vec::new();
         for service in services {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(service.shutdown));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (service.shutdown)(deadline)));
             let error = match result { Ok(Ok(())) => continue, Ok(Err(error)) => error, Err(_) => "Shutdown callback panicked; outcome unknown".into() };
             failures.push(ShutdownFailure { stage: service.stage, name: service.name, error });
         }
@@ -182,6 +195,19 @@ mod tests {
         let status = host.require_clean_start().unwrap_err();
         assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, deletion_journal: PendingState::Pending });
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "unresolved");
+    }
+
+    #[test]
+    fn shutdown_passes_one_deadline_to_each_registered_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = HostLifecycle::init(dir.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for stage in [ShutdownStage::SessionChild, ShutdownStage::Management] {
+            host.register_until(stage, format!("{stage:?}"), move |actual| {
+                assert_eq!(actual, deadline); Ok(())
+            }).unwrap();
+        }
+        host.shutdown_until(deadline).unwrap();
     }
 
     #[test]
