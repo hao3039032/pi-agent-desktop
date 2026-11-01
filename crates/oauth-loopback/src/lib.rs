@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+pub mod hosted;
+
 /// How one flow ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowOutcome {

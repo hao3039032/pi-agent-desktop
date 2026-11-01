@@ -98,9 +98,12 @@ export async function signInMcpWithHostedCallback(
       const timeout = AbortSignal.timeout(15_000);
       return fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
     };
-    const flow = { serverUrl, fetch: timedFetch, signal, resourceMetadataUrl: challenge?.resourceMetadataUrl,
+    // Like the existing sign-in path, do not abort an in-flight refresh or
+    // token exchange: the server may already have rotated its credentials.
+    const flow = { serverUrl, fetch: timedFetch, resourceMetadataUrl: challenge?.resourceMetadataUrl,
       authorizationServerMetadataUrl: settings.authServerMetadataUrl, scope };
     if (await authorizeMcp(provider, { ...flow, skipRefresh: stepUp }) === "AUTHORIZED") return;
+    if (signal.aborted) throw new Error("Sign-in cancelled");
     if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
     const state = await provider.state();
     const redirect = new URL((authorizationUrl as URL).searchParams.get("redirect_uri") ?? redirectUrl);
@@ -112,6 +115,7 @@ export async function signInMcpWithHostedCallback(
     let response: { code: string; iss?: string };
     try { response = await Promise.race([browser, manual]); }
     finally { controller.abort(); browser.catch(() => {}); manual.catch(() => {}); }
+    if (signal.aborted) throw new Error("Sign-in cancelled");
     await authorizeMcp(provider, { ...flow, authorizationCode: response.code, iss: response.iss });
   } finally { callback.close(); }
 }
