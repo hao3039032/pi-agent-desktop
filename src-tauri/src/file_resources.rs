@@ -24,6 +24,8 @@ pub const WALK_HARD_CAP: usize = 50_000;
 /// Open directory handles waiting to be visited; the active directory and
 /// one temporary enumeration handle are additional to this queue.
 const WALK_MAX_PENDING_DIRECTORIES: usize = 64;
+/// Cumulative bytes of materialized relative paths, including queued directories.
+const WALK_MAX_PATH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_WALK_DEPTH: usize = 8;
 pub const MAX_QUERY_LENGTH: usize = 500;
 pub const CACHE_TTL: Duration = Duration::from_secs(10);
@@ -130,12 +132,21 @@ struct FileWalkBudget<T> {
     visited: usize,
     node_limit: usize,
     pending_limit: usize,
+    path_bytes: usize,
+    path_byte_limit: usize,
+    path_exhausted: bool,
     truncated: bool,
 }
 
 impl<T> FileWalkBudget<T> {
     fn new(root: T, node_limit: usize, pending_limit: usize) -> Self {
-        Self { pending: std::collections::VecDeque::from([root]), visited: 0, node_limit, pending_limit, truncated: false }
+        Self { pending: std::collections::VecDeque::from([root]), visited: 0, node_limit, pending_limit, path_bytes: 0, path_byte_limit: WALK_MAX_PATH_BYTES, path_exhausted: false, truncated: false }
+    }
+    fn record_path(&mut self, path: &str) -> bool {
+        match self.path_bytes.checked_add(path.len()) {
+            Some(total) if total <= self.path_byte_limit => { self.path_bytes = total; true }
+            _ => { self.path_exhausted = true; self.truncated = true; false }
+        }
     }
     fn remaining(&self) -> usize { self.node_limit - self.visited }
     fn record(&mut self, count: usize, more: bool) {
@@ -163,16 +174,17 @@ impl<T> FileWalkBudget<T> {
 
 #[cfg(unix)]
 fn collect_files_with_walk(cwd: &std::fs::File) -> (Vec<String>, bool) {
-    collect_files_with_walk_limits(cwd, WALK_HARD_CAP, WALK_MAX_PENDING_DIRECTORIES)
+    collect_files_with_walk_limits(cwd, WALK_HARD_CAP, WALK_MAX_PENDING_DIRECTORIES, WALK_MAX_PATH_BYTES)
 }
 
 #[cfg(unix)]
-fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pending_limit: usize) -> (Vec<String>, bool) {
+fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pending_limit: usize, path_byte_limit: usize) -> (Vec<String>, bool) {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     let mut files = Vec::new();
     let Ok(root) = cwd.try_clone() else { return (files, true) };
     let mut budget = FileWalkBudget::new((root, String::new(), 0), node_limit, pending_limit);
+    budget.path_byte_limit = path_byte_limit;
 
     while let Some((directory, rel, depth)) = budget.pop() {
         let (read_dir, more) = match crate::file_access::file_directory_unix::directory_entries_bounded(&directory, budget.remaining()) {
@@ -190,6 +202,7 @@ fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pendin
             } else {
                 format!("{rel}/{name}")
             };
+            if !budget.record_path(&child_rel) { break; }
             let Ok(cname) = std::ffi::CString::new(entry.as_bytes()) else { budget.truncated = true; continue };
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
             if unsafe { libc::fstatat(directory.as_raw_fd(), cname.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 { budget.truncated = true; continue; }
@@ -203,7 +216,7 @@ fn collect_files_with_walk_limits(cwd: &std::fs::File, node_limit: usize, pendin
                 files.push(child_rel);
             }
         }
-        if more || budget.exhausted() { break; }
+        if more || budget.path_exhausted || budget.exhausted() { break; }
     }
     (files, budget.truncated)
 }
@@ -429,6 +442,7 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
             let Some(name) = name.to_str() else { return protocol_error(id, "io", "Directory contains a non-Unicode name") };
             if is_hidden_outside_git(name) || reparse { continue; }
             let child = if relative.is_empty() { name.to_owned() } else { format!("{relative}/{name}") };
+            if !budget.record_path(&child) { break; }
             if is_dir && depth < MAX_WALK_DEPTH {
                 if let Err(error) = budget.enqueue(|| crate::file_access::file_handle_windows::open_child(&directory, std::ffi::OsStr::new(name), true).map(|dir| (dir, child, depth + 1))) {
                     return protocol_error(id, "io", &error.to_string());
@@ -437,7 +451,7 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
                 files.push(child);
             } else { budget.truncated = true; }
         }
-        if more || budget.exhausted() { break; }
+        if more || budget.path_exhausted || budget.exhausted() { break; }
     }
     if let Some(query) = args.get("q").and_then(Value::as_str).filter(|q| !q.is_empty()) {
         if query.len() > MAX_QUERY_LENGTH { return protocol_error(id, "invalid_args", "query is too long"); }
@@ -836,6 +850,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn file_walk_path_budget_is_cumulative_and_marks_truncation() {
+        let mut budget = FileWalkBudget::new((), 20, 10);
+        budget.path_byte_limit = 5;
+        assert!(budget.record_path("abc"));
+        assert!(budget.record_path("de"));
+        assert!(!budget.record_path("x"));
+        assert!(budget.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_walk_returns_partial_when_path_bytes_exhausted() {
+        let dir = tempdir().unwrap();
+        for name in ["aaaa", "bbbb", "cccc"] { std::fs::write(dir.path().join(name), b"").unwrap(); }
+        let root = std::fs::File::open(dir.path()).unwrap();
+        let (files, truncated) = collect_files_with_walk_limits(&root, 100, 10, 8);
+        assert!(truncated);
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
     fn cached_index_bytes_counts_allocated_capacity() {
         let key = String::with_capacity(100);
         let mut files = Vec::with_capacity(10);
@@ -962,7 +997,7 @@ mod tests {
         let temp = tempdir().unwrap();
         for n in 0..12 { std::fs::create_dir(temp.path().join(format!("empty-{n}"))).unwrap(); }
         let root = std::fs::File::open(temp.path()).unwrap();
-        let (files, truncated) = collect_files_with_walk_limits(&root, 5, 10);
+        let (files, truncated) = collect_files_with_walk_limits(&root, 5, 10, WALK_MAX_PATH_BYTES);
         assert!(files.is_empty());
         assert!(truncated);
     }
