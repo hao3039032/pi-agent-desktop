@@ -179,6 +179,9 @@ test("how the sign-in ended stays under the row, with Sign in again", () => {
   assert.match(failed, /<span role="status" class="mcp-config-line is-error">The sign-in failed\.<\/span><span class="mcp-config-line is-error">Error: <code class="mcp-config-chip">registration failed: •••<\/code><\/span>/);
   assert.match(text(row({ run: { flow: flow("expired") } })), /The sign-in was not finished within 5 minutes, so Pi Web stopped waiting\./);
   assert.match(text(row({ run: { flow: flow("cancelled") } })), /Sign-in cancelled\./);
+  const unknown = text(row({ run: { flow: flow("cancelled", { warning: "remote-outcome-unknown" }) } }));
+  assert.match(unknown, /The authentication request may still be processing\. Remote or local credentials may change; check the connection and sign-in status later\./);
+  assert.doesNotMatch(text(row({ run: { flow: flow("cancelled") } })), /credentials may change/);
   assert.deepEqual(buttons(row({ run: { flow: flow("cancelled") } })).map((button) => button.label), ["Sign in"]);
   // A flow the server forgot, and requests that failed, each say so.
   assert.match(text(row({ run: { flow: flow("authorize"), gone: true } })), /Pi Web no longer knows this sign-in: it ended a while ago, or Pi Web restarted\. Press Sign in to start again\./);

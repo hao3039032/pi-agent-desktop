@@ -74,11 +74,12 @@ pub fn get_image_mime(path: &Path) -> Option<&'static str> {
 // files.index
 // ---------------------------------------------------------------------------
 
-fn collect_files_with_git(cwd: &Path) -> Option<(Vec<String>, bool)> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+#[cfg(unix)]
+fn collect_files_with_git(cwd: &std::fs::File) -> Option<(Vec<String>, bool)> {
+    let mut command = std::process::Command::new("git");
+    crate::file_access::file_directory_unix::git_directory(&mut command, cwd);
+    let output = command
+        .args(["-c", "core.fsmonitor=false", "ls-files", "--cached", "--others", "--exclude-standard", "-z"])
         .env("LC_ALL", "C")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -109,18 +110,20 @@ fn collect_files_with_git(cwd: &Path) -> Option<(Vec<String>, bool)> {
     Some((files, hard_truncated))
 }
 
-fn collect_files_with_walk(cwd: &Path) -> (Vec<String>, bool) {
+#[cfg(unix)]
+fn collect_files_with_walk(cwd: &std::fs::File) -> (Vec<String>, bool) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
     let mut files = Vec::new();
     let mut hard_truncated = false;
-    let mut queue: std::collections::VecDeque<(PathBuf, String, usize)> = std::collections::VecDeque::new();
-    queue.push_back((cwd.to_path_buf(), String::new(), 0));
+    let mut queue = std::collections::VecDeque::new();
+    let Ok(root) = cwd.try_clone() else { return (files, true) };
+    queue.push_back((root, String::new(), 0));
 
-    while let Some((abs, rel, depth)) = queue.pop_front() {
-        let Ok(read_dir) = std::fs::read_dir(&abs) else {
-            continue;
-        };
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+    while let Some((directory, rel, depth)) = queue.pop_front() {
+        let Ok(read_dir) = crate::file_access::file_directory_unix::directory_entries(&directory) else { hard_truncated = true; continue; };
+        for entry in read_dir {
+            let name = entry.to_string_lossy().into_owned();
             if is_hidden_outside_git(&name) {
                 continue;
             }
@@ -129,11 +132,15 @@ fn collect_files_with_walk(cwd: &Path) -> (Vec<String>, bool) {
             } else {
                 format!("{rel}/{name}")
             };
-            let child_abs = entry.path();
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            if is_dir {
+            let Ok(cname) = std::ffi::CString::new(entry.as_bytes()) else { hard_truncated = true; continue };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstatat(directory.as_raw_fd(), cname.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 { hard_truncated = true; continue; }
+            if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
                 if depth + 1 <= MAX_WALK_DEPTH {
-                    queue.push_back((child_abs, child_rel, depth + 1));
+                    match crate::file_access::openat_directory_no_follow(&directory, &name) {
+                        Ok(child) => queue.push_back((child, child_rel, depth + 1)),
+                        Err(_) => hard_truncated = true,
+                    }
                 }
             } else {
                 files.push(child_rel);
@@ -257,6 +264,7 @@ pub fn filter_file_entries(
     scored.into_iter().take(limit).map(|(e, _)| e.clone()).collect()
 }
 
+#[cfg(unix)]
 pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value {
     let cwd_str = args.get("cwd").and_then(Value::as_str).unwrap_or("").trim();
     if cwd_str.is_empty() {
@@ -280,13 +288,10 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
     if !cwd_path.is_dir() {
         return protocol_error(id, "invalid_args", "Not a directory");
     }
-    {
-        let roots = state.file_roots.lock().unwrap();
-        if !roots.is_existing_path_allowed(&cwd_path) {
-            return protocol_error(id, "unauthorized_scope", "Access denied");
-        }
-    }
-
+    let cwd_handle = match state.file_roots.lock().unwrap().open_directory(&cwd_path) {
+        Ok(handle) => handle,
+        Err(error) => return protocol_error(id, "unauthorized_scope", &error.to_string()),
+    };
     let query = args.get("q").and_then(Value::as_str).map(|q| {
         if q.len() > MAX_QUERY_LENGTH {
             &q[..MAX_QUERY_LENGTH]
@@ -306,11 +311,14 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
         let mut cache = state.file_index_cache.lock().unwrap();
         let now = Instant::now();
         cache.retain(|_, v| v.expires_at > now);
-        if let Some(entry) = cache.get(cwd_str) {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match cwd_handle.metadata() { Ok(meta) => meta, Err(error) => return protocol_error(id, "io", &error.to_string()) };
+        let cache_key = format!("{}:{}:{}", cwd_str, metadata.dev(), metadata.ino());
+        if let Some(entry) = cache.get(&cache_key) {
             entry.clone()
         } else {
-            let (files, hard_truncated) = collect_files_with_git(&cwd_path)
-                .unwrap_or_else(|| collect_files_with_walk(&cwd_path));
+            let (files, hard_truncated) = collect_files_with_git(&cwd_handle)
+                .unwrap_or_else(|| collect_files_with_walk(&cwd_handle));
             if cache.len() >= CACHE_MAX_ENTRIES {
                 cache.clear();
             }
@@ -319,7 +327,7 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
                 hard_truncated,
                 expires_at: now + CACHE_TTL,
             };
-            cache.insert(cwd_str.to_string(), entry.clone());
+            cache.insert(cache_key, entry.clone());
             entry
         }
     };
@@ -345,6 +353,11 @@ pub fn handle_files_index(state: &IpcHostState, id: &str, args: &Value) -> Value
             "truncated": truncated,
         }),
     )
+}
+
+#[cfg(not(unix))]
+pub fn handle_files_index(_state: &IpcHostState, id: &str, _args: &Value) -> Value {
+    protocol_error(id, "not_supported", "Secure file indexing is unavailable on this platform")
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +748,7 @@ mod tests {
 
     fn setup_state(allowed_root: &Path) -> IpcHostState {
         let state = IpcHostState::new();
-        state.file_roots.lock().unwrap().add(allowed_root);
+        state.file_roots.lock().unwrap().add(allowed_root).expect("fixture root");
         state
     }
 
@@ -756,7 +769,7 @@ mod tests {
 
         // Missing directory rejected
         let missing = tmp.path().join("missing_dir");
-        state.file_roots.lock().unwrap().add(&missing);
+        state.file_roots.lock().unwrap().add_missing(&missing);
         let res = handle_files_index(
             &state,
             "3",
@@ -768,7 +781,7 @@ mod tests {
         // File path instead of directory rejected
         let file = tmp.path().join("file.txt");
         std::fs::write(&file, "hello").unwrap();
-        state.file_roots.lock().unwrap().add(&file);
+        assert!(state.file_roots.lock().unwrap().add(&file).is_err());
         let res = handle_files_index(
             &state,
             "4",

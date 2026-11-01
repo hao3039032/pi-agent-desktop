@@ -272,7 +272,7 @@ impl Session {
     pub fn composer_enqueue(self: &Arc<Self>, message: &str, images: Option<Value>) -> Result<Value, String> {
         let _policy = self.policy_gate.try_read().map_err(|_| "session policy change is in progress".to_string())?;
         let _admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
-        (self.fence_checker)(&self.id)?;
+        (self.fence_checker)(&self.id, None)?;
         let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
         let item = self.composer_outbox.enqueue(message, images)?;
@@ -304,7 +304,7 @@ impl Session {
     pub fn composer_send_now(&self, id: &str) -> Result<Value, String> {
         let policy = self.policy_gate.try_read().map_err(|_| "session policy change is in progress".to_string())?;
         let admission = self.activity_gate.try_read().map_err(|_| "session branch operation is in progress".to_string())?;
-        (self.fence_checker)(&self.id)?;
+        (self.fence_checker)(&self.id, None)?;
         let _delivery = self.composer_outbox.delivery_guard();
         if self.client.has_exited() { return Err("session process has exited".to_string()); }
         let Some(item) = self.composer_outbox.take(id) else {
@@ -468,7 +468,7 @@ impl Session {
                     Err(_) => { std::thread::sleep(std::time::Duration::from_millis(20)); continue; }
                 };
                 let admission = self.activity_gate.read().unwrap();
-                if self.client.has_exited() || (self.fence_checker)(&self.id).is_err() { break; }
+                if self.client.has_exited() || (self.fence_checker)(&self.id, None).is_err() { break; }
                 let _delivery = self.composer_outbox.delivery_guard();
                 let Some(item) = self
                     .composer_outbox
@@ -510,7 +510,7 @@ impl Session {
                 let mut delivering = self.composer_delivering.lock().unwrap();
                 *delivering = false;
                 if self.composer_outbox.may_deliver(self.composer_generation)
-                    && (self.fence_checker)(&self.id).is_ok()
+                    && (self.fence_checker)(&self.id, None).is_ok()
                     && !self.run_state().is_running()
                     && !self.client.has_exited()
                 {
@@ -803,7 +803,7 @@ mod tests {
         // The P1 fix: the outbox lives in the registry keyed by session id,
         // so a Session being dropped (idle eviction, remove-then-resume)
         // must not take the queued messages with it. The same Arc answers.
-        let registry = crate::SessionRegistry::with_fence_checker(std::sync::Arc::new(|_| Ok(())));
+        let registry = crate::SessionRegistry::with_fence_checker(std::sync::Arc::new(|_, _| Ok(())));
         let outbox = registry.composer_outbox_for("s-1");
         outbox.enqueue("still queued", None).expect("enqueue");
 

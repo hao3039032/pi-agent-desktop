@@ -761,6 +761,8 @@ export interface McpSignInFlowInfo extends McpServerRef {
   /** `done`: what connecting with the new tokens found, also recorded as the server's status; `connect-failed`: what the first connection found. */
   result?: McpTestResult;
   failure?: McpSignInFailure;
+  /** Cancellation or expiry occurred while an OAuth token request was in flight. */
+  warning?: "remote-outcome-unknown";
   /** `failed`: the SDK's words, masked; at most 2,000 characters. */
   error?: string;
   /** In `POST /api/mcp/sign-in`'s answer only: the start joined this sign-in, already under way for the same URL. */

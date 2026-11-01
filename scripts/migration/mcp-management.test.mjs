@@ -23,10 +23,16 @@ test("real management pi reads and edits MCP without starting configured servers
     await buildProjectionInto(managed);
     const marker = join(root, "started");
     await writeFile(join(cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { project: { command: process.execPath, args: ["-e", `require('fs').writeFileSync(${JSON.stringify(marker)},'started')`] }, probe: { command: process.execPath, args: [resolve("lib/__fixtures__/mcp-env-server.mjs")] } } }));
+    await writeFile(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { oauth: { url: "http://127.0.0.1:9/mcp?token=fixture-secret" } } }));
     const nonce = "fixture-nonce";
-    client = new PiRpcClient(executable, { cwd, args: ["--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", resolve("lib/pi-rpc/assets/pi-web-management.mjs")], env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce }, onLog: () => {} });
+    const logs = [];
+    client = new PiRpcClient(executable, { cwd, args: ["--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", resolve("lib/pi-rpc/assets/pi-web-management.mjs")], env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_WEB_MANAGED_MODULES: managed, PI_WEB_MGMT_NONCE: nonce }, onLog: (message) => logs.push(message) });
     const envelopes = [];
-    client.onUi("notify", (record) => { if (record.message?.startsWith("PI_WEB_MGMT_V1 ")) envelopes.push(JSON.parse(record.message.slice(15))); });
+    const progress = [];
+    client.onUi("notify", (record) => {
+      if (record.message?.startsWith("PI_WEB_MGMT_V1 ")) envelopes.push(JSON.parse(record.message.slice(15)));
+      if (record.message?.startsWith("PI_WEB_MGMT_PROGRESS_V1 ")) progress.push(record.message);
+    });
     let n = 0;
     async function call(op, args) {
       const rid = `fixture-${++n}`;
@@ -43,6 +49,31 @@ test("real management pi reads and edits MCP without starting configured servers
     const overview = await call("mcp.configGet", { cwd });
     assert.equal(overview.mcp.available, true, JSON.stringify(overview.mcp));
     assert.ok(overview.servers.some((server) => server.name === "project"));
+    assert.doesNotMatch(JSON.stringify(overview), /fixture-secret/);
+    const identity = await call("mcp.credentialTarget", { scope: "global", name: "oauth" });
+    const revoked = await call("mcp.signOutCooperative", { scope: "global", name: "oauth", expectedCanonicalKey: identity.canonicalKey, expectedConfigKey: identity.configKey });
+    assert.equal(identity.schema, 1);
+    assert.equal(identity.admissionSchema, 1);
+    assert.equal(identity.canonicalKey, "mcp__oauth|http://127.0.0.1:9/mcp?token=fixture-secret");
+    assert.equal(identity.legacyKey, "http://127.0.0.1:9/mcp?token=fixture-secret");
+    assert.equal(revoked.schema, 1);
+    assert.equal(revoked.revocation.canonicalKey, identity.canonicalKey);
+    assert.equal(revoked.revocation.legacyKey, identity.legacyKey);
+    assert.equal(revoked.revocation.configKey, identity.configKey);
+    assert.equal(revoked.revocation.generation, identity.generation + 1);
+    assert.doesNotMatch(JSON.stringify(revoked.result), /fixture-secret/);
+    const fresh = await call("mcp.credentialTarget", { scope: "global", name: "oauth" });
+    const withoutLegacy = { ...fresh };
+    delete withoutLegacy.legacyKey;
+    for (const op of ["mcp.test", "mcp.signInStart"]) {
+      for (const admission of [identity, withoutLegacy, { ...fresh, legacyKey: "wrong" }]) {
+        const refused = await call(op, { scope: "global", name: "oauth", credentialAdmission: admission });
+        assert.equal(refused.mcpRefusal.reason, "invalid-request");
+        assert.doesNotMatch(JSON.stringify(refused), /fixture-secret/);
+      }
+    }
+    assert.doesNotMatch(JSON.stringify(progress), /fixture-secret/);
+    assert.doesNotMatch(JSON.stringify(logs), /fixture-secret/);
     const added = await call("mcp.configAction", { cwd, action: "add", scope: "global", text: "node fixture.js", name: "fixture" });
     assert.equal(added.added.name, "fixture", JSON.stringify(added));
     const duplicate = await call("mcp.configAction", { cwd, action: "add", scope: "global", text: "node fixture.js", name: "fixture" });

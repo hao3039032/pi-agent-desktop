@@ -15,11 +15,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+#[path = "file_directory_unix.rs"]
+pub(crate) mod file_directory_unix;
+#[cfg(unix)]
+use file_directory_unix::{directory_entries, directory_entry_info, git_directory};
+#[cfg(unix)]
+#[path = "pinned_root_unix.rs"]
+mod pinned_root_unix;
+#[cfg(windows)]
+#[path = "file_handle_windows.rs"]
+mod file_handle_windows;
+
 /// The allowed-root set (normalized, forward-slash, trailing-slash-free).
 #[derive(Debug, Default, Clone)]
 pub struct AllowedRoots {
     roots: BTreeSet<String>,
     resolved_roots: BTreeMap<String, PathBuf>,
+    #[cfg(unix)]
+    pinned_roots: BTreeMap<String, pinned_root_unix::PinnedRoot>,
 }
 
 impl AllowedRoots {
@@ -29,16 +43,54 @@ impl AllowedRoots {
 
     /// Add a root (normalized: forward slashes, no trailing slash; empty or
     /// relative roots are ignored — an allow-list root is absolute).
-    pub fn add(&mut self, root: &Path) {
-        if let Some(normalized) = normalize_root(root) {
-            if let Ok(canonical) = std::fs::canonicalize(root) {
-                self.resolved_roots.insert(normalized.clone(), canonical);
+    pub fn add(&mut self, root: &Path) -> std::io::Result<()> {
+        let normalized = normalize_root(root).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root must be absolute"))?;
+        #[cfg(unix)]
+        {
+            for known in &self.roots {
+                if is_within(&normalized, known) && self.unchanged_root(known).is_none() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "previously authorized root was replaced or removed"));
+                }
             }
-            self.roots.insert(normalized);
+            if let Some(existing) = self.pinned_roots.get(&normalized) {
+                existing.admit()?;
+                return Ok(());
+            }
+            if self.roots.contains(&normalized) {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "previously missing root requires explicit selection"));
+            }
+            let pinned = pinned_root_unix::PinnedRoot::open(root)?;
+            pinned.admit()?;
+            self.resolved_roots.insert(normalized.clone(), pinned.path().to_path_buf());
+            self.pinned_roots.insert(normalized.clone(), pinned);
         }
+        #[cfg(windows)]
+        { self.resolved_roots.insert(normalized.clone(), std::fs::canonicalize(root)?); }
+        self.roots.insert(normalized);
+        Ok(())
+    }
+
+    /// Only a fresh host-native selection may replace a prior grant.
+    #[cfg(unix)]
+    pub fn reauthorize(&mut self, root: &Path) -> std::io::Result<()> {
+        let normalized = normalize_root(root).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root must be absolute"))?;
+        let pinned = pinned_root_unix::PinnedRoot::open(root)?;
+        pinned.admit()?;
+        let canonical = pinned.path().to_path_buf();
+        self.resolved_roots.insert(normalized.clone(), canonical);
+        self.pinned_roots.insert(normalized.clone(), pinned);
+        self.roots.insert(normalized);
+        Ok(())
+    }
+
+    /// Record a missing historical cwd for status only, without a grant.
+    pub fn add_missing(&mut self, root: &Path) {
+        if let Some(normalized) = normalize_root(root) { self.roots.insert(normalized); }
     }
 
     fn unchanged_root(&self, root: &str) -> Option<PathBuf> {
+        #[cfg(unix)]
+        self.pinned_roots.get(root)?.admit().ok()?;
         let original = self.resolved_roots.get(root)?;
         let current = std::fs::canonicalize(root).ok()?;
         (current == *original).then_some(current)
@@ -46,25 +98,28 @@ impl AllowedRoots {
 
     /// The `~/pi-cwd` and `~/pi-cwd-YYYYMMDD` scan roots (the legacy
     /// default-cwd layouts stay browsable across restarts).
-    pub fn add_default_cwd_roots(&mut self, home: &Path) {
-        self.add(&home.join("pi-cwd"));
-        if let Ok(entries) = std::fs::read_dir(home) {
-            for entry in entries.flatten() {
+    pub fn add_default_cwd_roots(&mut self, home: &Path) -> std::io::Result<()> {
+        if home.join("pi-cwd").try_exists()? { self.add(&home.join("pi-cwd"))?; }
+        {
+            let entries = std::fs::read_dir(home)?;
+            for entry in entries {
+                let entry = entry?;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.len() == 15
                     && name.starts_with("pi-cwd-")
                     && name[8..].chars().all(|c| c.is_ascii_digit())
                 {
-                    self.add(&entry.path());
+                    self.add(&entry.path())?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Snapshot of host-authorized roots for scoped management operations.
     pub fn snapshot(&self) -> Vec<String> {
-        self.roots.iter().cloned().collect()
+        self.roots.iter().filter(|root| self.unchanged_root(root).is_some()).cloned().collect()
     }
 
     /// Lexical authorization: the path is inside a root by spelling (no
@@ -83,7 +138,10 @@ impl AllowedRoots {
     /// inside a root that ALSO resolves to the same spelling — a symlink or
     /// junction pointing outside the roots is refused.
     pub fn is_existing_path_allowed(&self, target: &Path) -> bool {
-        self.is_existing_path_allowed_at(target, true)
+        #[cfg(unix)]
+        { self.open_directory(target).is_ok() || self.open_file(target).is_ok() }
+        #[cfg(not(unix))]
+        { self.is_existing_path_allowed_at(target, true) }
     }
 
     /// Authorization for a path that may not exist yet (a new file):
@@ -127,19 +185,46 @@ impl AllowedRoots {
         false
     }
 
-    /// Open an already-authorized directory without following swapped path
-    /// components. The returned descriptor pins the directory across spawn.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn open_terminal_directory(&self, target: &Path) -> Option<(PathBuf, std::fs::File)> {
-        let (resolved, _) = self.resolved_write_parent_with_root(&target.join(".terminal-anchor"))?;
-        let mut directory = openat_directory_no_follow_by_path(Path::new("/")).ok()?;
-        for component in resolved.components() {
-            match component {
-                Component::RootDir => {},
-                Component::Normal(name) => directory = openat_directory_no_follow(&directory, name.to_str()?).ok()?,
-                _ => return None,
+    #[cfg(unix)]
+    fn admit_resolved(&self, target: &Path) -> std::io::Result<(PathBuf, PathBuf, std::fs::File)> {
+        let (resolved, root) = resolved_read_target_with_root(self, target)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside authorized roots"))?;
+        for (key, pinned) in &self.pinned_roots {
+            if self.resolved_roots.get(key) == Some(&root) {
+                return Ok((resolved, root, pinned.admit()?));
             }
         }
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root not pinned"))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_directory(&self, target: &Path) -> std::io::Result<std::fs::File> {
+        let (resolved, root, handle) = self.admit_resolved(target)?;
+        walk_directory(&handle, resolved.strip_prefix(root).map_err(|_| std::io::ErrorKind::PermissionDenied)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_file(&self, target: &Path) -> std::io::Result<std::fs::File> {
+        let (resolved, root, handle) = self.admit_resolved(target)?;
+        open_file_relative(&handle, resolved.strip_prefix(root).map_err(|_| std::io::ErrorKind::PermissionDenied)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_preview_directory(&self, target: &Path) -> std::io::Result<(std::fs::File, String)> {
+        let (resolved, root, handle) = self.admit_resolved(target)?;
+        let relative = resolved.strip_prefix(root).map_err(|_| std::io::ErrorKind::PermissionDenied)?;
+        let name = relative.file_name().and_then(|name| name.to_str()).ok_or(std::io::ErrorKind::InvalidInput)?.to_owned();
+        let _file = open_file_relative(&handle, relative)?;
+        let directory = walk_directory(&handle, relative.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?;
+        Ok((directory, name))
+    }
+
+    /// Open an already-authorized directory without following swapped path
+    /// components. The returned descriptor pins the directory across spawn.
+    #[cfg(unix)]
+    pub(crate) fn open_terminal_directory(&self, target: &Path) -> Option<(PathBuf, std::fs::File)> {
+        let (resolved, root, handle) = self.admit_resolved(target).ok()?;
+        let directory = walk_directory(&handle, resolved.strip_prefix(root).ok()?).ok()?;
         Some((resolved, directory))
     }
 
@@ -254,7 +339,11 @@ pub fn write_through_allowed_parent(
 
     #[cfg(unix)]
     {
-        write_beneath_root(&resolved_root, &resolved_parent, name, data)
+        let _ = (resolved_root, resolved_parent);
+        let parent = roots.open_directory(target.parent().ok_or(WriteRefusal::OutsideRoots)?)
+            .map_err(WriteRefusal::Io)?;
+        crate::project_upload::atomic_replace_os(&parent, std::ffi::OsStr::new(name), &mut &*data, None)
+            .map_err(|error| if error.kind() == std::io::ErrorKind::PermissionDenied { WriteRefusal::FinalComponentSymlink } else { WriteRefusal::Io(error) })
     }
 
     #[cfg(windows)]
@@ -480,9 +569,126 @@ mod tests {
     fn roots_with(items: &[&str]) -> AllowedRoots {
         let mut roots = AllowedRoots::new();
         for item in items {
-            roots.add(Path::new(item));
+            if Path::new(item).exists() { roots.add(Path::new(item)).unwrap(); } else { roots.add_missing(Path::new(item)); }
         }
         roots
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_root_handle_does_not_follow_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let old = temp.path().join("old");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("value"), b"old").unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        let admitted = roots.open_directory(&root).unwrap();
+        std::fs::rename(&root, &old).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("value"), b"replacement").unwrap();
+        assert!(roots.open_directory(&root).is_err());
+        crate::project_upload::atomic_replace_os(&admitted, std::ffi::OsStr::new("value"), &mut &b"admitted"[..], None).unwrap();
+        assert_eq!(std::fs::read(old.join("value")).unwrap(), b"admitted");
+        assert_eq!(std::fs::read(root.join("value")).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_root_write_replaces_hardlink_without_truncating_other_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::hard_link(&outside, root.join("value")).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        write_through_allowed_parent(&roots, &root.join("value"), b"new").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert_eq!(std::fs::read(root.join("value")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_walk_refuses_swapped_intermediate_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        let (_, _, admitted) = roots.admit_resolved(&root).unwrap();
+        std::fs::rename(root.join("inner"), root.join("old-inner")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("inner")).unwrap();
+        assert!(walk_directory(&admitted, Path::new("inner")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_uses_pinned_handle_after_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("inside"), b"ok").unwrap();
+        std::fs::write(outside.join("secret"), b"no").unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).expect("fixture root");
+        let fd = open_directory_beneath_root(&root, &root).unwrap();
+        std::fs::rename(&root, temp.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let entries = list_open_directory(&roots, &fd).unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "inside"));
+        assert!(!entries.iter().any(|entry| entry.name == "secret"));
+        let again = list_open_directory(&roots, &fd).unwrap();
+        assert!(again.iter().any(|entry| entry.name == "inside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_listing_reports_directory_links_from_pinned_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).expect("fixture root");
+        let entries = list_directory(&roots, &root).unwrap();
+        let link = entries.iter().find(|entry| entry.name == "link").unwrap();
+        assert!(link.is_dir);
+        assert_eq!(link.outside_link_target.as_deref(), Some(outside.canonicalize().unwrap().to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_directory_handle_remains_pinned_after_rename() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let cwd = root.join("cwd");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).expect("fixture root");
+        assert!(roots.open_terminal_directory(&outside).is_none());
+        assert!(roots.open_terminal_directory(&root.join("../outside")).is_none());
+        let expected = cwd.canonicalize().unwrap();
+        let (resolved, handle) = roots.open_terminal_directory(&cwd).unwrap();
+        assert_eq!(resolved, expected);
+        let identity = handle.metadata().unwrap();
+        std::fs::rename(&cwd, root.join("old-cwd")).unwrap();
+        std::os::unix::fs::symlink(&outside, &cwd).unwrap();
+        let pinned = std::fs::metadata(root.join("old-cwd")).unwrap();
+        assert_eq!((identity.dev(), identity.ino()), (pinned.dev(), pinned.ino()));
+        assert_ne!(identity.ino(), std::fs::metadata(&cwd).unwrap().ino());
+        assert!(roots.open_terminal_directory(&cwd).is_none());
     }
 
     #[cfg(unix)]
@@ -514,7 +720,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, project.join("leak")).expect("symlink");
 
         let mut roots = AllowedRoots::new();
-        roots.add(&project);
+        roots.add(&project).expect("fixture root");
         // Lexically inside; the resolved target escapes → refused.
         assert!(roots.is_path_allowed(&project.join("leak/secret.txt")));
         assert!(!roots.is_existing_path_allowed(&project.join("leak/secret.txt")));
@@ -538,8 +744,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("pi-cwd-20260101")).expect("one");
         std::fs::create_dir_all(dir.path().join("pi-cwd-not-a-date")).expect("two");
         let mut roots = AllowedRoots::new();
-        roots.add_default_cwd_roots(dir.path());
-        assert!(roots.is_path_allowed(&dir.path().join("pi-cwd")));
+        roots.add_default_cwd_roots(dir.path()).unwrap();
+        assert!(!roots.is_path_allowed(&dir.path().join("pi-cwd")));
         assert!(roots.is_path_allowed(&dir.path().join("pi-cwd-20260101/inner")));
         assert!(!roots.is_path_allowed(&dir.path().join("pi-cwd-not-a-date")));
     }
@@ -568,10 +774,11 @@ pub(crate) fn is_hidden_outside_git(name: &str) -> bool {
 
 /// Run git in `directory`; None when it is missing, fails or times out (the
 /// TS rules: never stall the tree on a slow git, degrade to the name list).
-fn run_git(directory: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(directory)
+#[cfg(unix)]
+fn run_git(directory: &std::fs::File, args: &[&str]) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    git_directory(&mut command, directory);
+    let output = command
         // A repository-configured fsmonitor hook must not run (expanding a
         // folder must never execute repo-configured commands).
         .args(["-c", "core.fsmonitor=false"])
@@ -610,98 +817,30 @@ pub struct ListedEntry {
 /// tracked `build/` stays visible, #677), the name list otherwise; dirs
 /// first then files, both alphabetically; a directory symlink resolving
 /// outside the roots carries `outsideLinkTarget` for the confirmation flow.
+#[cfg(unix)]
 pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<ListedEntry>, String> {
-    // Authorize on the canonical form (a directory symlink inside the roots
-    // pointing inside the roots lists its target — the /api/files
-    // semantics), then LIST THROUGH THE WALKED DESCRIPTOR so a component
-    // swapped for a symlink after the check cannot redirect the listing
-    // outside the roots. On Linux the fd lists via /proc/self/fd; elsewhere
-    // the fd is (dev,ino)-verified against the canonical path and the
-    // listing re-opens that path (the rename race remains, documented with
-    // the write path).
-    let Some((resolved_dir, resolved_root)) = resolved_read_target_with_root(roots, directory)
-    else {
-        return Err("the path is outside the allowed roots".to_string());
-    };
-    #[cfg(unix)]
-    let dirents: Vec<std::fs::DirEntry> = {
-        let walked = open_directory_beneath_root(&resolved_root, &resolved_dir)
-            .map_err(|error| error.to_string())?;
-        if !walked.metadata().map_err(|error| error.to_string())?.is_dir() {
-            return Err("Not a directory".to_string());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let via_fd = format!("/proc/self/fd/{}", {
-                use std::os::fd::AsRawFd;
-                walked.as_raw_fd()
-            });
-            std::fs::read_dir(via_fd)
-                .map_err(|error| error.to_string())?
-                .flatten()
-                .collect()
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Verify the walked fd IS the canonical directory, then read the
-            // canonical path (macOS has no /proc).
-            use std::os::unix::fs::MetadataExt;
-            let walked_meta = walked.metadata().map_err(|error| error.to_string())?;
-            let path_meta = std::fs::metadata(&resolved_dir).map_err(|error| error.to_string())?;
-            if walked_meta.dev() != path_meta.dev() || walked_meta.ino() != path_meta.ino() {
-                return Err("the path is outside the allowed roots".to_string());
-            }
-            std::fs::read_dir(&resolved_dir)
-                .map_err(|error| error.to_string())?
-                .flatten()
-                .collect()
-        }
-    };
-    #[cfg(windows)]
-    let dirents: Vec<std::fs::DirEntry> = {
-        let _ = (resolved_dir, resolved_root);
-        return Err("listing is not supported on this platform until the handle-based implementation ships".to_string());
-    };
-    let names: Vec<String> = dirents.iter().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
-    // Visibility: Git's view first (tracked wins over ignored), the fixed
-    // name list where git has no view (missing, outside a work tree, failed).
-    let visibility = directory_visibility(&resolved_dir, &names);
+    let walked = roots.open_directory(directory).map_err(|e| e.to_string())?;
+    list_open_directory(roots, &walked)
+}
 
-    let mut entries: Vec<ListedEntry> = Vec::new();
+#[cfg(windows)]
+pub fn list_directory(_roots: &AllowedRoots, _directory: &Path) -> Result<Vec<ListedEntry>, String> {
+    Err("listing is not supported on this platform until the handle-based implementation ships".to_string())
+}
+
+#[cfg(unix)]
+fn list_open_directory(roots: &AllowedRoots, walked: &std::fs::File) -> Result<Vec<ListedEntry>, String> {
+    let dirents = directory_entries(walked).map_err(|e| e.to_string())?;
+    let names: Vec<String> = dirents.iter().map(|name| name.to_string_lossy().into_owned()).collect();
+    let visibility = directory_visibility(walked, &names);
+    let mut entries = Vec::new();
     for entry in &dirents {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !visibility(&name) {
-            continue;
-        }
-        // Every probe goes through the CANONONICAL directory path, never the
-        // /proc/self/fd listing path (stat through an fd link component is
-        // not portable); the fd only sourced the NAME list.
-        let entry_path = resolved_dir.join(&name);
-        // Avoid per-entry stat where the dirent type is known; symlinks and
-        // filesystems without type info fall back to metadata.
-        let file_type = entry.file_type().ok();
-        let is_dir = match file_type {
-            Some(kind) if kind.is_dir() => true,
-            Some(kind) if kind.is_file() => false,
-            _ => match std::fs::metadata(&entry_path) {
-                Ok(meta) => meta.is_dir(),
-                Err(_) => continue, // raced away: skip, not an error
-            },
-        };
-        // A directory whose dirent says "file" is a SYMLINK to a directory
-        // (the TS resolveDirentIsDirectory fallback): report it as a dir and
-        // resolve whether it lands outside the roots.
-        let mut outside_link_target = None;
-        let mut outside_link_encloses = false;
-        let is_symlink_dir = is_dir && file_type.map(|kind| !kind.is_dir()).unwrap_or(false);
-        if is_symlink_dir || (is_dir && std::fs::symlink_metadata(&entry_path).map(|m| m.file_type().is_symlink()).unwrap_or(false)) {
-            if let Ok(resolved) = std::fs::canonicalize(&entry_path) {
-                if !roots.is_existing_path_allowed(&resolved) {
-                    outside_link_target = Some(resolved.to_string_lossy().into_owned());
-                    outside_link_encloses = encloses_home_or_root(&resolved);
-                }
-            }
-        }
+        let name = entry.to_string_lossy().into_owned();
+        if !visibility(&name) { continue; }
+        let Some((is_dir, target)) = directory_entry_info(walked, entry) else { continue };
+        let outside_link_target = target.filter(|target| !roots.is_existing_path_allowed(target))
+            .map(|target| target.to_string_lossy().into_owned());
+        let outside_link_encloses = outside_link_target.as_deref().map(Path::new).map(encloses_home_or_root).unwrap_or(false);
         entries.push(ListedEntry {
             name,
             is_dir,
@@ -743,8 +882,9 @@ fn encloses_home_or_root(target: &Path) -> bool {
 /// Build the visibility predicate for one directory listing: Git's tracked
 /// set overrides its ignore matches (a tracked `build/` stays visible);
 /// outside a work tree the fixed name list applies.
+#[cfg(unix)]
 fn directory_visibility<'a>(
-    directory: &'a Path,
+    directory: &'a std::fs::File,
     names: &'a [String],
 ) -> impl Fn(&str) -> bool + 'a {
     let tracked = read_tracked_names(directory, names);
@@ -768,7 +908,8 @@ fn directory_visibility<'a>(
 
 /// Names Git tracks at or below (the first path segment of every ls-files
 /// record). None when git has no view of the directory.
-fn read_tracked_names(directory: &Path, names: &[String]) -> Option<std::collections::HashSet<String>> {
+#[cfg(unix)]
+fn read_tracked_names(directory: &std::fs::File, names: &[String]) -> Option<std::collections::HashSet<String>> {
     let mut tracked = std::collections::HashSet::new();
     // Pathspec batches keep the command line well inside the OS limit.
     let mut batch: Vec<&str> = Vec::new();
@@ -801,7 +942,8 @@ fn read_tracked_names(directory: &Path, names: &[String]) -> Option<std::collect
 
 /// Names Git ignores (check-ignore --no-index: one process for every name,
 /// no index read). None when git has no view.
-fn read_ignored_names(directory: &Path, names: &[String]) -> Option<std::collections::HashSet<String>> {
+#[cfg(unix)]
+fn read_ignored_names(directory: &std::fs::File, names: &[String]) -> Option<std::collections::HashSet<String>> {
     if names.is_empty() {
         return Some(std::collections::HashSet::new());
     }
@@ -813,9 +955,9 @@ fn read_ignored_names(directory: &Path, names: &[String]) -> Option<std::collect
         data.push('\u{0}');
         data
     };
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(directory)
+    let mut command = std::process::Command::new("git");
+    git_directory(&mut command, directory);
+    let output = command
         .args(["-c", "core.fsmonitor=false"])
         .args(["check-ignore", "--no-index", "-z", "--stdin"])
         .env("LC_ALL", "C")
@@ -978,12 +1120,16 @@ pub fn open_file_beneath_root(
     resolved_root: &Path,
     resolved_target: &Path,
 ) -> Result<std::fs::File, std::io::Error> {
-    use std::os::fd::FromRawFd;
     let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
-    let mut current = root_fd;
-    let relative = resolved_target
-        .strip_prefix(resolved_root)
+    let relative = resolved_target.strip_prefix(resolved_root)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the root"))?;
+    open_file_relative(&root_fd, relative)
+}
+
+#[cfg(unix)]
+fn open_file_relative(root: &std::fs::File, relative: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let mut current = root.try_clone()?;
     let mut components: Vec<&str> = Vec::new();
     for component in relative.components() {
         let Some(step) = component.as_os_str().to_str() else {
@@ -1026,10 +1172,14 @@ pub fn open_directory_beneath_root(
     resolved_target: &Path,
 ) -> std::io::Result<std::fs::File> {
     let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
-    let mut current = root_fd;
-    let relative = resolved_target
-        .strip_prefix(resolved_root)
+    let relative = resolved_target.strip_prefix(resolved_root)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the root"))?;
+    walk_directory(&root_fd, relative)
+}
+
+#[cfg(unix)]
+fn walk_directory(root: &std::fs::File, relative: &Path) -> std::io::Result<std::fs::File> {
+    let mut current = root.try_clone()?;
     for component in relative.components() {
         let Some(step) = component.as_os_str().to_str() else {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));

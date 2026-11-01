@@ -882,6 +882,7 @@ export const enLocale: LocalePlugin = {
     "mcp.signIn.done.needsAuthAfter": "Signed in, but the server still asked for a sign-in when Pi Web connected again.",
     "mcp.signIn.done.notConnected": "Signed in. Press Test connection to see what the server offers.",
     "mcp.signIn.cancelled": "Sign-in cancelled.",
+    "mcp.signIn.remoteOutcomeUnknown": "The authentication request may still be processing. Remote or local credentials may change; check the connection and sign-in status later.",
     "mcp.signIn.expired": "The sign-in was not finished within 5 minutes, so Pi Web stopped waiting.",
     "mcp.signIn.failed.connect-failed": "The server did not connect, and did not ask for a sign-in, so there was nothing to sign in to. Connection above says why.",
     "mcp.signIn.failed.queue-timed-out": "Another test of a server that runs a shell command did not finish in time, so the sign-in did not start. Try again.",
