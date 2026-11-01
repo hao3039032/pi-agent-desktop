@@ -241,14 +241,16 @@ fn handle_connection(
         return None;
     }
     let query = path_query.split_once('?').map(|(_, query)| query).unwrap_or("");
-    let params: std::collections::HashMap<String, String> = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (percent_decode(key), percent_decode(value))
-        })
-        .collect();
+    let mut params = std::collections::HashMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key);
+        if matches!(key.as_str(), "state" | "code" | "error") && params.contains_key(&key) {
+            respond(&mut stream, "400 Bad Request", "duplicate callback parameter");
+            return None;
+        }
+        params.insert(key, percent_decode(value));
+    }
 
     let mut outcome = shared.outcome.lock().unwrap();
     if outcome.is_some() {
@@ -424,6 +426,22 @@ mod tests {
         let (status, _) = browser_get_on(listener.port(), &format!("/callback?code=GOOD&state={}", flow.state)).unwrap();
         assert_eq!(status, "200");
         assert!(matches!(listener.wait(Duration::from_secs(5)), Some(FlowOutcome::Success { .. })) );
+    }
+
+    #[test]
+    fn duplicate_security_parameters_do_not_settle_flow() {
+        let flow = Flow::new();
+        let listener = LoopbackListener::start(flow.state.clone()).unwrap();
+        for query in [
+            format!("code=a&code=b&state={}", flow.state),
+            format!("code=a&state={}&%73tate=wrong", flow.state),
+            format!("error=a&error=b&state={}", flow.state),
+        ] {
+            assert_eq!(browser_get_on(listener.port(), &format!("/callback?{query}")).unwrap().0, "400");
+            assert!(!listener.is_settled());
+        }
+        listener.cancel();
+        assert_eq!(listener.wait(Duration::from_secs(2)), Some(FlowOutcome::Cancelled));
     }
 
     #[test]
