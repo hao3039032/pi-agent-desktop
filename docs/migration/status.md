@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至 staged fork writer 集成点 `47a386ee` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至 group deletion journal 集成点 `17ddff35` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -31,9 +31,9 @@
 
 在各自 worktree 单 writer 实施，主代理合并共享注册点和冲突。基础类型/fixture 测试继续运行；实现完成后统一审阅，不为每个小提交反复扩展审计。
 
-- **会话删除**：严格 scheduled 引用扫描、同事务门检查与删除、session admission、journal/恢复、子关系与共享 Chat 文件夹规则。生产 DELETE 仍安全拒绝。
+- **会话删除**：group journal、严格 scheduled 引用、session admission、直接子 header 重写、传递 subagent 级联、共享/独占 Chat 文件夹规则已整合。生产破坏性删除许可和 journal 恢复许可彼此独立，均默认不授予；DELETE 返回 `busy`，reason 为 `session_deletion_exclusive_maintenance_required`。活动的其他受影响会话、跨目录直接 fork child、无法核验的 cwd/引用仍保守拒绝，尚未达到完整旧行为。
 - **会话资源消费者**：已合并工具图片 resolver、late-result revoke、Markdown sessionId 和安全 bash 下载；历史图片投影已配套启用。继续保留真实原生窗口/预览 ACL、对话框与平台验收门槛。
-- **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。删除工作线正在引入此基线验证 group journal 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
+- **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
 - **未决结果与生命周期**：trust/session 持久标记保留拒绝语义，产品恢复流程、旧宿主排他、正式 seed/scheduler 启动仍属 M5。
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
@@ -47,6 +47,7 @@
 - `57be5fa3` 资源整合：静态测试 **139 passed / 0 skipped**；static tsc + Vite build、Rust library+harness check 通过。工作 lane 的 overwrite 修复 **6 passed**、native import **1 passed**，父代理没有重复未改动的相同测试。
 - `4fcf5f92` 图片/下载整合：定向 JS **36 passed / 0 skipped**，Rust 保存测试 **3 passed / 0 ignored**（含新增共享文件游标回归）；static tsc、API inventory 校验（90 routes / 126 methods）、Rust library+harness check 通过。工作 lane 的 87 项定向 JS、真实 pi fixture 与 Vite build 是 lane 证据，未重复未改动的全套构建。
 - `47a386ee` fork writer 整合：能力冲突后管理扩展语法检查及隔离真实管理/客户端 **12 passed / 0 skipped**。工作 lane 报告 session-host **42 passed / 1 ignored**、生命周期 **1**、真实 pi 分支 **1**、staging **3**、Chat **5**、JS **30** 通过，static tsc/harness check 通过；这些是 lane 证据，本次主线未追加 Rust 重编译。
+- `17ddff35` 删除整合：除本状态文档外，合并代码与工作 lane 已测试的 `bae7a36e` 完全一致。lane 报告删除/journal **62 passed / 1 ignored**，该 ignored real-pi fork/group fixture 另行显式执行 **1 passed**；搜索 **5**、catalogue **3**、real-pi fork/branch **1**、UI service **4** 通过，非测试 `cargo check --lib` 通过。主线未重复这些未改动的相同检查；这些证据不代表生产删除权限已开放。
 - 主线 `src-tauri/target` 检查时为 **26 GiB**（其中 incremental 8.7 GiB、deps 14 GiB），已停止进一步重编译，尚未清理可能含历史构建的产物；此后不能把未运行的 Rust 检查称为通过。
 - 根目录普通 tsc 被 `.next`/`.next-desktop` 遗留生成类型对已删除 subagents 路由的引用阻塞；未删除开发缓存。排除这两处生成目录的临时 source-only 配置检查通过，不把它称为普通全量 tsc 通过。
 - 上述 Rust compile checks 使用进程局部 `TAURI_CONFIG={"bundle":{"resources":[]}}`，只证明源码组合可编译，不证明资源打包。
