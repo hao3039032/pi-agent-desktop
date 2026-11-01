@@ -148,7 +148,7 @@ export interface McpSignInConnection {
 
 export interface McpSignInDeps {
   /** The connection's store must call `guard` before each write (`guardedCredentialStore()`). */
-  open(target: McpSignInTarget, guard: McpSignInWriteGuard): McpSignInConnection;
+  open(target: McpSignInTarget, guard: McpSignInWriteGuard, refresh: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending: (active: boolean) => void }): McpSignInConnection;
   /** The SDK's `signInMcpServer()`. */
   signIn(options: McpSignInOptions, signal: AbortSignal, onTokenRequest: (inFlight: boolean) => void): Promise<void>;
   /** The server's part of `mcp-auth.json`, from the SDK's credential store, by its name and URL. */
@@ -171,10 +171,10 @@ export type McpSignInInternals = McpTestInternals & Pick<PiSdkInternals, "signIn
 export function openMcpSignInConnection(
   target: McpSignInTarget,
   internals: McpTestInternals,
-  options: { deadlineMs?: number; guard?: McpSignInWriteGuard } = {},
+  options: { deadlineMs?: number; guard?: McpSignInWriteGuard; refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void } } = {},
 ): McpSignInConnection {
   const deadlineMs = options.deadlineMs ?? MCP_TEST_DEADLINE_MS;
-  const opened = openTestConnection(target, internals, options.guard ? { credentials: guardedCredentialStore(internals, options.guard) } : {});
+  const opened = openTestConnection(target, internals, options.guard ? { credentials: guardedCredentialStore(internals, options.guard, options.refresh) } : {});
   const resolvedSecrets: string[] = [];
   let settings: { value: McpOAuthSettings } | { error: unknown } | undefined;
   const serial = runsShellCommand(target.config, internals);
@@ -238,7 +238,7 @@ export function openMcpSignInConnection(
 /** The SDK's own pieces: its connection (through Pi Web's transport factory), sign-in and credential store. */
 export function createMcpSignInDeps(internals: McpSignInInternals): McpSignInDeps {
   return {
-    open: (target, guard) => openMcpSignInConnection(target, internals, { guard }),
+    open: (target, guard, refresh) => openMcpSignInConnection(target, internals, { guard, refresh }),
     signIn: (options) => internals.signInMcpServer(options),
     store: (name, url) => new internals.McpOAuthCredentialStore().forServer(name, url),
     isCancelled: (error) => error instanceof internals.McpSignInCancelledError || (error instanceof Error && error.name === "McpSignInCancelledError"),
@@ -275,7 +275,7 @@ interface Flow {
   /** Answers the SDK's prompt, while it waits. */
   prompt?: (value: string | undefined) => void;
   sawPage: boolean;
-  tokenRequestInFlight?: boolean;
+  tokenRequestWindows?: number;
   warning?: "remote-outcome-unknown";
   completion?: Promise<void>;
   alreadySignedIn?: true;
@@ -325,7 +325,7 @@ function setPhase(flow: Flow, phase: McpSignInPhase): void {
 function end(flow: Flow, phase: McpSignInPhase, extra: Partial<Pick<Flow, "alreadySignedIn" | "refreshed" | "result" | "failure" | "error">> = {}): void {
   if (isEnded(flow)) return;
   Object.assign(flow, extra);
-  if ((phase === "cancelled" || phase === "expired") && flow.tokenRequestInFlight) flow.warning = "remote-outcome-unknown";
+  if ((phase === "cancelled" || phase === "expired") && (flow.tokenRequestWindows ?? 0) > 0) flow.warning = "remote-outcome-unknown";
   flow.phase = phase;
   clearTimeout(flow.expiry);
   flow.controller.abort();
@@ -458,12 +458,21 @@ async function runFlow(flow: Flow, deps: McpSignInDeps): Promise<void> {
   let connection: McpSignInConnection | undefined;
   const redact = (text: string) => (connection ? connection.redact(text) : text);
   const guard = writeGuard(flow);
+  let pendingRefreshes = 0;
+  let refreshesDone: (() => void) | undefined;
+  const notePendingRefresh = (active: boolean) => {
+    pendingRefreshes += active ? 1 : -1;
+    if (pendingRefreshes === 0) { refreshesDone?.(); refreshesDone = undefined; }
+  };
   try {
     // A run of the same server still unwinding goes first: two at once would overwrite each other's
     // verifier and state in mcp-auth.json.
     await previous;
     if (isEnded(flow)) return;
-    connection = deps.open(flow.target, guard);
+    const noteTokenWindow = (active: boolean) => {
+      flow.tokenRequestWindows = Math.max(0, (flow.tokenRequestWindows ?? 0) + (active ? 1 : -1));
+    };
+    connection = deps.open(flow.target, guard, { signal: flow.controller.signal, onRefresh: noteTokenWindow, onPending: notePendingRefresh });
 
     // 1. Connect, to learn whether the server asks for a sign-in, and its challenge.
     const first = await connection.connect(flow.controller.signal);
@@ -502,7 +511,7 @@ async function runFlow(flow: Flow, deps: McpSignInDeps): Promise<void> {
           showAuthorizationUrl: (url) => showAuthorizationUrl(flow, url),
           promptForRedirectUrl: (signal) => askForRedirect(flow, signal),
         },
-      }, flow.controller.signal, (inFlight) => { flow.tokenRequestInFlight = inFlight; });
+      }, flow.controller.signal, noteTokenWindow);
     } catch (error) {
       if (isEnded(flow)) return;
       if (deps.isCancelled(error) || error instanceof McpSignedOutError) end(flow, "cancelled");
@@ -531,6 +540,10 @@ async function runFlow(flow: Flow, deps: McpSignInDeps): Promise<void> {
   } finally {
     // The SDK's callback listener is closed by signInMcpServer itself; this closes the connection, briefly.
     if (connection) await connection.close().catch(() => undefined);
+    // The normal close is bounded, but an SDK refresh may still be writing.
+    // Keep this task and its per-server tail until every started refresh
+    // (including one waiting for its lock) has actually unwound.
+    if (pendingRefreshes > 0) await new Promise<void>((resolve) => { refreshesDone = resolve; });
     release();
     void tail.then(() => {
       if (tails.get(flow.key) === tail) tails.delete(flow.key);

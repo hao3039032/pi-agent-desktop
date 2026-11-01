@@ -122,6 +122,33 @@ export function guardMcpOAuthStateStore(store: McpOAuthStateStore, guard: McpSig
   };
 }
 
+/** The refresh callback window includes SDK checks, not necessarily a sent request. */
+export function guardMcpOAuthServerStore(
+  store: McpOAuthServerStore,
+  guard: McpSignInWriteGuard,
+  refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void },
+): McpOAuthServerStore {
+  return {
+    ...guardMcpOAuthStateStore(store, guard),
+    withRefreshLock: async (fn) => {
+      if (refresh?.signal.aborted) throw new Error("Sign-in cancelled");
+      refresh?.onPending?.(true);
+      try {
+        return await store.withRefreshLock(async () => {
+          guard();
+          // A cancelled connection must not start an unannounced refresh after
+          // waiting for the lock. This marks the callback window, not a claim
+          // that the SDK has already sent a request.
+          if (refresh?.signal.aborted) throw new Error("Sign-in cancelled");
+          refresh?.onRefresh(true);
+          try { return await fn(); }
+          finally { refresh?.onRefresh(false); }
+        });
+      } finally { refresh?.onPending?.(false); }
+    },
+  };
+}
+
 /**
  * The SDK's credential store over the same `mcp-auth.json`, whose writes call
  * `guard` first: the store a connection reads and refreshes tokens through, so
@@ -133,14 +160,12 @@ export function guardMcpOAuthStateStore(store: McpOAuthStateStore, guard: McpSig
 export function guardedCredentialStore(
   internals: Pick<PiSdkInternals, "McpOAuthCredentialStore">,
   guard: McpSignInWriteGuard,
+  refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void },
 ): McpOAuthCredentialStore {
   class GuardedCredentialStore extends internals.McpOAuthCredentialStore {
     forServer(name: string, serverUrl: string): McpOAuthServerStore {
       const store = super.forServer(name, serverUrl);
-      return {
-        ...guardMcpOAuthStateStore(store, guard),
-        withRefreshLock: (fn) => store.withRefreshLock(fn),
-      };
+      return guardMcpOAuthServerStore(store, guard, refresh);
     }
   }
   return new GuardedCredentialStore();
