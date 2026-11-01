@@ -109,6 +109,7 @@ pub struct IpcHostState {
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
     dispatch_gate: Arc<tokio::sync::Semaphore>,
+    dispatch_control_gate: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -228,6 +229,7 @@ impl IpcHostState {
             session_exports: Mutex::new(std::collections::VecDeque::new()),
             session_list_version: Arc::new(AtomicU64::new(1)),
             dispatch_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_DISPATCH)),
+            dispatch_control_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONCURRENT_CONTROL)),
             chat_unlock_policy: ChatUnlockPolicy::Denied,
             #[cfg(test)]
             session_writer_timeout: Mutex::new(Duration::from_secs(60)),
@@ -2683,6 +2685,9 @@ fn envelope_id(raw: &Value) -> String {
 /// Excess requests are rejected before dispatch; there is no host-side
 /// semaphore wait queue. This does not bound Tauri/WebView's own buffers.
 pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
+/// Separate capacity for stream cleanup/terminal ACK so slow operations do
+/// not prevent relays from being released. This lane is bounded too.
+pub const IPC_MAX_CONCURRENT_CONTROL: usize = 4;
 
 /// The product dispatch path the async `pi_ipc` command AND the static-UI
 /// acceptance harness share — one gate, one blocking pool, the same caps.
@@ -2705,7 +2710,9 @@ pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
 /// blocks process exit.
 pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -> Value {
     let id = envelope_id(&request);
-    let gate = Arc::clone(&state.dispatch_gate);
+    let control = matches!(request.get("op").and_then(Value::as_str),
+        Some("agent.unsubscribeEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe"));
+    let gate = Arc::clone(if control { &state.dispatch_control_gate } else { &state.dispatch_gate });
     let permit = match gate.try_acquire_owned() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::NoPermits) => {
@@ -6460,6 +6467,18 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             assert_eq!(response["error"]["reason"], "dispatch_not_admitted");
             assert_eq!(response["error"]["retryable"], true);
         }
+        let control = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"cleanup","op":"tasks.unsubscribe","args":{"subscriptionId":"missing"}}),
+        ));
+        assert_eq!(control["ok"], true, "cleanup has reserved capacity: {control}");
+        let control_permits: Vec<_> = (0..IPC_MAX_CONCURRENT_CONTROL)
+            .map(|_| Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap())
+            .collect();
+        let control = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"control-full","op":"tasks.unsubscribe"}),
+        ));
+        assert_eq!(control["error"]["reason"], "dispatch_not_admitted");
+        drop(control_permits);
         drop(permits);
         let response = tauri::async_runtime::block_on(dispatch_envelope_gated(
             state, json!({"v":1,"id":"after","op":"desktop.identity"}),
