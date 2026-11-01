@@ -737,8 +737,10 @@ fn route_envelope(
                 entry.task.lock().unwrap().snapshot.progress = envelope.get("progress").cloned();
             }
         }
-    } else if let Some(entry) = pending.remove(rid) {
-        let _ = entry.tx.send(envelope.clone());
+    } else if pending.get(rid).is_some_and(|entry| envelope.get("nonce").and_then(Value::as_str) == Some(entry.nonce.as_str())) {
+        if let Some(entry) = pending.remove(rid) {
+            let _ = entry.tx.send(envelope);
+        }
     }
 }
 
@@ -1014,9 +1016,11 @@ mod tests {
         route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_PROGRESS_V1 {\"rid\":\"a\",\"nonce\":\"bad\",\"progress\":0}"}));
         assert_eq!(task_a.lock().unwrap().snapshot.progress, Some(json!(999)));
         route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"b\",\"nonce\":\"bad\"}"}));
+        assert!(b_rx.try_recv().is_err(), "wrong nonce must not consume the pending task");
+        route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"b\",\"nonce\":\"good\"}"}));
         route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"a\",\"nonce\":\"good\"}"}));
         assert_eq!(a_rx.try_recv().unwrap()["nonce"], "good");
-        assert_eq!(b_rx.try_recv().unwrap()["nonce"], "bad");
+        assert_eq!(b_rx.try_recv().unwrap()["nonce"], "good");
         pending.lock().unwrap().remove("a");
         route_envelope(&pending, &json!({"message": "PI_WEB_MGMT_V1 {\"rid\":\"a\"}"}));
         assert!(a_rx.try_recv().is_err());

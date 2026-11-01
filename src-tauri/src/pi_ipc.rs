@@ -2680,8 +2680,8 @@ fn envelope_id(raw: &Value) -> String {
 /// The concurrency cap for envelope dispatches through the async entry:
 /// headroom for the page's bursts (state probes beside a slow management
 /// op) while a flooding page cannot grow the blocking pool unbounded.
-/// Excess requests QUEUE on the gate — backpressure the frontend already
-/// handles, since every invoke is an awaited request/response.
+/// Excess requests are rejected before dispatch; there is no host-side
+/// semaphore wait queue. This does not bound Tauri/WebView's own buffers.
 pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
 
 /// The product dispatch path the async `pi_ipc` command AND the static-UI
@@ -2706,9 +2706,12 @@ pub const IPC_MAX_CONCURRENT_DISPATCH: usize = 16;
 pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -> Value {
     let id = envelope_id(&request);
     let gate = Arc::clone(&state.dispatch_gate);
-    let permit = match gate.acquire_owned().await {
+    let permit = match gate.try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => {
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            return protocol_error_value(&id, json!({"code":"busy", "message":"dispatch capacity exhausted; request was not executed", "reason":"dispatch_not_admitted", "retryable":true}));
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
             return protocol_error(&id, "host_error", "the dispatch gate is closed");
         }
     };
@@ -6442,6 +6445,26 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let slow = tauri::async_runtime::block_on(slow).expect("the slow dispatch joins");
         assert_eq!(slow["ok"], false, "the stub child exits: models.list answers its real failure");
         assert_eq!(slow["error"]["code"], "io", "{slow}");
+    }
+
+    #[test]
+    fn dispatch_saturation_rejects_before_execution_and_recovers() {
+        let state = Arc::new(state());
+        let permits: Vec<_> = (0..IPC_MAX_CONCURRENT_DISPATCH)
+            .map(|_| Arc::clone(&state.dispatch_gate).try_acquire_owned().unwrap())
+            .collect();
+        for n in 0..1000 {
+            let response = tauri::async_runtime::block_on(dispatch_envelope_gated(
+                Arc::clone(&state), json!({"v":1,"id":format!("flood-{n}"),"op":"desktop.identity"}),
+            ));
+            assert_eq!(response["error"]["reason"], "dispatch_not_admitted");
+            assert_eq!(response["error"]["retryable"], true);
+        }
+        drop(permits);
+        let response = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            state, json!({"v":1,"id":"after","op":"desktop.identity"}),
+        ));
+        assert_eq!(response["ok"], true, "{response}");
     }
 
     /// The async `pi_ipc` command is the product boundary. This pins the
