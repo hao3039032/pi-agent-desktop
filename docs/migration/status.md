@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至 Windows 资源句柄源码、MCP credential admission 与运行中自动命名整合点 `ef075806` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至 Windows 资源句柄源码、MCP credential admission 与运行中自动命名整合点 `e099bbf3` 的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -19,7 +19,7 @@
 | Provider 认证 | provider 列表/API key/类型安全删除/logout、OAuth 进度流及关联 task-input/取消 | SDK 内置 OAuth callback 仍在 Node；Rust loopback 尚未接内置 provider |
 | MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 超时/取消显示远端 token 不确定性，保留 15 秒期限及迟到本地写保护；canonical/legacy/config/generation 私有 admission 已接 JS，native ledger/reservation/ACK 验证尚在实施，不能据 JS 合同直接解除 pending；仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
 | 插件/技能 | 列表/开关/批量技能禁用、搜索/check、install/update/remove 任务 UI/IPC | 不可取消的 SDK mutation 使用独占短寿命 pi；强停可能部分写入，结果 unknown；官方 skills CLI、真实 npm/git 安装及 Windows mutation 未验/未支持 |
-| 文件/资源 | Unix root grant 保留目录对象与身份、准入复核路径、beneath-walk、目录/index/精确会话引用；普通 add 不续授已替换根，显式 native picker 可重新授权；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows roots/read/index/pi-resource 句柄源码已接但未目标编译或原生执行，save/bash 与根外精确 session 引用仍缺；index 的 Git 可见性和目录句柄总预算尚未完成；真实 dialogs/ACL 未验 |
+| 文件/资源 | Unix root grant 保留目录对象与身份、准入复核路径、beneath-walk、目录/index/精确会话引用；普通 add 不续授已替换根，显式 native picker 可重新授权；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows roots/read/index/pi-resource 句柄源码已接但未目标编译或原生执行，save/bash 与根外精确 session 引用仍缺；Windows index 的 Git 可见性尚未完成，故持续标记截断；Windows/Unix fallback 已加总节点与目录句柄预算；真实 dialogs/ACL 未验 |
 | Git/worktrees | status/diff/list/create/switch/delete/fetch、隔离 Git fixture | Windows runner fail-closed；macOS 尚未验证 |
 | 设置 | 字体偏好/系统字体、tools/artifacts/Chat settings、自定义 CSS、状态镜像 | 非 Linux 字体与原生 UI 未验；跨版本镜像导入及升级仍需验收 |
 | 终端 | Linux 真 PTY、原 TerminalPanel、输入/resize/history/ACK/lease/reconnect/close/settings | macOS/Windows 安全 cwd-handle spawn 未完成，创建 fail-closed |
@@ -37,12 +37,13 @@
 - **未决结果与生命周期**：`073815f2` 已集成合作式 Unix ownership guard、`HostLifecycle::init/register/shutdown` 顺序关闭、`desktop.recoveryStatus` 及静态只读提示、fork/continue 双端 fence 配对诊断。未接正式 bootstrap，guard 不证明旧宿主或脱管 writer 已退出；记录匹配不授予恢复权。产品恢复、旧宿主排他、正式 seed/scheduler 启动仍属 M5。
 - **Terra 并行续作**：八个隔离工作树继续生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。SDK 最小补丁分发与合作升级/非合作 CLI 支持边界已向用户求决，尚未获准，不默认放行。
 - **自动命名**：`963f20fd` 接通 live child 的实际 model registry 和专用纯 helper bundle，`50714c76` 恢复运行中及 queued follow-up 的原行为；同分支正常追加不作 stale，模型/树 ABA、名称或 child 实例变化拒绝。改名使用公开 `pi.setSessionName`，不调用只读 extension context 未暴露的写方法；写前持久 marker，只有关联成功或明确写前拒绝清除，ACK 丢失/append 异常保留。最多 64 KiB 的 source 前缀仅为诊断，不冻结已准入运行。真实 90 秒 deadline 和原生 UI 仍待验。
-- **尚未整合的续作**：生命周期 lane `5e3d3d7b` 提供共用绝对 deadline 的 registry 关闭报告，打包 lane `d85ae23d` 已在隔离 mock static host 登记真实服务和 IPC drain；短寿命 writer 与普通 prompt 关联静默证据仍缺。平台 `0c61b276` 已作为 `ef075806` 合入 Windows roots/read/index/资源句柄及 Unix 嵌套根回退修复；Windows 未目标编译。整合检查另确认 index 对大量空目录缺乏待处理句柄/总节点预算，已交该 lane 修复，不将当前版本作为平台验收。MCP lane `ff3157de` 提供 probe mode admission/局部 guard/私有 receipt，尚待 native 消费；stdio/provider-auth/`!command` 的宽 scope 不作为只读放行。这些均不是正式 bootstrap 或 M5 验收。
+- **尚未整合的续作**：生命周期 lane `5e3d3d7b` 提供共用绝对 deadline 的 registry 关闭报告，打包 lane `d85ae23d` 已在隔离 mock static host 登记真实服务和 IPC drain；短寿命 writer 与普通 prompt 关联静默证据仍缺。平台 `0c61b276` 已作为 `ef075806` 合入 Windows roots/read/index/资源句柄及 Unix 嵌套根回退修复；Windows 未目标编译。整合检查确认的空目录无界队列已在 `e099bbf3` 修复：最多物化 50,000 个条目、最多 64 个待处理目录句柄，当前目录及临时枚举句柄另计；耗尽保留 partial/truncated。该修复不代替 Windows 目标编译或原生验收。MCP lane `ff3157de` 提供 probe mode admission/局部 guard/私有 receipt，尚待 native 消费；stdio/provider-auth/`!command` 的宽 scope 不作为只读放行。这些均不是正式 bootstrap 或 M5 验收。
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
 
-- `ef075806` 平台源码整合：父代理核对句柄调用链、独立 ReOpenFile 游标、锁文件和 Linux 嵌套根拒绝逻辑，尚未执行该合并点的 Rust 检查。lane 报告早先 Linux 根/目录 **28 passed**，资源 crate **15**、handler **5**、保存 **3**、资源授权 **1** 通过及 library+harness check；这些不是 Windows 编译/原生证据，也不覆盖新发现的 index 总目录预算问题。
+- `e099bbf3` index 预算修复：三个改动文件与 lane 的 `fd9d0ba8` 完全一致。lane 报告 Linux index **13 passed**（其中预算 5 项）、resource handler **5**、resource-protocol **15**，library+harness check 通过。父代理尝试合并后定向 Rust 测试时共享 heavy 锁繁忙，`flock -n` 返回 75，**没有执行测试**；没有把它计为通过或重复等待占锁。
+- `ef075806` 平台源码整合：父代理核对句柄调用链、独立 ReOpenFile 游标、锁文件和 Linux 嵌套根拒绝逻辑，尚未执行该合并点的 Rust 检查。lane 报告早先 Linux 根/目录 **28 passed**，资源 crate **15**、handler **5**、保存 **3**、资源授权 **1** 通过及 library+harness check；这些不是 Windows 编译/原生证据；其后 index 总目录预算问题由上述独立修复覆盖。
 - `44e6a102` Unix 固定根整合：lane 报告隔离 Linux **35 passed** 及 library+harness check。父代理随后在 `fed16264` 执行合并后 library+harness check，通过；使用已空闲 lifecycle lane 的现有 target（2.6 GiB），没有继续写主仓库 26 GiB target。
 - `fed16264` OAuth 超时/取消警告及私有撤权协议：父代理定向 JS **18 passed / 0 failed / 0 skipped**，包含真实 15 秒超时但仅 fake OAuth 服务。`19c17bc3` canonical/legacy admission 整合后定向 JS **36 passed / 0 failed / 0 skipped**；native 还未据此获得安全合作准入，跨实例/共享 legacy 的其他 canonical writer 不受单个 ACK 证明覆盖。
 - `963f20fd` title 首轮整合：父代理 JS **47 passed**、静态 tsc、root source-only tsc、inventory（90 routes / 126 methods）和 library+harness check 通过。后一次 Rust check 使用已空闲 packaging target，完成后 2.8 GiB。
