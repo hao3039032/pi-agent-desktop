@@ -14,6 +14,24 @@ static LEDGER_LOCK: Mutex<()> = Mutex::new(());
 pub enum OperationScope { Global, Project { path: String } }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationTarget { Settings, Credentials, Packages, Mcp, Trust }
+
+/// Digests of the trusted SDK-derived credential key and its legacy URL key.
+/// URLs and names may contain credentials and are never persisted here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpCredentialTarget { primary_digest: String, legacy_digest: String }
+impl McpCredentialTarget {
+    pub fn new(primary_digest: String, legacy_digest: String) -> Result<Self, String> {
+        let valid = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !valid(&primary_digest) || !valid(&legacy_digest) { return Err("invalid MCP credential target digest".into()); }
+        Ok(Self { primary_digest, legacy_digest })
+    }
+    pub fn primary_digest(&self) -> &str { &self.primary_digest }
+    pub fn legacy_digest(&self) -> &str { &self.legacy_digest }
+    /// Legacy URL-only credential migration aliases names sharing that URL.
+    pub fn conflicts(&self, other: &Self) -> bool {
+        self.primary_digest == other.primary_digest || self.legacy_digest == other.legacy_digest
+    }
+}
 /// Host-constructed, validated descriptor. It cannot carry raw arguments,
 /// OAuth input, package URLs or credentials.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,14 +64,16 @@ pub struct PendingOperation {
 pub struct OperationLedger { directory: std::fs::File, path: PathBuf }
 
 #[cfg(target_os = "linux")]
-fn child_directory(parent: &std::fs::File, name: &str, private: bool) -> Result<std::fs::File, String> {
+fn child_directory(parent: &std::fs::File, name: &str, private: bool, create: bool) -> Result<std::fs::File, String> {
     use std::os::unix::fs::{OpenOptionsExt, DirBuilderExt, MetadataExt};
     use std::os::fd::AsRawFd;
     let path = PathBuf::from(format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), name));
-    match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => parent.sync_all().map_err(|e| e.to_string())?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
-        Err(e) => return Err(format!("cannot create ledger directory: {e}")),
+    if create {
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => parent.sync_all().map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => return Err(format!("cannot create ledger directory: {e}")),
+        }
     }
     let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path).map_err(|e| format!("unsafe ledger directory: {e}"))?;
     let m = file.metadata().map_err(|e| e.to_string())?;
@@ -69,13 +89,35 @@ impl OperationLedger {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::fd::AsRawFd;
         let root = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(agent_dir).map_err(|e| format!("cannot open agent directory: {e}"))?;
-        let pi_web = child_directory(&root, "pi-web", false)?;
-        let directory = child_directory(&pi_web, "management-operations", true)?;
+        let pi_web = child_directory(&root, "pi-web", false, true)?;
+        let directory = child_directory(&pi_web, "management-operations", true, true)?;
         let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         Ok(Self { directory, path })
     }
     #[cfg(not(target_os = "linux"))]
     pub fn open(_agent_dir: &Path) -> Result<Self, String> { Err("safe management ledger is unavailable on this platform".into()) }
+
+    /// Inspect existing evidence without creating directories or changing records.
+    #[cfg(target_os = "linux")]
+    pub fn inspect(agent_dir: &Path) -> Result<Vec<PendingOperation>, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::fd::AsRawFd;
+        let root = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(agent_dir).map_err(|e| e.to_string())?;
+        for path in [agent_dir.join("pi-web"), agent_dir.join("pi-web/management-operations")] {
+            match std::fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e.to_string()),
+                Ok(m) if m.file_type().is_dir() => {},
+                Ok(_) => return Err("unsafe management ledger directory".into()),
+            }
+        }
+        let pi_web = child_directory(&root, "pi-web", false, false)?;
+        let directory = child_directory(&pi_web, "management-operations", true, false)?;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        Self { directory, path }.list_pending()
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub fn inspect(_agent_dir: &Path) -> Result<Vec<PendingOperation>, String> { Err("safe management ledger is unavailable on this platform".into()) }
 
     pub fn list_pending(&self) -> Result<Vec<PendingOperation>, String> {
         let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;

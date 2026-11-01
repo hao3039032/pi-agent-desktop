@@ -139,12 +139,11 @@ test("seq ordering, stale generations, and generation bumps", () => {
   const errors = [];
   source.onmessage = (message) => events.push(JSON.parse(message.data));
   source.onerror = () => errors.push("error");
-  // The FIRST frame establishes the generation (no error, no drop).
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 5, kind: "event", payload: { type: "a" } });
-  assert.equal(events.length, 1, "the first frame adopts its epoch");
+  // Every subscription starts with an atomic snapshot at seq 1.
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 1, kind: "snapshot", payload: { state: {} } });
+  assert.equal(events.length, 1, "the snapshot adopts its epoch");
   // Replayed/older seq within the generation never deliver.
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 5, kind: "event", payload: { type: "dup" } });
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 4, kind: "event", payload: { type: "old" } });
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 1, kind: "event", payload: { type: "dup" } });
   assert.equal(events.length, 1, "replayed/older seq frames never deliver");
   // A frame from an OLDER generation is stale: silently dropped.
   deliver({ subscriptionId: "sub", epoch: 1, seq: 99, kind: "event", payload: { type: "stale" } });
@@ -155,10 +154,31 @@ test("seq ordering, stale generations, and generation bumps", () => {
   deliver({ subscriptionId: "sub", epoch: 3, seq: 1, kind: "event", payload: { type: "fresh" } });
   assert.equal(errors.length, 1, "a generation bump surfaces as an error");
   assert.equal(events.length, 1, "the bumped frame itself never delivers");
-  // A reset frame is an error → the connection layer reconnects.
-  deliver({ subscriptionId: "sub", epoch: 2, seq: 6, kind: "reset", payload: null });
-  assert.equal(errors.length, 2);
+  // Once invalidated, stale delivery cannot resume this subscription.
+  deliver({ subscriptionId: "sub", epoch: 2, seq: 2, kind: "event", payload: { type: "late" } });
+  assert.equal(errors.length, 1);
+  assert.equal(events.length, 1);
   source.close();
+});
+
+test("missing sequence, non-snapshot first frame, and reset require reconnect", () => {
+  for (const frames of [
+    [{ epoch: 1, seq: 1, kind: "snapshot", payload: { state: {} } }, { epoch: 1, seq: 3, kind: "event", payload: { type: "skipped" } }],
+    [{ epoch: 1, seq: 1, kind: "event", payload: { type: "before-snapshot" } }],
+    [{ epoch: 1, seq: 1, kind: "snapshot", payload: { state: {} } }, { epoch: 1, seq: 2, kind: "reset", payload: null }],
+  ]) {
+    const { source, deliver } = framedSource();
+    let errors = 0;
+    const events = [];
+    source.onmessage = (message) => events.push(JSON.parse(message.data));
+    source.onerror = () => { errors++; };
+    for (const frame of frames) deliver({ subscriptionId: "sub", ...frame });
+    assert.equal(errors, 1);
+    assert.ok(!events.some((event) => event.type === "skipped" || event.type === "before-snapshot"));
+    deliver({ subscriptionId: "sub", epoch: 1, seq: 2, kind: "event", payload: { type: "late" } });
+    assert.ok(!events.some((event) => event.type === "late"));
+    source.close();
+  }
 });
 
 test("the connected event carries pendingExtensionUiIds (the SSE contract)", () => {

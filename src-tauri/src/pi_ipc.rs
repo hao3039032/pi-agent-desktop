@@ -2739,8 +2739,13 @@ pub const IPC_MAX_CONCURRENT_CONTROL: usize = 4;
 /// blocks process exit.
 pub async fn dispatch_envelope_gated(state: Arc<IpcHostState>, request: Value) -> Value {
     let id = envelope_id(&request);
-    let control = matches!(request.get("op").and_then(Value::as_str),
-        Some("agent.unsubscribeEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe"));
+    let op = request.get("op").and_then(Value::as_str);
+    let control = matches!(op,
+        Some("agent.unsubscribeEvents" | "terminal.unsubscribe" | "terminal.ack" | "tasks.unsubscribe" |
+             "agent.interrupt" | "auth.loginCancel" | "mcp.signInCancel" |
+             "plugins.mutation.cancel" | "plugins.install.cancel" | "skills.mutation.cancel"))
+        || (op == Some("agent.command") && matches!(request.pointer("/args/type").and_then(Value::as_str),
+            Some("abort" | "abort_bash" | "abort_retry" | "abort_branch_summary")));
     let gate = Arc::clone(if control { &state.dispatch_control_gate } else { &state.dispatch_gate });
     let permit = match gate.try_acquire_owned() {
         Ok(permit) => permit,
@@ -6541,6 +6546,20 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             Arc::clone(&state), json!({"v":1,"id":"cleanup","op":"tasks.unsubscribe","args":{"subscriptionId":"missing"}}),
         ));
         assert_eq!(control["ok"], true, "cleanup has reserved capacity: {control}");
+        for (op, args) in [
+            ("agent.interrupt", json!({"session":"missing"})),
+            ("agent.command", json!({"session":"missing", "type":"abort"})),
+            ("mcp.signInCancel", json!({})),
+        ] {
+            let result = tauri::async_runtime::block_on(dispatch_envelope_gated(
+                Arc::clone(&state), json!({"v":1,"id":"stop","op":op,"args":args}),
+            ));
+            assert_ne!(result["error"]["reason"], "dispatch_not_admitted", "Stop used reserved capacity: {result}");
+        }
+        let prompt = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"prompt","op":"agent.command","args":{"session":"missing","type":"prompt"}}),
+        ));
+        assert_eq!(prompt["error"]["reason"], "dispatch_not_admitted");
         let control_permits: Vec<_> = (0..IPC_MAX_CONCURRENT_CONTROL)
             .map(|_| Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap())
             .collect();

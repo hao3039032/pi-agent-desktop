@@ -95,7 +95,7 @@ fn operation_policy(op: &str, session_writer: bool) -> Result<OperationPolicy, S
         // projection. They are not pure reads and are never auto-retried.
         "modelsConfig.catalog" | "modelsConfig.discover" | "modelsConfig.test" | "models.refreshCatalog" |
         "models.providerUsage" | "skills.search" | "skills.check" | "plugins.check" | "mcp.test" |
-        "session.export" | "session.extractToolResultImage" => Ok(Ephemeral),
+        "session.export" | "session.extractToolResultImage" | "auth.loginCancel" => Ok(Ephemeral),
         _ => Err(format!("unclassified management operation: {op}")),
     }
 }

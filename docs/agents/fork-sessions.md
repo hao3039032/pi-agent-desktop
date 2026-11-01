@@ -408,8 +408,8 @@ Session starts, tool-policy restarts and chat-unlock writes share the per-sessio
 ## Static desktop dispatch admission (partial M5)
 
 The shared product/harness envelope dispatcher admits at most 16 ordinary
-blocking tasks and 4 independent stream-cleanup/terminal-ACK tasks, with no
-semaphore wait queue. Saturation returns `busy` / `dispatch_not_admitted`
+blocking tasks and 4 independent stream-cleanup, terminal-ACK and explicitly
+identified Stop/cancel tasks, with no semaphore wait queue. Saturation returns `busy` / `dispatch_not_admitted`
 before the operation executes. An admitted call abandoned by its WebView is
 not cancelled and may have an unknown outcome. The separate control budget
 prevents ordinary saturation starving cleanup, but can itself saturate; neither

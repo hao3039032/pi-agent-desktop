@@ -7,6 +7,28 @@ fn begin(ledger: &OperationLedger, op: &str) -> Result<String, String> {
 }
 
 #[test]
+fn mcp_credential_target_rejects_raw_keys_and_detects_legacy_aliases() {
+    let a = McpCredentialTarget::new("a".repeat(64), "c".repeat(64)).unwrap();
+    let alias = McpCredentialTarget::new("b".repeat(64), "c".repeat(64)).unwrap();
+    let other = McpCredentialTarget::new("d".repeat(64), "e".repeat(64)).unwrap();
+    assert!(a.conflicts(&alias));
+    assert!(!a.conflicts(&other));
+    assert!(McpCredentialTarget::new("https://user:secret@example.test".into(), "c".repeat(64)).is_err());
+    assert!(McpCredentialTarget::new("A".repeat(64), "c".repeat(64)).is_err());
+}
+
+#[test]
+fn read_only_inspection_never_creates_or_clears_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(OperationLedger::inspect(temp.path()).unwrap().is_empty());
+    assert!(!temp.path().join("pi-web").exists());
+    let ledger = OperationLedger::open(temp.path()).unwrap();
+    let id = begin(&ledger, "auth.logout").unwrap();
+    assert_eq!(OperationLedger::inspect(temp.path()).unwrap()[0].operation_id, id);
+    assert_eq!(ledger.list_pending().unwrap().len(), 1);
+}
+
+#[test]
 fn pending_survives_reopen_and_success_finishes_only_own_record() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = OperationLedger::open(temp.path()).unwrap();
