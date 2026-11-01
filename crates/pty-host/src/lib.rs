@@ -21,26 +21,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 /// Retained history cap, in UTF-16 code units (docs/terminal.md: 128 KiB).
 pub const HISTORY_LIMIT_UNITS: usize = 128 * 1024;
 
 type LogFn = Arc<dyn Fn(String) + Send + Sync>;
-
-struct SpawnGuard {
-    killer: Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
-    #[cfg(unix)]
-    pid: Option<u32>,
-}
-impl Drop for SpawnGuard {
-    fn drop(&mut self) {
-        if let Some(mut killer) = self.killer.take() {
-            #[cfg(unix)]
-            if let Some(pid) = self.pid { unsafe { libc::kill(pid as i32, libc::SIGKILL); } }
-            let _ = killer.kill();
-        }
-    }
-}
 
 /// Options for [`PtyHost::create`].
 pub struct PtyOptions {
@@ -205,6 +192,7 @@ pub struct Pty {
     log: LogFn,
     cwd: Option<std::path::PathBuf>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     output_closed: std::sync::atomic::AtomicBool,
     #[cfg(unix)]
     pid: Option<u32>,
@@ -214,6 +202,7 @@ pub struct Pty {
 enum ExitState {
     Exited(i32),
     Signaled,
+    Unknown,
 }
 
 impl Pty {
@@ -254,6 +243,7 @@ impl Pty {
     }
 
     fn force_kill(&self) {
+        let _child = self.child.lock().unwrap();
         if self.exit.lock().unwrap().is_some() { return; }
         #[cfg(unix)]
         if let Some(pid) = self.pid { unsafe { libc::kill(pid as i32, libc::SIGKILL); } }
@@ -282,7 +272,7 @@ impl Pty {
         match *state {
             Some(ExitState::Exited(code)) => Some(Some(code)),
             Some(ExitState::Signaled) => Some(None),
-            None => None,
+            Some(ExitState::Unknown) | None => None,
         }
     }
 
@@ -290,15 +280,41 @@ impl Pty {
 
 impl Drop for PtyHost {
     fn drop(&mut self) {
-        for pty in self.inner.lock().unwrap().values() {
-            pty.force_kill();
-        }
+        self.begin_shutdown();
+        let _ = self.shutdown_until(Instant::now() + Duration::from_millis(100));
     }
+}
+
+#[derive(Default)]
+struct PtyRegistry {
+    active: HashMap<String, Arc<Pty>>,
+    closing: Vec<(String, Arc<Pty>)>,
+    spawning: Vec<PendingSpawn>,
+}
+
+struct PendingSpawn {
+    id: String,
+    _child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+}
+
+struct ShutdownEntry {
+    id: String,
+    pty: Arc<Pty>,
+}
+
+/// Observed leader exits and unresolved identities or registry ranges.
+/// `unknown` includes sentinel ranges such as `<registry-busy>`; its length
+/// is not a process count. Neither field proves detached descendants exited.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PtyShutdownOutcome {
+    pub leader_exited: Vec<String>,
+    pub unknown: Vec<String>,
 }
 
 /// The registry of running PTYs. Create is idempotent by id.
 pub struct PtyHost {
-    inner: Arc<Mutex<HashMap<String, Arc<Pty>>>>,
+    inner: Arc<Mutex<PtyRegistry>>,
+    shutting_down: AtomicBool,
 }
 
 impl Default for PtyHost {
@@ -309,37 +325,45 @@ impl Default for PtyHost {
 
 impl PtyHost {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(HashMap::new())) }
+        Self { inner: Arc::new(Mutex::new(PtyRegistry::default())), shutting_down: AtomicBool::new(false) }
     }
 
     /// Check an existing live identity without launching a replacement.
     pub fn reuse(&self, id: &str, cwd: &std::path::Path) -> Result<bool, String> {
         let map = self.inner.lock().unwrap();
-        let Some(existing) = map.get(id) else { return Ok(false) };
+        if self.shutting_down.load(Ordering::Acquire) { return Err("terminal host is shutting down".into()); }
+        let Some(existing) = map.active.get(id) else { return Ok(false) };
         if existing.cwd.as_deref() != Some(cwd) {
             return Err("terminal id is already in use for another cwd".to_string());
         }
-        let live = existing.exit.lock().unwrap().is_none();
+        let live = matches!(*existing.exit.lock().unwrap(), None | Some(ExitState::Unknown));
         Ok(live)
     }
 
     /// Create (or return the existing) PTY with this id and cwd.
     /// A live id cannot be reused for a different cwd.
     pub fn create(&self, id: &str, cwd: Option<&std::path::Path>, options: PtyOptions) -> Result<Arc<Pty>, String> {
+        self.create_inner(id, cwd, options, || Ok(()))
+    }
+
+    fn create_inner(&self, id: &str, cwd: Option<&std::path::Path>, options: PtyOptions, after_spawn: impl FnOnce() -> Result<(), String>) -> Result<Arc<Pty>, String> {
+        if self.shutting_down.load(Ordering::Acquire) { return Err("terminal host is shutting down".into()); }
         // The whole open→spawn→insert runs under ONE lock: without it, two
         // concurrent creates for the same id both pass the existence check,
         // both spawn a shell, and the loser's child is orphaned (it is in no
         // registry, so close() can never reach it).
         let mut map = self.inner.lock().unwrap();
-        if let Some(existing) = map.get(id) {
+        if self.shutting_down.load(Ordering::Acquire) { return Err("terminal host is shutting down".into()); }
+        if let Some(existing) = map.active.get(id) {
             if existing.cwd.as_deref() != cwd {
                 return Err("terminal id is already in use for another cwd".to_string());
             }
-            if existing.exit.lock().unwrap().is_none() {
+            if matches!(*existing.exit.lock().unwrap(), None | Some(ExitState::Unknown)) {
                 return Ok(Arc::clone(existing));
             }
         }
-        map.remove(id);
+        map.closing.retain(|(_, pty)| !matches!(pty.exit.try_lock().as_deref(), Ok(Some(ExitState::Exited(_) | ExitState::Signaled))));
+        if let Some(old) = map.active.remove(id) { map.closing.push((id.to_string(), old)); }
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
             .openpty(portable_pty::PtySize {
@@ -390,13 +414,14 @@ impl PtyHost {
         };
         #[cfg(not(unix))]
         let spawned = pair.slave.spawn_command(command);
-        let mut child = spawned.map_err(|error| format!("spawn failed: {error}"))?;
+        let child = spawned.map_err(|error| format!("spawn failed: {error}"))?;
         drop(pair.slave);
-        let mut spawn_guard = SpawnGuard {
-            killer: Some(child.clone_killer()),
-            #[cfg(unix)]
-            pid: child.process_id(),
-        };
+        let killer = child.clone_killer();
+        #[cfg(unix)]
+        let pid = child.process_id();
+        let child = Arc::new(Mutex::new(child));
+        map.spawning.push(PendingSpawn { id: id.to_string(), _child: Arc::clone(&child) });
+        after_spawn()?;
 
         let mut reader = pair.master.try_clone_reader().map_err(|error| format!("reader failed: {error}"))?;
         let writer = pair.master.take_writer().map_err(|error| format!("writer failed: {error}"))?;
@@ -411,10 +436,11 @@ impl PtyHost {
             master: Mutex::new(Some(pair.master)),
             log: Arc::clone(&log),
             cwd: cwd.map(std::path::Path::to_path_buf),
-            killer: Mutex::new(child.clone_killer()),
+            killer: Mutex::new(killer),
+            child: Arc::clone(&child),
             output_closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(unix)]
-            pid: child.process_id(),
+            pid,
         });
 
         // Reader thread: chunks land in the history as they arrive (UTF-8 is
@@ -456,29 +482,33 @@ impl PtyHost {
             std::thread::Builder::new()
                 .name(format!("pty-exit-{id}"))
                 .spawn(move || {
-                    let status = child.wait();
-                    let mut exit = pty.exit.lock().unwrap();
-                    *exit = match status {
-                        Ok(status) if status.success() => Some(ExitState::Exited(0)),
-                        Ok(status) => {
-                            if status.signal().is_some() {
-                                Some(ExitState::Signaled)
-                            } else {
-                                Some(ExitState::Exited(status.exit_code() as i32))
-                            }
+                    loop {
+                        // Synchronize reaping with signaling: a reaped PID must
+                        // never be signaled after it can be reused by the OS.
+                        let mut child = child.lock().unwrap();
+                        let state = match child.try_wait() {
+                            Ok(None) => { drop(child); std::thread::sleep(Duration::from_millis(10)); continue; }
+                            Ok(Some(status)) if status.success() => ExitState::Exited(0),
+                            Ok(Some(status)) if status.signal().is_some() => ExitState::Signaled,
+                            Ok(Some(status)) => ExitState::Exited(status.exit_code() as i32),
+                            Err(error) => { (pty.log)(format!("pty wait failed: {error}")); ExitState::Unknown }
+                        };
+                        let unknown = state == ExitState::Unknown;
+                        *pty.exit.lock().unwrap() = Some(state);
+                        pty.exit_cv.notify_all();
+                        drop(child);
+                        if !unknown {
+                            *pty.master.lock().unwrap() = None;
+                            *pty.writer.lock().unwrap() = None;
                         }
-                        Err(_) => Some(ExitState::Signaled),
-                    };
-                    pty.exit_cv.notify_all();
-                    // Release the master so a re-opened reader cannot linger.
-                    *pty.master.lock().unwrap() = None;
-                    *pty.writer.lock().unwrap() = None;
+                        break;
+                    }
                 })
                 .map_err(|error| format!("exit thread failed: {error}"))?;
         }
 
         let mut map_guard = map;
-        let inserted = map_guard.entry(id.to_string()).or_insert_with(|| Arc::clone(&pty)).clone();
+        let inserted = map_guard.active.entry(id.to_string()).or_insert_with(|| Arc::clone(&pty)).clone();
         // If the registry already held a live entry (it cannot — the whole
         // open→spawn→insert ran under the lock — but entry() stays the
         // authority), the just-spawned loser must not leak: hang up its
@@ -487,26 +517,35 @@ impl PtyHost {
             *pty.master.lock().unwrap() = None;
             *pty.writer.lock().unwrap() = None;
         }
-        spawn_guard.killer = None;
+        map_guard.spawning.pop();
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("terminal host is shutting down".into());
+        }
         Ok(inserted)
     }
 
     /// A retained PTY by id, including an exited terminal awaiting expiry.
     pub fn get(&self, id: &str) -> Option<Arc<Pty>> {
         let map = self.inner.lock().unwrap();
-        map.get(id).cloned()
+        map.active.get(id).cloned()
     }
 
     /// Close a PTY and drop its registry entry. Further input fails explicitly.
     pub fn close(&self, id: &str) -> bool {
         let pty = {
             let mut map = self.inner.lock().unwrap();
-            map.remove(id)
+            map.closing.retain(|(_, pty)| !matches!(pty.exit.try_lock().as_deref(), Ok(Some(ExitState::Exited(_) | ExitState::Signaled))));
+            let removed = map.active.remove(id);
+            if let Some(pty) = &removed { map.closing.push((id.to_string(), Arc::clone(pty))); }
+            removed
         };
         let Some(pty) = pty else { return false };
         // The cloned reader holds another master fd; dropping the master alone
         // does not reliably hang up the child. Explicitly terminate it.
-        if pty.exit.lock().unwrap().is_none() { let _ = pty.killer.lock().unwrap().kill(); }
+        {
+            let _child = pty.child.lock().unwrap();
+            if pty.exit.lock().unwrap().is_none() { let _ = pty.killer.lock().unwrap().kill(); }
+        }
         #[cfg(unix)]
         {
             let pty = Arc::clone(&pty);
@@ -519,22 +558,57 @@ impl PtyHost {
         true
     }
 
-    /// Force-terminate every terminal when the application host exits.
-    pub fn shutdown(&self) {
-        let mut map = self.inner.lock().unwrap();
-        for pty in map.values() {
-            pty.force_kill();
-            *pty.master.lock().unwrap() = None;
-            *pty.writer.lock().unwrap() = None;
+    /// Close admission without waiting for an in-flight spawn or registry lock.
+    pub fn begin_shutdown(&self) { self.shutting_down.store(true, Ordering::Release); }
+
+    /// Observe actual leader exits until one shared absolute deadline.
+    /// Busy locks and failed waits remain tracked as unknown. No signals are
+    /// sent: an unbound numeric PID cannot safely identify the spawned child.
+    pub fn shutdown_until(&self, deadline: Instant) -> PtyShutdownOutcome {
+        self.begin_shutdown();
+        let mut outcome = PtyShutdownOutcome::default();
+        let registry = match self.inner.try_lock() {
+            Ok(registry) => registry,
+            Err(_) => { outcome.unknown.push("<registry-busy>".into()); return outcome; }
+        };
+        let entry = |id: &String, pty: &Arc<Pty>| ShutdownEntry { id: id.clone(), pty: Arc::clone(pty) };
+        let mut pending: Vec<ShutdownEntry> = registry.active.iter().map(|(id, pty)| entry(id, pty))
+            .chain(registry.closing.iter().map(|(id, pty)| entry(id, pty))).collect();
+        // Failed initialization has no exit watcher. Keep the child handle
+        // in the registry; no arbitrary Child method is safe on this path.
+        outcome.unknown.extend(registry.spawning.iter().map(|spawn| spawn.id.clone()));
+        drop(registry);
+        loop {
+            let mut index = 0;
+            while index < pending.len() {
+                let item = &pending[index];
+                let state = item.pty.exit.try_lock().ok().map(|state| state.clone());
+                match state {
+                    Some(Some(ExitState::Exited(_) | ExitState::Signaled)) => {
+                        outcome.leader_exited.push(item.id.clone()); pending.swap_remove(index);
+                    }
+                    Some(Some(ExitState::Unknown)) => {
+                        outcome.unknown.push(item.id.clone()); pending.swap_remove(index);
+                    }
+                    _ => index += 1,
+                }
+            }
+            if pending.is_empty() { break; }
+            let now = Instant::now();
+            if now >= deadline { outcome.unknown.extend(pending.into_iter().map(|entry| entry.id)); break; }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
         }
-        map.clear();
+        outcome
     }
 
-    /// All live ids (diagnostics/tests).
+    /// Compatibility wrapper; callers that require evidence use shutdown_until.
+    pub fn shutdown(&self) { let _ = self.shutdown_until(Instant::now() + Duration::from_secs(2)); }
+
+    /// All live or unconfirmed ids (diagnostics/tests).
     pub fn ids(&self) -> Vec<String> {
         let map = self.inner.lock().unwrap();
-        map.iter()
-            .filter(|(_, pty)| pty.exit.lock().unwrap().is_none())
+        map.active.iter()
+            .filter(|(_, pty)| matches!(*pty.exit.lock().unwrap(), None | Some(ExitState::Unknown)))
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -564,6 +638,119 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_reports_real_leader_exits_and_closes_admission() {
+        let host = PtyHost::new();
+        let a = host.create("a", None, PtyOptions::default()).unwrap();
+        let b = host.create("b", None, PtyOptions::default()).unwrap();
+        a.write_input(b"exit 0\n").unwrap(); b.write_input(b"exit 0\n").unwrap();
+        let outcome = host.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert!(outcome.unknown.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.leader_exited.len(), 2, "{outcome:?}");
+        assert!(a.wait_exit(Duration::from_secs(1)).is_some());
+        assert!(b.wait_exit(Duration::from_secs(1)).is_some());
+        assert!(host.create("later", None, PtyOptions::default()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_uses_one_deadline_for_locked_children_and_keeps_tracking() {
+        let host = PtyHost::new();
+        let a = host.create("a", None, PtyOptions::default()).unwrap();
+        let b = host.create("b", None, PtyOptions::default()).unwrap();
+        let ga = a.child.lock().unwrap(); let gb = b.child.lock().unwrap();
+        let start = Instant::now();
+        let outcome = host.shutdown_until(start + Duration::from_millis(60));
+        assert!(start.elapsed() < Duration::from_millis(400));
+        assert_eq!(outcome.unknown.len(), 2, "{outcome:?}");
+        drop(ga); drop(gb);
+        a.write_input(b"exit 0\n").unwrap(); b.write_input(b"exit 0\n").unwrap();
+        let later = host.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert!(later.unknown.is_empty(), "{later:?}");
+        assert_eq!(later.leader_exited.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_registry_busy_covers_spawn_before_registration() {
+        use std::sync::mpsc;
+        let host = Arc::new(PtyHost::new());
+        let (ready_tx, ready_rx) = mpsc::channel(); let (go_tx, go_rx) = mpsc::channel();
+        let worker_host = Arc::clone(&host);
+        let worker = std::thread::spawn(move || worker_host.create_inner("race", None, PtyOptions::default(), || {
+            ready_tx.send(()).unwrap(); go_rx.recv().unwrap(); Ok(())
+        }));
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        host.begin_shutdown();
+        let start = Instant::now();
+        let outcome = host.shutdown_until(start + Duration::from_millis(60));
+        assert_eq!(outcome.unknown, vec!["<registry-busy>"]);
+        assert!(start.elapsed() < Duration::from_millis(400));
+        go_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        host.get("race").unwrap().write_input(b"exit 0\n").unwrap();
+        let later = host.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert!(later.unknown.is_empty(), "{later:?}");
+        assert_eq!(later.leader_exited, vec!["race"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_post_spawn_setup_retains_unknown_child() {
+        let host = PtyHost::new();
+        assert!(host.create_inner("failed-setup", None, PtyOptions::default(), || Err("fixture failure".into())).is_err());
+        let child = Arc::clone(&host.inner.lock().unwrap().spawning[0]._child);
+        let outcome = host.shutdown_until(Instant::now() + Duration::from_millis(50));
+        assert_eq!(outcome.unknown, vec!["failed-setup"], "{outcome:?}");
+        assert!(outcome.leader_exited.is_empty());
+        // Explicit cleanup of this test-owned child, not part of shutdown_until.
+        let mut child = child.lock().unwrap(); let _ = child.kill(); let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unknown_wait_is_not_reported_as_exit_or_replaced() {
+        let host = PtyHost::new();
+        let pty = host.create("unknown", None, PtyOptions::default()).unwrap();
+        *pty.exit.lock().unwrap() = Some(ExitState::Unknown);
+        assert_eq!(pty.wait_exit(Duration::ZERO), None);
+        assert_eq!(host.ids(), vec!["unknown"]);
+        assert!(Arc::ptr_eq(&host.create("unknown", None, PtyOptions::default()).unwrap(), &pty));
+        let outcome = host.shutdown_until(Instant::now() + Duration::from_millis(50));
+        assert_eq!(outcome.unknown, vec!["unknown"]);
+        assert!(outcome.leader_exited.is_empty());
+        *pty.exit.lock().unwrap() = None;
+        pty.write_input(b"exit 0\n").unwrap();
+        let cleanup = host.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert!(cleanup.unknown.is_empty(), "{cleanup:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_does_not_call_slow_unregistered_child_methods() {
+        use std::sync::atomic::AtomicUsize;
+        #[derive(Debug, Clone)] struct Slow(Arc<AtomicUsize>);
+        impl portable_pty::ChildKiller for Slow {
+            fn kill(&mut self) -> std::io::Result<()> { self.0.fetch_add(1, Ordering::SeqCst); std::thread::sleep(Duration::from_secs(1)); Ok(()) }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> { Box::new(self.clone()) }
+        }
+        impl portable_pty::Child for Slow {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> { self.0.fetch_add(1, Ordering::SeqCst); std::thread::sleep(Duration::from_secs(1)); Ok(None) }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> { Err(std::io::Error::other("not used")) }
+            fn process_id(&self) -> Option<u32> { None }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let host = PtyHost::new();
+        host.inner.lock().unwrap().spawning.push(PendingSpawn { id: "slow".into(), _child: Arc::new(Mutex::new(Box::new(Slow(Arc::clone(&calls))))) });
+        let start = Instant::now();
+        let outcome = host.shutdown_until(start + Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_millis(400));
+        assert_eq!(outcome.unknown, vec!["slow"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(host.inner.lock().unwrap().spawning.len(), 1);
     }
 
     #[test]
@@ -724,15 +911,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn host_shutdown_forces_stubborn_shell_immediately() {
+    fn bounded_shutdown_leaves_stubborn_shell_unknown() {
         let host = PtyHost::new();
         let dir = tempfile::tempdir().unwrap();
         let pty = host.create("shutdown", Some(dir.path()), PtyOptions::default()).unwrap();
         pty.write_input(b"trap '' HUP; printf 'ready-for-%s\\n' shutdown; while :; do :; done\n").unwrap();
         wait_for_output(&pty, |text| text.contains("ready-for-shutdown\r\n"), "trap installed");
-        host.shutdown();
-        assert!(pty.wait_exit(Duration::from_secs(1)).is_some(), "shutdown force-kills the shell");
-        assert!(host.ids().is_empty());
+        let result = host.shutdown_until(Instant::now() + Duration::from_millis(50));
+        assert_eq!(result.unknown, vec!["shutdown"]);
+        assert!(result.leader_exited.is_empty());
+        // This test owns the child and uses the ordinary terminal close path.
+        host.close("shutdown");
+        assert!(pty.wait_exit(Duration::from_secs(5)).is_some());
     }
 
     #[cfg(unix)]

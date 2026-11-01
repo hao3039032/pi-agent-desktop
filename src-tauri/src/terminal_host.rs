@@ -132,6 +132,14 @@ impl TerminalStreams {
             next_generation: AtomicU64::new(1),
         }
     }
+    /// Stop new PTY admission without taking relay or lease locks.
+    pub fn begin_shutdown(&self) { self.host.begin_shutdown(); }
+
+    /// The result covers PTY leaders, not detached descendants or relay tasks.
+    pub fn shutdown_until(&self, deadline: Instant) -> pty_host::PtyShutdownOutcome {
+        self.host.shutdown_until(deadline)
+    }
+
     pub fn reuse(&self, id: &str, cwd: &Path) -> Result<bool, String> {
         let mut leases = self.leases.lock().unwrap();
         if !self.host.reuse(id, cwd)? {
@@ -312,6 +320,22 @@ impl TerminalStreams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_stream_shutdown_delegates_without_lease_lock() {
+        let host = Arc::new(pty_host::PtyHost::new());
+        let streams = TerminalStreams::new(Arc::clone(&host));
+        let dir = tempfile::tempdir().unwrap();
+        streams.create("shutdown", dir.path(), pty_host::PtyOptions::default()).unwrap();
+        let pty = host.get("shutdown").unwrap();
+        pty.write_input(b"exit 0\n").unwrap();
+        let _locked = streams.leases.lock().unwrap();
+        streams.begin_shutdown();
+        let result = streams.shutdown_until(Instant::now() + Duration::from_secs(2));
+        assert_eq!(result.leader_exited, vec!["shutdown"]);
+        assert!(result.unknown.is_empty(), "{result:?}");
+    }
 
     #[cfg(unix)]
     #[test]
