@@ -101,10 +101,11 @@ export function revokeMcpCredentialWriters(name: string, url: string): { canonic
   return { canonicalKey, generation: noteMcpSignOut(canonicalKey) };
 }
 
-/** Host-only preflight; canonicalKey may contain URL secrets. */
+/** Host-only preflight; canonicalKey and legacyKey may contain URL secrets. */
 export interface McpCredentialAdmission {
   schema: 1;
   canonicalKey: string;
+  legacyKey: string;
   configKey: string;
   generation: number;
 }
@@ -116,10 +117,10 @@ export class McpCredentialAdmissionError extends Error {
 
 /** Validate and capture in the same synchronous turn, before any store is opened. */
 export function mcpSignOutGuard(name: string, url: string, configKey?: string, admission?: unknown): McpSignInWriteGuard {
-  const key = mcpSignInKey(name, url);
+  const { key, legacyKey } = mcpOAuthStoreKeys(name, url);
   const atStart = mcpSignOutCount(key);
   if (admission !== undefined) {
-    if (!isRecord(admission) || admission.schema !== 1 || admission.canonicalKey !== key ||
+    if (!isRecord(admission) || admission.schema !== 1 || admission.canonicalKey !== key || admission.legacyKey !== legacyKey ||
         typeof configKey !== "string" || !configKey || admission.configKey !== configKey || !Number.isSafeInteger(admission.generation) ||
         (admission.generation as number) < 0 || admission.generation !== atStart) {
       throw new McpCredentialAdmissionError();

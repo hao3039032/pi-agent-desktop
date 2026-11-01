@@ -585,7 +585,7 @@ function signOutsOf(target: McpTestTarget): number {
 }
 
 function flightKey(target: McpTestTarget, admitted: boolean): string {
-  return [target.scope, target.sourcePath, target.name, target.configKey, target.cwd, signOutsOf(target), admitted ? "admitted" : "legacy"].join("\0");
+  return [target.scope, target.sourcePath, target.name, target.configKey, target.cwd, signOutsOf(target), admitted ? "admitted-legacy-v1" : "legacy"].join("\0");
 }
 
 /**
