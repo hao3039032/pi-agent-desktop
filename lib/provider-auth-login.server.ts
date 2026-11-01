@@ -26,10 +26,8 @@ import { oauthLoginOptions } from "./oauth-login-options";
  * flows themselves run inside the SDK (pi-ai's own callback server), inside
  * this child — no app HTTP server exists on any path.
  *
- * The host (src-tauri/src/provider_auth.rs) owns the flow id, drives the
- * polling and cancels on unsubscribe; this module never invents ids, and a
- * flow nobody polls for FLOW_IDLE_TIMEOUT is cancelled (the poll IS the
- * lease — the same backstop the SSE client disconnect was).
+ * The host (src-tauri/src/provider_auth.rs) owns the flow id and drives
+ * polling. Losing an observer does not prove the credential writer stopped.
  */
 
 /** The SSE `data:` payloads of the old login stream, verbatim. */
@@ -60,10 +58,8 @@ export interface QueuedLoginEvent {
   event: OAuthLoginEvent;
 }
 
-/** At most this many concurrent flows; the oldest is cancelled on overflow. */
+/** At most this many concurrent flows; never evict an active writer. */
 const MAX_FLOWS = 8;
-/** A flow nobody polls for this long is cancelled (the poll IS the lease). */
-const FLOW_IDLE_TIMEOUT_MS = 120_000;
 /** A bounded buffer: a real login is a few dozen events at most. */
 const MAX_EVENTS = 512;
 /** Finished flows kept for late polls (bounded; the terminal event survives). */
@@ -97,20 +93,6 @@ const flows = new Map<string, LoginFlow>();
 const finishedFlows = new Map<string, LoginFlow>();
 /** Every live token across flows: the old route's global registry. */
 const tokens = new Map<string, PendingPrompt>();
-
-const flowSweeper = setInterval(() => {
-  const now = Date.now();
-  for (const [flowId, flow] of flows) {
-    if (flow.done) continue;
-    // A poller refreshes lastPolled; an abandoned flow (relay gone, host
-    // died without the unsubscribe) cancels like the old client disconnect.
-    if (now - flow.lastPolled > FLOW_IDLE_TIMEOUT_MS) {
-      cancelLoginFlow(flowId);
-    }
-  }
-}, 30_000);
-// Never hold the child open for the sweeper alone.
-flowSweeper.unref?.();
 
 function enqueue(flow: LoginFlow, event: OAuthLoginEvent): void {
   if (flow.done) return;
@@ -242,12 +224,10 @@ export async function startLoginFlow(
   if (!modelRuntime.getProvider(provider)?.auth.oauth) {
     return { started: false, message: `Unknown provider: ${provider}` };
   }
-  if (flows.size >= MAX_FLOWS) {
-    // Evict the oldest flow when the table is full (cancelLoginFlow also
-    // retires it, keeping its terminal events for a late poll).
-    const oldest = flows.keys().next().value;
-    if (typeof oldest === "string") cancelLoginFlow(oldest);
-  }
+  // Recheck after the asynchronous runtime load: another start may have
+  // occupied this id or the last slot while it was in progress.
+  if (flows.has(flowId)) return { started: false, message: "A login flow is already running" };
+  if (flows.size >= MAX_FLOWS) return { started: false, message: "Login capacity exhausted" };
   const flow: LoginFlow = {
     provider,
     seq: 0,
@@ -433,7 +413,8 @@ export function submitLoginCode(
 export function cancelLoginFlow(flowId: string): boolean {
   const flow = flows.get(flowId);
   if (!flow) return false;
+  // Retire only in the login promise's finally: aborting interaction does
+  // not prove the credential writer has unwound or released its slot.
   finishFlow(flow, { type: "cancelled" });
-  retireFlow(flowId, flow);
   return true;
 }
