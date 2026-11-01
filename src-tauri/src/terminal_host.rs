@@ -508,7 +508,7 @@ mod tests {
             )
             .unwrap();
         pty.write_input(
-            b"pwd -P; cat marker; for f in /proc/$$/fd/*; do readlink \"$f\"; done; exit 0\n",
+            b"pwd -P; cat marker; for f in /proc/$$/fd/*; do printf '<FD>%s</FD>\\n' \"$(readlink \"$f\")\"; done; exit 0\n",
         )
         .unwrap();
         assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(Some(0)));
@@ -527,14 +527,8 @@ mod tests {
             output.contains(&moved.join("work").display().to_string()),
             "{output:?}"
         );
-        // Only pwd prints this directory: no inherited fd points back at it.
-        assert_eq!(
-            output
-                .matches(&moved.join("work").display().to_string())
-                .count(),
-            1,
-            "{output:?}"
-        );
+        // Shell prompts may also print cwd; inspect only marked fd targets.
+        assert!(!output.contains(&format!("<FD>{}</FD>", moved.join("work").display())), "{output:?}");
         host.close("pinned");
     }
 

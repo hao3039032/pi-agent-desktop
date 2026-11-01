@@ -51,8 +51,8 @@ pub struct PtyOptions {
     pub env: Vec<(String, String)>,
     /// Host-selected executable and arguments, never supplied by a client.
     pub shell: Option<(std::path::PathBuf, Vec<String>)>,
-    /// An authorized directory pinned by the Linux host through spawn.
-    #[cfg(target_os = "linux")]
+    /// An authorized directory pinned by the host through spawn.
+    #[cfg(unix)]
     pub cwd_handle: Option<std::fs::File>,
     /// Diagnostics (spawn trouble, read errors).
     pub on_log: Option<LogFn>,
@@ -65,7 +65,7 @@ impl Default for PtyOptions {
             rows: 24,
             env: Vec::new(),
             shell: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             cwd_handle: None,
             on_log: None,
         }
@@ -359,26 +359,20 @@ impl PtyHost {
                 { (std::env::var_os("COMSPEC").map(std::path::PathBuf::from).ok_or("no shell configured")?, Vec::new()) }
             },
         };
+        #[cfg(unix)]
+        if options.cwd_handle.is_some() && !shell.is_absolute() {
+            return Err("pinned terminal shell must be an absolute path".to_string());
+        }
         let mut command = portable_pty::CommandBuilder::new(shell);
         for arg in args { command.arg(arg); }
         if let Some(cwd) = cwd {
-            #[cfg(target_os = "linux")]
-            if let Some(handle) = options.cwd_handle.as_ref() {
-                use std::os::fd::AsRawFd;
-                // portable-pty closes inherited fds in its child pre-exec;
-                // the parent's fd stays open until spawn_command returns.
-                let pinned = format!("/proc/{}/fd/{}", std::process::id(), handle.as_raw_fd());
-                // CommandBuilder otherwise silently falls back to HOME for a
-                // cwd it cannot stat, which would bypass the host's scope.
-                if !std::path::Path::new(&pinned).is_dir() {
-                    return Err("pinned terminal cwd is unavailable".to_string());
-                }
-                command.cwd(pinned);
+            #[cfg(unix)]
+            if options.cwd_handle.is_some() {
                 command.env("PWD", cwd);
             } else {
                 command.cwd(cwd);
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(unix))]
             command.cwd(cwd);
         }
         command.env_remove("PI_WEB_PASSWORD");
@@ -388,10 +382,15 @@ impl PtyHost {
             command.env(key, value);
         }
 
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| format!("spawn failed: {error}"))?;
+        #[cfg(unix)]
+        let spawned = if let Some(handle) = options.cwd_handle {
+            pair.slave.spawn_command_in_directory(command, handle)
+        } else {
+            pair.slave.spawn_command(command)
+        };
+        #[cfg(not(unix))]
+        let spawned = pair.slave.spawn_command(command);
+        let mut child = spawned.map_err(|error| format!("spawn failed: {error}"))?;
         drop(pair.slave);
         let mut spawn_guard = SpawnGuard {
             killer: Some(child.clone_killer()),

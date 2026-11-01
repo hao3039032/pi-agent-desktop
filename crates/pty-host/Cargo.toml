@@ -9,7 +9,7 @@ publish = false
 
 
 [dependencies]
-portable-pty = "0.9"
+portable-pty = { path = "../vendor/portable-pty" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
