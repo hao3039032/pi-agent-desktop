@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
-pub(super) fn directory_entries(directory: &std::fs::File) -> std::io::Result<Vec<OsString>> {
+pub(crate) fn directory_entries(directory: &std::fs::File) -> std::io::Result<Vec<OsString>> {
     // Open a new file description: dup() would share the directory cursor.
     let fd = unsafe { libc::openat(directory.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
@@ -63,7 +63,7 @@ fn path_of_directory(directory: &std::fs::File) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_vec(bytes.to_vec())))
 }
 
-pub(super) fn git_directory(command: &mut std::process::Command, directory: &std::fs::File) {
+pub(crate) fn git_directory(command: &mut std::process::Command, directory: &std::fs::File) {
     use std::os::unix::process::CommandExt;
     let fd = directory.as_raw_fd();
     // The borrowed descriptor remains live until spawn returns. Only the

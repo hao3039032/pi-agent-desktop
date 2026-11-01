@@ -44,6 +44,8 @@ impl PinnedRoot {
         Ok(Self { path, selected_path, directory: Arc::new(directory), identity: (metadata.dev(), metadata.ino()) })
     }
 
+    pub(crate) fn path(&self) -> &Path { &self.path }
+
     /// Return the pinned object only if its current path binding still matches.
     pub(crate) fn admit(&self) -> io::Result<File> {
         if std::fs::canonicalize(&self.selected_path)? != self.path {

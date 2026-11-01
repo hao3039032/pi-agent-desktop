@@ -361,7 +361,7 @@ fn main() {
         let root = PathBuf::from(root).canonicalize().expect("fixture root exists");
         let temp = std::env::temp_dir().canonicalize().expect("temporary directory resolves");
         if !root.starts_with(&temp) || root == temp { panic!("fixture root must be an isolated temporary directory"); }
-        host_state.propose_path(&root);
+        host_state.propose_path(&root).expect("fixture root must be authorized");
     }
     if let Some(agent) = scheduler_agent_dir {
         let isolated = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from).and_then(|path| path.canonicalize().ok());

@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
 #[path = "file_directory_unix.rs"]
-mod file_directory_unix;
+pub(crate) mod file_directory_unix;
 #[cfg(unix)]
 use file_directory_unix::{directory_entries, directory_entry_info, git_directory};
 #[cfg(unix)]
@@ -32,6 +32,8 @@ mod file_handle_windows;
 pub struct AllowedRoots {
     roots: BTreeSet<String>,
     resolved_roots: BTreeMap<String, PathBuf>,
+    #[cfg(unix)]
+    pinned_roots: BTreeMap<String, pinned_root_unix::PinnedRoot>,
 }
 
 impl AllowedRoots {
@@ -41,16 +43,54 @@ impl AllowedRoots {
 
     /// Add a root (normalized: forward slashes, no trailing slash; empty or
     /// relative roots are ignored — an allow-list root is absolute).
-    pub fn add(&mut self, root: &Path) {
-        if let Some(normalized) = normalize_root(root) {
-            if let Ok(canonical) = std::fs::canonicalize(root) {
-                self.resolved_roots.insert(normalized.clone(), canonical);
+    pub fn add(&mut self, root: &Path) -> std::io::Result<()> {
+        let normalized = normalize_root(root).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root must be absolute"))?;
+        #[cfg(unix)]
+        {
+            for known in &self.roots {
+                if is_within(&normalized, known) && self.unchanged_root(known).is_none() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "previously authorized root was replaced or removed"));
+                }
             }
-            self.roots.insert(normalized);
+            if let Some(existing) = self.pinned_roots.get(&normalized) {
+                existing.admit()?;
+                return Ok(());
+            }
+            if self.roots.contains(&normalized) {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "previously missing root requires explicit selection"));
+            }
+            let pinned = pinned_root_unix::PinnedRoot::open(root)?;
+            pinned.admit()?;
+            self.resolved_roots.insert(normalized.clone(), pinned.path().to_path_buf());
+            self.pinned_roots.insert(normalized.clone(), pinned);
         }
+        #[cfg(windows)]
+        { self.resolved_roots.insert(normalized.clone(), std::fs::canonicalize(root)?); }
+        self.roots.insert(normalized);
+        Ok(())
+    }
+
+    /// Only a fresh host-native selection may replace a prior grant.
+    #[cfg(unix)]
+    pub fn reauthorize(&mut self, root: &Path) -> std::io::Result<()> {
+        let normalized = normalize_root(root).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "root must be absolute"))?;
+        let pinned = pinned_root_unix::PinnedRoot::open(root)?;
+        pinned.admit()?;
+        let canonical = pinned.path().to_path_buf();
+        self.resolved_roots.insert(normalized.clone(), canonical);
+        self.pinned_roots.insert(normalized.clone(), pinned);
+        self.roots.insert(normalized);
+        Ok(())
+    }
+
+    /// Record a missing historical cwd for status only, without a grant.
+    pub fn add_missing(&mut self, root: &Path) {
+        if let Some(normalized) = normalize_root(root) { self.roots.insert(normalized); }
     }
 
     fn unchanged_root(&self, root: &str) -> Option<PathBuf> {
+        #[cfg(unix)]
+        self.pinned_roots.get(root)?.admit().ok()?;
         let original = self.resolved_roots.get(root)?;
         let current = std::fs::canonicalize(root).ok()?;
         (current == *original).then_some(current)
@@ -58,25 +98,28 @@ impl AllowedRoots {
 
     /// The `~/pi-cwd` and `~/pi-cwd-YYYYMMDD` scan roots (the legacy
     /// default-cwd layouts stay browsable across restarts).
-    pub fn add_default_cwd_roots(&mut self, home: &Path) {
-        self.add(&home.join("pi-cwd"));
-        if let Ok(entries) = std::fs::read_dir(home) {
-            for entry in entries.flatten() {
+    pub fn add_default_cwd_roots(&mut self, home: &Path) -> std::io::Result<()> {
+        if home.join("pi-cwd").try_exists()? { self.add(&home.join("pi-cwd"))?; }
+        {
+            let entries = std::fs::read_dir(home)?;
+            for entry in entries {
+                let entry = entry?;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.len() == 15
                     && name.starts_with("pi-cwd-")
                     && name[8..].chars().all(|c| c.is_ascii_digit())
                 {
-                    self.add(&entry.path());
+                    self.add(&entry.path())?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Snapshot of host-authorized roots for scoped management operations.
     pub fn snapshot(&self) -> Vec<String> {
-        self.roots.iter().cloned().collect()
+        self.roots.iter().filter(|root| self.unchanged_root(root).is_some()).cloned().collect()
     }
 
     /// Lexical authorization: the path is inside a root by spelling (no
@@ -95,7 +138,10 @@ impl AllowedRoots {
     /// inside a root that ALSO resolves to the same spelling — a symlink or
     /// junction pointing outside the roots is refused.
     pub fn is_existing_path_allowed(&self, target: &Path) -> bool {
-        self.is_existing_path_allowed_at(target, true)
+        #[cfg(unix)]
+        { self.open_directory(target).is_ok() || self.open_file(target).is_ok() }
+        #[cfg(not(unix))]
+        { self.is_existing_path_allowed_at(target, true) }
     }
 
     /// Authorization for a path that may not exist yet (a new file):
@@ -139,19 +185,46 @@ impl AllowedRoots {
         false
     }
 
+    #[cfg(unix)]
+    fn admit_resolved(&self, target: &Path) -> std::io::Result<(PathBuf, PathBuf, std::fs::File)> {
+        let (resolved, root) = resolved_read_target_with_root(self, target)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside authorized roots"))?;
+        for (key, pinned) in &self.pinned_roots {
+            if self.resolved_roots.get(key) == Some(&root) {
+                return Ok((resolved, root, pinned.admit()?));
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root not pinned"))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_directory(&self, target: &Path) -> std::io::Result<std::fs::File> {
+        let (resolved, root, handle) = self.admit_resolved(target)?;
+        walk_directory(&handle, resolved.strip_prefix(root).map_err(|_| std::io::ErrorKind::PermissionDenied)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_file(&self, target: &Path) -> std::io::Result<std::fs::File> {
+        let (resolved, root, handle) = self.admit_resolved(target)?;
+        open_file_relative(&handle, resolved.strip_prefix(root).map_err(|_| std::io::ErrorKind::PermissionDenied)?)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_preview_directory(&self, target: &Path) -> std::io::Result<(std::fs::File, String)> {
+        let (resolved, root, handle) = self.admit_resolved(target)?;
+        let relative = resolved.strip_prefix(root).map_err(|_| std::io::ErrorKind::PermissionDenied)?;
+        let name = relative.file_name().and_then(|name| name.to_str()).ok_or(std::io::ErrorKind::InvalidInput)?.to_owned();
+        let _file = open_file_relative(&handle, relative)?;
+        let directory = walk_directory(&handle, relative.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?;
+        Ok((directory, name))
+    }
+
     /// Open an already-authorized directory without following swapped path
     /// components. The returned descriptor pins the directory across spawn.
     #[cfg(unix)]
     pub(crate) fn open_terminal_directory(&self, target: &Path) -> Option<(PathBuf, std::fs::File)> {
-        let (resolved, _) = self.resolved_write_parent_with_root(&target.join(".terminal-anchor"))?;
-        let mut directory = openat_directory_no_follow_by_path(Path::new("/")).ok()?;
-        for component in resolved.components() {
-            match component {
-                Component::RootDir => {},
-                Component::Normal(name) => directory = openat_directory_no_follow(&directory, name.to_str()?).ok()?,
-                _ => return None,
-            }
-        }
+        let (resolved, root, handle) = self.admit_resolved(target).ok()?;
+        let directory = walk_directory(&handle, resolved.strip_prefix(root).ok()?).ok()?;
         Some((resolved, directory))
     }
 
@@ -266,7 +339,11 @@ pub fn write_through_allowed_parent(
 
     #[cfg(unix)]
     {
-        write_beneath_root(&resolved_root, &resolved_parent, name, data)
+        let _ = (resolved_root, resolved_parent);
+        let parent = roots.open_directory(target.parent().ok_or(WriteRefusal::OutsideRoots)?)
+            .map_err(WriteRefusal::Io)?;
+        crate::project_upload::atomic_replace_os(&parent, std::ffi::OsStr::new(name), &mut &*data, None)
+            .map_err(|error| if error.kind() == std::io::ErrorKind::PermissionDenied { WriteRefusal::FinalComponentSymlink } else { WriteRefusal::Io(error) })
     }
 
     #[cfg(windows)]
@@ -492,9 +569,61 @@ mod tests {
     fn roots_with(items: &[&str]) -> AllowedRoots {
         let mut roots = AllowedRoots::new();
         for item in items {
-            roots.add(Path::new(item));
+            if Path::new(item).exists() { roots.add(Path::new(item)).unwrap(); } else { roots.add_missing(Path::new(item)); }
         }
         roots
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_root_handle_does_not_follow_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let old = temp.path().join("old");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("value"), b"old").unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        let admitted = roots.open_directory(&root).unwrap();
+        std::fs::rename(&root, &old).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("value"), b"replacement").unwrap();
+        assert!(roots.open_directory(&root).is_err());
+        crate::project_upload::atomic_replace_os(&admitted, std::ffi::OsStr::new("value"), &mut &b"admitted"[..], None).unwrap();
+        assert_eq!(std::fs::read(old.join("value")).unwrap(), b"admitted");
+        assert_eq!(std::fs::read(root.join("value")).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_root_write_replaces_hardlink_without_truncating_other_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::hard_link(&outside, root.join("value")).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        write_through_allowed_parent(&roots, &root.join("value"), b"new").unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert_eq!(std::fs::read(root.join("value")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_walk_refuses_swapped_intermediate_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut roots = AllowedRoots::new();
+        roots.add(&root).unwrap();
+        let (_, _, admitted) = roots.admit_resolved(&root).unwrap();
+        std::fs::rename(root.join("inner"), root.join("old-inner")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("inner")).unwrap();
+        assert!(walk_directory(&admitted, Path::new("inner")).is_err());
     }
 
     #[cfg(unix)]
@@ -508,7 +637,7 @@ mod tests {
         std::fs::write(root.join("inside"), b"ok").unwrap();
         std::fs::write(outside.join("secret"), b"no").unwrap();
         let mut roots = AllowedRoots::new();
-        roots.add(&root);
+        roots.add(&root).expect("fixture root");
         let fd = open_directory_beneath_root(&root, &root).unwrap();
         std::fs::rename(&root, temp.path().join("old")).unwrap();
         std::os::unix::fs::symlink(&outside, &root).unwrap();
@@ -529,7 +658,7 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let mut roots = AllowedRoots::new();
-        roots.add(&root);
+        roots.add(&root).expect("fixture root");
         let entries = list_directory(&roots, &root).unwrap();
         let link = entries.iter().find(|entry| entry.name == "link").unwrap();
         assert!(link.is_dir);
@@ -547,7 +676,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir(&outside).unwrap();
         let mut roots = AllowedRoots::new();
-        roots.add(&root);
+        roots.add(&root).expect("fixture root");
         assert!(roots.open_terminal_directory(&outside).is_none());
         assert!(roots.open_terminal_directory(&root.join("../outside")).is_none());
         let expected = cwd.canonicalize().unwrap();
@@ -591,7 +720,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, project.join("leak")).expect("symlink");
 
         let mut roots = AllowedRoots::new();
-        roots.add(&project);
+        roots.add(&project).expect("fixture root");
         // Lexically inside; the resolved target escapes → refused.
         assert!(roots.is_path_allowed(&project.join("leak/secret.txt")));
         assert!(!roots.is_existing_path_allowed(&project.join("leak/secret.txt")));
@@ -615,8 +744,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("pi-cwd-20260101")).expect("one");
         std::fs::create_dir_all(dir.path().join("pi-cwd-not-a-date")).expect("two");
         let mut roots = AllowedRoots::new();
-        roots.add_default_cwd_roots(dir.path());
-        assert!(roots.is_path_allowed(&dir.path().join("pi-cwd")));
+        roots.add_default_cwd_roots(dir.path()).unwrap();
+        assert!(!roots.is_path_allowed(&dir.path().join("pi-cwd")));
         assert!(roots.is_path_allowed(&dir.path().join("pi-cwd-20260101/inner")));
         assert!(!roots.is_path_allowed(&dir.path().join("pi-cwd-not-a-date")));
     }
@@ -690,10 +819,7 @@ pub struct ListedEntry {
 /// outside the roots carries `outsideLinkTarget` for the confirmation flow.
 #[cfg(unix)]
 pub fn list_directory(roots: &AllowedRoots, directory: &Path) -> Result<Vec<ListedEntry>, String> {
-    let Some((resolved_dir, resolved_root)) = resolved_read_target_with_root(roots, directory) else {
-        return Err("the path is outside the allowed roots".to_string());
-    };
-    let walked = open_directory_beneath_root(&resolved_root, &resolved_dir).map_err(|e| e.to_string())?;
+    let walked = roots.open_directory(directory).map_err(|e| e.to_string())?;
     list_open_directory(roots, &walked)
 }
 
@@ -994,12 +1120,16 @@ pub fn open_file_beneath_root(
     resolved_root: &Path,
     resolved_target: &Path,
 ) -> Result<std::fs::File, std::io::Error> {
-    use std::os::fd::FromRawFd;
     let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
-    let mut current = root_fd;
-    let relative = resolved_target
-        .strip_prefix(resolved_root)
+    let relative = resolved_target.strip_prefix(resolved_root)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the root"))?;
+    open_file_relative(&root_fd, relative)
+}
+
+#[cfg(unix)]
+fn open_file_relative(root: &std::fs::File, relative: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let mut current = root.try_clone()?;
     let mut components: Vec<&str> = Vec::new();
     for component in relative.components() {
         let Some(step) = component.as_os_str().to_str() else {
@@ -1042,10 +1172,14 @@ pub fn open_directory_beneath_root(
     resolved_target: &Path,
 ) -> std::io::Result<std::fs::File> {
     let root_fd = openat_directory_no_follow_by_path(resolved_root)?;
-    let mut current = root_fd;
-    let relative = resolved_target
-        .strip_prefix(resolved_root)
+    let relative = resolved_target.strip_prefix(resolved_root)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "outside the root"))?;
+    walk_directory(&root_fd, relative)
+}
+
+#[cfg(unix)]
+fn walk_directory(root: &std::fs::File, relative: &Path) -> std::io::Result<std::fs::File> {
+    let mut current = root.try_clone()?;
     for component in relative.components() {
         let Some(step) = component.as_os_str().to_str() else {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bad component"));
