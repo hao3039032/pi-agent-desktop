@@ -373,7 +373,7 @@ impl Session {
             return Err(pi_host::PiRpcError::invalid("session host is shutting down"));
         }
         let epoch_at_send = self.machine.lock().unwrap().epoch();
-        let response = self.client.command("prompt", payload, Some(std::time::Duration::from_secs(120)))?;
+        let response = self.submit_tracked_prompt("prompt", payload, Some(std::time::Duration::from_secs(120)))?;
         drop(admission);
         drop(policy);
         let disposition = match response.get("disposition").and_then(Value::as_str) {

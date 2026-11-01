@@ -82,7 +82,7 @@ fn real_pi_title_uses_live_session_start_provider() {
     let append_error_flag = temp.path().join("error-after-title-append");
     let bridge_asset = temp.path().join("pi-web-bridge.mjs");
     let source = std::fs::read_to_string("../lib/pi-rpc/assets/pi-web-bridge.mjs").unwrap();
-    let needle = "      ctx.sessionManager.appendSessionInfo(payload.name.trim());";
+    let needle = "      pi.setSessionName(payload.name.trim());";
     assert_eq!(source.matches(needle).count(), 2);
     let delayed = format!("      if ((await import('node:fs')).existsSync({})) await new Promise(resolve => setTimeout(resolve, 600));\n{}\n      if ((await import('node:fs')).existsSync({})) throw new Error('fixture error after append');", json!(delay_flag), needle, json!(append_error_flag));
     let precheck = "    if (payload.op === \"title.rename\") {\n      const task = bridgeState.title;\n      try {";

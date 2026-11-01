@@ -9,6 +9,7 @@ use crate::pi_ipc::IpcHostState;
 fn error(code: &str, message: impl ToString) -> (String, String) { (code.into(), message.to_string()) }
 
 struct Prepared {
+    writer: crate::session_writer_lifecycle::WriterGuard,
     operation: String,
     target: String,
     staging: PathBuf,
@@ -126,6 +127,7 @@ pub(crate) fn copy(state: &IpcHostState, id: &str, kind: &str, args: &Value) -> 
         }
         let original_digest = source_digest(&source_handle)?;
         let operation = crate::chat_sessions::random_id()?;
+        let mut writer = state.session_writers.admit(&operation).map_err(|e| error("busy", e))?;
         let target = crate::chat_sessions::random_id()?;
         let staging_root = agent.join("pi-web/fork-staging");
         let staging = staging_root.join(&operation);
@@ -153,7 +155,7 @@ pub(crate) fn copy(state: &IpcHostState, id: &str, kind: &str, args: &Value) -> 
         let snapshot_file = staging.join("source.jsonl");
         write_live_snapshot(&snapshot_file, &header, entries)?;
         sync_dir(&staging).map_err(|e| error("outcome_unknown", e.1))?;
-        let answer = crate::chat_sessions::run_writer(state, "session.forkStaged", json!({"snapshot":snapshot_file,"staging":staging,"entryId":entry,"mode":kind}))?;
+        let answer = crate::chat_sessions::run_writer(state, &mut writer, "session.forkStaged", json!({"snapshot":snapshot_file,"staging":staging,"entryId":entry,"mode":kind}))?;
         let cancelled = answer.get("cancelled").and_then(Value::as_bool).ok_or_else(|| error("outcome_unknown", "Invalid fork result; do not retry"))?;
         if !cancelled {
             let output = answer.get("path").and_then(Value::as_str).ok_or_else(|| error("outcome_unknown", "Missing fork output; do not retry"))?;
@@ -187,7 +189,7 @@ pub(crate) fn copy(state: &IpcHostState, id: &str, kind: &str, args: &Value) -> 
                 return Err(error("outcome_unknown", "Published fork identity mismatch; do not retry"));
             }
         }
-        Ok((Some(Prepared { operation, target, staging, source: source_handle, source_path: file, source_digest: original_digest, cancelled }), !cancelled && kind != "fork_branch"))
+        Ok((Some(Prepared { writer, operation, target, staging, source: source_handle, source_path: file, source_digest: original_digest, cancelled }), !cancelled && kind != "fork_branch"))
     }, |prepared| {
         let Some(prepared) = prepared else { return Ok(json!({"cancelled":true})); };
         if !source_identity_matches(&prepared.source, &prepared.source_path)
@@ -196,6 +198,7 @@ pub(crate) fn copy(state: &IpcHostState, id: &str, kind: &str, args: &Value) -> 
         }
         crate::session_writer_fence::finish(&agent, &prepared.target, &prepared.operation).map_err(|e| error("partial_success", format!("Fork completed but target fence remains; do not retry: {e}")))?;
         crate::session_writer_fence::finish(&agent, id, &prepared.operation).map_err(|e| error("partial_success", format!("Fork completed but source fence remains; do not retry: {e}")))?;
+        prepared.writer.complete();
         std::fs::remove_dir_all(&prepared.staging).map_err(|e| error("partial_success", format!("Fork completed but staging cleanup failed; do not retry: {e}")))?;
         Ok(if prepared.cancelled { json!({"cancelled":true}) } else { json!({"cancelled":false,"newSessionId":prepared.target}) })
     });

@@ -27,6 +27,7 @@
 pub mod composer_outbox;
 pub mod history;
 pub mod machine;
+mod prompt_lifecycle;
 mod session_ui;
 pub mod spawn_plan;
 pub use history::{list_session_files, scan_session_file_info, scan_sessions, SessionIndex, SessionSummary};
@@ -232,6 +233,7 @@ pub struct Session {
     /// Host-wide policy changes exclude prompt admission and queued delivery.
     policy_gate: Arc<std::sync::RwLock<()>>,
     host_closing: Arc<std::sync::atomic::AtomicBool>,
+    prompt_receipts: Arc<Mutex<prompt_lifecycle::PromptLifecycle>>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
     /// The registry-wide running-set signal (shared with the relay).
@@ -260,10 +262,10 @@ impl Session {
         data: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
-        let _policy = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
+        let _policy = if matches!(command, "prompt" | "steer" | "follow_up" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.policy_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session policy change is in progress"))?)
         } else { None };
-        let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
+        let _admission = if matches!(command, "prompt" | "steer" | "follow_up" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
         if matches!(command, "abort" | "abort_bash") { self.cancel_ui(); }
@@ -271,8 +273,17 @@ impl Session {
             if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(pi_host::PiRpcError::invalid("session host is shutting down")); }
             (self.fence_checker)(&self.id, None).map_err(pi_host::PiRpcError::invalid)?;
         }
-        let result = self.client.command(command, data, timeout);
+        let result = if matches!(command, "prompt" | "steer" | "follow_up") {
+            self.submit_tracked_prompt(command, data, timeout)
+        } else { self.client.command(command, data, timeout) };
         self.touch();
+        result
+    }
+
+    pub(crate) fn submit_tracked_prompt(&self, command: &str, data: Value, timeout: Option<Duration>) -> Result<Value, pi_host::PiRpcError> {
+        let receipt = self.prompt_receipts.lock().map_err(|_| pi_host::PiRpcError::invalid("prompt receipt tracking unavailable"))?.begin();
+        let result = self.client.command(command, data, timeout);
+        if let Ok(mut receipts) = self.prompt_receipts.lock() { receipts.response(receipt, command, &result); }
         result
     }
 
@@ -495,6 +506,7 @@ impl Session {
     }
 
     fn fan_out(self: &Arc<Self>, record: Value) {
+        if let Ok(mut receipts) = self.prompt_receipts.lock() { receipts.observe(&record); }
         // 1. The state machine eats first (it may request follow-ups).
         let follow_up = {
             let mut machine = self.machine.lock().unwrap();
@@ -810,6 +822,7 @@ pub struct SessionRegistry {
     policy_gate: Arc<std::sync::RwLock<()>>,
     host_closing: Arc<std::sync::atomic::AtomicBool>,
     starts_in_flight: Mutex<HashMap<String, usize>>,
+    prompt_receipts: Mutex<HashMap<String, Arc<Mutex<prompt_lifecycle::PromptLifecycle>>>>,
 }
 
 struct SessionStart<'a> { registry: &'a SessionRegistry, id: String }
@@ -851,6 +864,7 @@ impl SessionRegistry {
             policy_gate,
             host_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             starts_in_flight: Mutex::new(HashMap::new()),
+            prompt_receipts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1076,6 +1090,10 @@ impl SessionRegistry {
         // The composer outbox comes from the session-id store: a resumed
         // session inherits the queue an evicted child left behind.
         let composer_outbox = self.composer_outbox_for(id);
+        let receipts = {
+            let mut all = self.prompt_receipts.lock().map_err(|_| SessionHostError::Spawn("prompt receipt tracking unavailable".into()))?;
+            Arc::clone(all.entry(id.to_string()).or_default())
+        };
         let session = spawn_session(
             id,
             session_file,
@@ -1087,6 +1105,7 @@ impl SessionRegistry {
             Arc::clone(&self.policy_gate),
             Arc::clone(&self.fence_checker),
             Arc::clone(&self.host_closing),
+            receipts,
         )?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
         if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1127,14 +1146,20 @@ impl SessionRegistry {
             },
             Err(_) => report.unknown.push("composer queue registry unavailable or busy".into()),
         }
+        match self.prompt_receipts.try_lock() {
+            Ok(all) => for (id, receipts) in all.iter() {
+                match receipts.try_lock() {
+                    Ok(receipts) => report.unknown.extend(receipts.unknown().into_iter().map(|item| format!("{id}: {item}"))),
+                    Err(_) => report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")),
+                }
+            },
+            Err(_) => report.unknown.push("prompt receipt registry unavailable or busy".into()),
+        }
         let sessions: Vec<_> = match self.sessions.try_lock() {
             Ok(sessions) => sessions.iter().map(|(id, session)| (id.clone(), Arc::clone(session))).collect(),
             Err(_) => { report.unknown.push("session registry unavailable or busy".into()); return report; }
         };
         for (id, session) in sessions {
-            // An idle-looking projection can miss prompt acknowledgement before
-            // its first event. Exiting the leader is not run-settlement proof.
-            report.unknown.push(format!("{id}: session operation quiescence unconfirmed"));
             let activity = session.activity_gate.try_write();
             if activity.is_err() { report.unknown.push(format!("{id}: activity in flight or lock unavailable")); }
             match session.machine.try_lock() {
@@ -1147,8 +1172,12 @@ impl SessionRegistry {
                 Ok(_) => {},
                 Err(_) => report.unknown.push(format!("{id}: session state unavailable or busy")),
             }
-            // Recheck under the activity gate: a pre-shutdown enqueue may have
-            // completed after the registry-wide queue snapshot.
+            // Recheck under the activity gate: a pre-shutdown submission or
+            // enqueue may have completed after the registry-wide snapshots.
+            match session.prompt_receipts.try_lock() {
+                Ok(receipts) => report.unknown.extend(receipts.unknown().into_iter().map(|item| format!("{id}: {item}"))),
+                Err(_) => report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")),
+            }
             match session.composer_outbox.try_has_pending_or_in_flight() {
                 Some(false) => {},
                 Some(true) => report.unknown.push(format!("{id}: composer queue pending or in flight")),
@@ -1281,6 +1310,7 @@ fn spawn_session(
     policy_gate: Arc<std::sync::RwLock<()>>,
     fence_checker: SessionFenceChecker,
     host_closing: Arc<std::sync::atomic::AtomicBool>,
+    prompt_receipts: Arc<Mutex<prompt_lifecycle::PromptLifecycle>>,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -1472,6 +1502,7 @@ fn spawn_session(
         activity_gate: std::sync::RwLock::new(()),
         policy_gate,
         host_closing,
+        prompt_receipts,
         fence_checker,
         settle_cv: std::sync::Condvar::new(),
         running_signal,

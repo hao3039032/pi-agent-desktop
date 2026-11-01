@@ -63,6 +63,7 @@ mod host_ownership;
 pub mod host_lifecycle;
 #[cfg(any(test, feature = "harness"))]
 pub mod static_host;
+pub mod session_writer_lifecycle;
 pub mod recovery_evidence;
 mod scheduler_host;
 mod scheduler_tick;
