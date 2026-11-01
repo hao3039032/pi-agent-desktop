@@ -46,6 +46,16 @@ function failureStatus(failure: IpcFailure): number {
   return failure.error.code === "not_found" ? 404 : 500;
 }
 
+export async function downloadBashOutput(sessionId: string, path: string): Promise<boolean> {
+  const { handle } = await ensureClient().request<{ handle: string }>("agent.bashOutput", { session: sessionId, path, download: true }, { timeoutMs: 30_000 });
+  try {
+    const { saveResourceAsNative } = await import("../../../lib/desktop-native");
+    return await saveResourceAsNative(handle, "bash-output.log");
+  } finally {
+    await ensureClient().request("resources.revoke", { handle }, { timeoutMs: 15_000 }).catch(() => {});
+  }
+}
+
 export async function fetchBashOutput(sessionId: string, path: string): Promise<{ output?: string; error?: string }> {
   try {
     return await ensureClient().request<{ output: string }>("agent.bashOutput", { session: sessionId, path }, { timeoutMs: 20_000 });
@@ -55,7 +65,7 @@ export async function fetchBashOutput(sessionId: string, path: string): Promise<
 }
 
 export async function fetchThinkingContent(sessionId: string, entryId: string, blockIndex: number): Promise<string> {
-  const data = await ensureClient().request<{ thinking?: unknown }>("sessions.thinking", { session: sessionId, entryId, blockIndex }, { timeoutMs: 20_000 });
+  const data = await ensureClient().request<{ thinking?: unknown }>("sessions.entryThinking", { session: sessionId, entryId, blockIndex }, { timeoutMs: 20_000 });
   if (typeof data.thinking !== "string") throw new Error("Invalid thinking response");
   return data.thinking;
 }

@@ -47,6 +47,7 @@ mod session_view;
 pub mod settings_extras;
 mod session_search;
 mod session_fleet;
+mod session_bash;
 mod session_actions;
 mod trust_policy_fence;
 mod trust_policy_mutation;

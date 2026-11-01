@@ -25,6 +25,17 @@ test("generated image is visible when the entire trace is unmounted", () => {
   assert.match(markup, /Save image/);
 });
 
+test("a deferred generated image remains outside collapsed process details", () => {
+  const deferred = { ...result, content: [{ type: "image", source: { type: "session", sessionId: "s", entryId: "e", blockIndex: 0, media_type: "image/png" } }] };
+  const projected = collectTurnResultImages([call, deferred], new Map([["g1", deferred]]));
+  const markup = render(h(TurnImageOwner, { id: "gallery", images: projected, sessionId: "s" }, h("button", { "aria-expanded": false }, "Process details")));
+  const wrongSession = render(h(TurnImageOwner, { id: "gallery", images: projected, sessionId: "other" }, null));
+  assert.doesNotMatch(wrongSession, /Loading image/, "foreign references cannot start a grant");
+  assert.match(markup, /aria-expanded="false"/);
+  assert.match(markup, /Loading image/);
+  assert.match(markup, /Save image/);
+});
+
 test("expanding the process shows a reference rather than a duplicate image", () => {
   setToolCallExpanded("g1", true);
   try {

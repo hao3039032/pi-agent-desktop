@@ -1308,23 +1308,91 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             Ok(data) => protocol_ok(&id, data),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
+        "sessions.entryToolResultImage" => {
+            let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
+            let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
+            let index = args.get("blockIndex").and_then(Value::as_u64);
+            if sid.is_empty() || entry.is_empty() || entry.len() > 256 || index.is_none() || index.is_some_and(|n| n > 9_007_199_254_740_991) {
+                return protocol_error(&id, "invalid_args", "session, entryId and a valid blockIndex are required");
+            }
+            let file = state.registry.get(sid).map(|session| session.session_file.clone())
+                .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
+            let Some(file) = file else { return protocol_error(&id, "not_found", "session not found") };
+            let dir = match tempfile::Builder::new().prefix("pi-session-image-").tempdir() {
+                Ok(dir) => dir,
+                Err(error) => return protocol_error(&id, "io", &error.to_string()),
+            };
+            let output = dir.path().join("image");
+            let result = match management_call(state, "session.extractToolResultImage", json!({"file":file.display().to_string(),"entryId":entry,"blockIndex":index,"outputFile":output.display().to_string()})) {
+                Ok(result) => result,
+                Err((code, message)) => return protocol_error(&id, &code, &message),
+            };
+            let Some(mime) = result.get("mime").and_then(Value::as_str) else { return protocol_error(&id, "io", "invalid image metadata") };
+            let Some(size) = result.get("size").and_then(Value::as_u64).filter(|size| *size > 0 && *size <= resource_protocol::MAX_RESOURCE_IMAGE_BYTES as u64) else { return protocol_error(&id, "io", "invalid image size") };
+            let bytes = {
+                use std::io::Read;
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC); }
+                let opened = match options.open(&output) {
+                    Ok(file) if file.metadata().is_ok_and(|metadata| metadata.is_file()) => file,
+                    _ => return protocol_error(&id, "io", "image handoff is unavailable"),
+                };
+                let mut bytes = Vec::new();
+                if opened.take(size + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != size {
+                    return protocol_error(&id, "io", "invalid image handoff size");
+                }
+                bytes
+            };
+            match state.resources.grant_image_bytes(bytes, mime, Duration::from_secs(600)) {
+                Ok(handle) => protocol_ok(&id, json!({"handle":handle,"mime":mime})),
+                Err(_) => protocol_error(&id, "io", "image resource grant failed"),
+            }
+        }
         "agent.bashOutput" => {
             let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
             if sid.is_empty() || path.is_empty() || path.len() > 4096 {
                 return protocol_error(&id, "invalid_args", "session and path required");
             }
+            let download = match args.get("download") { None => false, Some(Value::Bool(value)) => *value, _ => return protocol_error(&id, "invalid_args", "download must be a boolean") };
             let file = state.registry.get(sid).map(|session| session.session_file.clone())
                 .or_else(|| session_host::history::find_session_by_id(&state.agent_dir(), sid).map(|summary| summary.file));
-            match file {
-                Some(file) => match management_call(state, "session.readBashOutput", json!({"file":file.display().to_string(),"sessionId":sid,"path":path})) {
-                    Ok(data) => protocol_ok(&id, data),
-                    Err((code, message)) => protocol_error(&id, &code, &message),
-                },
-                None => protocol_error(&id, "not_found", "session not found"),
+            let Some(file) = file else { return protocol_error(&id, "not_found", "session not found") };
+            #[cfg(not(unix))]
+            { let _ = (file, download); protocol_error(&id, "not_supported", "Secure bash output access is not supported on this platform") }
+            #[cfg(unix)]
+            {
+                use std::io::Read;
+                const MAX: u64 = 5 * 1024 * 1024;
+                // Pin the directory before checking the session reference; a
+                // later ancestor replacement cannot redirect the open.
+                let prepared = match crate::session_bash::PreparedBashOutput::prepare(path) {
+                    Ok(prepared) => prepared,
+                    Err(message) => return protocol_error(&id, "invalid_args", message),
+                };
+                if let Err((code, message)) = management_call(state, "session.authorizeBashOutput", json!({"file":file.display().to_string(),"sessionId":sid,"path":path})) {
+                    return protocol_error(&id, &code, &message);
+                }
+                let opened = match prepared.open() {
+                    Ok(file) => file,
+                    Err(_) => return protocol_error(&id, "not_found", "full output unavailable"),
+                };
+                if download {
+                    match state.resources.grant_open_file(opened, Path::new(path), Duration::from_secs(600)) {
+                        Ok(handle) => protocol_ok(&id, json!({"handle":handle})),
+                        Err(_) => protocol_error(&id, "io", "bash output grant failed"),
+                    }
+                } else {
+                    let mut bytes = Vec::new();
+                    if opened.take(MAX + 1).read_to_end(&mut bytes).is_err() { return protocol_error(&id, "io", "full output unavailable"); }
+                    if bytes.len() as u64 > MAX { return protocol_error(&id, "too_large", "Full output is too large to display (limit 5242880 bytes)"); }
+                    protocol_ok(&id, json!({"output":String::from_utf8_lossy(&bytes)}))
+                }
             }
         }
-        "sessions.thinking" => {
+        "sessions.entryThinking" => {
             let sid = args.get("session").and_then(Value::as_str).unwrap_or("");
             let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("");
             let index = args.get("blockIndex").and_then(Value::as_u64);
@@ -3323,7 +3391,7 @@ fn session_view_dispatch(
         "sessions.context" => {
             let summary = session_host::history::find_session_by_id(&agent_dir, session_id)
                 .ok_or_else(|| ("not_found".to_string(), format!("Session not found: {session_id}")))?;
-            let mut call_args = json!({ "file": summary.file.display().to_string() });
+            let mut call_args = json!({ "file": summary.file.display().to_string(), "sessionId": session_id });
             for field in ["leafId", "before"] {
                 if let Some(value) = args.get(field).and_then(Value::as_str) {
                     call_args[field] = json!(value);
@@ -3388,6 +3456,7 @@ fn session_view_dispatch(
             } else {
                 let call_args = json!({
                     "file": file.display().to_string(),
+                    "sessionId": session_id,
                     "summaryTree": summary_tree,
                     "deferThinking": defer_thinking,
                     "deferMedia": defer_media,
@@ -4707,16 +4776,39 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let before = read();
         assert_eq!(before["data"]["state"]["systemPromptStatus"], "recorded", "{before}");
         assert_eq!(before["data"]["state"]["systemPrompt"], "BRANCH B");
-        let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
+        let thinking = send(&state, json!({"v":1,"id":"thinking","op":"sessions.entryThinking","args":{"session":id,"entryId":"think","blockIndex":0}}));
         assert_eq!(thinking["data"]["thinking"], "fixture hidden reasoning", "{thinking}");
         let read_bash = |path: &Path| send(&state, json!({"v":1,"id":"bash","op":"agent.bashOutput","args":{"session":id,"path":path}}));
         assert_eq!(read_bash(bash.path())["data"]["output"], "fixture bash output");
         assert_eq!(read_bash(large.path())["error"]["code"], "too_large");
+        let big_download = send(&state, json!({"v":1,"id":"download","op":"agent.bashOutput","args":{"session":id,"path":large.path(),"download":true}}));
+        let big_handle = big_download["data"]["handle"].as_str().expect("large output grant");
+        assert_eq!(state.resources.clone_open_file(big_handle).unwrap().metadata().unwrap().len(), 5 * 1024 * 1024 + 1);
+        assert!(state.resources.revoke(big_handle));
+        for path in [link.path(), unreferenced.path()] {
+            let denied = send(&state, json!({"v":1,"id":"bad-download","op":"agent.bashOutput","args":{"session":id,"path":path,"download":true}}));
+            assert_eq!(denied["ok"], false, "{denied}");
+        }
         assert_eq!(read_bash(link.path())["error"]["code"], "not_found");
         assert_eq!(read_bash(unreferenced.path())["error"]["code"], "unauthorized_scope");
         assert_eq!(read_bash(&root_path.join("not-allowed.log"))["error"]["code"], "invalid_args");
-        let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.thinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
+        let missing = send(&state, json!({"v":1,"id":"missing","op":"sessions.entryThinking","args":{"session":id,"entryId":"think","blockIndex":1}}));
         assert_eq!(missing["ok"], false, "{missing}");
+        let history = send(&state, json!({"v":1,"id":"history","op":"sessions.get","args":{"session":id,"deferMedia":true}}));
+        let messages = history["data"]["context"]["messages"].as_array().unwrap();
+        let tool_result = messages.iter().find(|message| message["role"] == "toolResult").unwrap();
+        assert_eq!(tool_result["content"][0]["source"], json!({"type":"session","sessionId":id,"entryId":"media","blockIndex":0,"media_type":"image/png"}));
+        let grant = send(&state, json!({"v":1,"id":"image","op":"sessions.entryToolResultImage","args":{"session":id,"entryId":"media","blockIndex":0}}));
+        let handle = grant["data"]["handle"].as_str().expect("resource handle");
+        match state.resources.read(handle, "", None) {
+            resource_protocol::ResourceResponse::Ok { bytes, mime, .. } => { assert_eq!(mime, "image/png"); assert_eq!(bytes, [137,80,78,71,13,10,26,10]); }
+            _ => panic!("image handle did not resolve"),
+        }
+        assert!(state.resources.revoke(handle));
+        for (entry, index) in [("media", 1), ("media", 99), ("think", 0)] {
+            let denied = send(&state, json!({"v":1,"id":"bad-image","op":"sessions.entryToolResultImage","args":{"session":id,"entryId":entry,"blockIndex":index}}));
+            assert_eq!(denied["ok"], false, "{denied}");
+        }
         let output = root_path.join("image.bin");
         let image = management_call(&state, "session.extractToolResultImage", json!({"file":file,"entryId":"media","blockIndex":0,"outputFile":output})).unwrap();
         assert_eq!(image["mime"], "image/png");
@@ -4733,6 +4825,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let mut other_config = config.clone();
         other_config.shape = session_host::SessionSpawnShape::ChatOnly { prompt_file };
         state.registry.start(&other_id, &other_file, &other_id, &cwd, &other_config).unwrap();
+        let foreign = send(&state, json!({"v":1,"id":"foreign","op":"sessions.entryToolResultImage","args":{"session":other_id,"entryId":"media","blockIndex":0}}));
+        assert_eq!(foreign["ok"], false, "foreign entry must not grant bytes: {foreign}");
         let fallback = send(&state, json!({"v":1,"id":"base","op":"sessions.state","args":{"session":other_id}}));
         assert_eq!(fallback["data"]["state"]["systemPromptStatus"], "configured", "{fallback}");
         assert_eq!(fallback["data"]["state"]["systemPrompt"], "FIXTURE BASE");
