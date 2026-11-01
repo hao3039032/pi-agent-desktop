@@ -298,6 +298,9 @@ function McpSignInOutcome({ flow, shared }: { flow: McpSignInFlowInfo; shared: b
   return (
     <>
       <span role="status" className={lineClass}>{t(key, { name: revealHiddenCharacters(flow.name) })}</span>
+      {flow.warning === "remote-outcome-unknown" && (
+        <span role="status" className="mcp-config-line is-warning">{t("mcp.signIn.remoteOutcomeUnknown")}</span>
+      )}
       {flow.error && (
         <span className="mcp-config-line is-error">
           {t("mcp.test.error")} <code className="mcp-config-chip">{revealHiddenCharacters(flow.error)}</code>

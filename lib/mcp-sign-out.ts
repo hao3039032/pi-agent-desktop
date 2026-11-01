@@ -1,5 +1,5 @@
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
-import type { McpOAuthCredentialStore, McpOAuthServerStore, PiSdkInternals } from "./pi-sdk-internals";
+import type { McpOAuthCredentialStore, McpOAuthServerStore, McpOAuthStateStore, PiSdkInternals } from "./pi-sdk-internals";
 
 // What a sign-out of an MCP server bars (ADR 0006, Settings › MCP sign-in):
 // every connection Pi Web opened for the server before the sign-out, a
@@ -80,17 +80,93 @@ export function mcpSignOutCount(key: string): number {
 }
 
 /** Counts a sign-out of the sign-in key: every guard made before it throws from now on. */
-export function noteMcpSignOut(key: string): void {
+export function noteMcpSignOut(key: string): number {
   const counts = signOutCounts();
-  counts.set(key, (counts.get(key) ?? 0) + 1);
+  const next = (counts.get(key) ?? 0) + 1;
+  if (!Number.isSafeInteger(next)) throw new Error("MCP credential revocation generation exhausted");
+  counts.set(key, next);
+  return next;
 }
 
-/** A guard for a run of server `name` at `url` starting now: it throws once the server is signed out after this call. */
-export function mcpSignOutGuard(name: string, url: string): McpSignInWriteGuard {
-  const key = mcpSignInKey(name, url);
+/**
+ * Revoke guards already created for this SDK credential key in this process.
+ * The key can contain URL secrets: return it only over the private management
+ * channel, never in progress, UI output or logs. This is not evidence about
+ * other processes, previous instances or requests at the remote server. The
+ * host must hold target admission through credential deletion; new guards
+ * created after this call belong to a new generation.
+ */
+export function revokeMcpCredentialWriters(name: string, url: string): { canonicalKey: string; generation: number } {
+  const canonicalKey = mcpSignInKey(name, url);
+  return { canonicalKey, generation: noteMcpSignOut(canonicalKey) };
+}
+
+/** Host-only preflight; canonicalKey and legacyKey may contain URL secrets. */
+export interface McpCredentialAdmission {
+  schema: 1;
+  canonicalKey: string;
+  legacyKey: string;
+  configKey: string;
+  generation: number;
+}
+
+/** A stale or malformed host preflight must never capture a newer generation. */
+export class McpCredentialAdmissionError extends Error {
+  constructor() { super("MCP credential admission is invalid or stale"); this.name = "McpCredentialAdmissionError"; }
+}
+
+/** Validate and capture in the same synchronous turn, before any store is opened. */
+export function mcpSignOutGuard(name: string, url: string, configKey?: string, admission?: unknown): McpSignInWriteGuard {
+  const { key, legacyKey } = mcpOAuthStoreKeys(name, url);
   const atStart = mcpSignOutCount(key);
+  if (admission !== undefined) {
+    if (!isRecord(admission) || admission.schema !== 1 || admission.canonicalKey !== key || admission.legacyKey !== legacyKey ||
+        typeof configKey !== "string" || !configKey || admission.configKey !== configKey || !Number.isSafeInteger(admission.generation) ||
+        (admission.generation as number) < 0 || admission.generation !== atStart) {
+      throw new McpCredentialAdmissionError();
+    }
+  }
   return () => {
     if (mcpSignOutCount(key) !== atStart) throw new McpSignedOutError();
+  };
+}
+
+/**
+ * Wrap the exact store a management writer uses. Its load/save must complete
+ * their locked file operation synchronously before returning; an async deferred
+ * write would escape the generation check. Load may migrate legacy state.
+ */
+export function guardMcpOAuthStateStore(store: McpOAuthStateStore, guard: McpSignInWriteGuard): McpOAuthStateStore {
+  return {
+    load: () => { guard(); return store.load(); },
+    save: (state) => { guard(); return store.save(state); },
+  };
+}
+
+/** The refresh callback window includes SDK checks, not necessarily a sent request. */
+export function guardMcpOAuthServerStore(
+  store: McpOAuthServerStore,
+  guard: McpSignInWriteGuard,
+  refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void },
+): McpOAuthServerStore {
+  return {
+    ...guardMcpOAuthStateStore(store, guard),
+    withRefreshLock: async (fn) => {
+      if (refresh?.signal.aborted) throw new Error("Sign-in cancelled");
+      refresh?.onPending?.(true);
+      try {
+        return await store.withRefreshLock(async () => {
+          guard();
+          // A cancelled connection must not start an unannounced refresh after
+          // waiting for the lock. This marks the callback window, not a claim
+          // that the SDK has already sent a request.
+          if (refresh?.signal.aborted) throw new Error("Sign-in cancelled");
+          refresh?.onRefresh(true);
+          try { return await fn(); }
+          finally { refresh?.onRefresh(false); }
+        });
+      } finally { refresh?.onPending?.(false); }
+    },
   };
 }
 
@@ -99,24 +175,18 @@ export function mcpSignOutGuard(name: string, url: string): McpSignInWriteGuard 
  * `guard` first: the store a connection reads and refreshes tokens through, so
  * a refresh that is still on its way when the server is signed out cannot
  * store the renewed tokens after they were removed. `guard` runs in the same
- * synchronous step as the SDK's write, so no removal fits between. A load that
- * takes over legacy state moves what is already stored and is not guarded.
+ * synchronous step as the SDK's write, so no removal fits between. Loads are
+ * guarded too: the SDK may move legacy state to the server key during load.
  */
 export function guardedCredentialStore(
   internals: Pick<PiSdkInternals, "McpOAuthCredentialStore">,
   guard: McpSignInWriteGuard,
+  refresh?: { signal: AbortSignal; onRefresh: (active: boolean) => void; onPending?: (active: boolean) => void },
 ): McpOAuthCredentialStore {
   class GuardedCredentialStore extends internals.McpOAuthCredentialStore {
     forServer(name: string, serverUrl: string): McpOAuthServerStore {
       const store = super.forServer(name, serverUrl);
-      return {
-        load: () => store.load(),
-        save: (state) => {
-          guard();
-          return store.save(state);
-        },
-        withRefreshLock: (fn) => store.withRefreshLock(fn),
-      };
+      return guardMcpOAuthServerStore(store, guard, refresh);
     }
   }
   return new GuardedCredentialStore();

@@ -28,6 +28,73 @@ pub(crate) fn assert_session_writable(agent_dir: &Path, session_id: &str) -> Res
     }
 }
 
+/// Only the operation which created this exact title-rename fence may pass it.
+pub(crate) fn assert_owned_title_fence(agent_dir: &Path, session_id: &str, operation_id: &str) -> Result<(), String> {
+    let path = fence_path(agent_dir, session_id);
+    for ancestor in [agent_dir.join("pi-web"), agent_dir.join("pi-web/session-writer-fences")] {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() { return Err("Unsafe session fence directory".into()); }
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_file() || metadata.len() > 65536 { return Err("Invalid session writer fence".into()); }
+    let value: Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if value.get("version").and_then(Value::as_u64) != Some(1)
+        || value.get("sessionId").and_then(Value::as_str) != Some(session_id)
+        || value.get("operationId").and_then(Value::as_str) != Some(operation_id)
+        || value.get("operation").and_then(Value::as_str) != Some("title-rename") {
+        return Err("Session writer fence owner mismatch".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_owned_title_fence(agent_dir: &Path, session_id: &str, operation_id: &str) -> Result<(), String> {
+    assert_owned_title_fence(agent_dir, session_id, operation_id)?;
+    finish_checked(agent_dir, session_id, operation_id, Some("title-rename"))
+}
+
+/// A live title rename may run while the session file is being appended, or
+/// before the SDK has flushed it. This bounded prefix is diagnostic only;
+/// neither its presence nor its digest grants write authority.
+pub(crate) fn begin_live_title(agent_dir: &Path, session_id: &str, operation_id: &str, source: &Path) -> Result<(), String> {
+    use std::io::Read;
+    assert_session_writable(agent_dir, session_id)?;
+    let path = fence_path(agent_dir, session_id);
+    let dir = path.parent().ok_or("Invalid fence path")?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    assert_session_writable(agent_dir, session_id)?;
+    let diagnostic = std::fs::symlink_metadata(source).ok().filter(|meta| meta.file_type().is_file()).and_then(|_| {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(source).ok()?;
+        if !file.metadata().ok()?.file_type().is_file() { return None; }
+        let mut bytes = Vec::new();
+        file.take(65536).read_to_end(&mut bytes).ok()?;
+        let digest = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        Some(json!({"prefixBytes": bytes.len(), "prefixSha256": digest}))
+    });
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|e| format!("Cannot create session writer fence: {e}"))?;
+    let record = json!({"version":1,"operationId":operation_id,"sessionId":session_id,"operation":"title-rename", "source":{"path":source,"diagnosticOnly":true,"prefix":diagnostic}});
+    file.write_all(record.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(dir).and_then(|directory| directory.sync_all()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Caller holds the session offline-writer gate. A failed or interrupted write
 /// deliberately leaves a refusing fence, never a falsely clean state.
 pub(crate) fn begin(agent_dir: &Path, session_id: &str, operation_id: &str, operation: &str, source: &Path, target: Option<&Path>, target_id: Option<&str>) -> Result<(), String> {
@@ -79,6 +146,10 @@ fn begin_record(agent_dir: &Path, session_id: &str, operation_id: &str, operatio
 /// Remove only the operation's own valid fence after its writer has terminated
 /// and its result is known. This does not recover unknown outcomes.
 pub(crate) fn finish(agent_dir: &Path, session_id: &str, operation_id: &str) -> Result<(), String> {
+    finish_checked(agent_dir, session_id, operation_id, None)
+}
+
+fn finish_checked(agent_dir: &Path, session_id: &str, operation_id: &str, kind: Option<&str>) -> Result<(), String> {
     let path = fence_path(agent_dir, session_id);
     let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
     if !metadata.file_type().is_file() || metadata.len() > 65536 { return Err("Invalid session writer fence".into()); }
@@ -86,7 +157,8 @@ pub(crate) fn finish(agent_dir: &Path, session_id: &str, operation_id: &str) -> 
     let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     if value.get("version").and_then(Value::as_u64) != Some(1)
         || value.get("sessionId").and_then(Value::as_str) != Some(session_id)
-        || value.get("operationId").and_then(Value::as_str) != Some(operation_id) {
+        || value.get("operationId").and_then(Value::as_str) != Some(operation_id)
+        || kind.is_some_and(|expected| value.get("operation").and_then(Value::as_str) != Some(expected)) {
         return Err("Session writer fence identity mismatch".into());
     }
     std::fs::remove_file(&path).map_err(|e| e.to_string())?;
@@ -98,6 +170,54 @@ pub(crate) fn finish(agent_dir: &Path, session_id: &str, operation_id: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_title_fence_allows_unflushed_source_and_bounds_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("not-flushed.jsonl");
+        begin_live_title(root, "s", "one", &source).unwrap();
+        let path = fence_path(root, "s");
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["source"]["diagnosticOnly"], true);
+        assert!(record["source"]["prefix"].is_null());
+        finish_owned_title_fence(root, "s", "one").unwrap();
+        std::fs::write(&source, vec![b'x'; 200_000]).unwrap();
+        begin_live_title(root, "s", "two", &source).unwrap();
+        let record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record["source"]["prefix"]["prefixBytes"], 65536);
+        finish_owned_title_fence(root, "s", "two").unwrap();
+    }
+
+    #[test]
+    fn title_fence_requires_exact_owner_and_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, "fixture").unwrap();
+        assert!(assert_owned_title_fence(root, "s", "op").is_err());
+        begin(root, "s", "op", "title-rename", &source, None, None).unwrap();
+        assert!(assert_session_writable(root, "s").is_err());
+        assert!(assert_owned_title_fence(root, "s", "op").is_ok());
+        assert!(assert_owned_title_fence(root, "s", "other").is_err());
+        assert!(assert_owned_title_fence(root, "other", "op").is_err());
+        assert!(finish_owned_title_fence(root, "s", "other").is_err());
+        let path = fence_path(root, "s");
+        let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["operation"] = json!("other");
+        std::fs::write(&path, record.to_string()).unwrap();
+        assert!(assert_owned_title_fence(root, "s", "op").is_err());
+        assert!(finish_owned_title_fence(root, "s", "op").is_err());
+        assert!(path.exists());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(assert_owned_title_fence(root, "s", "op").is_err());
+        #[cfg(unix)] {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&source, &path).unwrap();
+            assert!(assert_owned_title_fence(root, "s", "op").is_err());
+            assert!(finish_owned_title_fence(root, "s", "op").is_err());
+        }
+    }
+
     #[test]
     fn unresolved_or_corrupt_fence_survives_new_host_and_fails_closed() {
         let temp = tempfile::tempdir().unwrap();

@@ -16,6 +16,7 @@ import "../../app/native-theme.css";
 import { AppShell } from "../../components/AppShell";
 import { I18nProvider } from "../../hooks/useI18n";
 import { DistroSetupGate } from "../../components/distro";
+import { RecoveryNotice } from "./RecoveryNotice.tsx";
 import { bindAgentClient } from "./data/agent-client.ts";
 import { bindArtifactsSettingsService } from "./data/artifact-settings-service.ts";
 import { bindChatSettingsService } from "./data/chat-settings-service.ts";
@@ -107,6 +108,7 @@ async function boot(): Promise<void> {
         <I18nProvider>
           <AppShell />
           <DistroSetupGate />
+          <RecoveryNotice client={client} />
         </I18nProvider>
       </Suspense>
     </StrictMode>,

@@ -18,7 +18,7 @@ use session_host::{
 struct SessionRegistry;
 impl SessionRegistry {
     fn new() -> session_host::SessionRegistry {
-        session_host::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+        session_host::SessionRegistry::with_fence_checker(Arc::new(|_, _| Ok(())))
     }
 }
 
@@ -1306,7 +1306,7 @@ fn session_writer_fence_blocks_live_admissions_and_drain() {
     ]);
     let fenced = Arc::new(AtomicBool::new(false));
     let checker_flag = Arc::clone(&fenced);
-    let registry = session_host::SessionRegistry::with_fence_checker(Arc::new(move |_| {
+    let registry = session_host::SessionRegistry::with_fence_checker(Arc::new(move |_, _| {
         if checker_flag.load(Ordering::SeqCst) { Err("unknown writer outcome".into()) } else { Ok(()) }
     }));
     let session = registry.start(id, &file, id, &cwd, &config).unwrap();

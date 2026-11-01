@@ -30,7 +30,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("project");
         std::fs::create_dir(&root).unwrap();
-        let mut roots = AllowedRoots::new(); roots.add(&root);
+        let mut roots = AllowedRoots::new(); roots.add(&root).expect("fixture root");
         assert_eq!(status(&roots, root.to_str().unwrap()).unwrap()["availability"], "available");
         assert_eq!(status(&roots, root.join("missing").to_str().unwrap()).unwrap()["availability"], "missing");
         assert!(status(&roots, tmp.path().join("other").to_str().unwrap()).is_err());

@@ -18,12 +18,7 @@ pub fn import_dropped(state: &IpcHostState, id: &str, args: &Value) -> Value {
         return protocol_error(id, "invalid_args", "Only skip conflicts is supported for native drops");
     }
     let dest = Path::new(args.get("destDirectory").and_then(Value::as_str).unwrap_or(""));
-    let scoped = {
-        let roots = state.file_roots.lock().unwrap();
-        crate::file_access::resolved_read_target_with_root(&roots, dest)
-    };
-    let Some((target, root)) = scoped else { return protocol_error(id, "unauthorized_scope", "Destination is outside authorized roots") };
-    let directory = match crate::file_access::open_directory_beneath_root(&root, &target) {
+    let directory = match state.file_roots.lock().unwrap().open_directory(dest) {
         Ok(directory) => directory,
         Err(error) => return protocol_error(id, "unauthorized_scope", &error.to_string()),
     };
@@ -72,7 +67,7 @@ mod tests {
         let src = tmp.path().join("src"); let dest = tmp.path().join("dest");
         std::fs::create_dir(&src).unwrap(); std::fs::create_dir(&dest).unwrap();
         let input = src.join("report.txt"); std::fs::write(&input, b"original").unwrap();
-        let state = IpcHostState::new(); state.file_roots.lock().unwrap().add(&dest);
+        let state = IpcHostState::new(); state.file_roots.lock().unwrap().add(&dest).expect("fixture root");
         let args = json!({ "destDirectory": dest, "sourcePaths": [input], "conflict": "skip" });
         assert_eq!(import_dropped(&state, "a", &args)["error"]["code"], "unauthorized_scope");
         state.native_drops.register(&state, &[input.clone()]);

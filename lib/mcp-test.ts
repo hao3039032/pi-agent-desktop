@@ -10,7 +10,7 @@ import {
   SECRET_MASK,
   urlSecretParts,
 } from "./mcp-secrets";
-import { guardedCredentialStore, mcpOAuthUrl, mcpSignInKey, mcpSignOutCount, mcpSignOutGuard, type McpSignInWriteGuard } from "./mcp-sign-out";
+import { guardedCredentialStore, mcpOAuthUrl, mcpSignInKey, mcpSignOutCount, mcpSignOutGuard, McpCredentialAdmissionError, type McpSignInWriteGuard } from "./mcp-sign-out";
 import { recordMcpStatus } from "./mcp-status";
 import { createPiWebMcpTransportFactory, resolvedConfigValues } from "./mcp-transport";
 import { createModelRuntimeWithExtensions } from "./model-runtime";
@@ -116,6 +116,8 @@ export interface McpTestOptions {
   closeWaitMs?: number;
   /** Replaces connecting (tests); the queue, joining, the deadline and recording stay. */
   connect?: McpTestConnect;
+  /** Host-only preflight; never exposed in test results. */
+  credentialAdmission?: unknown;
 }
 
 function errorMessage(error: unknown): string {
@@ -556,12 +558,16 @@ export async function takeMcpCommandSlot(signal: AbortSignal, waitMs: number): P
 }
 
 /** The sign-out guard of a test of `target` starting now, for an entry that signs in with OAuth. */
-function signOutGuardFor(target: McpTestTarget): McpSignInWriteGuard | undefined {
+function signOutGuardFor(target: McpTestTarget, admission?: unknown): McpSignInWriteGuard | undefined {
   const url = mcpOAuthUrl(target.config);
-  if (url === undefined) return undefined;
+  if (url === undefined) {
+    if (admission !== undefined) throw new McpCredentialAdmissionError();
+    return undefined;
+  }
   try {
-    return mcpSignOutGuard(target.name, url);
-  } catch {
+    return mcpSignOutGuard(target.name, url, target.configKey, admission);
+  } catch (error) {
+    if (admission !== undefined) throw new McpCredentialAdmissionError();
     // Not a URL the store could key: it stores nothing for it either.
     return undefined;
   }
@@ -578,8 +584,8 @@ function signOutsOf(target: McpTestTarget): number {
   }
 }
 
-function flightKey(target: McpTestTarget): string {
-  return [target.scope, target.sourcePath, target.name, target.configKey, target.cwd, signOutsOf(target)].join("\0");
+function flightKey(target: McpTestTarget, admitted: boolean): string {
+  return [target.scope, target.sourcePath, target.name, target.configKey, target.cwd, signOutsOf(target), admitted ? "admitted-legacy-v1" : "legacy"].join("\0");
 }
 
 /**
@@ -588,7 +594,8 @@ function flightKey(target: McpTestTarget): string {
  * every caller gave up first, or it never left the queue.
  */
 export function testMcpServer(target: McpTestTarget, internals: McpTestInternals, options: McpTestOptions = {}): Promise<McpTestResult> {
-  const key = flightKey(target);
+  const guard = signOutGuardFor(target, options.credentialAdmission);
+  const key = flightKey(target, options.credentialAdmission !== undefined);
   const running = flights();
   const existing = running.get(key);
   if (existing) {
@@ -598,7 +605,7 @@ export function testMcpServer(target: McpTestTarget, internals: McpTestInternals
   // A test every caller gave up on is let go at once, while it still closes:
   // a press in that window starts a new test instead of joining one that will
   // only answer "no answer" and record nothing.
-  const flight = startTest(target, internals, options, () => {
+  const flight = startTest(target, internals, options, guard, () => {
     if (running.get(key) === flight) running.delete(key);
   });
   running.set(key, flight);
@@ -613,12 +620,12 @@ function startTest(
   target: McpTestTarget,
   internals: McpTestInternals,
   options: McpTestOptions,
+  guard: McpSignInWriteGuard | undefined,
   onCancelled: () => void,
 ): Promise<McpTestResult> & { join: (signal?: AbortSignal) => void } {
   const deadlineMs = options.deadlineMs ?? MCP_TEST_DEADLINE_MS;
   const closeWaitMs = options.closeWaitMs ?? MCP_TEST_CLOSE_WAIT_MS;
-  // Taken when the test starts: a sign-out from then on bars its token writes and its record.
-  const guard = signOutGuardFor(target);
+  // The guard was captured synchronously before joining or starting this flight.
   const connect: McpTestConnect = options.connect
     ?? ((entry, signal) => connectForTest(entry, internals, signal, { requestTimeoutMs: options.requestTimeoutMs, closeWaitMs, guard }));
   const signedOutSince = (): boolean => {

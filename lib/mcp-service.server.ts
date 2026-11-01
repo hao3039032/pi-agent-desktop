@@ -42,6 +42,8 @@ import {
 } from "./mcp-entry-request";
 import { MCP_EXPOSURES, isMcpExposure, suggestFreeName } from "./mcp-import";
 import { mcpOAuthUrl, signOutMcpServer } from "./mcp-sign-in";
+import { mcpEntryConfigKey } from "./mcp-config-key";
+import { mcpOAuthStoreKeys, mcpSignOutCount } from "./mcp-sign-out";
 import { forgetMcpEntryStatuses } from "./mcp-status";
 import { findWebPasswordField } from "./mcp-transport";
 import { holdRemovedEntry, returnRemovedEntry, takeRemovedEntry } from "./mcp-undo";
@@ -318,12 +320,12 @@ async function undoRemoval(
   return buildOverview(agentDir, project, { restored: server });
 }
 
-async function signOutServer(
+function resolveSignOutEntry(
   agentDir: string,
   project: Project | undefined,
   internals: PiSdkInternals,
   server: McpServerRef,
-): Promise<McpActionResponse> {
+): { url: string; sourcePath: string; configKey: string } {
   writeTarget(server.scope, project, agentDir);
   const { name } = server;
   const read = readMcpServerEntry({ agentDir, scope: server.scope, name, project });
@@ -341,9 +343,56 @@ async function signOutServer(
   if (url === undefined) {
     throw new McpServiceError(409, "sign-in-not-oauth", `MCP server "${name}" does not use OAuth: only an HTTP server without an Authorization header does`, { name });
   }
-  const removed = signOutMcpServer(name, url, agentDir, internals);
-  forgetMcpEntryStatuses({ scope: server.scope, sourcePath: read.sourcePath, name });
+  return { url, sourcePath: read.sourcePath, configKey: mcpEntryConfigKey(read.value, config) };
+}
+
+async function signOutServer(
+  agentDir: string,
+  project: Project | undefined,
+  internals: PiSdkInternals,
+  server: McpServerRef,
+): Promise<McpActionResponse> {
+  const { url, sourcePath } = resolveSignOutEntry(agentDir, project, internals, server);
+  const removed = signOutMcpServer(server.name, url, agentDir, internals);
+  forgetMcpEntryStatuses({ scope: server.scope, sourcePath, name: server.name });
   return buildOverview(agentDir, project, { signedOut: { ...server, removed } });
+}
+
+type PrivateCredentialRequest = { agentDir: string; allowedRoots: Set<string>; body: Record<string, unknown> };
+
+async function privateCredentialContext(options: PrivateCredentialRequest) {
+  const { agentDir, allowedRoots, body } = options;
+  const scope = readScope(body.scope);
+  const name = readName(body.name);
+  if (!scope || name === undefined) throw new McpServiceError(400, "invalid-request", "scope and name are required");
+  const project = typeof body.cwd === "string" && body.cwd ? await validateProject(body.cwd, allowedRoots) : undefined;
+  const internals = await mcpWritable();
+  const server = { scope, name };
+  return { agentDir, project, internals, server };
+}
+
+/** Host-only: the canonical key may contain URL secrets and must never be logged or exposed to the UI. */
+export async function managedMcpCredentialTarget(options: PrivateCredentialRequest) {
+  const { agentDir, project, internals, server } = await privateCredentialContext(options);
+  const entry = resolveSignOutEntry(agentDir, project, internals, server);
+  const { key: canonicalKey, legacyKey } = mcpOAuthStoreKeys(server.name, entry.url);
+  return { schema: 1 as const, admissionSchema: 1 as const, canonicalKey, legacyKey, configKey: entry.configKey, generation: mcpSignOutCount(canonicalKey) };
+}
+
+/** Host-only: the caller holds same-target admission until this operation is known complete. */
+export async function signOutMcpCooperative(options: PrivateCredentialRequest & { expectedCanonicalKey: string; expectedConfigKey: string }) {
+  const { agentDir, project, internals, server } = await privateCredentialContext(options);
+  const entry = resolveSignOutEntry(agentDir, project, internals, server);
+  const { key: canonicalKey, legacyKey } = mcpOAuthStoreKeys(server.name, entry.url);
+  if (canonicalKey !== options.expectedCanonicalKey || entry.configKey !== options.expectedConfigKey) {
+    throw new McpServiceError(409, "invalid-request", "MCP credential target or configuration changed");
+  }
+  // No await between the validated snapshot, generation advance and SDK's locked removal.
+  const removed = signOutMcpServer(server.name, entry.url, agentDir, internals);
+  const generation = mcpSignOutCount(canonicalKey);
+  forgetMcpEntryStatuses({ scope: server.scope, sourcePath: entry.sourcePath, name: server.name });
+  const result = await buildOverview(agentDir, project, { signedOut: { ...server, removed } });
+  return { schema: 1 as const, result, revocation: { canonicalKey, legacyKey, configKey: entry.configKey, generation } };
 }
 
 function namesInFile(agentDir: string, project: Project | undefined, scope: McpScope, internals: PiSdkInternals): string[] {
