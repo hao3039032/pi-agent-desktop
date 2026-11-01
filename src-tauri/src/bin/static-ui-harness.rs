@@ -420,17 +420,21 @@ fn main() {
                         Err(error) => {
                             let _ = reply.send(json!({ "harness": "shutdown", "ok": false,
                                 "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
-                                "reportError": error }));
+                                "reportError": error, "sessionReportStatus": "unknown",
+                                "sessionExited": null, "sessionUnknown": null, "sessionDiagnostics": null }));
                             continue;
                         }
                     };
+                    let session_fields = pi_agent_desktop_lib::static_host::session_report_fields(report.sessions.as_ref());
                     json!({
                         "harness": "shutdown", "ok": result.is_ok(),
                         "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
                         "scheduler": report.scheduler.as_ref(),
                         "schedulerMayRepeatSessionDiagnostics": true,
-                        "sessionExited": report.sessions.as_ref().map(|r| &r.exited),
-                        "sessionUnknown": report.sessions.as_ref().map(|r| &r.unknown),
+                        "sessionReportStatus": session_fields["sessionReportStatus"],
+                        "sessionExited": session_fields["sessionExited"],
+                        "sessionUnknown": session_fields["sessionUnknown"],
+                        "sessionDiagnostics": session_fields["sessionDiagnostics"],
                         "writerCompleted": report.session_writers.as_ref().map(|r| &r.exited),
                         "writerUnknown": report.session_writers.as_ref().map(|r| &r.unknown),
                         "managementExited": report.management.as_ref().map(|r| &r.exited),

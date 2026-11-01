@@ -10,7 +10,23 @@ pub(crate) struct PromptLifecycle {
     records: BTreeMap<u64, Receipt>,
     overflow: bool,
 }
-struct Receipt { phase: &'static str, start_seen: bool, terminal_seen: bool }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptReceiptPhase {
+    Submitting, AcknowledgedQueued, AcknowledgedStarted,
+    ChildRefusalSideEffectsUnconfirmed, SubmissionOutcomeUnknown,
+}
+impl PromptReceiptPhase {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Submitting => "submitting", Self::AcknowledgedQueued => "acknowledged queued",
+            Self::AcknowledgedStarted => "acknowledged started",
+            Self::ChildRefusalSideEffectsUnconfirmed => "child refusal; side effects unconfirmed",
+            Self::SubmissionOutcomeUnknown => "submission outcome unknown",
+        }
+    }
+}
+struct Receipt { phase: PromptReceiptPhase, start_seen: bool, terminal_seen: bool }
 
 impl PromptLifecycle {
     pub(crate) fn begin(&mut self) -> Option<u64> {
@@ -19,7 +35,7 @@ impl PromptLifecycle {
             return None;
         }
         self.next += 1;
-        self.records.insert(self.next, Receipt { phase: "submitting", start_seen: false, terminal_seen: false });
+        self.records.insert(self.next, Receipt { phase: PromptReceiptPhase::Submitting, start_seen: false, terminal_seen: false });
         Some(self.next)
     }
     pub(crate) fn response(&mut self, id: Option<u64>, command: &str, result: &Result<Value, PiRpcError>) {
@@ -30,13 +46,13 @@ impl PromptLifecycle {
             // it says nothing about any background work an extension spawned.
             Ok(value) if command == "prompt" && value.get("disposition").and_then(Value::as_str) == Some("handled") => { self.records.remove(&id); }
             Ok(value) => receipt.phase = match value.get("disposition").and_then(Value::as_str) {
-                Some("queued") => "acknowledged queued",
-                _ if command != "prompt" => "acknowledged queued",
-                _ => "acknowledged started",
+                Some("queued") => PromptReceiptPhase::AcknowledgedQueued,
+                _ if command != "prompt" => PromptReceiptPhase::AcknowledgedQueued,
+                _ => PromptReceiptPhase::AcknowledgedStarted,
             },
             Err(error) if error.kind == ErrorKind::Invalid => { self.records.remove(&id); }
-            Err(error) if error.kind == ErrorKind::Command => receipt.phase = "child refusal; side effects unconfirmed",
-            Err(_) => receipt.phase = "submission outcome unknown",
+            Err(error) if error.kind == ErrorKind::Command => receipt.phase = PromptReceiptPhase::ChildRefusalSideEffectsUnconfirmed,
+            Err(_) => receipt.phase = PromptReceiptPhase::SubmissionOutcomeUnknown,
         }
     }
     pub(crate) fn observe(&mut self, record: &Value) {
@@ -46,10 +62,19 @@ impl PromptLifecycle {
             _ => {},
         }
     }
+    pub(crate) fn diagnostics(&self, session_id: &str) -> Vec<crate::SessionShutdownDiagnostic> {
+        use crate::{SessionShutdownDiagnostic as Diagnostic, ShutdownScope, ShutdownScopeReason};
+        let mut result: Vec<_> = self.records.iter().map(|(&receipt_id, receipt)| Diagnostic::PromptReceipt {
+            session_id: session_id.to_owned(), receipt_id, phase: receipt.phase,
+            uncorrelated_start_seen: receipt.start_seen, uncorrelated_terminal_seen: receipt.terminal_seen,
+        }).collect();
+        if self.overflow { result.push(Diagnostic::ScopeUnknown { scope: ShutdownScope::PromptReceipts, session_id: Some(session_id.to_owned()), reason: ShutdownScopeReason::CapacityExceeded }); }
+        result
+    }
     pub(crate) fn unknown(&self) -> Vec<String> {
         let mut result = Vec::new();
         for (id, receipt) in &self.records {
-            result.push(format!("prompt {id}: {}; uncorrelated start={}, terminal={}", receipt.phase, receipt.start_seen, receipt.terminal_seen));
+            result.push(format!("prompt {id}: {}; uncorrelated start={}, terminal={}", receipt.phase.description(), receipt.start_seen, receipt.terminal_seen));
         }
         if self.overflow { result.push("prompt receipt capacity exceeded".into()); }
         result
@@ -68,6 +93,7 @@ mod tests {
         tracker.observe(&json!({"type":"agent_start"}));
         tracker.observe(&json!({"type":"agent_settled"}));
         assert!(tracker.unknown()[0].contains("terminal=true"));
+        assert!(matches!(&tracker.diagnostics("session")[0], crate::SessionShutdownDiagnostic::PromptReceipt { uncorrelated_terminal_seen: true, phase: PromptReceiptPhase::AcknowledgedStarted, .. }));
     }
     #[test]
     fn handled_or_certain_pre_send_rejection_completes_only_its_receipt() {
