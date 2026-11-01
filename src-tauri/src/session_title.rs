@@ -38,32 +38,43 @@ pub(crate) fn start(state: &IpcHostState, args: &Value) -> Result<Value, (String
     let _policy = state.policy_gate.try_read().map_err(|_| err("busy", "Session policy change is in progress"))?;
     dispatch_with_resume(state, "agent.command", &json!({"session":id,"type":"get_state"}))?;
     let session = state.registry.get(id).ok_or_else(|| err("not_found", "Session not found"))?;
-    let mut tasks = state.title_tasks.lock().unwrap();
-    tasks.retain(|_, task| task.lock().unwrap().expires > Instant::now());
-    if tasks.contains_key(id) { return Err(err("busy", "Title generation is already in progress")); }
-    if tasks.len() >= 32 { return Err(err("busy", "Too many title requests are in progress")); }
+    {
+        let mut tasks = state.title_tasks.lock().unwrap();
+        tasks.retain(|_, task| task.as_ref().is_none_or(|task| task.try_lock().map_or(true, |task| task.expires > Instant::now())));
+        if tasks.contains_key(id) { return Err(err("busy", "Title generation is already in progress")); }
+        if tasks.len() >= 32 { return Err(err("busy", "Too many title requests are in progress")); }
+        tasks.insert(id.to_owned(), None);
+    }
+    struct Reservation<'a> { state: &'a IpcHostState, id: &'a str }
+    impl Drop for Reservation<'_> {
+        fn drop(&mut self) {
+            let mut tasks = self.state.title_tasks.lock().unwrap();
+            if tasks.get(self.id).is_some_and(Option::is_none) { tasks.remove(self.id); }
+        }
+    }
+    let _reservation = Reservation { state, id };
     let guard = session.try_branch_activity().map_err(|e| err("busy", e))?;
     if session.run_state().is_running() || !session.composer_outbox.snapshot().0.is_empty() { return Err(err("busy", "Wait for the current response and queued messages before generating a title")); }
     session.bridge_request("tree.assertIdle", None, Some(Duration::from_secs(30))).map_err(|e| err("busy", e))?;
     let saved = snapshot(&session)?;
     let config = state.management_config.lock().unwrap().clone().ok_or_else(|| err("management_unavailable", "Managed title modules are unavailable"))?;
     let dir = config.env.iter().find(|(key, _)| key == "PI_WEB_MANAGED_MODULES").map(|(_, value)| value).ok_or_else(|| err("management_unavailable", "Managed title modules are unavailable"))?;
-    let module = std::path::Path::new(dir).join("pi-web-session-projection.mjs").canonicalize().map_err(|e| err("management_unavailable", e))?;
+    let module = std::path::Path::new(dir).join("pi-web-session-title.mjs").canonicalize().map_err(|e| err("management_unavailable", e))?;
     let result = session.bridge_request("title.start", Some(json!({"module":module})), Some(Duration::from_secs(30))).map_err(|e| err("op_failed", e))?;
     let task = result.get("id").and_then(Value::as_str).filter(|v| !v.is_empty()).ok_or_else(|| err("op_failed", "Invalid title task"))?.to_owned();
     drop(guard);
-    tasks.insert(id.to_owned(), Arc::new(Mutex::new(TitleTask { session, id: task.clone(), snapshot: saved, expires: Instant::now() + Duration::from_secs(120) })));
+    state.title_tasks.lock().unwrap().insert(id.to_owned(), Some(Arc::new(Mutex::new(TitleTask { session, id: task.clone(), snapshot: saved, expires: Instant::now() + Duration::from_secs(120) }))));
     Ok(json!({"task":task}))
 }
 
 fn find(state: &IpcHostState, session: &str, id: &str) -> Result<Arc<Mutex<TitleTask>>, (String, String)> {
-    let task = state.title_tasks.lock().unwrap().get(session).cloned().ok_or_else(|| err("not_found", "Title task not found"))?;
+    let task = state.title_tasks.lock().unwrap().get(session).and_then(Clone::clone).ok_or_else(|| err("not_found", "Title task not found"))?;
     if task.lock().unwrap().id != id { return Err(err("not_found", "Title task not found")); }
     Ok(task)
 }
 fn remove(state: &IpcHostState, session: &str, task: &Arc<Mutex<TitleTask>>) {
     let mut tasks = state.title_tasks.lock().unwrap();
-    if tasks.get(session).is_some_and(|value| Arc::ptr_eq(value, task)) { tasks.remove(session); }
+    if tasks.get(session).and_then(Option::as_ref).is_some_and(|value| Arc::ptr_eq(value, task)) { tasks.remove(session); }
 }
 
 pub(crate) fn status(state: &IpcHostState, args: &Value) -> Result<Value, (String, String)> {
@@ -113,9 +124,28 @@ pub(crate) fn status(state: &IpcHostState, args: &Value) -> Result<Value, (Strin
         if task_guard.session.run_state().is_running() || !task_guard.session.composer_outbox.snapshot().0.is_empty() { return Err(err("busy", "Session is no longer idle")); }
         task_guard.session.bridge_request("tree.assertIdle", None, Some(Duration::from_secs(30))).map_err(|e| err("busy", e))?;
         if snapshot(&task_guard.session)? != task_guard.snapshot { return Err(err("stale", "Session changed while generating the title")); }
-        task_guard.session.bridge_request_with_activity(&guard, "session.rename", Some(json!({"name":title})), Some(Duration::from_secs(30)))
-            .map_err(|e| err("outcome_unknown", format!("Rename failed or its outcome is unknown; refresh the session list before trying again: {e}")))?;
-        Ok(json!({"title":title,"usage":response["result"]["usage"]}))
+        let agent = state.agent_dir();
+        let operation_id = crate::chat_sessions::random_id()?;
+        crate::session_writer_fence::begin(&agent, id, &operation_id, "title-rename", &session.session_file, None, None)
+            .map_err(|e| err("outcome_unknown", format!("Could not persist title rename fence; do not retry: {e}")))?;
+        #[cfg(test)]
+        let timeout = *state.title_rename_timeout.lock().unwrap();
+        #[cfg(not(test))]
+        let timeout = Duration::from_secs(30);
+        let renamed = session.title_rename_with_owned_fence(&guard, &operation_id, title, Some(timeout));
+        match renamed {
+            Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+                crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id)
+                    .map_err(|e| err("outcome_unknown", format!("Title was renamed but its fence remains; do not retry: {e}")))?;
+                Ok(json!({"title":title,"usage":response["result"]["usage"]}))
+            }
+            Err(pi_host::bridge::BridgeError::Op(ref error)) if error.code.as_deref() == Some("rename_not_applied") => {
+                crate::session_writer_fence::finish_owned_title_fence(&agent, id, &operation_id)
+                    .map_err(|e| err("outcome_unknown", format!("Rename was refused but its fence remains; do not retry: {e}")))?;
+                Err(err("busy", &error.message))
+            }
+            other => Err(err("outcome_unknown", format!("Title rename outcome is unknown; its writer fence remains and retry is blocked: {other:?}"))),
+        }
     })();
     drop(guard);
     drop(task_guard);

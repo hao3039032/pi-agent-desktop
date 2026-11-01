@@ -20,7 +20,10 @@ activity gates, verifies the same child and unchanged snapshot, and invokes the
 existing guarded rename. Navigation or model selection invalidates the task even
 if the user returns to the original state. Cancellation aborts only that title
 request; if a rename has already been dispatched its outcome is never called a
-confirmed cancellation. This does not add cross-process writer exclusion.
+confirmed cancellation. A durable session-writer fence is created before rename;
+only the matching owned operation can pass it, and an unknown reply leaves it
+in place across host restart. A proven pre-append refusal or confirmed success
+clears it. This does not add cross-process writer exclusion or automatic recovery.
 
 ## Editable composer outbox
 

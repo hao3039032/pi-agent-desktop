@@ -96,7 +96,7 @@ pub struct IpcHostState {
     pub projects: crate::session_view::ProjectResolver,
     /// Private exported HTML directories, removed on eviction or host exit.
     pub(crate) session_exports: Mutex<std::collections::VecDeque<tempfile::TempDir>>,
-    pub(crate) title_tasks: Mutex<HashMap<String, Arc<Mutex<crate::session_title::TitleTask>>>>,
+    pub(crate) title_tasks: Mutex<HashMap<String, Option<Arc<Mutex<crate::session_title::TitleTask>>>>>,
     /// The catalogue's version counter (`invalidateSessionListCache` +
     /// `getSessionListVersion`): bumped by every host-visible mutation that
     /// changes the list a client holds (a create, a rename). Clients compare
@@ -106,6 +106,8 @@ pub struct IpcHostState {
     chat_unlock_policy: ChatUnlockPolicy,
     #[cfg(test)]
     pub(crate) session_writer_timeout: Mutex<Duration>,
+    #[cfg(test)]
+    pub(crate) title_rename_timeout: Mutex<Duration>,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
@@ -170,7 +172,7 @@ impl IpcHostState {
         let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
         let fence_agent_dir = Arc::clone(&task_agent_dir);
         let admitted_agent_dir = Mutex::new(None::<PathBuf>);
-        let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
+        let checker: session_host::SessionFenceChecker = Arc::new(move |id, owner| {
             let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
                 .clone().ok_or_else(|| "Agent directory unavailable".to_string())?;
             let mut admitted = admitted_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?;
@@ -181,7 +183,10 @@ impl IpcHostState {
             if crate::trust_policy_fence::is_pending(&agent) {
                 return Err("Trust policy outcome is unresolved; session admission is blocked".into());
             }
-            crate::session_writer_fence::assert_session_writable(&agent, id)
+            match owner {
+                Some(operation_id) => crate::session_writer_fence::assert_owned_title_fence(&agent, id, operation_id),
+                None => crate::session_writer_fence::assert_session_writable(&agent, id),
+            }
         });
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
@@ -203,6 +208,8 @@ impl IpcHostState {
             #[cfg(test)]
             terminal_test_shell: Mutex::new(None),
             title_tasks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            title_rename_timeout: Mutex::new(Duration::from_secs(30)),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
