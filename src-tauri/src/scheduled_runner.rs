@@ -13,7 +13,16 @@ pub struct RunOutcome {
     pub error_code: Option<&'static str>,
     pub error_params: Option<Value>,
     pub counts_as_failure: bool,
+    /// Request attribution is separate from the persisted display status.
+    pub prompt_result: PromptResult,
+    /// Leader lifetime is separate from both prompt and ledger results.
+    pub controlled_writer: ControlledWriter,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptResult { NotSubmitted, Unknown, Uncorrelated }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlledWriter { NotStarted, Unconfirmed }
 
 pub(crate) fn now_iso() -> String {
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
@@ -30,30 +39,37 @@ pub(crate) fn new_run_id() -> Result<String, String> {
 }
 
 fn failure(error: impl Into<String>) -> RunOutcome {
-    RunOutcome { status: "failed", error: Some(error.into()), error_code: None, error_params: None, counts_as_failure: true }
+    RunOutcome { status: "failed", error: Some(error.into()), error_code: None, error_params: None, counts_as_failure: true,
+        prompt_result: PromptResult::NotSubmitted, controlled_writer: ControlledWriter::NotStarted }
 }
 
 /// Admit one manual run and return once its session is durably linked, or its
 /// early failure is recorded. Never retries a prompt whose outcome is unknown.
 pub fn run_now(state: &IpcHostState, task_id: &str) -> Result<Value, String> {
+    let run_id = new_run_id()?;
+    let mut tracking = state.scheduled_lifecycle.admit(&run_id).map_err(str::to_string)?;
     let lifecycle = state.scheduler_lifecycle.lock().unwrap();
-    if !state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst) { return Err("Scheduler is not the owner".into()); }
+    if !state.scheduler_owner.load(std::sync::atomic::Ordering::SeqCst) || state.scheduled_lifecycle.is_closing() { return Err("Scheduler is not the owner".into()); }
     let agent = state.agent_dir();
     let repo = TaskRepository::new(&agent);
     let task = repo.list()?.into_iter().find(|task| task["id"] == task_id).ok_or("Task not found")?;
-    let run_id = new_run_id()?;
     let record = json!({ "runId": run_id, "taskId": task_id, "trigger": "manual", "startedAt": now_iso(), "status": "running", "pid": std::process::id() });
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis() as i64;
     state.scheduled_active.lock().unwrap().insert(run_id.clone());
+    tracking.claimed();
     if let Err(error) = repo.admit_manual(task_id, &task, record.clone(), now_ms, std::process::id()) {
         state.scheduled_active.lock().unwrap().remove(&run_id);
+        // These repository rejections precede its write. I/O errors may
+        // follow a partial write and remain unresolved instead.
+        if matches!(error.as_str(), "Invalid task id" | "Scheduler is not the owner" | "Task not found" | "Task changed during run admission; reload before retrying" | "This task is already running")
+            || error.starts_with("scheduler transaction busy:") { tracking.resolved(); }
         return Err(error);
     }
     drop(lifecycle);
-    spawn_claimed(state, task, record)
+    spawn_claimed(state, task, record, tracking)
 }
 
-pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) -> Result<Value, String> {
+pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value, mut tracking: crate::scheduled_lifecycle::ScheduledRunGuard) -> Result<Value, String> {
     struct ActiveGuard { active: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>, run_id: String }
     impl Drop for ActiveGuard { fn drop(&mut self) { self.active.lock().unwrap().remove(&self.run_id); } }
     let agent = state.agent_dir();
@@ -64,17 +80,24 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let trigger = record["trigger"].as_str().ok_or("Run missing trigger")?.to_string();
     let cwd = task["cwd"].as_str().unwrap_or("");
     if !std::path::Path::new(cwd).is_dir() {
-        return finish_early(state, &agent, &task, &record, RunOutcome {
+        let result = finish_early(state, &agent, &task, &record, RunOutcome {
             status: "failed", error: Some(format!("Directory does not exist: {cwd}")), error_code: Some("cwd-missing"),
             error_params: Some(json!({ "path": cwd })), counts_as_failure: true,
+            prompt_result: PromptResult::NotSubmitted, controlled_writer: ControlledWriter::NotStarted,
         });
+        if result.is_ok() { tracking.resolved(); }
+        return result;
     }
     let names = match task["toolPreset"].as_str().unwrap_or("read-only") {
         "none" => vec![],
         "read-only" => vec!["read", "grep", "find", "ls"],
         "default" => vec!["read", "bash", "edit", "write"],
         "full" => vec!["bash", "read", "edit", "write", "grep", "find", "ls"],
-        _ => return finish_early(state, &agent, &task, &record, failure("Invalid task tool preset")),
+        _ => {
+            let result = finish_early(state, &agent, &task, &record, failure("Invalid task tool preset"));
+            if result.is_ok() { tracking.resolved(); }
+            return result;
+        },
     };
     let mut args = json!({ "cwd": task["cwd"], "type": "ensure_session", "toolNames": names });
     if task["model"].is_object() { args["provider"] = task["model"]["provider"].clone(); args["modelId"] = task["model"]["modelId"].clone(); }
@@ -89,6 +112,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let Some(session) = state.registry.get(session_id) else {
         return finish_early(state, &agent, &task, &record, failure("Created session disappeared"));
     };
+    tracking.set_session(session_id).map_err(str::to_string)?;
     let task_id = task_id.to_string();
     let prompt = task["prompt"].as_str().unwrap_or("").to_string();
     let duration = task["maxDurationMin"].as_u64().unwrap_or(30).clamp(1, 1440);
@@ -103,6 +127,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
     let task_name = task["name"].as_str().unwrap_or("").to_string();
     let spawned = std::thread::Builder::new().name(format!("scheduled-run-{run_id}")).spawn(move || {
         let _guard = guard;
+        let mut tracking = tracking;
         let link_tx = ready_tx.clone();
         let attention_events = std::sync::Arc::clone(&events);
         let outcome = run_session(&session, marker, &prompt, Duration::from_secs(duration * 60), |session_id| {
@@ -134,7 +159,7 @@ pub(crate) fn spawn_claimed(state: &IpcHostState, task: Value, record: Value) ->
         let error = outcome.error.clone();
         let error_code = outcome.error_code;
         let error_params = outcome.error_params.clone();
-        let finished = finish_run(&thread_agent, &thread_task, &thread_run, outcome);
+        let finished = finish_tracked_run(&thread_agent, &thread_task, &thread_run, outcome, &mut tracking);
         if let Ok((run, auto_paused)) = &finished {
             let mut event = json!({ "type": "run_finished", "taskId": thread_task, "taskName": task_name, "runId": thread_run, "trigger": trigger, "status": status });
             if run["sessionId"].is_string() { event["sessionId"] = run["sessionId"].clone(); }
@@ -181,6 +206,18 @@ fn finish_early(state: &IpcHostState, agent: &std::path::Path, task: &Value, rec
     Ok(run)
 }
 
+fn finish_tracked_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: RunOutcome, tracking: &mut crate::scheduled_lifecycle::ScheduledRunGuard) -> Result<(Value, bool), String> {
+    let prompt = outcome.prompt_result;
+    let writer = outcome.controlled_writer;
+    let finished = finish_run(agent, task_id, run_id, outcome);
+    if finished.is_ok() && prompt == PromptResult::NotSubmitted && writer == ControlledWriter::NotStarted {
+        tracking.resolved();
+    } else {
+        tracking.record_outcome(finished.is_ok(), format!("{prompt:?}"), format!("{writer:?}"));
+    }
+    finished
+}
+
 fn finish_run(agent: &std::path::Path, task_id: &str, run_id: &str, outcome: RunOutcome) -> Result<(Value, bool), String> {
     let repo = TaskRepository::new(agent);
     let finished = repo.mutate_runs(task_id, |runs| {
@@ -219,7 +256,26 @@ pub fn run_session(
     prompt: &str,
     limit: Duration,
     link_session: impl FnOnce(&str) -> Result<(), String>,
-    mut on_attention: impl FnMut(),
+    on_attention: impl FnMut(),
+) -> RunOutcome {
+    run_session_with_timeouts(session, marker, prompt, limit, link_session, on_attention, Duration::from_secs(120), Duration::from_secs(5))
+}
+
+fn run_session_with_timeouts(
+    session: &Session, marker: Value, prompt: &str, limit: Duration,
+    link_session: impl FnOnce(&str) -> Result<(), String>, mut on_attention: impl FnMut(),
+    prompt_timeout: Duration, abort_timeout: Duration,
+) -> RunOutcome {
+    let mut outcome = run_session_inner(session, marker, prompt, limit, link_session, &mut on_attention, prompt_timeout, abort_timeout);
+    // A command response or ledger write does not prove this leader stopped.
+    outcome.controlled_writer = ControlledWriter::Unconfirmed;
+    outcome
+}
+
+fn run_session_inner(
+    session: &Session, marker: Value, prompt: &str, limit: Duration,
+    link_session: impl FnOnce(&str) -> Result<(), String>, mut on_attention: impl FnMut(),
+    prompt_timeout: Duration, abort_timeout: Duration,
 ) -> RunOutcome {
     let name = marker["taskName"].as_str().unwrap_or("").to_string();
     let confirmed = match session.bridge_request("meta.scheduled-run", Some(marker), Some(Duration::from_secs(30))) {
@@ -234,18 +290,21 @@ pub fn run_session(
     let _ = session.command("set_session_name", json!({ "name": title }), Some(Duration::from_secs(10)));
     if let Err(error) = link_session(&session.id) { return failure(format!("recording the scheduled session failed: {error}")); }
     let (subscriber, events) = session.subscribe();
-    let result = (|| {
-        match session.command("prompt", json!({ "message": prompt }), Some(Duration::from_secs(120))) {
+    let mut prompt_result = PromptResult::Unknown;
+    let mut result = (|| {
+        match session.command("prompt", json!({ "message": prompt }), Some(prompt_timeout)) {
             Err(error) => {
                 // A lost acknowledgement does not prove the prompt was rejected.
                 // Abort rather than leaving a possibly running child behind.
-                let _ = session.command("abort", json!({}), Some(Duration::from_secs(5)));
+                let _ = session.command("abort", json!({}), Some(abort_timeout));
                 return failure(error.to_string());
             }
             Ok(response) if matches!(response["disposition"].as_str(), Some("handled" | "queued")) => {
                 return failure("scheduled prompt did not start a new run");
             }
-            Ok(_) => {}
+            Ok(response) => {
+                if response["disposition"] == "started" { prompt_result = PromptResult::Uncorrelated; }
+            }
         }
         let deadline = Instant::now() + limit;
         let mut last_assistant = Value::Null;
@@ -258,10 +317,10 @@ pub fn run_session(
             if now >= end {
                 if timed_out {
                     session.shutdown(Duration::from_secs(5));
-                    return RunOutcome { status: "aborted", error: Some(format!("Stopped after reaching the {} minute limit", limit.as_secs() / 60)), error_code: Some("time-limit"), error_params: Some(json!({ "minutes": limit.as_secs() / 60 })), counts_as_failure: true };
+                    return RunOutcome { status: "aborted", error: Some(format!("Stopped after reaching the {} minute limit", limit.as_secs() / 60)), error_code: Some("time-limit"), error_params: Some(json!({ "minutes": limit.as_secs() / 60 })), counts_as_failure: true, prompt_result: PromptResult::Unknown, controlled_writer: ControlledWriter::Unconfirmed };
                 }
                 timed_out = true;
-                let _ = session.command("abort", json!({}), Some(Duration::from_secs(5)));
+                let _ = session.command("abort", json!({}), Some(abort_timeout));
                 end = Instant::now() + Duration::from_secs(30);
                 continue;
             }
@@ -277,13 +336,13 @@ pub fn run_session(
                     Some("message_end") if event["message"]["role"] == "assistant" => last_assistant = event["message"].clone(),
                     Some("prompt_error") => prompt_error = Some(event["errorMessage"].as_str().unwrap_or("Prompt failed").to_string()),
                     Some("agent_settled") => {
-                        if timed_out { return RunOutcome { status: "aborted", error: Some(format!("Stopped after reaching the {} minute limit", limit.as_secs() / 60)), error_code: Some("time-limit"), error_params: Some(json!({ "minutes": limit.as_secs() / 60 })), counts_as_failure: true }; }
+                        if timed_out { return RunOutcome { status: "aborted", error: Some(format!("Stopped after reaching the {} minute limit", limit.as_secs() / 60)), error_code: Some("time-limit"), error_params: Some(json!({ "minutes": limit.as_secs() / 60 })), counts_as_failure: true, prompt_result: PromptResult::Unknown, controlled_writer: ControlledWriter::Unconfirmed }; }
                         if let Some(error) = prompt_error { return failure(error); }
                         return match last_assistant["stopReason"].as_str() {
                             Some("error") => failure(last_assistant["errorMessage"].as_str().unwrap_or("Model request failed")),
-                            Some("aborted") => RunOutcome { status: "aborted", error: Some("Stopped by the user".into()), error_code: Some("stopped"), error_params: None, counts_as_failure: false },
+                            Some("aborted") => RunOutcome { status: "aborted", error: Some("Stopped by the user".into()), error_code: Some("stopped"), error_params: None, counts_as_failure: false, prompt_result: PromptResult::Unknown, controlled_writer: ControlledWriter::Unconfirmed },
                             None => failure("scheduled run settled without an assistant response"),
-                            _ => RunOutcome { status: "succeeded", error: None, error_code: None, error_params: None, counts_as_failure: false },
+                            _ => RunOutcome { status: "succeeded", error: None, error_code: None, error_params: None, counts_as_failure: false, prompt_result: PromptResult::Unknown, controlled_writer: ControlledWriter::Unconfirmed },
                         };
                     }
                     _ => {}
@@ -299,5 +358,10 @@ pub fn run_session(
         }
     })();
     session.unsubscribe(subscriber);
+    result.prompt_result = prompt_result;
     result
 }
+
+#[cfg(test)]
+#[path = "scheduled_runner_tests.rs"]
+mod tests;
