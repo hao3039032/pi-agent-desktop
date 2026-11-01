@@ -10,16 +10,25 @@ mod tests;
 
 #[cfg(unix)]
 pub(crate) fn git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    git_with_cwd(cwd, args, timeout, false)
+    git_with_cwd(cwd, args, timeout, None)
 }
 #[cfg(unix)]
-fn git_with_cwd(cwd: &Path, args: &[&str], timeout: Duration, fixed_cwd: bool) -> Result<String, String> {
+fn git_with_cwd(cwd: &Path, args: &[&str], timeout: Duration, directory: Option<&std::fs::File>) -> Result<String, String> {
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
     let mut command = Command::new("git");
-    if fixed_cwd { command.current_dir(cwd); } else { command.arg("-C").arg(cwd); }
-    let mut child = command.args(args).env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0")
+    if let Some(directory) = directory {
+        let fd = directory.as_raw_fd();
+        // The descriptor remains open in the parent until spawn returns; only
+        // async-signal-safe fchdir runs in the forked child before exec.
+        unsafe { command.pre_exec(move || {
+            if libc::fchdir(fd) == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+        }); }
+    } else { command.arg("-C").arg(cwd); }
+    let mut child = command.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
+        .args(args).env("LC_ALL", "C").env("GIT_TERMINAL_PROMPT", "0")
         .process_group(0).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| e.to_string())?;
     let pgid = child.id() as i32;
@@ -141,11 +150,7 @@ fn create_with_base_opened(cwd: &Path, b: &str, after_open: impl FnOnce()) -> Re
     if !local_exists { args.extend(["-b", b]); }
     args.extend(["--", dir]);
     if local_exists { args.push(b); } else if remote_exists { args.push(&remote); }
-    #[cfg(target_os = "linux")]
-    let pinned = PathBuf::from(format!("/proc/self/fd/{}", base_fd.as_raw_fd()));
-    #[cfg(not(target_os = "linux"))]
-    let pinned = PathBuf::from(format!("/dev/fd/{}", base_fd.as_raw_fd()));
-    git_with_cwd(&pinned, &args, Duration::from_secs(300), true)?;
+    git_with_cwd(&base, &args, Duration::from_secs(300), Some(&base_fd))?;
     let held = base_fd.metadata().map_err(|e| e.to_string())?;
     let visible = std::fs::symlink_metadata(&base).map_err(|e| e.to_string())?;
     if !visible.is_dir() || held.dev() != visible.dev() || held.ino() != visible.ino() { return Err("Worktree directory changed during creation; no access granted".into()); }

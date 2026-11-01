@@ -4,8 +4,7 @@ use std::process::Command;
 
 #[cfg(unix)]
 #[test]
-fn deadline_kills_hook_process_group_and_bounds_pipe_drain() {
-    use std::os::unix::fs::PermissionsExt;
+fn deadline_kills_process_group_and_bounds_pipe_drain() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path();
     git(repo, &["init"]);
@@ -15,13 +14,28 @@ fn deadline_kills_hook_process_group_and_bounds_pipe_drain() {
     git(repo, &["add", "file"]);
     git(repo, &["commit", "-m", "initial"]);
     git(repo, &["branch", "other"]);
-    let hook = repo.join(".git/hooks/post-checkout");
-    std::fs::write(&hook, "#!/bin/sh\nsleep 30 &\nexit 0\n").unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let start = Instant::now();
-    let result = super::git(repo, &["checkout", "other"], Duration::from_millis(400));
+    let result = super::git(repo, &["-c", "alias.fixture=!sleep 30 & wait", "fixture"], Duration::from_millis(400));
     assert!(result.unwrap_err().contains("timed out"));
     assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+#[cfg(unix)]
+#[test]
+fn checkout_does_not_run_repository_hook() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path();
+    git(repo, &["init"]);
+    git(repo, &["config", "user.email", "fixture@example.invalid"]);
+    git(repo, &["config", "user.name", "Fixture"]);
+    git(repo, &["commit", "--allow-empty", "-m", "initial"]);
+    git(repo, &["branch", "other"]);
+    let hook = repo.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    super::git(repo, &["checkout", "other"], Duration::from_secs(5)).unwrap();
+    assert!(!repo.join("hook-ran").exists());
 }
 
 fn git(cwd: &Path, args: &[&str]) {
