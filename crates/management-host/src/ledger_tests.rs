@@ -135,7 +135,9 @@ for line in sys.stdin:
     if mode in ('coop','coop_lost'):
         op=data['op']; args=data['args']
         print(json.dumps({'type':'response','id':r['id'],'success':True,'data':{'disposition':'handled'}}),flush=True)
-        canonical='mcp__fixture|https://secret@example.invalid'; legacy='https://secret@example.invalid'; config='fixture-config'
+        name=args.get('name','fixture')
+        legacy='https://other.invalid' if name == 'other' else 'https://secret@example.invalid'
+        canonical='mcp__'+name+'|'+legacy; config='fixture-config'
         if op == 'mcp.credentialTarget':
             emit(rid,data['nonce'],{'schema':1,'admissionSchema':1,'canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation})
         elif op == 'mcp.signInStart':
@@ -242,6 +244,27 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
     let fresh = restarted.instance("global", &config).unwrap();
     assert!(fresh.reserve_mcp_cooperation(&target).is_err(), "restart cannot claim old task ownership");
     restarted.shutdown_all(Duration::from_secs(1));
+    host.shutdown_all(Duration::from_secs(1));
+}
+
+#[test]
+fn admitted_mcp_tasks_join_same_key_allow_disjoint_and_refuse_legacy_alias() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "coop");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let context = |name| serde_json::json!({"scope":"global","name":name,"agentDir":temp.path(),"allowedRoots":[]});
+    let (first, joined) = instance.start_admitted_mcp("mcp.signInStart", instance.resolve_mcp_admission(context("fixture")).unwrap(), Duration::from_secs(5)).unwrap();
+    assert!(!joined);
+    let (duplicate, joined) = instance.start_admitted_mcp("mcp.signInStart", instance.resolve_mcp_admission(context("fixture")).unwrap(), Duration::from_secs(5)).unwrap();
+    assert!(joined);
+    assert_eq!(first, duplicate);
+    let (other, joined) = instance.start_admitted_mcp("mcp.signInStart", instance.resolve_mcp_admission(context("other")).unwrap(), Duration::from_secs(5)).unwrap();
+    assert!(!joined);
+    assert_ne!(first, other);
+    let alias = instance.resolve_mcp_admission(context("alias")).unwrap();
+    assert!(instance.start_admitted_mcp("mcp.signInStart", alias, Duration::from_secs(5)).is_err());
+    assert_eq!(OperationLedger::inspect(temp.path()).unwrap().len(), 2);
     host.shutdown_all(Duration::from_secs(1));
 }
 

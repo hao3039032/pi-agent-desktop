@@ -69,6 +69,12 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
       new MessageEvent("message", { data: JSON.stringify(event) }) as MessageEvent<string>,
     );
   };
+  const invalidate = () => {
+    invalidated = true;
+    // A reconnect snapshot alone does not contain the transcript.
+    deliver({ type: "stream_gap" });
+    source.onerror?.(new Event("error"));
+  };
 
   detach = client.subscribe<IpcStreamMessage>(
     "agent.subscribeEvents",
@@ -92,8 +98,7 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
           // A NEW generation mid-stream: the stream identity changed, the
           // incremental view is unreliable — surface as an error → close →
           // reconnect (the new subscription's snapshot re-synchronizes).
-          invalidated = true;
-          source.onerror?.(new Event("error"));
+          invalidate();
           return;
         }
       }
@@ -101,8 +106,7 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
       // until reconnect obtains a new snapshot instead of silently skipping it.
       if (frame.seq <= seenSeq) return;
       if (frame.seq !== seenSeq + 1 || (seenSeq === 0 && frame.kind !== "snapshot")) {
-        invalidated = true;
-        source.onerror?.(new Event("error"));
+        invalidate();
         return;
       }
       seenSeq = frame.seq;
@@ -130,8 +134,7 @@ export function createSessionEventSource(sessionId: string): AgentEventSourceLik
         // A reset means the consumer's incremental view is unreliable: the
         // connection layer models this as an error → close → reconnect with
         // a fresh subscription (whose snapshot re-synchronizes it).
-        invalidated = true;
-        source.onerror?.(new Event("error"));
+        invalidate();
         return;
       }
       readyState = OPEN;

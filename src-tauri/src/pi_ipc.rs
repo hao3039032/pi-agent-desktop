@@ -654,7 +654,7 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
     );
     let subscription_id_for_relay = subscription_id.clone();
     let epoch = session_handle.epoch();
-    let (subscriber_id, events, pending_ui) = session_handle.subscribe_with_ui();
+    let (subscriber_id, events, pending_ui, gap) = session_handle.subscribe_with_ui_bounded();
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -710,6 +710,12 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                     detach(subscriber_id);
                     return;
                 }
+                if gap.load(Ordering::SeqCst) {
+                    seq += 1;
+                    let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                    detach(subscriber_id);
+                    return;
+                }
                 match events.recv_timeout(Duration::from_millis(500)) {
                     Ok(record) => {
                         seq += 1;
@@ -723,6 +729,10 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if gap.load(Ordering::SeqCst) {
+                            seq += 1;
+                            let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                        }
                         detach(subscriber_id);
                         return;
                     }

@@ -153,11 +153,12 @@ test("seq ordering, stale generations, and generation bumps", () => {
   // (error → reconnect), never quietly re-base and continue.
   deliver({ subscriptionId: "sub", epoch: 3, seq: 1, kind: "event", payload: { type: "fresh" } });
   assert.equal(errors.length, 1, "a generation bump surfaces as an error");
-  assert.equal(events.length, 1, "the bumped frame itself never delivers");
+  assert.equal(events.length, 2, "the gap is surfaced for reconciliation");
+  assert.equal(events[1].type, "stream_gap");
   // Once invalidated, stale delivery cannot resume this subscription.
   deliver({ subscriptionId: "sub", epoch: 2, seq: 2, kind: "event", payload: { type: "late" } });
   assert.equal(errors.length, 1);
-  assert.equal(events.length, 1);
+  assert.equal(events.length, 2);
   source.close();
 });
 
@@ -174,6 +175,7 @@ test("missing sequence, non-snapshot first frame, and reset require reconnect", 
     source.onerror = () => { errors++; };
     for (const frame of frames) deliver({ subscriptionId: "sub", ...frame });
     assert.equal(errors, 1);
+    assert.equal(events.filter((event) => event.type === "stream_gap").length, 1);
     assert.ok(!events.some((event) => event.type === "skipped" || event.type === "before-snapshot"));
     deliver({ subscriptionId: "sub", epoch: 1, seq: 2, kind: "event", payload: { type: "late" } });
     assert.ok(!events.some((event) => event.type === "late"));

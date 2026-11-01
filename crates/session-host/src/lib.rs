@@ -242,7 +242,39 @@ struct SessionState {
     started_at: Instant,
     last_active: Instant,
     subscribers: Vec<(u64, std::sync::mpsc::Sender<Value>)>,
+    bounded_subscribers: Vec<BoundedSubscriber>,
     ui: session_ui::SessionUi,
+}
+
+/// The IPC relay's own ingress queue; downstream Tauri buffers are separate.
+pub const SESSION_RELAY_QUEUE_FRAMES: usize = 16;
+pub const SESSION_RELAY_EVENT_BYTES: usize = 256 * 1024;
+struct BoundedSubscriber {
+    id: u64,
+    tx: std::sync::mpsc::SyncSender<Value>,
+    gap: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionState {
+    fn broadcast(&mut self, event: &Value) {
+        self.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        if self.bounded_subscribers.is_empty() { return; }
+        struct Count { remaining: usize }
+        impl std::io::Write for Count {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if data.len() > self.remaining { return Err(std::io::Error::other("event exceeds relay budget")); }
+                self.remaining -= data.len();
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let fits = serde_json::to_writer(Count { remaining: SESSION_RELAY_EVENT_BYTES }, event).is_ok();
+        self.bounded_subscribers.retain(|subscriber| {
+            if fits && subscriber.tx.try_send(event.clone()).is_ok() { return true; }
+            subscriber.gap.store(true, Ordering::SeqCst);
+            false
+        });
+    }
 }
 
 impl Session {
@@ -353,6 +385,19 @@ impl Session {
         (id, rx, pending)
     }
 
+    /// Subscribe with a bounded ingress and an explicit gap flag. The caller
+    /// must reset/reconcile when the flag is raised; events are never silently
+    /// discarded as if delivery were complete.
+    pub fn subscribe_with_ui_bounded(&self) -> (u64, std::sync::mpsc::Receiver<Value>, Vec<Value>, Arc<std::sync::atomic::AtomicBool>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(SESSION_RELAY_QUEUE_FRAMES);
+        let gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = self.state.lock().unwrap();
+        let id = self.next_subscriber_id();
+        let pending = state.ui.records();
+        state.bounded_subscribers.push(BoundedSubscriber { id, tx, gap: Arc::clone(&gap) });
+        (id, rx, pending, gap)
+    }
+
     pub fn pending_ui_ids(&self) -> Vec<String> {
         self.state.lock().unwrap().ui.ids()
     }
@@ -369,7 +414,7 @@ impl Session {
         let (child_id, payload) = state.ui.answer(id, response)?;
         if !self.client.respond_ui(&child_id, payload) { return Err("session process is closed") }
         let event = json!({"type":"extension_ui_closed", "id":id});
-        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        state.broadcast(&event);
         Ok(())
     }
 
@@ -379,10 +424,10 @@ impl Session {
         if let Some((child_id, id)) = cancel {
             self.client.respond_ui(&child_id, json!({"cancelled": true}));
             let closed = json!({"type":"extension_ui_closed", "id":id});
-            state.subscribers.retain(|(_, tx)| tx.send(closed.clone()).is_ok());
+            state.broadcast(&closed);
         }
         if let Some(record) = record {
-            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+            state.broadcast(&record);
         }
     }
 
@@ -392,7 +437,7 @@ impl Session {
         for child_id in state.ui.drain() { self.client.respond_ui(&child_id, json!({"cancelled": true})); }
         for id in ids {
             let event = json!({"type":"extension_ui_closed", "id":id});
-            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+            state.broadcast(&event);
         }
     }
 
@@ -401,7 +446,7 @@ impl Session {
         for (child_id, id) in state.ui.expire() {
             self.client.respond_ui(&child_id, json!({"cancelled": true}));
             let event = json!({"type":"extension_ui_closed", "id":id});
-            state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+            state.broadcast(&event);
         }
     }
 
@@ -410,7 +455,8 @@ impl Session {
     pub fn unsubscribe(&self, subscriber_id: u64) {
         let mut state = self.state.lock().unwrap();
         state.subscribers.retain(|(id, _)| *id != subscriber_id);
-        if state.subscribers.is_empty() {
+        state.bounded_subscribers.retain(|subscriber| subscriber.id != subscriber_id);
+        if state.subscribers.is_empty() && state.bounded_subscribers.is_empty() {
             for id in state.ui.drain() { self.client.respond_ui(&id, json!({"cancelled": true})); }
         }
     }
@@ -463,7 +509,7 @@ impl Session {
     pub(crate) fn emit_host_event(&self, event: Value) {
         let mut state = self.state.lock().unwrap();
         state.last_active = Instant::now();
-        state.subscribers.retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        state.broadcast(&event);
     }
 
     fn fan_out(self: &Arc<Self>, record: Value) {
@@ -486,7 +532,7 @@ impl Session {
         // 2. Subscribers see the raw record in arrival order.
         {
             let mut state = self.state.lock().unwrap();
-            state.subscribers.retain(|(_, tx)| tx.send(record.clone()).is_ok());
+            state.broadcast(&record);
         }
         // 3. Follow-ups run off the dispatch path (a slow get_state must not
         //    stall the event thread): a settle refresh is epoch-guarded when
@@ -1335,6 +1381,7 @@ fn spawn_session(
             started_at: Instant::now(),
             last_active: Instant::now(),
             subscribers: Vec::new(),
+            bounded_subscribers: Vec::new(),
             ui: session_ui::SessionUi::default(),
         }),
         epoch: AtomicU64::new(1),
@@ -2089,6 +2136,28 @@ mod dispatch_tests {
         fn new() -> super::SessionRegistry {
             super::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
         }
+    }
+
+    #[test]
+    fn bounded_relay_ingress_signals_overflow_and_oversize() {
+        let now = Instant::now();
+        let mut state = SessionState { lease_until: now, started_at: now, last_active: now,
+            subscribers: Vec::new(), bounded_subscribers: Vec::new(), ui: session_ui::SessionUi::default() };
+        let (legacy_tx, legacy_rx) = std::sync::mpsc::channel();
+        state.subscribers.push((1, legacy_tx));
+        let (tx, rx) = std::sync::mpsc::sync_channel(SESSION_RELAY_QUEUE_FRAMES);
+        let gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.bounded_subscribers.push(BoundedSubscriber { id: 2, tx, gap: Arc::clone(&gap) });
+        for n in 0..=SESSION_RELAY_QUEUE_FRAMES { state.broadcast(&json!({"n":n})); }
+        assert!(gap.load(Ordering::SeqCst));
+        assert_eq!(rx.try_iter().count(), SESSION_RELAY_QUEUE_FRAMES);
+        assert_eq!(legacy_rx.try_iter().count(), SESSION_RELAY_QUEUE_FRAMES + 1);
+        let (tx, rx) = std::sync::mpsc::sync_channel(SESSION_RELAY_QUEUE_FRAMES);
+        let gap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state.bounded_subscribers.push(BoundedSubscriber { id: 3, tx, gap: Arc::clone(&gap) });
+        state.broadcast(&json!({"text":"x".repeat(SESSION_RELAY_EVENT_BYTES)}));
+        assert!(gap.load(Ordering::SeqCst));
+        assert_eq!(rx.try_iter().count(), 0);
     }
 
     #[test]

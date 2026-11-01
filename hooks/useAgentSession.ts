@@ -1627,6 +1627,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const handleAgentEvent = useCallback((event: AgentEvent) => {
     switch (event.type) {
+      case "stream_gap": {
+        const sid = sessionIdRef.current;
+        if (sid) void loadSession(sid, false, true, { force: true, fresh: true });
+        break;
+      }
       case "connected": {
         dispatch({ type: "end" });
         if (Array.isArray(event.pendingExtensionUiIds)) {
