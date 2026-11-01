@@ -57,8 +57,8 @@ mod session_writer_fence;
 mod session_deletion;
 mod session_deletion_journal;
 mod terminal_host;
-#[allow(dead_code)] // Static bootstrap will retain this cooperative guard; it grants no mutation permission.
 mod host_ownership;
+pub mod host_lifecycle;
 mod scheduler_host;
 mod scheduler_tick;
 mod scheduled_runner;
