@@ -47,6 +47,7 @@ pub struct IpcHostState {
     subscription_counter: AtomicU64,
     /// Live event-stream relays by subscription id (unsubscribe detaches).
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
+    session_relay_gate: Arc<tokio::sync::Semaphore>,
     /// The provider-auth domain's login-stream relays (the same release
     /// contract: unsubscribe cancels the flow host-side). Kept in the
     /// domain's own map so the shared one stays untouched.
@@ -167,8 +168,10 @@ impl IpcHostState {
     pub fn new() -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
         let policy_gate = Arc::new(std::sync::RwLock::new(()));
-        let task_agent_dir = Arc::new(Mutex::new(Some(default_agent_dir())));
+        let agent_dir = default_agent_dir();
+        let task_agent_dir = Arc::new(Mutex::new(Some(agent_dir.clone())));
         let fence_agent_dir = Arc::clone(&task_agent_dir);
+        let management_agent_dir = Arc::clone(&task_agent_dir);
         let admitted_agent_dir = Mutex::new(None::<PathBuf>);
         let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
             let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
@@ -195,6 +198,7 @@ impl IpcHostState {
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
+            session_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_SESSION_RELAYS)),
             login_relays: Arc::new(Default::default()),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
@@ -202,8 +206,12 @@ impl IpcHostState {
             terminals,
             #[cfg(test)]
             terminal_test_shell: Mutex::new(None),
-            management: ManagementHost::new(),
-            management_config: Mutex::new(resolve_management_config()),
+            management: ManagementHost::with_agent_dir_check(Arc::new(move |configured| {
+                let pinned = management_agent_dir.lock().map_err(|_| "agent directory unavailable")?;
+                if pinned.as_deref() != Some(configured) { return Err("management agent directory differs from host agent directory".into()); }
+                Ok(())
+            })),
+            management_config: Mutex::new(resolve_management_config(agent_dir)),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir,
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
@@ -553,7 +561,7 @@ fn resolve_managed_modules() -> Option<PathBuf> {
 /// The management spawn config (the vendored management extension; its
 /// managed module tree is wired with the M3 packaging — until then the
 /// config stays None and models ops answer management_unavailable).
-fn resolve_management_config() -> Option<ManagementSpawnConfig> {
+fn resolve_management_config(agent_dir: PathBuf) -> Option<ManagementSpawnConfig> {
     let executable = resolve_pi_executable()?;
     let dev = Path::new("../lib/pi-rpc/assets/pi-web-management.mjs");
     let extension = match dev.canonicalize() {
@@ -563,7 +571,7 @@ fn resolve_management_config() -> Option<ManagementSpawnConfig> {
     let managed = resolve_managed_modules()?;
     Some(ManagementSpawnConfig {
         executable: executable.to_string_lossy().into_owned(),
-        agent_dir: None,
+        agent_dir: Some(agent_dir),
         extensions: vec![extension],
         env: vec![(
             "PI_WEB_MANAGED_MODULES".to_string(),
@@ -619,12 +627,24 @@ pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event:
 /// when the receiver unsubscribes (`agent.unsubscribeEvents`, page reload,
 /// window close) or the session leaves the registry; the relay thread then
 /// detaches — a dropped channel alone must not leak a thread.
+/// Session relay threads remain counted until their actual exit, even after
+/// unsubscribe. This cap does not bound channel transport buffers.
+pub const IPC_MAX_SESSION_RELAYS: usize = 32;
+
 #[tauri::command]
 pub fn pi_ipc_subscribe_events(
     state: State<'_, Arc<IpcHostState>>,
     session: String,
     on_event: Channel<Value>,
 ) -> Value {
+    subscribe_session_events(&state, session, on_event)
+}
+
+fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Channel<Value>) -> Value {
+    let permit = match Arc::clone(&state.session_relay_gate).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"session stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
+    };
     let Some(session_handle) = state.registry.get(&session) else {
         return protocol_error("?", "not_found", &format!("no running session {session}"));
     };
@@ -653,9 +673,12 @@ pub fn pi_ipc_subscribe_events(
     // The relay: snapshot first, then every record in order. A closed
     // channel (send error) or the unsubscribe flag ends the loop and
     // detaches the subscriber.
-    std::thread::Builder::new()
+    let relay_session = Arc::clone(&session_handle);
+    let spawn = std::thread::Builder::new()
         .name(format!("ipc-events-{subscription_id}"))
         .spawn(move || {
+            let _permit = permit;
+            let session_handle = relay_session;
             let subscription_id = subscription_id_for_relay;
             let detach = |subscriber_id| {
                 session_handle.unsubscribe(subscriber_id);
@@ -705,8 +728,12 @@ pub fn pi_ipc_subscribe_events(
                     }
                 }
             }
-        })
-        .ok();
+        });
+    if let Err(error) = spawn {
+        session_handle.unsubscribe(subscriber_id);
+        state.event_relays.lock().unwrap().remove(&subscription_id);
+        return protocol_error("?", "io", &format!("session relay could not start: {error}"));
+    }
 
     json!({ "subscriptionId": subscription_id, "epoch": epoch })
 }
@@ -3012,7 +3039,8 @@ fn management_serial_inner(state: &IpcHostState, op: &str, args: Value, cwd: Opt
 fn management_read_scoped(state: &IpcHostState, op: &str, args: &Value, cwd: &Path) -> Result<Value, (String, String)> {
     let config = state.management_config.lock().unwrap().clone().ok_or_else(|| ("management_unavailable".into(), "management instance is not configured".into()))?;
     let instance = state.management.instance(&cwd.to_string_lossy(), &config).map_err(|e| ("management_unavailable".into(), e))?;
-    let handle = instance.start_task(op, args.clone(), std::time::Duration::from_secs(60), management_host::TaskKind::ReadOnly).map_err(|e| ("io".into(), e))?;
+    let kind = if matches!(op, "skills.search" | "skills.check" | "plugins.check") { management_host::TaskKind::Mutation } else { management_host::TaskKind::ReadOnly };
+    let handle = instance.start_task(op, args.clone(), std::time::Duration::from_secs(60), kind).map_err(|e| ("io".into(), e))?;
     loop {
         let snapshot = instance.task_snapshot(&handle).map_err(|e| ("io".into(), e))?;
         match snapshot.status {
@@ -6455,6 +6483,24 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     }
 
     #[test]
+    fn session_relay_capacity_rejects_before_subscription() {
+        let state = state();
+        let permits: Vec<_> = (0..IPC_MAX_SESSION_RELAYS)
+            .map(|_| Arc::clone(&state.session_relay_gate).try_acquire_owned().unwrap())
+            .collect();
+        let channel = Channel::new(|_| Ok(()));
+        for _ in 0..1000 {
+            let response = subscribe_session_events(&state, "missing".into(), channel.clone());
+            assert_eq!(response["error"]["reason"], "stream_not_admitted");
+        }
+        assert!(state.event_relays.lock().unwrap().is_empty());
+        drop(permits);
+        let response = subscribe_session_events(&state, "missing".into(), channel);
+        assert_eq!(response["error"]["code"], "not_found");
+        assert_eq!(state.session_relay_gate.available_permits(), IPC_MAX_SESSION_RELAYS);
+    }
+
+    #[test]
     fn dispatch_saturation_rejects_before_execution_and_recovers() {
         let state = Arc::new(state());
         let permits: Vec<_> = (0..IPC_MAX_CONCURRENT_DISPATCH)
@@ -6540,7 +6586,10 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         for path in [&agent, &project, &package] { std::fs::create_dir_all(path).unwrap(); }
         std::fs::write(package.join("package.json"), r#"{"name":"fixture","version":"1.0.0"}"#).unwrap();
         std::fs::write(agent.join("settings.json"), json!({"packages": [package]}).to_string()).unwrap();
-        let managed = dir.path().join("managed");
+        let managed = dir.path().join("managed/node_modules");
+        std::fs::create_dir_all(&managed).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
         let state = state();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());

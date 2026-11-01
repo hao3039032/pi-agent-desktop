@@ -20,6 +20,10 @@
 //! - a management child is spawned `--no-session`: it must never create
 //!   user session files.
 
+pub mod ledger;
+#[cfg(all(test, target_os = "linux"))]
+mod ledger_tests;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -59,11 +63,75 @@ pub struct ManagementInstance {
     /// from anywhere in the child bind to the management protocol.
     nonce: String,
     pending: Arc<Mutex<HashMap<String, PendingTask>>>,
+    agent_dir: PathBuf,
+    session_file_writer: bool,
+    agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     _notify_subscription: Arc<pi_host::client::UiSubscription>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind { ReadOnly, Mutation }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationPolicy { ReadOnly, Ephemeral, PersistentMutation, SessionWriter }
+
+fn operation_policy(op: &str, session_writer: bool) -> Result<OperationPolicy, String> {
+    use OperationPolicy::*;
+    if session_writer {
+        return if matches!(op, "session.setOfflineChatUnlock" | "session.continueChat" | "session.forkStaged") { Ok(SessionWriter) } else { Err("unclassified session writer operation".into()) };
+    }
+    if ledger::target_for(op).is_some() { return Ok(PersistentMutation); }
+    match op {
+        "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
+        "session.readHeader" | "session.readEntries" | "session.readContext" | "session.readView" |
+        "session.projectSnapshot" | "session.isFileReferenced" | "session.reference" | "session.search" |
+        "session.readThinking" | "session.recordedSystemPrompt" | "session.authorizeBashOutput" |
+        "chat.systemPrompt" | "session.chatOnlyPrompt" | "models.list" | "models.enabledGet" |
+        "modelsConfig.get" | "models.nonchat" | "skills.list" | "plugins.list" |
+        "auth.providers" | "auth.loginPoll" | "mcp.configGet" | "trust.projectListing" | "trust.projectStatus" |
+        "terminal.settingsGet" | "terminal.resolveShell" | "distro.status" | "docx.extractText" | "docx.renderHtml" |
+        "tasks.validateCreate" | "tasks.validateUpdate" | "tasks.nextRun" | "tasks.decideSlot" | "tasks.previewCron" => Ok(ReadOnly),
+        // These can call a network service or write an explicitly temporary
+        // projection. They are not pure reads and are never auto-retried.
+        "modelsConfig.catalog" | "modelsConfig.discover" | "modelsConfig.test" | "models.refreshCatalog" |
+        "models.providerUsage" | "skills.search" | "skills.check" | "plugins.check" | "mcp.test" |
+        "session.export" | "session.extractToolResultImage" => Ok(Ephemeral),
+        _ => Err(format!("unclassified management operation: {op}")),
+    }
+}
+
+fn mutation_scope(op: &str, args: &Value) -> Result<ledger::OperationScope, String> {
+    if op == "trust.setFenced" || (matches!(op, "plugins.install" | "plugins.remove" | "plugins.update" | "skills.install" | "skills.update" | "mcp.configAction" | "mcp.signInStart")
+        && args.get("scope").and_then(Value::as_str) == Some("project")) {
+        let cwd = args.get("cwd").and_then(Value::as_str).ok_or("project mutation lacks a physical scope")?;
+        let canonical = std::fs::canonicalize(cwd).map_err(|e| format!("cannot identify project mutation scope: {e}"))?;
+        let path = canonical.to_str().ok_or("project mutation scope is not UTF-8")?.to_string();
+        return Ok(ledger::OperationScope::Project { path });
+    }
+    Ok(ledger::OperationScope::Global)
+}
+
+fn confirmed_success(op: &str, value: &Value) -> bool {
+    fn contains_failure(value: &Value) -> bool {
+        match value {
+            Value::Array(items) => items.iter().any(contains_failure),
+            Value::Object(fields) => fields.iter().any(|(key, value)| {
+                ((key == "error" || key == "mcpRefusal") && !value.is_null()) || contains_failure(value)
+            }),
+            _ => false,
+        }
+    }
+    if value.get("mcpRefusal").is_some() { return false; }
+    match op {
+        "plugins.setEnabled" | "skills.setDisabled" => !contains_failure(value),
+        // These asynchronous flows encode failure/cancellation in successful
+        // envelopes, so only their explicitly successful terminal phase counts.
+        "mcp.signInStart" => value.get("phase").and_then(Value::as_str) == Some("done"),
+        "auth.loginStart" => value.get("success").and_then(Value::as_bool) == Some(true),
+        "trust.setFenced" | "mcp.trustFolderAdd" => value.get("result").is_some_and(|result| result.get("mcpRefusal").is_none()),
+        _ => true,
+    }
+}
 
 /// Host-internal snapshot. Operations must return frontend-safe results and
 /// progress: this generic transport cannot infer which arbitrary values are secrets.
@@ -220,18 +288,17 @@ impl ManagementInstance {
 
     fn start_task_inner(&self, op: &str, args: Value, deadline: Duration, kind: TaskKind, serial_scope: bool, exclusive_config: Option<ManagementSpawnConfig>, shared_runner: Option<Arc<ManagementInstance>>) -> Result<String, String> {
         if deadline.is_zero() || deadline > Duration::from_secs(600) { return Err("invalid management task deadline".into()); }
-        if kind == TaskKind::ReadOnly && !matches!(op,
-            "sys.capabilities" | "cron.preview" | "cron.previousRuns" | "cron.countSlots" |
-            "session.readHeader" | "session.readEntries" | "session.readContext" | "session.readView" |
-            "session.projectSnapshot" | "session.isFileReferenced" | "session.reference" | "chat.systemPrompt" | "session.chatOnlyPrompt" |
-            "models.list" | "models.enabledGet" | "modelsConfig.get" | "skills.search" | "skills.list" | "plugins.list" | "skills.check" | "plugins.check" | "auth.loginPoll" | "mcp.configGet" | "trust.projectListing" | "trust.projectStatus") {
+        if let Some(check) = &self.agent_dir_check { check(&self.agent_dir)?; }
+        let policy = operation_policy(op, self.session_file_writer)?;
+        if kind == TaskKind::ReadOnly && policy != OperationPolicy::ReadOnly {
             return Err("operation is not approved as read-only".into());
         }
+        let kind = if matches!(policy, OperationPolicy::ReadOnly | OperationPolicy::Ephemeral) { TaskKind::ReadOnly } else { TaskKind::Mutation };
         let handle = format!("task-{}", uuid::Uuid::new_v4());
         let task = Arc::new(Mutex::new(TaskRecord { snapshot: TaskSnapshot {
             status: TaskStatus::Running, progress: None, result: None, error: None, cancel_requested: false,
         }, finished_at: None, serial_scope, exclusive: exclusive_config.is_some(), operation: op.to_string(), runner: None }));
-        let activity = {
+        let (activity, evidence) = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
             if state.closing || self.client.has_exited() { return Err("management instance is closing".into()); }
@@ -245,18 +312,25 @@ impl ManagementInstance {
             if kind == TaskKind::Mutation && state.tasks.values().any(|task| task.lock().unwrap().snapshot.status == TaskStatus::Unknown) {
                 return Err("management scope has an unknown outcome".into());
             }
+            let evidence = if policy == OperationPolicy::PersistentMutation {
+                let ledger = ledger::OperationLedger::open(&self.agent_dir)?;
+                let descriptor = ledger::MutationDescriptor::new(op, mutation_scope(op, &args)?)?;
+                let id = ledger.begin(&descriptor)?;
+                Some((ledger, id))
+            } else { None };
             state.active += 1;
             state.tasks.insert(handle.clone(), Arc::clone(&task));
-            Activity(Arc::clone(&self.state))
+            (Activity(Arc::clone(&self.state)), evidence)
         };
         let instance = self.clone();
         let id = handle.clone();
         let operation = op.to_string();
         let worker_task = Arc::clone(&task);
         if let Err(error) = std::thread::Builder::new().name("mgmt-task".into()).spawn(move || {
+            let mut exclusive_clean_exit = false;
             let result = if let Some(mut config) = exclusive_config {
                 config.env.push(("PI_WEB_EXCLUSIVE_MUTATION".into(), "1".into()));
-                match spawn_management(&instance.scope, &config) {
+                match spawn_management(&instance.scope, &config, instance.agent_dir_check.clone()) {
                     Ok(runner) => {
                         let cancelled = {
                             let mut record = worker_task.lock().unwrap();
@@ -267,7 +341,7 @@ impl ManagementInstance {
                             runner.management_call_wait(&operation, args, &id, Arc::clone(&worker_task))
                         };
                         if cancelled { let _ = runner.force_stop(Duration::from_secs(5)); }
-                        else { runner.shutdown(Duration::from_secs(5)); }
+                        else { exclusive_clean_exit = runner.close_session_file_writer(Duration::from_secs(5)); }
                         result
                     }
                     Err(error) => Err(format!("[op_failed] {error}")),
@@ -289,7 +363,28 @@ impl ManagementInstance {
                 return;
             }
             match result {
-                Ok(value) => { record.snapshot.status = TaskStatus::Succeeded; record.snapshot.result = Some(value); record.finished_at = Some(Instant::now()); }
+                Ok(value) => {
+                    // A deadline/response-loss/forced stop remains unknown even
+                    // if a late envelope subsequently arrives. Exclusive writers
+                    // must also have completed an orderly, unforced leader exit.
+                    if let Some((ledger, id)) = evidence {
+                        if record.snapshot.status == TaskStatus::Unknown || (record.exclusive && !exclusive_clean_exit) || !confirmed_success(&operation, &value) {
+                            record.snapshot.status = TaskStatus::Unknown;
+                            record.snapshot.error = Some("management outcome requires reconciliation".into());
+                            drop(record); drop(activity); return;
+                        }
+                        if let Err(error) = ledger.finish(&id) {
+                            record.snapshot.status = TaskStatus::Unknown;
+                            record.snapshot.error = Some(format!("management completion could not be persisted: {error}"));
+                            drop(record); drop(activity); return;
+                        }
+                    }
+                    record.snapshot.status = TaskStatus::Succeeded; record.snapshot.result = Some(value); record.finished_at = Some(Instant::now());
+                }
+                Err(error) if evidence.is_some() => {
+                    record.snapshot.status = TaskStatus::Unknown;
+                    record.snapshot.error = Some(error);
+                }
                 Err(error) if error.starts_with("[outcome_unknown]") => {
                     record.snapshot.status = TaskStatus::Unknown;
                     record.snapshot.error = Some(error);
@@ -602,6 +697,8 @@ pub struct ManagementHost {
     /// spawn a child and one becomes an orphan that is never recycled.
     start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     shutting_down: std::sync::atomic::AtomicBool,
+    agent_dir: Mutex<Option<PathBuf>>,
+    agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
 }
 
 impl Default for ManagementHost {
@@ -616,7 +713,14 @@ impl ManagementHost {
             instances: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            agent_dir: Mutex::new(None),
+            agent_dir_check: None,
         }
+    }
+
+    /// Bind management admission to the host's independently pinned agent directory.
+    pub fn with_agent_dir_check(check: Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>) -> Self {
+        Self { agent_dir_check: Some(check), ..Self::new() }
     }
 
     /// The instance for a scope (`"global"` or a project cwd), started on
@@ -626,6 +730,13 @@ impl ManagementHost {
         scope: &str,
         config: &ManagementSpawnConfig,
     ) -> Result<Arc<ManagementInstance>, String> {
+        let agent_dir = config.agent_dir.as_ref().ok_or("management agent directory is not pinned")?;
+        if let Some(check) = &self.agent_dir_check { check(agent_dir)?; }
+        {
+            let mut pinned = self.agent_dir.lock().map_err(|_| "management agent directory lock poisoned")?;
+            if pinned.as_ref().is_some_and(|previous| previous != agent_dir) { return Err("management agent directory changed after admission".into()); }
+            *pinned = Some(agent_dir.clone());
+        }
         let scope = canonical_scope(scope);
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("management host is shutting down".into());
@@ -642,7 +753,7 @@ impl ManagementHost {
         if let Some(existing) = self.live_instance(&scope) {
             return Ok(existing);
         }
-        let instance = spawn_management(&scope, config)?;
+        let instance = spawn_management(&scope, config, self.agent_dir_check.clone())?;
         let mut instances = self.instances.lock().unwrap();
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             drop(instances);
@@ -779,8 +890,9 @@ fn canonical_scope(scope: &str) -> String {
 fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
+    check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
 ) -> Result<Arc<ManagementInstance>, String> {
-    spawn_management_with_environment(scope, config, false)
+    spawn_management_with_environment(scope, config, false, check)
 }
 
 /// Dedicated host-owned process for the synchronous session-file operations.
@@ -805,13 +917,14 @@ pub fn spawn_session_file_writer(config: &ManagementSpawnConfig) -> Result<Sessi
         || config.env.len() != 1 || config.env[0].0 != "PI_WEB_MANAGED_MODULES" {
         return Err("invalid session writer configuration".into());
     }
-    spawn_management_with_environment("session-file-writer", config, true).map(SessionFileWriter)
+    spawn_management_with_environment("session-file-writer", config, true, None).map(SessionFileWriter)
 }
 
 fn spawn_management_with_environment(
     scope: &str,
     config: &ManagementSpawnConfig,
     restricted: bool,
+    check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
 ) -> Result<Arc<ManagementInstance>, String> {
     let mut args: Vec<String> = vec![
         // The management shape: no session files, no discovery — only the
@@ -856,6 +969,9 @@ fn spawn_management_with_environment(
     let notify_subscription = client.on_notify_inline(Arc::new(move |record| route_envelope(&router_pending, record)));
     Ok(Arc::new(ManagementInstance {
         scope: scope.to_string(),
+        agent_dir: config.agent_dir.clone().ok_or("management agent directory is not pinned")?,
+        session_file_writer: restricted,
+        agent_dir_check: check,
         nonce,
         client,
         pending,

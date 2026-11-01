@@ -413,9 +413,11 @@ semaphore wait queue. Saturation returns `busy` / `dispatch_not_admitted`
 before the operation executes. An admitted call abandoned by its WebView is
 not cancelled and may have an unknown outcome. The separate control budget
 prevents ordinary saturation starving cleanup, but can itself saturate; neither
-budget bounds messages already buffered by Tauri or the WebView, direct stream
-subscription commands, request bytes, child queues, or unacknowledged channels.
-These remain M5 work, not an end-to-end backpressure claim.
+budget bounds messages already buffered by Tauri or the WebView, request bytes,
+child queues, or unacknowledged channels. Session event relay threads have a
+separate 32-slot immediate admission cap, held until each relay really exits;
+other direct stream subscription commands are not covered. These remain M5
+work, not an end-to-end backpressure claim.
 
 ## Static desktop session deletion — gated pending M5
 
