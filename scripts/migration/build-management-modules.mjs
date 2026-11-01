@@ -48,6 +48,7 @@ export { isFilePathReferencedByEntries } from "${ROOT}/lib/session-file-referenc
 export { formatSessionReference } from "${ROOT}/lib/session-reference.ts";
 export { patchExportHtml } from "${ROOT}/lib/session-export-html.ts";
 export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";
+export { generateSessionTitleFromRegistry } from "${ROOT}/lib/session-title.ts";
 export {
   readSubagentRun,
   SUBAGENT_META_TYPE,

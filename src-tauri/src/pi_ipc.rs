@@ -96,6 +96,7 @@ pub struct IpcHostState {
     pub projects: crate::session_view::ProjectResolver,
     /// Private exported HTML directories, removed on eviction or host exit.
     pub(crate) session_exports: Mutex<std::collections::VecDeque<tempfile::TempDir>>,
+    pub(crate) title_tasks: Mutex<HashMap<String, Arc<Mutex<crate::session_title::TitleTask>>>>,
     /// The catalogue's version counter (`invalidateSessionListCache` +
     /// `getSessionListVersion`): bumped by every host-visible mutation that
     /// changes the list a client holds (a create, a rename). Clients compare
@@ -201,6 +202,7 @@ impl IpcHostState {
             terminals,
             #[cfg(test)]
             terminal_test_shell: Mutex::new(None),
+            title_tasks: Mutex::new(HashMap::new()),
             management: ManagementHost::new(),
             management_config: Mutex::new(resolve_management_config()),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
@@ -1353,7 +1355,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
-        "sessions.autoName" => protocol_error(&id, "not_supported", "Automatic session naming is unavailable until the live provider's request semantics can be preserved."),
+        "sessions.autoName" => match crate::session_title::start(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.autoNameStatus" => match crate::session_title::status(state, &args) {
+            Ok(data) => { if data.get("title").is_some() { bump_session_list_version(state); } protocol_ok(&id, data) },
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.autoNameCancel" => match crate::session_title::cancel(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "agent.command" if args.get("type").and_then(Value::as_str) == Some("abort_branch_summary") => {
             protocol_error(&id, "not_supported", "Branch summaries are unavailable in the desktop session host.")
         }
