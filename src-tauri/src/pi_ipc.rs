@@ -34,6 +34,12 @@ pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
     /// Global policy transaction gate shared with session admission and drains.
     pub(crate) policy_gate: Arc<std::sync::RwLock<()>>,
+    #[cfg(test)]
+    pub(crate) deletion_recovery_exclusive: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) deletion_write_exclusive: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) deletion_use_app_trash: std::sync::atomic::AtomicBool,
     /// The spawn base is resolved at host startup (the packaged pi
     /// executable and asset paths); identity operations answer before any
     /// child exists.
@@ -123,6 +129,31 @@ struct EventRelayHandle {
 }
 
 impl IpcHostState {
+    pub(crate) fn deletion_recovery_permitted(&self) -> bool {
+        #[cfg(test)]
+        { return self.deletion_recovery_exclusive.load(std::sync::atomic::Ordering::SeqCst); }
+        #[cfg(not(test))]
+        { false }
+    }
+
+    /// No production path grants destructive-write exclusivity yet. M5 must
+    /// prove exclusion of old/new external writers and retain that proof from
+    /// preflight through child shutdown, final admission and journal completion.
+    /// This is separate from the permission to recover an existing journal.
+    pub(crate) fn destructive_session_deletion_permitted(&self) -> bool {
+        #[cfg(test)]
+        { return self.deletion_write_exclusive.load(std::sync::atomic::Ordering::SeqCst); }
+        #[cfg(not(test))]
+        { false }
+    }
+
+    pub(crate) fn deletion_prefers_fixture_trash(&self) -> bool {
+        #[cfg(test)]
+        { return self.deletion_use_app_trash.load(std::sync::atomic::Ordering::SeqCst); }
+        #[cfg(not(test))]
+        { false }
+    }
+
     pub(crate) fn chat_unlock_permitted(&self) -> bool {
         self.chat_unlock_policy == ChatUnlockPolicy::StaticPackaged
     }
@@ -154,6 +185,12 @@ impl IpcHostState {
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
+            #[cfg(test)]
+            deletion_recovery_exclusive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            deletion_write_exclusive: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            deletion_use_app_trash: std::sync::atomic::AtomicBool::new(false),
             spawn_base: Mutex::new(resolve_session_spawn_base()),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1149,8 +1186,38 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // per-cwd scan with skipped-file reasons. `sessions.list` below is
         // the real GET /api/sessions (the inventory's name for it).
         "sessions.index" => {
+            let _policy = match state.policy_gate.try_read() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session policy change is in progress"),
+            };
             let agent_dir = state.agent_dir();
-            let index = session_host::scan_sessions(&agent_dir);
+            if crate::trust_policy_fence::is_pending(&agent_dir) {
+                return protocol_error(&id, "busy", "Trust policy outcome is unresolved");
+            }
+            let transaction = match task_scheduler::transaction_lock::TransactionLock::acquire(&agent_dir) {
+                Ok(lock) => lock,
+                Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
+            };
+            if let Err((code, message)) = crate::session_deletion_journal::recover_pending(state, &agent_dir) {
+                return protocol_error(&id, &code, &message);
+            }
+            let initial = session_host::scan_sessions(&agent_dir);
+            let mut identities: Vec<_> = initial.projects.values().flatten().map(|session| (session.file.clone(), session.id.clone())).collect();
+            identities.sort();
+            let ids: Vec<_> = identities.iter().map(|(_, id)| id.clone()).collect();
+            let index = match state.registry.with_session_snapshot_gates(&ids, || {
+                let index = session_host::scan_sessions(&agent_dir);
+                let mut current: Vec<_> = index.projects.values().flatten().map(|session| (session.file.clone(), session.id.clone())).collect();
+                current.sort();
+                if current != identities { return Err(("busy".to_string(), "Sessions changed during index scan".to_string())); }
+                Ok(index)
+            }) {
+                Ok(index) => index,
+                Err(session_host::SessionWriterError::Busy(message)) => return protocol_error(&id, "busy", message),
+                Err(session_host::SessionWriterError::Operation((code, message))) => return protocol_error(&id, &code, &message),
+            };
+            drop(transaction);
+            drop(_policy);
             // The /api/files semantics: session cwds (and the chat roots)
             // become browsable roots, derived host-side.
             for (cwd, _) in index.projects.iter() {
@@ -1171,44 +1238,56 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // completionNotificationSuppressedSessionIds, chatWorkspaceCwd,
         // sessionListVersion).
         "sessions.list" => {
+            let _policy = match state.policy_gate.try_read() {
+                Ok(guard) => guard,
+                Err(_) => return protocol_error(&id, "busy", "Session policy change is in progress"),
+            };
             let agent_dir = state.agent_dir();
+            if crate::trust_policy_fence::is_pending(&agent_dir) {
+                return protocol_error(&id, "busy", "Trust policy outcome is unresolved");
+            }
+            let transaction = match task_scheduler::transaction_lock::TransactionLock::acquire(&agent_dir) {
+                Ok(lock) => lock,
+                Err(error) => return protocol_error(&id, "busy", &format!("Scheduler transaction unavailable: {error}")),
+            };
+            if let Err((code, message)) = crate::session_deletion_journal::recover_pending(state, &agent_dir) {
+                return protocol_error(&id, &code, &message);
+            }
             let files = session_host::list_session_files(&agent_dir);
-            // The parent-id map first (a fork's originSessionId resolves
-            // from ITS header, never a filename suffix).
-            let mut id_by_file: HashMap<String, String> = HashMap::new();
-            let mut scans: Vec<session_host::history::ScannedSession> = Vec::new();
-            for file in &files {
-                if let Some(scan) = session_host::scan_session_file_info(file) {
-                    if let Some(id) = session_host::history::read_header_id(file) {
-                        id_by_file.insert(key_of(file), id);
-                    }
+            // Discover ids first, then fence them in stable order and re-read
+            // every row: unknown Chat writers must not race the final scan.
+            let initial: Vec<_> = files.iter().filter_map(|file| session_host::scan_session_file_info(file)).collect();
+            let session_ids: Vec<_> = initial.iter().map(|scan| scan.id.clone()).collect();
+            let (scans, relations) = match state.registry.with_session_snapshot_gates(&session_ids, || {
+                let mut scans = Vec::with_capacity(initial.len());
+                for old in &initial {
+                    let scan = session_host::scan_session_file_info(&old.path)
+                        .ok_or_else(|| ("busy".to_string(), "Session changed during catalogue scan".to_string()))?;
+                    if scan.id != old.id { return Err(("busy".to_string(), "Session identity changed during catalogue scan".to_string())); }
                     scans.push(scan);
                 }
-            }
-            let mut sessions: Vec<Value> = Vec::new();
-            for scan in &scans {
-                let parent_id = scan
-                    .parent_session_path
-                    .as_deref()
-                    .map(Path::new)
-                    .and_then(|parent| id_by_file.get(&key_of(parent)).cloned());
-                // The subagent relation reads the file's bounded prefix/tail;
-                // a fork falls back to the parent link alone (the origin id
-                // present only when the parent file itself still resolves).
-                let relation = session_host::history::read_subagent_relation(&scan.path).or_else(|| {
-                    scan.parent_session_path.as_deref().map(|_| {
-                        json!({
-                            "kind": "fork",
-                            "originSessionId": parent_id.clone().map(Value::String).unwrap_or(Value::Null),
-                        })
-                    })
-                });
-                let relation = match relation {
-                    Some(value) if value.is_object() => Some(value),
-                    _ => None,
-                };
-                sessions.push(catalogue_info(state, &agent_dir, scan, parent_id, relation));
-            }
+                let id_by_file: HashMap<_, _> = scans.iter().map(|scan| (key_of(&scan.path), scan.id.clone())).collect();
+                let relations: Vec<_> = scans.iter().map(|scan| {
+                    let parent_id = scan.parent_session_path.as_deref().map(Path::new).and_then(|parent| id_by_file.get(&key_of(parent)).cloned());
+                    let relation = session_host::history::read_subagent_relation(&scan.path).or_else(|| {
+                        scan.parent_session_path.as_deref().map(|_| json!({"kind":"fork", "originSessionId":parent_id}))
+                    }).filter(Value::is_object);
+                    (parent_id, relation)
+                }).collect();
+                Ok::<_, (String, String)>((scans, relations))
+            }) {
+                Ok(result) => result,
+                Err(session_host::SessionWriterError::Busy(message)) => return protocol_error(&id, "busy", message),
+                Err(session_host::SessionWriterError::Operation((code, message))) => return protocol_error(&id, &code, &message),
+            };
+            let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
+                Ok(index) => index,
+                Err(error) => return protocol_error(&id, "io", &error.0),
+            };
+            drop(transaction);
+            drop(_policy);
+            let mut sessions: Vec<Value> = scans.iter().zip(relations).map(|(scan, (parent_id, relation))|
+                catalogue_info(state, &agent_dir, scan, parent_id, relation)).collect();
             // The running set the payload carries (the SSE stream's source).
             let running: Vec<String> = state
                 .registry
@@ -1232,10 +1311,6 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     sessions.push(info);
                 }
             }
-            let scheduled = match crate::scheduled_session_index::ScheduledSessionIndex::load(&agent_dir) {
-                Ok(index) => index,
-                Err(error) => return protocol_error(&id, "io", &error.0),
-            };
             for session in &mut sessions {
                 let relation = session.get("id").and_then(Value::as_str).and_then(|id| scheduled.relation(id));
                 if let Some((task_id, run_id)) = relation {
@@ -1282,6 +1357,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "sessions.delete" => match crate::session_deletion::delete(state, &args) {
             Ok(data) => { bump_session_list_version(state); protocol_ok(&id, data) }
+            Err((code, message)) if code == crate::session_deletion::EXCLUSIVE_MAINTENANCE_REQUIRED => protocol_error_value(&id, json!({
+                "code":"busy", "reason":code, "message":message, "retryable":false,
+            })),
             Err((code, message)) => protocol_error(&id, &code, &message),
         },
         "sessions.export" => match crate::session_actions::export(state, &args) {

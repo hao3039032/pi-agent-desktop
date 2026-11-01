@@ -405,5 +405,48 @@ Session starts, tool-policy restarts and chat-unlock writes share the per-sessio
   `lib/pi-rpc/recovery.smoke.test.mjs`. The real-CLI smoke isolates cwd/agent/session
   storage and supplies compaction with a fixture extension (no provider request).
 
+## Static desktop session deletion — gated pending M5
+
+The Rust deletion implementation is **not enabled in production**: the host
+cannot yet prove that an old or external writer has stopped. `sessions.delete`
+returns `busy` with reason `session_deletion_exclusive_maintenance_required`.
+The new staged fork writer and an empty fence directory are not that proof.
+The legacy Next route remains unchanged until the final switch.
+
+The isolated implementation uses the policy gate, scheduler transaction and
+ordered session admission/fence gates. It holds source handles and verifies
+versions again after an idle child exits; active runs and unresolved queues are
+never killed. One durable group journal stages the deleted session and its
+transitive subagents, plus rewritten direct fork children, before recording the
+commit. Rewrites retain message bytes, ownership, permissions and extended
+attributes; inability to preserve them fails closed. Trash is in the same group:
+shared Chat folders remain, while an unshared folder uses the system Trash and
+`.trashinfo`, or the app Trash when the system location cannot be prepared or
+is on another filesystem. A later Trash failure returns an error and retains
+journal evidence. Every publish and rollback refuses to replace a new file.
+Malformed records, mismatched subagent parent-id/path pairs, unknown session
+cwd references, out-of-directory fork children and active affected children
+may be refused rather than guessed.
+
+Pending deletion journals have a **separate**, default-denied recovery gate.
+List, index and search report recovery pending instead of automatically
+restoring or deleting staged data. Isolated tests alone can assert exclusive
+fixture ownership; neither IPC, environment variables, elapsed time nor PID
+checks grant recovery or clear the scheduler transaction lock. M5 must provide
+verified cross-process/old-version exclusion: destructive-write permission must
+remain valid from preflight through idle shutdown, final admission and journal
+completion, and recovery requires its own exclusive maintenance proof across
+validation and replay. The destructive-write and recovery permissions are
+independent; only isolated test fixtures can currently grant either one. A
+cross-host upgrade strategy and Windows/native WebView acceptance remain open.
+
+`session_deletion::tests` and `session_deletion_journal::linux::tests` cover
+ordered fences, source replacement, shared folders, staged group phases,
+recovery conflicts, system Trash failure and isolated process crashes. The
+real-pi fork/group smoke is explicitly invoked as an ignored integration test;
+it uses an isolated agent directory and makes no model request. Search takes a
+bounded private snapshot while holding the scheduler/session gates, then calls
+the existing management search after releasing them.
+
 ## Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then patches recursive tree helpers in the generated HTML to iterative versions so very deep linear sessions do not overflow the browser call stack.
