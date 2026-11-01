@@ -1352,6 +1352,8 @@ export interface McpTestRun {
   error?: McpActionFailure;
   /** The last press waited past the deadline for another test of a server that runs a shell command and never ran. */
   queueTimedOut?: boolean;
+  /** The probe answered but its credential-write outcome is unresolved. */
+  credentialOutcomeUnknown?: true;
   /**
    * The entry `error` and `queueTimedOut` are about: the one the press was for
    * (a refusal names none), or the one the route read. Neither is shown for an
@@ -1378,8 +1380,9 @@ export function mcpTestRunAfter(previous: McpTestRun | undefined, result: McpTes
   if (!result.ok) {
     return { running: false, ...marks, ...kept, error: result.error, ...(pressedConfigKey !== undefined ? { configKey: pressedConfigKey } : {}) };
   }
-  if (result.data.result.queueTimedOut) return { running: false, ...marks, ...kept, queueTimedOut: true, configKey: result.data.configKey };
-  return { running: false, ...marks, response: result.data };
+  const credentialOutcomeUnknown = result.data.credentialOutcomeUnknown === true ? { credentialOutcomeUnknown: true as const } : {};
+  if (result.data.result.queueTimedOut) return { running: false, ...marks, ...kept, ...credentialOutcomeUnknown, queueTimedOut: true, configKey: result.data.configKey };
+  return { running: false, ...marks, ...credentialOutcomeUnknown, response: result.data };
 }
 
 /**

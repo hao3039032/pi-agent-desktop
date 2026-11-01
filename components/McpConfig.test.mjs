@@ -1304,6 +1304,9 @@ test("a test request that failed says why in a test's words, and keeps the last 
   const queued = connection(testView({}, { view: { tests: { [key]: { running: false, queueTimedOut: true, configKey: "key" } } } }));
   assert.match(queued.value, /<span role="alert" class="mcp-config-line is-error">Another test of a server that runs a shell command did not finish in time, so this one did not start\. Try again\.<\/span>/);
   assert.doesNotMatch(connection(testView({}, { view: { tests: { [key]: { running: false, queueTimedOut: true, configKey: "old-key" } } } })).text, /did not start/);
+  const unknown = connection(testView({}, { view: { tests: { [key]: { running: false, credentialOutcomeUnknown: true, configKey: "key" } } } }));
+  assert.match(unknown.text, /credential write may still be unresolved/);
+  assert.match(unknown.value, /role="alert"/);
 });
 
 test("the panel's own answer shows over the listing while it is about the entry shown", () => {

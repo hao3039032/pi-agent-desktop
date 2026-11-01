@@ -2276,10 +2276,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let mut payload = args.clone();
             payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
             payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
-            match management_call(state, "mcp.test", payload) {
-                Ok(result) => mcp_management_response(&id, result),
-                Err(error) => protocol_error(&id, error.0.as_str(), &error.1),
-            }
+            mcp_test_dispatch(state, &id, payload)
         }
         "mcp.configGet" => {
             let cwd = args.get("cwd").and_then(Value::as_str);
@@ -2325,6 +2322,11 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 if let Err(error) = validate_scoped_cwd(state, cwd) {
                     return mcp_cwd_error(&id, &error);
                 }
+            }
+            if args.get("action").and_then(Value::as_str) == Some("sign-out") {
+                return mcp_signout_dispatch(state, &id, payload);
+            }
+            if let Some(cwd) = cwd {
                 if args.get("action").and_then(Value::as_str) == Some("add")
                     && args.get("scope").and_then(Value::as_str) == Some("project")
                     && args.get("trustFolder").and_then(Value::as_bool) == Some(true) {
@@ -2839,6 +2841,72 @@ pub(crate) fn management_call(
     instance.management_call_sync(op, args).map_err(|error| management_error_code(&error))
 }
 
+fn mcp_test_dispatch(state: &IpcHostState, id: &str, payload: Value) -> Value {
+    let Some(config) = state.management_config.lock().unwrap().clone() else {
+        return protocol_error(id, "management_unavailable", "Management instance is not configured");
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => return protocol_error(id, "management_unavailable", &error),
+    };
+    let admission = match instance.resolve_mcp_admission(payload) {
+        Ok(admission) => admission,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    let (handle, _) = match instance.start_admitted_mcp("mcp.test", admission, Duration::from_secs(60)) {
+        Ok(result) => result,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    loop {
+        match instance.task_snapshot(&handle) {
+            Ok(snapshot) if snapshot.status == management_host::TaskStatus::Running => std::thread::sleep(Duration::from_millis(20)),
+            Ok(snapshot) if snapshot.status == management_host::TaskStatus::Unknown => {
+                if let Some(mut result) = snapshot.result {
+                    if result.is_object() {
+                        result["credentialOutcomeUnknown"] = json!(true);
+                        return mcp_management_response(id, result);
+                    }
+                }
+                return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("MCP test outcome unknown"));
+            }
+            Ok(snapshot) => return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("MCP test outcome unavailable")),
+            Err(error) => return protocol_error(id, "io", &error),
+        }
+    }
+}
+
+fn mcp_signout_dispatch(state: &IpcHostState, id: &str, payload: Value) -> Value {
+    let Some(config) = state.management_config.lock().unwrap().clone() else {
+        return protocol_error(id, "management_unavailable", "Management instance is not configured");
+    };
+    let instance = match state.management.instance("global", &config) {
+        Ok(instance) => instance,
+        Err(error) => return protocol_error(id, "management_unavailable", &error),
+    };
+    let admission = match instance.resolve_mcp_admission(payload.clone()) {
+        Ok(admission) => admission,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    let pending = match management_host::ledger::OperationLedger::inspect(&state.agent_dir()) {
+        Ok(pending) => pending,
+        Err(error) => return protocol_error(id, "io", &error),
+    };
+    if pending.is_empty() {
+        return match management_call(state, "mcp.configAction", payload) {
+            Ok(result) => mcp_management_response(id, result),
+            Err((code, message)) => protocol_error(id, &code, &message),
+        };
+    }
+    let reservation = match instance.reserve_mcp_cooperation(admission.target()) {
+        Ok(reservation) => reservation,
+        Err(error) => return protocol_error(id, "busy", &error),
+    };
+    match instance.cooperative_mcp_sign_out(admission, &reservation, Duration::from_secs(60)) {
+        Ok(result) => mcp_management_response(id, result),
+        Err(error) => protocol_error(id, "io", &error),
+    }
+}
+
 fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Value {
     let Some(config) = state.management_config.lock().unwrap().clone() else {
         return protocol_error(id, "management_unavailable", "Management instance is not configured");
@@ -2861,13 +2929,19 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
         payload["agentDir"] = json!(state.agent_dir().to_string_lossy());
         payload["allowedRoots"] = json!(state.file_roots.lock().unwrap().snapshot());
         payload["hostedOAuth"] = json!(true);
-        let handle = match instance.start_task("mcp.signInStart", payload, Duration::from_secs(600), management_host::TaskKind::Mutation) {
-            Ok(handle) => handle,
+        let admission = match instance.resolve_mcp_admission(payload) {
+            Ok(admission) => admission,
             Err(error) => return protocol_error(id, "io", &error),
         };
-        if let Err(error) = crate::mcp_oauth_callback::start(instance.clone(), handle.clone()) {
-            let _ = instance.cancel_task(&handle);
-            return protocol_error(id, "io", &format!("Could not start callback monitor: {error}"));
+        let (handle, joined) = match instance.start_admitted_mcp("mcp.signInStart", admission, Duration::from_secs(600)) {
+            Ok(result) => result,
+            Err(error) => return protocol_error(id, "io", &error),
+        };
+        if !joined {
+            if let Err(error) = crate::mcp_oauth_callback::start(instance.clone(), handle.clone()) {
+                let _ = instance.cancel_task(&handle);
+                return protocol_error(id, "io", &format!("Could not start callback monitor: {error}"));
+            }
         }
         {
             let mut handles = state.mcp_signin_tasks.lock().unwrap();
@@ -2907,6 +2981,17 @@ fn mcp_signin_dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -
         return match instance.task_snapshot(handle) {
             Ok(snapshot) => {
                 if snapshot.status == management_host::TaskStatus::Unknown {
+                    // Interaction cancellation and mutation outcome are separate:
+                    // only a proven local revocation may expose the cancelled
+                    // flow, with the existing explicit remote-unknown warning.
+                    if instance.task_writes_revoked(handle) {
+                        if let Some(mut flow) = snapshot.progress {
+                            if matches!(flow.get("phase").and_then(Value::as_str), Some("cancelled" | "expired")) {
+                                flow["warning"] = json!("remote-outcome-unknown");
+                                return mcp_signin_flow_response(id, handle, flow);
+                            }
+                        }
+                    }
                     return protocol_error(id, "io", snapshot.error.as_deref().unwrap_or("Sign-in outcome unknown; retry status"));
                 }
                 match snapshot.result.or(snapshot.progress) {
@@ -6964,6 +7049,11 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         BufReader::new(fixture.0.stdout.take().unwrap()).read_line(&mut url).unwrap();
         let url = url.trim();
         assert!(url.starts_with("http://127.0.0.1:"));
+        let mut second_fixture = Fixture(Command::new("node").arg("../scripts/migration/mcp-oauth-fixture.mjs").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut second_url = String::new();
+        BufReader::new(second_fixture.0.stdout.take().unwrap()).read_line(&mut second_url).unwrap();
+        let second_url = second_url.trim();
+        assert_ne!(url, second_url);
         let state = state();
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
@@ -6972,7 +7062,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&managed).unwrap();
         symlink(std::path::Path::new("../node_modules/@earendil-works").canonicalize().unwrap(), managed.join("@earendil-works")).unwrap();
         assert!(Command::new("node").arg("../scripts/migration/build-management-modules.mjs").arg("--out").arg(&managed).status().unwrap().success());
-        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"signout":{"url":url},"exit":{"url":url}}}).to_string()).unwrap();
+        std::fs::write(agent.join("mcp.json"), json!({"mcpServers":{"fixture":{"url":url},"manual":{"url":url},"cancel":{"url":url},"alias":{"url":url},"signout":{"url":second_url},"exit":{"url":second_url}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable, agent_dir: Some(agent.clone()),
@@ -6983,6 +7073,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let start = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
         assert_eq!(start["ok"], true, "{start}");
         let handle = start["data"]["flowId"].as_str().unwrap().to_string();
+        let joined = call("mcp.signInStart", json!({"scope":"global","name":"fixture"}));
+        assert_eq!(joined["data"]["flowId"], handle, "same guarded target joins the existing task: {joined}");
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let waiting = loop {
             let status = call("mcp.signInStatus", json!({"flowId":handle}));
@@ -7033,11 +7125,18 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             assert!(std::time::Instant::now() < deadline, "{status}");
             std::thread::sleep(Duration::from_millis(50));
         }
+        let probe = call("mcp.test", json!({"scope":"global","name":"fixture"}));
+        assert_eq!(probe["ok"], true, "{probe}");
+        assert_eq!(probe["data"]["credentialOutcomeUnknown"], true, "probe result must not claim credential completion: {probe}");
+        assert_eq!(probe["data"]["result"]["state"], "connected", "{probe}");
         let out = call("mcp.configAction", json!({"action":"sign-out","scope":"global","name":"fixture"}));
         assert_eq!(out["data"]["signedOut"]["removed"], true, "{out}");
         let start = call("mcp.signInStart", json!({"scope":"global","name":"cancel"}));
         let cancelled = call("mcp.signInCancel", json!({"flowId":start["data"]["flowId"]}));
         assert_eq!(cancelled["data"]["phase"], "cancelled", "{cancelled}");
+        let alias = call("mcp.signInStart", json!({"scope":"global","name":"alias"}));
+        assert_eq!(alias["ok"], false, "shared legacy URL cannot be treated as independent: {alias}");
+        assert!(alias["error"]["message"].as_str().unwrap_or("").contains("busy"), "{alias}");
         let start = call("mcp.signInStart", json!({"scope":"global","name":"signout"}));
         assert_eq!(start["ok"], true, "{start}");
         let handle = start["data"]["flowId"].as_str().unwrap();
@@ -7072,6 +7171,20 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             assert!(std::time::Instant::now() < close_deadline, "callback listener survived child shutdown");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let restarted = IpcHostState::new();
+        *restarted.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        *restarted.management_config.lock().unwrap() = Some(config);
+        let refused = send(&restarted, json!({"v":1,"id":"restarted","op":"mcp.signInStart","args":{"scope":"global","name":"exit"}}));
+        assert_eq!(refused["ok"], false, "a new instance cannot claim the old writer: {refused}");
+        let pending = management_host::ledger::OperationLedger::inspect(&agent).unwrap();
+        assert!(!pending.is_empty());
+        for entry in std::fs::read_dir(agent.join("pi-web/management-operations")).unwrap() {
+            let record = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(!record.contains("access-"));
+            assert!(!record.contains("refresh-"));
+            assert!(!record.contains("http://"));
+        }
+        restarted.management.shutdown_all(Duration::from_secs(5));
         state.management.shutdown_all(Duration::from_secs(5));
     }
 

@@ -144,7 +144,7 @@ for line in sys.stdin:
         elif op == 'mcp.signOutCooperative':
             assert args['expectedCanonicalKey']==canonical and args['expectedLegacyKey']==legacy and args['expectedConfigKey']==config
             generation += 1
-            if mode != 'coop_lost': emit(rid,data['nonce'],{'schema':1,'result':{'signedOut':{'removed':True}},'revocation':{'canonicalKey':canonical,'configKey':config,'generation':generation}})
+            if mode != 'coop_lost': emit(rid,data['nonce'],{'schema':1,'result':{'signedOut':{'removed':True}},'revocation':{'canonicalKey':canonical,'legacyKey':legacy,'configKey':config,'generation':generation}})
         elif op == 'auth.logout':
             if old: emit(old[0],old[1],{'phase':'done'})
             emit(rid,data['nonce'],{'success':True})
@@ -222,7 +222,7 @@ fn cooperation_reservation_blocks_new_writers_and_instance_replacement() {
     assert!(instance.reserve_mcp_cooperation(&target).is_err(), "preflight target alone is not a guard receipt");
     task.lock().unwrap().mcp_guard = guard;
     let reservation = instance.reserve_mcp_cooperation(&target).unwrap();
-    let mut proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
+    let mut proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), legacy_fingerprint: "b".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
     assert!(reservation.matches_revocation(&proof));
     proof.generation = 2;
     assert!(!reservation.matches_revocation(&proof), "revocation must advance the guard generation");
@@ -332,7 +332,7 @@ fn partial_revocation_persistence_leaves_remaining_writer_blocked() {
         instance.state.lock().unwrap().tasks.insert(id.clone(), Arc::new(Mutex::new(task)));
     }
     let mut reservation = instance.reserve_mcp_cooperation(&target).unwrap();
-    let proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
+    let proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), legacy_fingerprint: "b".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
     reservation.fail_after = Some(1);
     assert!(reservation.persist_revocation(&proof).is_err());
     assert_eq!(ledger.list_pending().unwrap().len(), 1, "unwritten record remains pending");
@@ -366,7 +366,7 @@ fn confirmed_local_revocation_is_monotonic_and_allows_new_generation() {
     }));
     instance.state.lock().unwrap().tasks.insert("old".into(), Arc::clone(&task));
     let reservation = instance.reserve_mcp_cooperation(&target).unwrap();
-    let proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
+    let proof = super::VerifiedMcpRevocation { instance_id: instance.instance_id, target_fingerprint: "a".repeat(64), legacy_fingerprint: "b".repeat(64), config_fingerprint: "e".repeat(64), generation: 3 };
     reservation.persist_revocation(&proof).unwrap();
     assert!(task.lock().unwrap().revoked);
     assert_eq!(task.lock().unwrap().snapshot.status, TaskStatus::Unknown);
@@ -397,7 +397,7 @@ fn cooperative_revocation_evidence_is_instance_and_target_bound() {
     let fingerprint = key.fingerprint(canonical).unwrap();
     let task = Arc::new(Mutex::new(super::TaskRecord {
         snapshot: super::TaskSnapshot { status: TaskStatus::Succeeded, progress: None,
-            result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"configKey":"trusted-config","generation":3}})),
+            result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"legacyKey":"https://example.invalid","configKey":"trusted-config","generation":3}})),
             error: None, cancel_requested: false },
         finished_at: Some(Instant::now()), serial_scope: false, exclusive: false,
         operation: "mcp.signOutCooperative".into(), ledger_operation_id: None, mcp_target: None, mcp_guard: None, revoked: false, runner: None,

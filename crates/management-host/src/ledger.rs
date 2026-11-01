@@ -198,7 +198,7 @@ impl OperationLedger {
         Ok(records)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn begin(&self, descriptor: &MutationDescriptor) -> Result<String, String> {
         self.begin_allowing(descriptor, &[])
     }
@@ -239,7 +239,7 @@ impl OperationLedger {
 
     #[cfg(not(target_os = "linux"))]
     fn read_records(&self) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(test, not(target_os = "linux")))]
     pub(crate) fn begin(&self, _: &MutationDescriptor) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn begin_allowing(&self, _: &MutationDescriptor, _: &[String]) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }

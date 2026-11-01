@@ -1830,6 +1830,7 @@ function McpConnectionRows({
         <span className="mcp-config-lines">
           {status ? <McpStatusLines status={status} /> : <span className="mcp-config-line">{t("mcp.test.never")}</span>}
           {test?.queueTimedOut && <span role="alert" className="mcp-config-line is-error">{t("mcp.test.queueTimedOut")}</span>}
+          {test?.credentialOutcomeUnknown && <span role="alert" className="mcp-config-line is-error">{t("mcp.test.credentialOutcomeUnknown")}</span>}
           {test?.error && (
             <span role="alert" className="mcp-config-line is-error">
               {t("mcp.test.requestFailed")} {testFailureText(test.error, t)}

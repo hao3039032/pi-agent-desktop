@@ -177,6 +177,7 @@ impl McpCredentialAdmission {
 pub struct VerifiedMcpRevocation {
     instance_id: uuid::Uuid,
     target_fingerprint: String,
+    legacy_fingerprint: String,
     config_fingerprint: String,
     generation: u64,
 }
@@ -249,6 +250,7 @@ impl McpCooperativeReservation {
         if state.closing || self.client.has_exited() || self.agent_dir_check.as_ref().is_some_and(|check| check(&self.agent_dir).is_err()) { return false; }
         admission.reservation == Some(self.reservation_id) && self.instance_id == proof.instance_id
             && self.target.primary_digest() == proof.target_fingerprint
+            && self.target.legacy_digest() == proof.legacy_fingerprint
             && self.config_fingerprint == proof.config_fingerprint && proof.generation > self.previous_generation
     }
 
@@ -643,6 +645,7 @@ impl ManagementInstance {
                         if record.snapshot.status == TaskStatus::Unknown || (record.exclusive && !exclusive_clean_exit) || !confirmed_success(&operation, &value) {
                             record.snapshot.status = TaskStatus::Unknown;
                             record.snapshot.error = Some("management outcome requires reconciliation".into());
+                            if operation == "mcp.test" { record.snapshot.result = Some(value); }
                             drop(record); drop(activity); return;
                         }
                         if !is_cooperative {
@@ -772,6 +775,7 @@ impl ManagementInstance {
         let result = task.snapshot.result.as_ref().ok_or("MCP revocation is not confirmed")?;
         let revocation = result.get("revocation").ok_or("MCP revocation is not confirmed")?;
         let canonical = revocation.get("canonicalKey").and_then(Value::as_str).ok_or("MCP revocation is not confirmed")?;
+        let legacy = revocation.get("legacyKey").and_then(Value::as_str).ok_or("MCP revocation is not confirmed")?;
         let generation = revocation.get("generation").and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991).ok_or("MCP revocation is not confirmed")?;
         if result.get("schema").and_then(Value::as_u64) != Some(1)
             || revocation.get("configKey").and_then(Value::as_str) != Some(expected_config_key)
@@ -780,11 +784,16 @@ impl ManagementInstance {
         }
         let key = target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?;
         let config_fingerprint = key.fingerprint(&format!("config:{expected_config_key}"))?;
-        Ok(VerifiedMcpRevocation { instance_id: self.instance_id, target_fingerprint: expected_fingerprint.to_string(), config_fingerprint, generation })
+        let legacy_fingerprint = key.fingerprint_legacy(legacy)?;
+        Ok(VerifiedMcpRevocation { instance_id: self.instance_id, target_fingerprint: expected_fingerprint.to_string(), legacy_fingerprint, config_fingerprint, generation })
     }
 
     pub fn revocation_matches(&self, proof: &VerifiedMcpRevocation, target_fingerprint: &str) -> bool {
         proof.instance_id == self.instance_id && proof.target_fingerprint == target_fingerprint
+    }
+
+    pub fn task_writes_revoked(&self, handle: &str) -> bool {
+        self.state.lock().ok().and_then(|state| state.tasks.get(handle).and_then(|task| task.lock().ok().map(|record| record.revoked))).unwrap_or(false)
     }
 
     pub fn task_snapshot(&self, handle: &str) -> Result<TaskSnapshot, String> {
