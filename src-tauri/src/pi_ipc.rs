@@ -553,11 +553,7 @@ fn resolve_managed_modules() -> Option<PathBuf> {
 /// config stays None and models ops answer management_unavailable).
 fn resolve_management_config() -> Option<ManagementSpawnConfig> {
     let executable = resolve_pi_executable()?;
-    let dev = Path::new("../lib/pi-rpc/assets/pi-web-management.mjs");
-    let extension = match dev.canonicalize() {
-        Ok(resolved) if resolved.is_file() => Some(resolved),
-        _ => None,
-    }?;
+    let extension = resolve_asset("pi-web-management.mjs", "PI_WEB_MANAGEMENT_EXTENSION")?;
     let managed = resolve_managed_modules()?;
     Some(ManagementSpawnConfig {
         executable: executable.to_string_lossy().into_owned(),
