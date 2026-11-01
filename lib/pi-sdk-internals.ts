@@ -395,7 +395,7 @@ export async function importPiSdkInternals(options: {
 
   let packageDir: string;
   try {
-    const managedDir = environment.PI_WEB_MANAGED_MODULES;
+    const managedDir = environment.PI_WEB_MANAGEMENT_SDK_ROOT ?? environment.PI_WEB_MANAGED_MODULES;
     const managedPackage = managedDir && existsSync(join(managedDir, "node_modules", SDK_PACKAGE))
       ? join(managedDir, "node_modules", SDK_PACKAGE)
       : managedDir && join(managedDir, SDK_PACKAGE);
@@ -408,7 +408,7 @@ export async function importPiSdkInternals(options: {
     return { ok: false, reason: `cannot locate ${SDK_PACKAGE}: ${errorMessage(error)}` };
   }
 
-  const modules = await importSdkModules(packageDir, environment.PI_WEB_MANAGED_MODULES);
+  const modules = await importSdkModules(packageDir, environment.PI_WEB_MANAGEMENT_SDK_ROOT ?? environment.PI_WEB_MANAGED_MODULES);
   if (typeof modules === "string") return { ok: false, reason: modules };
   // The SDK root pi-web imports normally must be the same module instance.
   if (modules.mcpExtension.createMcpExtension !== createMcpExtension) {

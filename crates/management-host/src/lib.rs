@@ -54,6 +54,18 @@ pub struct ManagementSpawnConfig {
     pub env: Vec<(String, String)>,
 }
 
+/// Trusted, host-configured management-only Node runtime. This is never built
+/// from a WebView request and does not affect dialogue child spawning.
+#[derive(Clone)]
+pub struct ManagementSdkRuntime {
+    pub node: PathBuf,
+    pub entry: PathBuf,
+    pub dependency_root: PathBuf,
+    pub projection_root: PathBuf,
+    /// The version from the independently verified CLI distribution.
+    pub cli_version: String,
+}
+
 /// One running management child.
 #[derive(Clone)]
 pub struct ManagementInstance {
@@ -70,6 +82,7 @@ pub struct ManagementInstance {
     pending: Arc<Mutex<HashMap<String, PendingTask>>>,
     agent_dir: PathBuf,
     session_file_writer: bool,
+    sdk_runtime: Option<ManagementSdkRuntime>,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
     _notify_subscription: Arc<pi_host::client::UiSubscription>,
@@ -651,7 +664,7 @@ impl ManagementInstance {
             let mut exclusive_clean_exit = false;
             let result = if let Some(mut config) = exclusive_config {
                 config.env.push(("PI_WEB_EXCLUSIVE_MUTATION".into(), "1".into()));
-                match spawn_management(&instance.scope, &config, Arc::clone(&instance.host_closing), instance.agent_dir_check.clone(), Arc::clone(&instance.admission)) {
+                match spawn_management(&instance.scope, &config, instance.sdk_runtime.clone(), Arc::clone(&instance.host_closing), instance.agent_dir_check.clone(), Arc::clone(&instance.admission)) {
                     Ok(runner) => {
                         let cancelled = {
                             let mut record = worker_task.lock().unwrap();
@@ -1143,6 +1156,7 @@ pub struct ManagementHost {
     agent_dir: Mutex<Option<PathBuf>>,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
+    sdk_runtime: Option<ManagementSdkRuntime>,
 }
 
 struct HostOperation<'a> { host: &'a ManagementHost, scope: String }
@@ -1174,7 +1188,13 @@ impl ManagementHost {
             agent_dir: Mutex::new(None),
             agent_dir_check: None,
             admission: Arc::new(Mutex::new(ManagementAdmission::default())),
+            sdk_runtime: None,
         }
+    }
+
+    /// Select the independent management SDK graph explicitly for this host.
+    pub fn with_sdk_runtime(runtime: ManagementSdkRuntime, check: Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>) -> Self {
+        Self { sdk_runtime: Some(runtime), agent_dir_check: Some(check), ..Self::new() }
     }
 
     fn begin_operation(&self, scope: &str) -> Result<HostOperation<'_>, String> {
@@ -1227,7 +1247,7 @@ impl ManagementHost {
             admission.starting_instances += 1;
             StartingInstance(Arc::clone(&self.admission))
         };
-        let instance = spawn_management(&scope, config, Arc::clone(&self.shutting_down), self.agent_dir_check.clone(), Arc::clone(&self.admission))?;
+        let instance = spawn_management(&scope, config, self.sdk_runtime.clone(), Arc::clone(&self.shutting_down), self.agent_dir_check.clone(), Arc::clone(&self.admission))?;
         let mut instances = self.instances.lock().unwrap();
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             drop(instances);
@@ -1412,11 +1432,12 @@ fn canonical_scope(scope: &str) -> String {
 fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
+    sdk_runtime: Option<ManagementSdkRuntime>,
     host_closing: Arc<std::sync::atomic::AtomicBool>,
     check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
 ) -> Result<Arc<ManagementInstance>, String> {
-    spawn_management_with_environment(scope, config, false, host_closing, check, admission)
+    spawn_management_with_environment(scope, config, false, sdk_runtime, host_closing, check, admission)
 }
 
 /// Dedicated host-owned process for the synchronous session-file operations.
@@ -1441,13 +1462,14 @@ pub fn spawn_session_file_writer(config: &ManagementSpawnConfig) -> Result<Sessi
         || config.env.len() != 1 || config.env[0].0 != "PI_WEB_MANAGED_MODULES" {
         return Err("invalid session writer configuration".into());
     }
-    spawn_management_with_environment("session-file-writer", config, true, Arc::new(std::sync::atomic::AtomicBool::new(false)), None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
+    spawn_management_with_environment("session-file-writer", config, true, None, Arc::new(std::sync::atomic::AtomicBool::new(false)), None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
 }
 
 fn spawn_management_with_environment(
     scope: &str,
     config: &ManagementSpawnConfig,
     restricted: bool,
+    sdk_runtime: Option<ManagementSdkRuntime>,
     host_closing: Arc<std::sync::atomic::AtomicBool>,
     check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
@@ -1482,14 +1504,24 @@ fn spawn_management_with_environment(
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
     }
     for (key, value) in &config.env {
+        if sdk_runtime.is_some() && matches!(key.as_str(), "PI_CODING_AGENT_DIR" | "PI_PACKAGE_DIR" | "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT" | "JITI_ALIAS" | "NODE_OPTIONS" | "NODE_PATH") { continue; }
         env = env.set(key, value.clone());
     }
     env = env.set("PI_WEB_MGMT_NONCE", nonce.clone());
-    let client = PiRpcClient::spawn(
-        &config.executable,
-        SpawnOptions { args, cwd: None, env, ..SpawnOptions::default() },
-    )
-    .map_err(|error| format!("management instance failed to start: {error}"))?;
+    let client = if let Some(runtime) = &sdk_runtime {
+        if runtime.cli_version != "1.4.0" || !runtime.node.is_absolute() || !runtime.entry.is_absolute() || !runtime.dependency_root.is_absolute() || !runtime.projection_root.is_absolute() {
+            return Err("invalid management SDK runtime configuration".into());
+        }
+        for key in ["PI_PACKAGE_DIR", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "JITI_ALIAS", "NODE_OPTIONS", "NODE_PATH"] {
+            env = env.remove_var(key);
+        }
+        env = env.set("PI_WEB_MANAGEMENT_SDK_ROOT", runtime.dependency_root.to_string_lossy().into_owned())
+            .set("PI_WEB_MANAGED_MODULES", runtime.projection_root.to_string_lossy().into_owned())
+            .set("PI_WEB_MANAGEMENT_CLI_VERSION", runtime.cli_version.clone());
+        PiRpcClient::spawn_program(&runtime.node.to_string_lossy(), SpawnOptions { args: vec![runtime.entry.to_string_lossy().into_owned()], cwd: None, env, ..SpawnOptions::default() })
+    } else {
+        PiRpcClient::spawn(&config.executable, SpawnOptions { args, cwd: None, env, ..SpawnOptions::default() })
+    }.map_err(|error| format!("management instance failed to start: {error}"))?;
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let router_pending = Arc::clone(&pending);
     let notify_subscription = client.on_notify_inline(Arc::new(move |record| route_envelope(&router_pending, record)));
@@ -1498,6 +1530,7 @@ fn spawn_management_with_environment(
         instance_id: uuid::Uuid::new_v4(),
         agent_dir: config.agent_dir.clone().ok_or("management agent directory is not pinned")?,
         session_file_writer: restricted,
+        sdk_runtime,
         agent_dir_check: check,
         admission,
         nonce,
@@ -1515,6 +1548,9 @@ fn spawn_management_with_environment(
         })),
     }))
 }
+
+#[cfg(test)]
+mod sdk_runtime_tests;
 
 #[cfg(test)]
 impl ManagementInstance {
