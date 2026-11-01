@@ -45,6 +45,24 @@ fn git(cwd: &Path, args: &[&str]) {
 
 #[cfg(unix)]
 #[test]
+fn git_in_directory_uses_held_directory_after_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("repo");
+    let moved = temp.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+    git(&original, &["init"]);
+    git(&original, &["config", "test.identity", "original"]);
+    let directory = std::fs::File::open(&original).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    git(&original, &["init"]);
+    git(&original, &["config", "test.identity", "replacement"]);
+    let actual = git_in_directory(&directory, &["config", "--local", "test.identity"], Duration::from_secs(5)).unwrap();
+    assert_eq!(actual.trim(), "original");
+}
+
+#[cfg(unix)]
+#[test]
 fn create_rejects_symlinked_worktree_base() {
     let temp = tempfile::tempdir().unwrap(); let repo = temp.path().join("repo"); let outside = temp.path().join("outside");
     std::fs::create_dir(&repo).unwrap(); std::fs::create_dir(&outside).unwrap();

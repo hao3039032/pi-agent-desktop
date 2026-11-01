@@ -13,3 +13,31 @@ fn status_and_diff_real_repo_cover_tracked_untracked_deleted_and_scope() {
     for name in ["tracked", "new", "deleted"] { let patch = diff(&roots, repo, &repo.join(name)).unwrap(); assert_eq!(patch["supported"], true, "{name}: {patch}"); }
     assert_eq!(diff(&roots, repo, &temp.path().join("missing")).unwrap()["supported"], false);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nested_git_cwd_stays_pinned_and_diff_uses_repository_relative_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let nested = repo.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+    git(&repo, &["config", "user.name", "Fixture"]);
+    std::fs::write(nested.join("file"), "old\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+    std::fs::write(nested.join("file"), "new\n").unwrap();
+    let mut roots = AllowedRoots::new(); roots.add(&repo);
+    assert_eq!(status(&roots, &nested).unwrap()["additions"], 1);
+    assert_eq!(diff(&roots, &nested, &nested.join("file")).unwrap()["supported"], true);
+    let anchor = GitCwd::open(&roots, &nested).unwrap();
+    std::fs::rename(&nested, repo.join("moved")).unwrap();
+    std::fs::create_dir(&nested).unwrap();
+    assert!(anchor.git(&["rev-parse", "--is-inside-work-tree"]).unwrap().contains("true"));
+    assert!(anchor.git(&["status", "--porcelain"]).unwrap().contains("nested/file"));
+    assert!(anchor.pin_repository(&roots, &repo).is_ok());
+    let outside = temp.path().join("outside"); std::fs::create_dir(&outside).unwrap();
+    std::fs::rename(repo.join("moved"), outside.join("moved")).unwrap();
+    assert!(anchor.pin_repository(&roots, &repo).is_err());
+}

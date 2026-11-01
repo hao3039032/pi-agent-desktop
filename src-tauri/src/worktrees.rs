@@ -12,6 +12,11 @@ mod tests;
 pub(crate) fn git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     git_with_cwd(cwd, args, timeout, None)
 }
+/// Execute Git from an already-authorized, held directory descriptor.
+#[cfg(unix)]
+pub(crate) fn git_in_directory(directory: &std::fs::File, args: &[&str], timeout: Duration) -> Result<String, String> {
+    git_with_cwd(Path::new("."), args, timeout, Some(directory))
+}
 #[cfg(unix)]
 fn git_with_cwd(cwd: &Path, args: &[&str], timeout: Duration, directory: Option<&std::fs::File>) -> Result<String, String> {
     use std::io::Read;
@@ -150,7 +155,7 @@ fn create_with_base_opened(cwd: &Path, b: &str, after_open: impl FnOnce()) -> Re
     if !local_exists { args.extend(["-b", b]); }
     args.extend(["--", dir]);
     if local_exists { args.push(b); } else if remote_exists { args.push(&remote); }
-    git_with_cwd(&base, &args, Duration::from_secs(300), Some(&base_fd))?;
+    git_in_directory(&base_fd, &args, Duration::from_secs(300))?;
     let held = base_fd.metadata().map_err(|e| e.to_string())?;
     let visible = std::fs::symlink_metadata(&base).map_err(|e| e.to_string())?;
     if !visible.is_dir() || held.dev() != visible.dev() || held.ino() != visible.ino() { return Err("Worktree directory changed during creation; no access granted".into()); }
