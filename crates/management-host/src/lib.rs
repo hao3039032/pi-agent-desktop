@@ -21,6 +21,7 @@
 //!   user session files.
 
 pub mod ledger;
+pub mod target_key;
 #[cfg(all(test, target_os = "linux"))]
 mod ledger_tests;
 
@@ -55,6 +56,7 @@ pub struct ManagementSpawnConfig {
 #[derive(Clone)]
 pub struct ManagementInstance {
     pub scope: String,
+    instance_id: uuid::Uuid,
     client: Arc<PiRpcClient>,
     state: Arc<Mutex<InstanceState>>,
     /// The management protocol nonce this child was spawned with. The HOST
@@ -88,7 +90,7 @@ fn operation_policy(op: &str, session_writer: bool) -> Result<OperationPolicy, S
         "session.readThinking" | "session.recordedSystemPrompt" | "session.authorizeBashOutput" |
         "chat.systemPrompt" | "session.chatOnlyPrompt" | "models.list" | "models.enabledGet" |
         "modelsConfig.get" | "models.nonchat" | "skills.list" | "plugins.list" |
-        "auth.providers" | "auth.loginPoll" | "mcp.configGet" | "trust.projectListing" | "trust.projectStatus" |
+        "auth.providers" | "auth.loginPoll" | "mcp.configGet" | "mcp.credentialTarget" | "trust.projectListing" | "trust.projectStatus" |
         "terminal.settingsGet" | "terminal.resolveShell" | "distro.status" | "docx.extractText" | "docx.renderHtml" |
         "tasks.validateCreate" | "tasks.validateUpdate" | "tasks.nextRun" | "tasks.decideSlot" | "tasks.previewCron" => Ok(ReadOnly),
         // These can call a network service or write an explicitly temporary
@@ -150,6 +152,17 @@ pub struct TaskSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskStatus { Running, Unknown, Succeeded, Failed, Cancelled }
+
+/// Instance-local evidence only: never authority to clear a restarted
+/// operation or to assert that unrelated children have stopped.
+pub struct VerifiedMcpRevocation {
+    instance_id: uuid::Uuid,
+    target_fingerprint: String,
+    generation: u64,
+}
+impl VerifiedMcpRevocation {
+    pub fn generation(&self) -> u64 { self.generation }
+}
 
 struct TaskRecord {
     snapshot: TaskSnapshot,
@@ -317,6 +330,9 @@ impl ManagementInstance {
                 return Err("management scope has an unknown outcome".into());
             }
             let evidence = if policy == OperationPolicy::PersistentMutation {
+                // Establish the HMAC key before creating any ledger directory;
+                // missing key beside existing evidence can never be regenerated.
+                let _key = target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?;
                 let ledger = ledger::OperationLedger::open(&self.agent_dir)?;
                 let descriptor = ledger::MutationDescriptor::new(op, mutation_scope(op, &args)?)?;
                 let id = ledger.begin(&descriptor)?;
@@ -443,6 +459,29 @@ impl ManagementInstance {
     pub fn cancel_exclusive_task(&self, handle: &str, domain: &str) -> Result<(), String> {
         self.exclusive_task_snapshot(handle, domain)?;
         self.cancel_task(handle)
+    }
+
+    /// Interpret only a nonce-routed terminal response for the named private
+    /// cooperative operation. Config and canonical keys are compared in
+    /// memory and are never included in the returned evidence or errors.
+    pub fn verified_mcp_revocation(&self, handle: &str, expected_fingerprint: &str, expected_config_key: &str) -> Result<VerifiedMcpRevocation, String> {
+        let state = self.state.lock().map_err(|_| "management state unavailable")?;
+        let task = state.tasks.get(handle).ok_or("management task not found")?.lock().map_err(|_| "management task unavailable")?;
+        if task.operation != "mcp.signOutCooperative" || task.snapshot.status != TaskStatus::Succeeded { return Err("MCP revocation is not confirmed".into()); }
+        let result = task.snapshot.result.as_ref().ok_or("MCP revocation is not confirmed")?;
+        let revocation = result.get("revocation").ok_or("MCP revocation is not confirmed")?;
+        let canonical = revocation.get("canonicalKey").and_then(Value::as_str).ok_or("MCP revocation is not confirmed")?;
+        let generation = revocation.get("generation").and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991).ok_or("MCP revocation is not confirmed")?;
+        if result.get("schema").and_then(Value::as_u64) != Some(1)
+            || revocation.get("configKey").and_then(Value::as_str) != Some(expected_config_key)
+            || target_key::ManagementTargetKey::load_or_create(&self.agent_dir)?.fingerprint(canonical)? != expected_fingerprint {
+            return Err("MCP revocation identity mismatch".into());
+        }
+        Ok(VerifiedMcpRevocation { instance_id: self.instance_id, target_fingerprint: expected_fingerprint.to_string(), generation })
+    }
+
+    pub fn revocation_matches(&self, proof: &VerifiedMcpRevocation, target_fingerprint: &str) -> bool {
+        proof.instance_id == self.instance_id && proof.target_fingerprint == target_fingerprint
     }
 
     pub fn task_snapshot(&self, handle: &str) -> Result<TaskSnapshot, String> {
@@ -973,6 +1012,7 @@ fn spawn_management_with_environment(
     let notify_subscription = client.on_notify_inline(Arc::new(move |record| route_envelope(&router_pending, record)));
     Ok(Arc::new(ManagementInstance {
         scope: scope.to_string(),
+        instance_id: uuid::Uuid::new_v4(),
         agent_dir: config.agent_dir.clone().ok_or("management agent directory is not pinned")?,
         session_file_writer: restricted,
         agent_dir_check: check,

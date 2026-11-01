@@ -7,6 +7,39 @@ fn begin(ledger: &OperationLedger, op: &str) -> Result<String, String> {
 }
 
 #[test]
+fn target_key_is_private_stable_and_never_regenerated_beside_a_ledger() {
+    use std::os::unix::fs::PermissionsExt;
+    use super::target_key::ManagementTargetKey;
+    let temp = tempfile::tempdir().unwrap();
+    let key = ManagementTargetKey::load_or_create(temp.path()).unwrap();
+    let path = temp.path().join("pi-web/management-target-key.v1");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let digest = key.fingerprint("mcp__fixture|https://example.invalid").unwrap();
+    assert_eq!(digest, ManagementTargetKey::load_or_create(temp.path()).unwrap().fingerprint("mcp__fixture|https://example.invalid").unwrap());
+    let _ledger = OperationLedger::open(temp.path()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(ManagementTargetKey::load_or_create(temp.path()).is_err());
+    assert!(!path.exists());
+    std::fs::write(&path, b"corrupt").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(ManagementTargetKey::load_or_create(temp.path()).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"corrupt");
+}
+
+#[test]
+fn target_fingerprint_matches_hmac_sha256_contract() {
+    use std::os::unix::fs::PermissionsExt;
+    use super::target_key::ManagementTargetKey;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("pi-web")).unwrap();
+    let path = temp.path().join("pi-web/management-target-key.v1");
+    std::fs::write(&path, (0u8..32).collect::<Vec<_>>()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let key = ManagementTargetKey::load_or_create(temp.path()).unwrap();
+    assert_eq!(key.fingerprint("mcp__fixture|https://example.invalid").unwrap(), "38f3e0224a7ff8dd66089bb2439d9dff37f6fb0745196da8eca7ce2f8a019837");
+}
+
+#[test]
 fn mcp_credential_target_rejects_raw_keys_and_detects_legacy_aliases() {
     let a = McpCredentialTarget::new("a".repeat(64), "c".repeat(64)).unwrap();
     let alias = McpCredentialTarget::new("b".repeat(64), "c".repeat(64)).unwrap();
@@ -136,6 +169,38 @@ fn catalog_partial_and_probe_completion_are_not_mutation_completion_proof() {
     assert!(super::confirmed_success("models.refreshCatalog", &serde_json::json!({"completed": true})));
     assert!(!super::confirmed_success("mcp.test", &serde_json::json!({"result":{"state":"connected"}})));
     assert!(!super::confirmed_success("trust.setFenced", &serde_json::json!({"result":{"mcpRefusal":{}}})));
+}
+
+#[test]
+fn cooperative_revocation_evidence_is_instance_and_target_bound() {
+    use std::sync::{Arc, Mutex};
+    let temp = tempfile::tempdir().unwrap();
+    let config = fixture(&temp, "ok");
+    let host = ManagementHost::new();
+    let instance = host.instance("global", &config).unwrap();
+    let key = super::target_key::ManagementTargetKey::load_or_create(temp.path()).unwrap();
+    let canonical = "mcp__fixture|https://user:private@example.invalid";
+    let fingerprint = key.fingerprint(canonical).unwrap();
+    let task = Arc::new(Mutex::new(super::TaskRecord {
+        snapshot: super::TaskSnapshot { status: TaskStatus::Succeeded, progress: None,
+            result: Some(serde_json::json!({"schema":1,"revocation":{"canonicalKey":canonical,"configKey":"trusted-config","generation":3}})),
+            error: None, cancel_requested: false },
+        finished_at: Some(Instant::now()), serial_scope: false, exclusive: false,
+        operation: "mcp.signOutCooperative".into(), runner: None,
+    }));
+    instance.state.lock().unwrap().tasks.insert("fake-routed".into(), Arc::clone(&task));
+    let proof = instance.verified_mcp_revocation("fake-routed", &fingerprint, "trusted-config").unwrap();
+    assert_eq!(proof.generation(), 3);
+    assert!(instance.revocation_matches(&proof, &fingerprint));
+    assert!(!instance.revocation_matches(&proof, &"0".repeat(64)));
+    assert!(instance.verified_mcp_revocation("fake-routed", &fingerprint, "wrong").is_err());
+    task.lock().unwrap().snapshot.status = TaskStatus::Unknown;
+    assert!(instance.verified_mcp_revocation("fake-routed", &fingerprint, "trusted-config").is_err());
+    host.shutdown_all(Duration::from_secs(1));
+    let other = ManagementHost::new();
+    let second = other.instance("global", &config).unwrap();
+    assert!(!second.revocation_matches(&proof, &fingerprint));
+    other.shutdown_all(Duration::from_secs(1));
 }
 
 #[test]
