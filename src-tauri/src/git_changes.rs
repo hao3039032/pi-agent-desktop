@@ -7,13 +7,18 @@ use crate::file_access::AllowedRoots;
 #[path = "git_changes_tests.rs"]
 mod tests;
 
-struct GitCwd {
-    path: PathBuf,
+#[cfg(unix)]
+pub(crate) type CheckoutStamp = ((u64, u64, i64, i64), (u64, u64, i64, i64, u64));
+#[cfg(not(unix))]
+pub(crate) type CheckoutStamp = ();
+
+pub(crate) struct GitCwd {
+    pub(crate) path: PathBuf,
     #[cfg(unix)]
     directory: std::fs::File,
 }
 impl GitCwd {
-    fn open(roots: &AllowedRoots, cwd: &Path) -> Result<Self, String> {
+    pub(crate) fn open(roots: &AllowedRoots, cwd: &Path) -> Result<Self, String> {
         #[cfg(unix)]
         {
             let (path, directory) = roots.open_terminal_directory(cwd).ok_or("Git cwd is not authorized")?;
@@ -22,34 +27,54 @@ impl GitCwd {
         #[cfg(not(unix))]
         { let _ = roots; Ok(Self { path: cwd.to_path_buf() }) }
     }
-    fn git(&self, args: &[&str]) -> Result<String, String> {
-        let mut argv = vec!["--literal-pathspecs"];
+    pub(crate) fn git(&self, args: &[&str]) -> Result<String, String> {
+        self.git_timeout(args, Duration::from_secs(10))
+    }
+    pub(crate) fn git_timeout(&self, args: &[&str], timeout: Duration) -> Result<String, String> {
+        let mut argv = vec!["--no-optional-locks", "--literal-pathspecs"];
         argv.extend_from_slice(args);
         #[cfg(unix)]
-        { crate::worktrees::git_in_directory(&self.directory, &argv, Duration::from_secs(10)) }
+        { crate::worktrees::git_in_directory(&self.directory, &argv, timeout) }
         #[cfg(not(unix))]
-        { crate::worktrees::git(&self.path, &argv, Duration::from_secs(10)) }
+        { crate::worktrees::git(&self.path, &argv, timeout) }
     }
     #[cfg(unix)]
-    fn pin_repository(&self, roots: &AllowedRoots, root: &Path) -> Result<Self, String> {
+    pub(crate) fn pin_repository(&self, _roots: &AllowedRoots, root: &Path) -> Result<Self, String> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
         let relative = self.path.strip_prefix(root).map_err(|_| "Git repository is outside cwd ancestry")?;
-        let (resolved, directory) = roots.open_terminal_directory(root).ok_or("Git repository is not authorized")?;
-        if resolved != root { return Err("Git repository identity changed".into()); }
+        let visible_cwd = std::fs::metadata(&self.path).map_err(|e| e.to_string())?;
+        let held_cwd = self.directory.metadata().map_err(|e| e.to_string())?;
+        if (visible_cwd.dev(), visible_cwd.ino()) != (held_cwd.dev(), held_cwd.ino()) { return Err("Git cwd identity changed".into()); }
         let mut ancestor = self.directory.try_clone().map_err(|e| e.to_string())?;
         for _ in relative.components() {
             let fd = unsafe { libc::openat(ancestor.as_raw_fd(), c"..".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
             if fd < 0 { return Err(std::io::Error::last_os_error().to_string()); }
             ancestor = unsafe { std::fs::File::from_raw_fd(fd) };
         }
+        let visible = crate::file_access::open_directory_beneath_root(root, root).map_err(|e| e.to_string())?;
         let a = ancestor.metadata().map_err(|e| e.to_string())?;
-        let b = directory.metadata().map_err(|e| e.to_string())?;
+        let b = visible.metadata().map_err(|e| e.to_string())?;
         if (a.dev(), a.ino()) != (b.dev(), b.ino()) { return Err("Git repository identity changed".into()); }
-        Ok(Self { path: resolved, directory })
+        Ok(Self { path: root.to_path_buf(), directory: ancestor })
     }
     #[cfg(not(unix))]
-    fn pin_repository(&self, roots: &AllowedRoots, root: &Path) -> Result<Self, String> { Self::open(roots, root) }
+    pub(crate) fn pin_repository(&self, roots: &AllowedRoots, root: &Path) -> Result<Self, String> { Self::open(roots, root) }
+    #[cfg(unix)]
+    pub(crate) fn checkout_stamp(&self) -> Result<CheckoutStamp, String> {
+        use std::os::unix::fs::MetadataExt;
+        let held = self.directory.metadata().map_err(|e| e.to_string())?;
+        let visible = std::fs::symlink_metadata(&self.path).map_err(|e| e.to_string())?;
+        if !visible.is_dir() || (held.dev(), held.ino()) != (visible.dev(), visible.ino()) {
+            return Err("Git checkout identity changed".into());
+        }
+        let marker = std::fs::symlink_metadata(self.path.join(".git")).map_err(|e| e.to_string())?;
+        if !marker.is_dir() { return Err("Git metadata pointer identity cannot be verified".into()); }
+        Ok(((held.dev(), held.ino(), held.ctime(), held.ctime_nsec()),
+            (marker.dev(), marker.ino(), marker.ctime(), marker.ctime_nsec(), marker.len())))
+    }
+    #[cfg(not(unix))]
+    pub(crate) fn checkout_stamp(&self) -> Result<(), String> { Err("Git checkout identity is unavailable".into()) }
     fn pathspec(&self, root: &Path, path: &Path) -> Option<String> {
         let prefix = self.path.strip_prefix(root).ok()?;
         let relative = path.strip_prefix(root).ok()?;
@@ -80,7 +105,13 @@ fn classify(e: &Entry) -> (&'static str, &'static str) {
     else if pair.contains('A') { ("added", "A") }
     else { ("modified", "M") }
 }
-fn repository(cwd: &GitCwd) -> Option<PathBuf> { cwd.git(&["rev-parse", "--show-toplevel"]).ok().map(|s| PathBuf::from(s.trim())) }
+pub(crate) fn repository(cwd: &GitCwd) -> Result<Option<PathBuf>, String> {
+    match cwd.git(&["rev-parse", "--show-toplevel"]) {
+        Ok(output) => Ok(Some(PathBuf::from(output.trim()))),
+        Err(error) if error.contains("not a git repository") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 fn text_file(roots: &AllowedRoots, path: &Path) -> Option<String> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.is_file() || meta.len() > 256 * 1024 { return None; }
@@ -99,9 +130,10 @@ fn added_patch(path: &str, text: &str) -> String {
 }
 pub fn status(roots: &AllowedRoots, cwd: &Path) -> Result<Value, String> {
     let anchor = GitCwd::open(roots, cwd)?;
-    let Some(root) = repository(&anchor) else { return Ok(json!({"isGitRepository":false,"repositoryRoot":null,"files":[],"additions":0,"deletions":0})); };
+    let Some(root) = repository(&anchor)? else { return Ok(json!({"isGitRepository":false,"repositoryRoot":null,"files":[],"additions":0,"deletions":0})); };
     let scope = anchor.path.clone();
     let anchor = anchor.pin_repository(roots, &root)?;
+    let stamp = anchor.checkout_stamp()?;
     let list = entries(&anchor)?; let mut files = Vec::new(); let mut additions: u64 = 0; let mut deletions: u64 = 0;
     let spec = anchor.pathspec(&root, &scope).ok_or("Git cwd is outside repository")?;
     if let Ok(stats) = anchor.git(&["diff", "--no-color", "--no-ext-diff", "--numstat", "HEAD", "--", &spec]) {
@@ -111,12 +143,15 @@ pub fn status(roots: &AllowedRoots, cwd: &Path) -> Result<Value, String> {
         if status == "untracked" { if let Some(text) = text_file(roots, &path) { additions += text.lines().count() as u64; } }
         files.push(json!({"filePath":path.to_string_lossy(),"status":status,"code":code,"indexStatus":e.index.to_string(),"worktreeStatus":e.worktree.to_string()}));
     }
+    if stamp != anchor.checkout_stamp()? { return Err("Git checkout metadata changed during status".into()); }
     Ok(json!({"isGitRepository":true,"repositoryRoot":root.to_string_lossy(),"files":files,"additions":additions,"deletions":deletions}))
 }
 pub fn diff(roots: &AllowedRoots, cwd: &Path, path: &Path) -> Result<Value, String> {
     let anchor = GitCwd::open(roots, cwd)?;
-    let Some(root) = repository(&anchor) else { return Ok(json!({"supported":false})); };
+    let Some(root) = repository(&anchor)? else { return Ok(json!({"supported":false})); };
     let anchor = anchor.pin_repository(roots, &root)?;
+    let stamp = anchor.checkout_stamp()?;
+    let result = (|| {
     let Ok(rel) = path.strip_prefix(&root) else { return Ok(json!({"supported":false})); };
     let relative = rel.to_string_lossy().replace('\\', "/");
     let Some(entry) = entries(&anchor)?.into_iter().find(|e| e.path == relative) else { return Ok(json!({"supported":false})); };
@@ -132,4 +167,7 @@ pub fn diff(roots: &AllowedRoots, cwd: &Path, path: &Path) -> Result<Value, Stri
     };
     if !patch.contains("\n@@ ") { return Ok(json!({"supported":false})); }
     Ok(json!({"supported":true,"status":status,"patch":patch}))
+    })();
+    if stamp != anchor.checkout_stamp()? { return Err("Git checkout metadata changed during diff".into()); }
+    result
 }

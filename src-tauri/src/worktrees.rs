@@ -24,6 +24,11 @@ fn git_with_cwd(cwd: &Path, args: &[&str], timeout: Duration, directory: Option<
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
     let mut command = Command::new("git");
+    // Inherited Git routing variables could redirect discovery away from the
+    // held checkout before any of its metadata identity checks run.
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
+        command.env_remove(key);
+    }
     if let Some(directory) = directory {
         let fd = directory.as_raw_fd();
         // The descriptor remains open in the parent until spawn returns; only
@@ -103,8 +108,11 @@ fn same(a: &Path, b: &Path) -> bool {
     if cfg!(windows) { a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()) } else { a == b }
 }
 fn branches(cwd: &Path) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
-    let local = run(cwd, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads"])?;
-    let remote = run(cwd, &["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/remotes"])?;
+    branch_output(|args| run(cwd, args))
+}
+fn branch_output(mut run_git: impl FnMut(&[&str]) -> Result<String, String>) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+    let local = run_git(&["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/heads"])?;
+    let remote = run_git(&["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", "refs/remotes"])?;
     let local: Vec<String> = local.lines().filter(|s| !s.is_empty()).take(40).map(str::to_owned).collect();
     let refs: Vec<String> = remote.lines().filter(|s| !s.is_empty() && !s.ends_with("/HEAD")).map(str::to_owned).collect();
     let mut only = Vec::new();
@@ -115,6 +123,9 @@ fn branches(cwd: &Path) -> Result<(Vec<String>, Vec<String>, Vec<String>), Strin
 struct Tree { path: PathBuf, branch: Option<String>, main: bool }
 fn trees(cwd: &Path) -> Result<Vec<Tree>, String> {
     let output = run(cwd, &["worktree", "list", "--porcelain", "-z"])?;
+    Ok(parse_trees(&output))
+}
+fn parse_trees(output: &str) -> Vec<Tree> {
     let mut trees = Vec::new(); let mut path = None; let mut branch = None; let mut prunable = false;
     for item in output.split('\0').chain(std::iter::once("")) {
         if let Some(v) = item.strip_prefix("worktree ") { path = Some(PathBuf::from(v)); }
@@ -122,7 +133,7 @@ fn trees(cwd: &Path) -> Result<Vec<Tree>, String> {
         else if item.starts_with("prunable") { prunable = true; }
         else if item.is_empty() { if let Some(p) = path.take() { if !prunable && p.exists() { let main = trees.is_empty(); trees.push(Tree { path: p, branch: branch.take(), main }); } } branch = None; prunable = false; }
     }
-    Ok(trees)
+    trees
 }
 fn valid_branch(branch: &str) -> Result<&str, String> { let b = branch.trim(); if b.is_empty() || b.starts_with('-') { Err("Invalid branch name".into()) } else { Ok(b) } }
 
@@ -179,6 +190,9 @@ pub fn project(cwd: &Path) -> Result<crate::session_view::ProjectInfo, String> {
         Err(error) if error.contains("not a git repository") => return Ok(fallback()),
         Err(error) => return Err(error),
     };
+    project_from_output(cwd, &output)
+}
+fn project_from_output(cwd: &Path, output: &str) -> Result<crate::session_view::ProjectInfo, String> {
     let parts: Vec<_> = output.lines().collect();
     if parts.len() < 4 { return Err("Invalid git project identity".into()); }
     let common = PathBuf::from(parts[0]); let git_dir = PathBuf::from(parts[1]); let top = PathBuf::from(parts[2]);
@@ -186,6 +200,51 @@ pub fn project(cwd: &Path) -> Result<crate::session_view::ProjectInfo, String> {
     let root = if linked { common.parent().unwrap_or(&top).to_path_buf() } else if top_level { top } else { cwd.to_path_buf() };
     Ok(crate::session_view::ProjectInfo { project_root: std::fs::canonicalize(&root).unwrap_or(root), branch: if parts[3] == "HEAD" { None } else { Some(parts[3].into()) }, is_worktree: linked, is_top_level: top_level })
 }
+/// A Git-only capability derived from the host-authorized cwd. It never grants
+/// the repository root to the general file allow-list.
+pub(crate) struct PinnedWorktreeView {
+    checkout: Option<crate::git_changes::GitCwd>,
+    stamp: Option<crate::git_changes::CheckoutStamp>,
+    pub(crate) project: crate::session_view::ProjectInfo,
+}
+impl PinnedWorktreeView {
+    pub(crate) fn open(roots: &crate::file_access::AllowedRoots, cwd: &Path) -> Result<Self, String> {
+        let scope = crate::git_changes::GitCwd::open(roots, cwd)?;
+        let Some(root) = crate::git_changes::repository(&scope)? else {
+            return Ok(Self { checkout: None, stamp: None, project: crate::session_view::ProjectInfo {
+                project_root: cwd.to_path_buf(), branch: None, is_worktree: false, is_top_level: false,
+            }});
+        };
+        let checkout = scope.pin_repository(roots, &root)?;
+        let before = checkout.checkout_stamp()?;
+        let output = checkout.git(&["rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir", "--show-toplevel", "--abbrev-ref", "HEAD"])?;
+        if before != checkout.checkout_stamp()? { return Err("Git checkout metadata changed during discovery".into()); }
+        let project = project_from_output(cwd, &output)?;
+        Ok(Self { checkout: Some(checkout), stamp: Some(before), project })
+    }
+
+    pub(crate) fn list(&self, cwd: &Path, args: &Value) -> Result<(Value, Vec<PathBuf>), String> {
+        let Some(checkout) = &self.checkout else {
+            return Ok((json!({"projectRoot":self.project.project_root.to_string_lossy(),"projectKey":crate::session_view::project_identity_key(&self.project.project_root),"isGit":false,"isTopLevel":false,"currentWorktreePath":null,"worktrees":[]}), vec![]));
+        };
+        let before = checkout.checkout_stamp()?;
+        if self.stamp.as_ref() != Some(&before) { return Err("Git checkout metadata changed after discovery".into()); }
+        let output = checkout.git(&["worktree", "list", "--porcelain", "-z"])?;
+        let trees = parse_trees(&output);
+        let branches = if args.get("branches").and_then(Value::as_bool).unwrap_or(false) {
+            Some(branch_output(|args| checkout.git(args))?)
+        } else { None };
+        if before != checkout.checkout_stamp()? { return Err("Git checkout metadata changed during listing".into()); }
+        let current = trees.iter().find(|t| same(&t.path, cwd)).map(|t| t.path.to_string_lossy().into_owned());
+        // A Git listing alone does not authorize new filesystem roots.
+        let grants = Vec::new();
+        let entries: Vec<Value> = trees.iter().map(|t| json!({"path":t.path.to_string_lossy(),"branch":t.branch,"isMain":t.main})).collect();
+        let mut result = json!({"projectRoot":self.project.project_root.to_string_lossy(),"projectKey":crate::session_view::project_identity_key(&self.project.project_root),"isGit":true,"isTopLevel":self.project.is_top_level,"currentWorktreePath":current,"worktrees":entries});
+        if let Some((local, remote, _)) = branches { result["branches"] = json!(local); result["remoteBranches"] = json!(remote); }
+        Ok((result, grants))
+    }
+}
+
 pub fn execute(op: &str, cwd: &Path, args: &Value, project: &crate::session_view::ProjectInfo) -> Result<(Value, Vec<PathBuf>), String> {
     let branch = || valid_branch(args.get("branch").and_then(Value::as_str).unwrap_or_default());
     match op {

@@ -88,7 +88,7 @@ fn create_does_not_follow_base_swapped_after_open() {
 }
 
 #[test]
-fn ipc_worktree_lifecycle_preserves_grants_dirty_and_removed_identity() {
+fn ipc_worktree_mutations_refuse_unpinned_git_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo"); std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init"]); git(&repo, &["config", "user.email", "fixture@example.invalid"]); git(&repo, &["config", "user.name", "Fixture"]);
@@ -99,11 +99,51 @@ fn ipc_worktree_lifecycle_preserves_grants_dirty_and_removed_identity() {
     let path = PathBuf::from(created["data"]["path"].as_str().unwrap());
     assert!(state.file_roots.lock().unwrap().is_existing_path_allowed(&path));
     let listed = call("worktrees.list", json!({"cwd":repo,"branches":true})); assert_eq!(listed["data"]["worktrees"].as_array().unwrap().len(), 2);
-    std::fs::write(path.join("file"), "dirty\n").unwrap();
-    let dirty = call("worktrees.delete", json!({"cwd":repo,"path":path})); assert_eq!(dirty["error"]["details"]["dirty"], true, "{dirty}");
-    let removed = call("worktrees.delete", json!({"cwd":repo,"path":path,"force":true})); assert_eq!(removed["ok"], true, "{removed}");
-    let missing = call("worktrees.list", json!({"cwd":path})); assert_eq!(missing["data"]["projectRoot"], repo.to_string_lossy().as_ref(), "{missing}");
-    let switched = call("worktrees.switch", json!({"cwd":repo,"branch":"new"})); assert_eq!(switched["ok"], true, "{switched}");
+    let removed = call("worktrees.delete", json!({"cwd":repo,"path":path,"force":true})); assert_eq!(removed["error"]["code"], "not_supported", "{removed}");
+    let switched = call("worktrees.switch", json!({"cwd":repo,"branch":"new"})); assert_eq!(switched["error"]["code"], "not_supported", "{switched}");
+    let fetched = call("worktrees.fetch", json!({"cwd":repo})); assert_eq!(fetched["error"]["code"], "not_supported", "{fetched}");
+    assert!(path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_view_derives_git_only_ancestor_and_linked_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo"); let sub = repo.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&repo, &["init"]); git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+    git(&repo, &["config", "user.name", "Fixture"]); git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+    let linked = temp.path().join("linked");
+    git(&repo, &["worktree", "add", "-b", "linked-test", linked.to_str().unwrap()]);
+    let mut roots = crate::file_access::AllowedRoots::new(); roots.add(&sub);
+    let view = PinnedWorktreeView::open(&roots, &sub).unwrap();
+    let (listed, grants) = view.list(&sub, &json!({"branches":true})).unwrap();
+    assert_eq!(listed["worktrees"].as_array().unwrap().len(), 2);
+    assert!(grants.is_empty()); assert!(!roots.is_path_allowed(&repo));
+    let mut linked_roots = crate::file_access::AllowedRoots::new(); linked_roots.add(&linked);
+    assert!(PinnedWorktreeView::open(&linked_roots, &linked).err().unwrap().contains("metadata pointer"));
+    let nested = sub.join("nested"); std::fs::create_dir(&nested).unwrap(); git(&nested, &["init"]);
+    git(&nested, &["config", "user.email", "fixture@example.invalid"]); git(&nested, &["config", "user.name", "Fixture"]); git(&nested, &["commit", "--allow-empty", "-m", "initial"]);
+    let nested_view = PinnedWorktreeView::open(&roots, &nested).unwrap();
+    assert_eq!(nested_view.list(&nested, &json!({})).unwrap().0["worktrees"].as_array().unwrap().len(), 1);
+    std::fs::rename(&repo, temp.path().join("old-repo")).unwrap();
+    std::fs::create_dir(&repo).unwrap();
+    assert!(view.list(&sub, &json!({})).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_view_rejects_replaced_git_metadata() {
+    let temp = tempfile::tempdir().unwrap(); let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap(); git(&repo, &["init"]);
+    git(&repo, &["config", "user.email", "fixture@example.invalid"]); git(&repo, &["config", "user.name", "Fixture"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+    let mut roots = crate::file_access::AllowedRoots::new(); roots.add(&repo);
+    let view = PinnedWorktreeView::open(&roots, &repo).unwrap();
+    std::fs::rename(repo.join(".git"), repo.join(".old-git")).unwrap();
+    git(&repo, &["init"]);
+    // A replacement before an operation is not the capability we opened.
+    assert!(view.list(&repo, &json!({})).is_err());
 }
 
 #[test]

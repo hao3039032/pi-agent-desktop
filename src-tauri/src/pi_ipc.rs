@@ -2479,6 +2479,24 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             {
                 return protocol_error(&id, "unauthorized_scope", "Access denied");
             }
+            if op != "worktrees.create" {
+                let fallback = if existing_allowed { None } else { Some(state.projects.resolve(&cwd)) };
+                if fallback.as_ref().is_some_and(|project| !project.is_worktree || !roots.is_existing_path_allowed(&project.project_root)) {
+                    return protocol_error(&id, "unauthorized_scope", "Access denied");
+                }
+                let base = fallback.as_ref().map(|project| project.project_root.as_path()).unwrap_or(&cwd);
+                let view = match crate::worktrees::PinnedWorktreeView::open(&roots, base) {
+                    Ok(view) => view,
+                    Err(message) => return protocol_error(&id, "io", &message),
+                };
+                if op != "worktrees.list" {
+                    return protocol_error(&id, "not_supported", "Git mutation requires a pinned Git metadata identity");
+                }
+                return match view.list(&cwd, &args) {
+                    Ok((data, _)) => protocol_ok(&id, data),
+                    Err(message) => protocol_error(&id, "io", &message),
+                };
+            }
             let project = if existing_allowed {
                 match crate::worktrees::project(&cwd) { Ok(project) => project, Err(message) => return protocol_error(&id, "io", &message) }
             } else { state.projects.resolve(&cwd) };
