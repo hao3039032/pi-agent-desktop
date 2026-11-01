@@ -470,7 +470,8 @@ covered; stopping an observer does not prove its session writer stopped.
 | Envelope dispatcher | 16 ordinary + 4 cleanup/ACK/Stop slots; no semaphore queue | After Tauri has decoded the request; not a request-byte bound |
 | Session event relay | 32 reservations; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
 | Session Channel delivery | One frame awaiting client ACK, plus at most one terminal reset on failure | ACK means the JS callback ran, not rendering or WebView buffer release |
-| Management task registry | 128 retained tasks per instance | Not a global bound on instances, task-input requests or child buffers |
+| Management task registry | 128 retained tasks per instance | Not a global bound on instances or child buffers |
+| Management task input | 4 in-flight input calls per instance, separate from ordinary activity admission | Shares the host-closing fence and shutdown activity count; a returned input call does not prove its credential writer stopped |
 | Management ledger | At most 128 records; pending and locally revoked evidence are not evicted | Agent-directory-local evidence, not a cross-process lock or recovery permission |
 
 ## Static desktop session deletion — gated pending M5

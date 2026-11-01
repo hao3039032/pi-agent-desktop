@@ -24,6 +24,8 @@ pub mod ledger;
 pub mod target_key;
 #[cfg(all(test, target_os = "linux"))]
 mod ledger_tests;
+#[cfg(all(test, unix))]
+mod task_input_shutdown_tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -224,6 +226,7 @@ struct InstanceState {
     lease_until: Instant,
     last_used: Instant,
     active: usize,
+    task_inputs: usize,
     closing: bool,
     tasks: HashMap<String, Arc<Mutex<TaskRecord>>>,
 }
@@ -321,12 +324,13 @@ impl Drop for StartingInstance {
     }
 }
 
-struct Activity(Arc<Mutex<InstanceState>>);
+struct Activity(Arc<Mutex<InstanceState>>, bool);
 
 impl Drop for Activity {
     fn drop(&mut self) {
         let mut state = self.0.lock().unwrap();
         state.active -= 1;
+        if self.1 { state.task_inputs -= 1; }
         state.last_used = Instant::now();
         state.lease_until = state.last_used + IDLE_RECYCLE;
     }
@@ -635,7 +639,7 @@ impl ManagementInstance {
             } else { None };
             state.active += 1;
             state.tasks.insert(handle.clone(), Arc::clone(&task));
-            (Activity(Arc::clone(&self.state)), evidence)
+            (Activity(Arc::clone(&self.state), false), evidence)
         };
         drop(_admission);
         let instance = self.clone();
@@ -895,6 +899,13 @@ impl ManagementInstance {
     /// writes from bypassing unknown-outcome scope isolation. Input data is bounded
     /// to 4096 bytes.
     pub fn submit_task_input(&self, handle: &str, data: Value) -> Result<Value, String> {
+        // Use the same admission/accounting as other work on retained handles:
+        // a post-close input is refused, while a pre-close admission remains
+        // visible through validation, dispatch and the bounded response wait.
+        // A separate bounded input lane prevents full ordinary activity from
+        // starving the input those very tasks need in order to finish.
+        // This does not establish completion of the parent credential writer.
+        let _activity = self.admit_task_input()?;
         let task = {
             let state = self.state.lock().unwrap();
             if state.closing || self.client.has_exited() {
@@ -987,6 +998,17 @@ impl ManagementInstance {
         }).map(|_| ()).map_err(|error| format!("management cancel request could not start: {error}"))
     }
 
+    fn admit_task_input(&self) -> Result<Activity, String> {
+        let mut state = self.state.lock().map_err(|_| "management input admission unavailable")?;
+        if state.closing || self.host_closing.load(std::sync::atomic::Ordering::SeqCst) || self.client.has_exited() {
+            return Err("management instance is closing".into());
+        }
+        if state.task_inputs >= 4 { return Err("management task input capacity reached".into()); }
+        state.task_inputs += 1;
+        state.active += 1;
+        Ok(Activity(Arc::clone(&self.state), true))
+    }
+
     fn admit(&self) -> Result<Activity, String> {
         let mut state = self.state.lock().unwrap();
         if state.closing || self.host_closing.load(std::sync::atomic::Ordering::SeqCst) || self.client.has_exited() {
@@ -996,7 +1018,7 @@ impl ManagementInstance {
             return Err("management instance has too many active operations".into());
         }
         state.active += 1;
-        Ok(Activity(Arc::clone(&self.state)))
+        Ok(Activity(Arc::clone(&self.state), false))
     }
 
     fn retire_if_expired(&self) -> bool {
@@ -1487,6 +1509,7 @@ fn spawn_management_with_environment(
             lease_until: Instant::now() + IDLE_RECYCLE,
             last_used: Instant::now(),
             active: 0,
+            task_inputs: 0,
             closing: false,
             tasks: HashMap::new(),
         })),

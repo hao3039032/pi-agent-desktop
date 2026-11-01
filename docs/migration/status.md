@@ -43,6 +43,8 @@
 
 ## 集成验证记录（不是全量/跨平台验收）
 
+- 父代理补齐 task-input 关闭门禁：`submit_task_input` 原先未读取共享 host-closing fence；现在在同一个实例状态临界区检查关闭并登记 activity，覆盖验证、派发及响应等待。使用独立 **4 槽/实例** 输入准入，避免 128 个普通 activity 饱和时阻断任务完成所需的输入；关闭前已准入但未发送的输入仍进入 unknown 统计，不把输入返回当凭据 writer 停止。新增真实 Rust→fake management child 定向回归 **4 passed / 0 failed / 0 ignored**，覆盖旧引用、锁等待后关闭、发送前在途及普通饱和/输入饱和；不是真实认证或跨平台验收。
+
 - `09029072` 三类 relay 关闭整合：父代理检查了准入先关闭、共享绝对 deadline、预留跨登记/启动/清理保留、独立于 registry 的 shutdown 检查、阻塞 Channel 与锁忙 unknown，以及可选报告缺失时的 null/unknown。代码树与 lane 测试提交一致；lane 定向 Rust **23 passed**、harness JS **1 passed**，不重复称作父代理测试。父代理另跑合并树 running 回归 **12 passed / 0 failed / 0 ignored**，其中两项使用真实本地 pi 与隔离假模型端点；Tauri `--locked` 测试构建通过（1 条 deprecated warning），target **3.6 GiB**。报告仅覆盖受跟踪应用工作清理，不证明 OS 线程或 WebView 内部队列回收；auth relay、上游监听器及生产关闭仍不在覆盖内。
 - MCP 补充调查（lane `e35f6fe0`，父代理未重复实验）：复用唯一 **428 MiB** bundle，以隔离 HOME、无仓库挂载的 bwrap 分别运行固定 Node 的公开 CLI bin 与公开 rpc-entry；两次 RPC handled，disk public/internal `createMcpExtension` 相等，而 `ctx.sessionManager instanceof` disk public `SessionManager` 为 false。这些是身份探针，不是 MCP 功能通过证据，也没有断言 CLI 内部 MCP factory 的身份；不能把旧 fixture 改指 bundle 就认定单图安全。此前 standalone Bun identity guard 的红门禁保留，未修改 SDK、正式入口或根路径校验。
 
