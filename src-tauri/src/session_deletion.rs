@@ -35,13 +35,15 @@ fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) { a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()) } else { a == b }
 }
 
-fn verified_subagent_parent(entry: &Value) -> Result<&str, (String, String)> {
-    if entry.pointer("/data/version").and_then(Value::as_u64) != Some(1)
-        || entry.pointer("/data/parentSessionPath").and_then(Value::as_str).is_none_or(str::is_empty) {
+fn verified_subagent_parent(entry: &Value) -> Result<(&str, &str), (String, String)> {
+    let path = entry.pointer("/data/parentSessionPath").and_then(Value::as_str)
+        .filter(|path| Path::new(path).is_absolute()).ok_or_else(|| error("not_supported", "Cannot verify subagent metadata."))?;
+    if entry.pointer("/data/version").and_then(Value::as_u64) != Some(1) {
         return Err(error("not_supported", "Cannot verify subagent metadata."));
     }
-    entry.pointer("/data/parentSessionId").and_then(Value::as_str).filter(|id| !id.is_empty())
-        .ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))
+    let id = entry.pointer("/data/parentSessionId").and_then(Value::as_str).filter(|id| !id.is_empty())
+        .ok_or_else(|| error("not_supported", "Cannot verify a subagent parent."))?;
+    Ok((id, path))
 }
 
 #[derive(Debug)]
@@ -50,6 +52,7 @@ struct SessionReference {
     path: PathBuf,
     parent: Option<PathBuf>,
     subagent_parent: Option<String>,
+    subagent_parent_path: Option<PathBuf>,
     file: std::fs::File,
     metadata: std::fs::Metadata,
 }
@@ -79,10 +82,12 @@ fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Affecte
             _ => return Err(error("not_supported", "Cannot verify a parent session path.")),
         };
         let mut subagent_parent = None;
+        let mut subagent_parent_path = None;
         while let Some(entry) = bounded_line(&mut reader, 16 * 1024 * 1024)? {
             if entry.get("type").and_then(Value::as_str) == Some("custom")
                 && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent") {
-                let parent = verified_subagent_parent(&entry)?;
+                let (parent, parent_path) = verified_subagent_parent(&entry)?;
+                subagent_parent_path = Some(PathBuf::from(parent_path));
                 if subagent_parent.replace(parent.to_string()).is_some() {
                     return Err(error("not_supported", "Cannot verify duplicate subagent metadata."));
                 }
@@ -90,11 +95,21 @@ fn affected_session_ids(state: &IpcHostState, target_id: &str) -> Result<Affecte
         }
         let after = reader.get_ref().metadata().map_err(|e| error("io", e))?;
         if !same_file_version(&before, &after) { return Err(error("busy", "Session changed while checking references")); }
-        records.push(SessionReference { id, path, parent, subagent_parent, file: reader.into_inner(), metadata: after });
+        records.push(SessionReference { id, path, parent, subagent_parent, subagent_parent_path, file: reader.into_inner(), metadata: after });
     }
     let target = records.iter().find(|record| record.id == target_id).ok_or_else(|| error("not_found", "Session not found"))?;
     let target_path = target.path.canonicalize().map_err(|e| error("io", e))?;
     if !target_path.starts_with(&root) { return Err(error("access_denied", "Session path is outside session storage.")); }
+    let by_id: HashMap<_, _> = records.iter().map(|record| (record.id.as_str(), &record.path)).collect();
+    for record in &records {
+        if let (Some(parent), Some(parent_path)) = (record.subagent_parent.as_deref(), &record.subagent_parent_path) {
+            if let Some(actual) = by_id.get(parent) {
+                let stated = parent_path.canonicalize().unwrap_or_else(|_| parent_path.clone());
+                let actual = actual.canonicalize().unwrap_or_else(|_| (*actual).clone());
+                if !same_path(&stated, &actual) { return Err(error("not_supported", "Subagent parent identity does not match its path.")); }
+            }
+        }
+    }
     let mut by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
     for record in &records {
         if let Some(parent) = record.subagent_parent.as_deref() {
@@ -355,7 +370,7 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
             if entry.get("type").and_then(Value::as_str) == Some("custom")
                 && entry.get("customType").and_then(Value::as_str) == Some("pi-web:subagent")
             {
-                let parent = verified_subagent_parent(&entry)?;
+                let (parent, _) = verified_subagent_parent(&entry)?;
                 if subagent_parent.is_some() {
                     return Err(error("not_supported", "Cannot verify duplicate subagent metadata."));
                 }
@@ -373,6 +388,7 @@ fn delete_locked(state: &IpcHostState, id: &str, scheduled: &impl ScheduledRefer
         }
         if child_id == id {
             if target.is_some() { return Err(error("not_supported", "Duplicate session ids require manual resolution.")); }
+            if cwd.as_ref().is_none_or(|cwd| !cwd.is_absolute()) { return Err(error("not_supported", "Cannot verify the target session working directory.")); }
             target_cwd = cwd.clone();
             target = Some((file.clone(), reader.into_inner(), after));
         }
@@ -658,8 +674,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let sub1 = session(&root, "sub1", None);
         let sub2 = session(&root, "sub2", None);
         use std::io::Write;
-        for (path, parent) in [(&sub1, "target"), (&sub2, "sub1"), (&fork, "other")] {
-            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":parent,"parentSessionPath":"old"}});
+        let unresolved = root.join("other.jsonl");
+        for (path, parent, parent_path) in [(&sub1, "target", &target), (&sub2, "sub1", &sub1), (&fork, "other", &unresolved)] {
+            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":parent,"parentSessionPath":parent_path}});
             writeln!(std::fs::OpenOptions::new().append(true).open(path).unwrap(), "{marker}").unwrap();
         }
         writeln!(std::fs::OpenOptions::new().append(true).open(&fork).unwrap(), "{}", json!({"type":"message","message":{"role":"user","content":"keep"}})).unwrap();
@@ -694,8 +711,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let sub2 = session(&root, "sub2", None);
         let unrelated = session(&root, "unrelated", None);
         use std::io::Write;
-        for (path, parent) in [(&sub1, "target"), (&sub2, "sub1")] {
-            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":parent,"parentSessionPath":"fixture"}});
+        for (path, parent, parent_path) in [(&sub1, "target", &target), (&sub2, "sub1", &sub1)] {
+            let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":parent,"parentSessionPath":parent_path}});
             writeln!(std::fs::OpenOptions::new().append(true).open(path).unwrap(), "{marker}").unwrap();
         }
         assert_eq!(affected_session_ids(&state, "target").unwrap().ids, vec!["fork", "sub1", "sub2", "target"]);
@@ -1132,7 +1149,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         let (_dir, state, root) = fixture();
         let parent = session(&root, "parent", None);
         let child = session(&root, "sub", None);
-        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"parent","parentSessionPath":"fixture"}});
+        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"parent","parentSessionPath":parent}});
         use std::io::Write;
         writeln!(std::fs::OpenOptions::new().append(true).open(&child).unwrap(), "{marker}").unwrap();
         assert_eq!(super::delete(&state, &json!({"session":"sub"})).unwrap()["ok"], true);
@@ -1147,13 +1164,31 @@ readline.createInterface({input:process.stdin}).on('line', line => {
         std::fs::write(chat.join("kept.txt"), "kept").unwrap();
         let target = session(&root, "target", None);
         let child = session(&root, "sub", None);
-        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target","parentSessionPath":"fixture"}});
+        let marker = json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target","parentSessionPath":target}});
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().append(true).open(&child).unwrap();
         writeln!(file, "{}", json!({"type":"model_change","provider":"fixture","modelId":"fixture"})).unwrap();
         writeln!(file, "{marker}").unwrap();
         assert_eq!(delete(&state, &json!({"session":"target"})).unwrap()["ok"], true);
         assert!(!target.exists() && !child.exists() && chat.join("kept.txt").exists());
+    }
+    #[test]
+    fn missing_target_cwd_never_authorizes_deletion() {
+        let (_dir, state, root) = fixture();
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, format!("{}\n", json!({"type":"session","id":"target"}))).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(target.exists());
+    }
+    #[test]
+    fn mismatched_subagent_parent_path_never_authorizes_a_cascade() {
+        let (_dir, state, root) = fixture();
+        let target = session(&root, "target", None);
+        let other = session(&root, "other", None);
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&other).unwrap(), "{}", json!({"type":"custom","customType":"pi-web:subagent","data":{"version":1,"parentSessionId":"target","parentSessionPath":root.join("wrong.jsonl")}})).unwrap();
+        assert_eq!(super::delete(&state, &json!({"session":"target"})).unwrap_err().0, "not_supported");
+        assert!(target.exists() && other.exists());
     }
     #[test]
     fn malformed_subagent_marker_never_authorizes_a_cascade() {

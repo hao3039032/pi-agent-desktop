@@ -424,8 +424,9 @@ shared Chat folders remain, while an unshared folder uses the system Trash and
 `.trashinfo`, or the app Trash when the system location cannot be prepared or
 is on another filesystem. A later Trash failure returns an error and retains
 journal evidence. Every publish and rollback refuses to replace a new file.
-Malformed records, unknown session cwd references, out-of-directory fork
-children and active affected children may be refused rather than guessed.
+Malformed records, mismatched subagent parent-id/path pairs, unknown session
+cwd references, out-of-directory fork children and active affected children
+may be refused rather than guessed.
 
 Pending deletion journals have a **separate**, default-denied recovery gate.
 List, index and search report recovery pending instead of automatically
@@ -435,8 +436,9 @@ checks grant recovery or clear the scheduler transaction lock. M5 must provide
 verified cross-process/old-version exclusion: destructive-write permission must
 remain valid from preflight through idle shutdown, final admission and journal
 completion, and recovery requires its own exclusive maintenance proof across
-validation and replay. A cross-host upgrade strategy and Windows/native WebView
-acceptance remain open.
+validation and replay. The destructive-write and recovery permissions are
+independent; only isolated test fixtures can currently grant either one. A
+cross-host upgrade strategy and Windows/native WebView acceptance remain open.
 
 `session_deletion::tests` and `session_deletion_journal::linux::tests` cover
 ordered fences, source replacement, shared folders, staged group phases,
