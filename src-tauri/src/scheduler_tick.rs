@@ -121,6 +121,7 @@ fn orphaned(run: &serde_json::Value, current_pid: u32, active: &std::collections
 pub struct SchedulerLoop {
     stop: std::sync::mpsc::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
+    failed: bool,
 }
 impl SchedulerLoop {
     pub fn start(state: Arc<IpcHostState>, interval: std::time::Duration) -> Result<Self, String> {
@@ -150,18 +151,65 @@ impl SchedulerLoop {
                 eprintln!("scheduler lease release failed: {error}");
             }
         }).map_err(|error| error.to_string())?;
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { stop, thread: Some(thread), failed: false })
     }
+    /// Request that the timer stop after its current tick. This does not
+    /// interrupt a tick already blocked in filesystem or management work.
+    pub fn begin_shutdown(&self) { let _ = self.stop.send(()); }
+
+    /// Wait only until the caller's shared deadline. A timed-out worker stays
+    /// owned here and retains its lease until it actually leaves the tick.
+    /// Success covers only the timer thread: it does not drain scheduled runs
+    /// or prove host shutdown. The existing loop releases its lease on exit.
+    pub fn shutdown_until(&mut self, deadline: std::time::Instant) -> bool {
+        self.begin_shutdown();
+        loop {
+            let Some(thread) = self.thread.as_ref() else { return !self.failed };
+            if thread.is_finished() {
+                self.failed = self.thread.take().unwrap().join().is_err();
+                return !self.failed;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return false; }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+        }
+    }
+
     pub fn stop(&mut self) {
-        let _ = self.stop.send(());
-        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        self.begin_shutdown();
+        if let Some(thread) = self.thread.take() { self.failed = thread.join().is_err(); }
     }
 }
-impl Drop for SchedulerLoop { fn drop(&mut self) { self.stop(); } }
+// Never turn a deadline failure into an unbounded join during unwinding/drop.
+// The thread owns its state and releases its lease only on its actual exit.
+impl Drop for SchedulerLoop { fn drop(&mut self) { self.begin_shutdown(); } }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocked_tick_obeys_shared_deadline_and_retains_worker() {
+        let (stop, _receiver) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || { blocked.recv().unwrap(); });
+        let mut scheduler = SchedulerLoop { stop, thread: Some(thread), failed: false };
+        let start = std::time::Instant::now();
+        assert!(!scheduler.shutdown_until(start + std::time::Duration::from_millis(50)));
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert!(scheduler.thread.is_some());
+        release.send(()).unwrap();
+        assert!(scheduler.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn panicked_worker_remains_unknown_on_repeated_wait() {
+        let (stop, _receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(|| panic!("fixture panic"));
+        let mut scheduler = SchedulerLoop { stop, thread: Some(thread), failed: false };
+        assert!(!scheduler.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2)));
+        assert!(!scheduler.shutdown_until(std::time::Instant::now()));
+    }
+
     #[test]
     fn timer_runs_without_a_window_and_releases_lease_on_stop() {
         let dir = tempfile::tempdir().unwrap();

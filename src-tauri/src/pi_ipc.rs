@@ -283,10 +283,9 @@ impl IpcHostState {
     }
 
     fn stop_scheduler_locked(&self) {
-        let mut current = self.scheduler_loop.lock().unwrap();
+        let scheduler = self.scheduler_loop.lock().unwrap().take();
         self.scheduler_owner.store(false, Ordering::SeqCst);
-        let scheduler = current.take();
-        drop(scheduler);
+        if let Some(mut scheduler) = scheduler { scheduler.stop(); }
         self.scheduler_owner.store(false, Ordering::SeqCst);
     }
 
