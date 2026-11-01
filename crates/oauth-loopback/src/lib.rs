@@ -104,7 +104,11 @@ impl LoopbackListener {
     /// Bind and start serving. The OS assigns the port (nothing else on the
     /// machine can predict or pre-empt it for this bind).
     pub fn start(flow_state: String) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Self::start_with_options(flow_state, 0, Duration::from_secs(600))
+    }
+
+    fn start_with_options(flow_state: String, port: u16, timeout: Duration) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port))?;
         let port = listener.local_addr()?.port();
         let shared = Arc::new(Shared { outcome: Mutex::new(None) });
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -116,13 +120,19 @@ impl LoopbackListener {
                 // One accepted completion: after it, stop accepting (the
                 // listener drops and the port closes).
                 listener.set_nonblocking(true).ok();
-                let deadline = Instant::now() + Duration::from_secs(600);
+                let deadline = Instant::now() + timeout;
                 loop {
                     if thread_shared.outcome.lock().unwrap().is_some() {
                         break;
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            if cancel_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                                let result = if Instant::now() >= deadline { FlowOutcome::TimedOut } else { FlowOutcome::Cancelled };
+                                *thread_shared.outcome.lock().unwrap() = Some(result.clone());
+                                let _ = done_tx.send(result);
+                                break;
+                            }
                             let outcome = handle_connection(stream, &thread_shared, &flow_state);
                             if let Some(outcome) = outcome {
                                 // Signal the waiter exactly once per flow.
@@ -186,6 +196,12 @@ impl LoopbackListener {
     }
 }
 
+impl Drop for LoopbackListener {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Serve exactly one connection: parse the request line + query, validate
 /// state, record the outcome, answer the browser, close. Returns the
 /// recorded outcome when THIS connection settled the flow.
@@ -241,17 +257,15 @@ fn handle_connection(
         return None;
     }
     let received_state = params.get("state").cloned().unwrap_or_default();
+    if received_state != expected_state {
+        // A stale or unrelated callback must not settle this flow, including errors.
+        respond(&mut stream, "400 Bad Request", "state mismatch");
+        return None;
+    }
     if let Some(error) = params.get("error") {
         let recorded = FlowOutcome::ProviderError { error: error.clone(), state: received_state };
         *outcome = Some(recorded.clone());
         respond(&mut stream, "200 OK", "sign-in failed; you can close this tab");
-        return Some(recorded);
-    }
-    if received_state != expected_state {
-        // Impostor or stale callback: NEVER a success.
-        let recorded = FlowOutcome::StateMismatch { received: received_state };
-        *outcome = Some(recorded.clone());
-        respond(&mut stream, "400 Bad Request", "state mismatch");
         return Some(recorded);
     }
     match params.get("code") {
@@ -404,10 +418,12 @@ mod tests {
         let (status, _) =
             browser_get_on(listener.port(), "/callback?code=STOLEN&state=impostor").expect("callback");
         assert_eq!(status, "400");
-        match listener.wait(Duration::from_secs(5)) {
-            Some(FlowOutcome::StateMismatch { received }) => assert_eq!(received, "impostor"),
-            other => panic!("expected mismatch, got {other:?}"),
-        }
+        let (status, _) = browser_get_on(listener.port(), "/callback?error=denied&state=impostor").unwrap();
+        assert_eq!(status, "400");
+        assert!(!listener.is_settled());
+        let (status, _) = browser_get_on(listener.port(), &format!("/callback?code=GOOD&state={}", flow.state)).unwrap();
+        assert_eq!(status, "200");
+        assert!(matches!(listener.wait(Duration::from_secs(5)), Some(FlowOutcome::Success { .. })) );
     }
 
     #[test]
@@ -473,12 +489,24 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "long-running timeout path; run explicitly with --ignored"]
     fn timeout_completes_the_flow() {
-        let flow = Flow::new();
-        let listener = LoopbackListener::start(flow.state.clone()).expect("listen");
-        // The internal deadline is 600s — too long for a unit test, so this
-        // documents the path; the cancel test covers the shutdown half.
-        let _ = listener;
+        let listener = LoopbackListener::start_with_options(Flow::new().state, 0, Duration::from_millis(30)).unwrap();
+        assert_eq!(listener.wait(Duration::from_secs(2)), Some(FlowOutcome::TimedOut));
+    }
+
+    #[test]
+    fn occupied_port_is_not_silently_reused() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        assert!(LoopbackListener::start_with_options(Flow::new().state, port, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn drop_closes_listener() {
+        let listener = LoopbackListener::start(Flow::new().state).unwrap();
+        let port = listener.port();
+        drop(listener);
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }
