@@ -54,10 +54,11 @@ pub struct RelayShutdownReport {
     pub session: RelayShutdownStatus,
     pub running: RelayShutdownStatus,
     pub scheduled: RelayShutdownStatus,
+    pub auth: RelayShutdownStatus,
 }
 impl RelayShutdownReport {
     pub fn is_complete(&self) -> bool {
-        [&self.session, &self.running, &self.scheduled].iter().all(|s| s.in_flight == 0 && !s.registry_busy)
+        [&self.session, &self.running, &self.scheduled, &self.auth].iter().all(|s| s.in_flight == 0 && !s.registry_busy)
     }
 }
 
@@ -331,6 +332,7 @@ impl IpcHostState {
     /// Close both IPC lanes and fence tracked child starts before draining
     /// already-admitted calls. This does not prove detached writers stopped.
     pub(crate) fn begin_static_shutdown(&self) {
+        self.login_relays.begin_shutdown();
         self.dispatch_gate.close();
         self.dispatch_control_gate.close();
         self.session_relay_gate.close();
@@ -364,6 +366,7 @@ impl IpcHostState {
                 session: RelayShutdownStatus { in_flight: IPC_MAX_SESSION_RELAYS - self.session_relay_gate.available_permits(), registry_busy },
                 running: RelayShutdownStatus { in_flight: IPC_MAX_RUNNING_RELAYS - self.running_relay_gate.available_permits(), registry_busy },
                 scheduled: RelayShutdownStatus { in_flight: self.scheduled_events.in_flight(), registry_busy: self.scheduled_events.registry_busy() },
+                auth: self.login_relays.shutdown_status(),
             };
             if report.is_complete() || std::time::Instant::now() >= deadline { return report; }
             std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));

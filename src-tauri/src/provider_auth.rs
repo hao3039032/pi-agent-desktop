@@ -132,14 +132,37 @@ impl Drop for RelaySlot {
 
 /// The login-stream relays by subscription id (pi_ipc's event_relays
 /// pattern, this domain's own map so the shared one stays untouched).
-#[derive(Default)]
 pub(crate) struct LoginRelays {
     pub(crate) relays: Mutex<BTreeMap<String, LoginRelayHandle>>,
     tasks: Mutex<BTreeMap<String, LoginTask>>,
     alive: Arc<AtomicUsize>,
+    gate: Arc<tokio::sync::Semaphore>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl Default for LoginRelays {
+    fn default() -> Self {
+        Self { relays: Mutex::new(BTreeMap::new()), tasks: Mutex::new(BTreeMap::new()),
+            alive: Arc::new(AtomicUsize::new(0)), gate: Arc::new(tokio::sync::Semaphore::new(LOGIN_MAX_RELAYS)),
+            shutdown: Arc::new(AtomicBool::new(false)) }
+    }
 }
 
 impl LoginRelays {
+    pub(crate) fn begin_shutdown(&self) {
+        self.gate.close();
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn shutdown_status(&self) -> crate::pi_ipc::RelayShutdownStatus {
+        crate::pi_ipc::RelayShutdownStatus {
+            in_flight: LOGIN_MAX_RELAYS - self.gate.available_permits(),
+            registry_busy: self.relays.try_lock().is_err() || self.tasks.try_lock().is_err(),
+        }
+    }
+    fn reserve(&self) -> Result<Arc<tokio::sync::OwnedSemaphorePermit>, String> {
+        Arc::clone(&self.gate).try_acquire_owned().map(Arc::new)
+            .map_err(|_| "login observer capacity exhausted or closed".to_string())
+    }
     pub fn cancel(&self, subscription_id: &str) -> Option<LoginRelayHandle> {
         self.relays.lock().unwrap().remove(subscription_id)
     }
@@ -421,17 +444,27 @@ pub fn dispatch(state: &IpcHostState, op: &str, id: &str, args: &Value) -> Optio
 
 /// Reserve the observer thread before starting a mutation. It waits for a
 /// task binding, then polls and forwards one acknowledged frame at a time.
+#[cfg(test)]
 fn reserve_login_relay(
     state: &Arc<IpcHostState>,
     subscription_id: String,
     on_event: Channel<Value>,
 ) -> Result<std::sync::mpsc::SyncSender<(String, String, Arc<management_host::ManagementInstance>)>, String> {
+    let permit = state.login_relays.reserve()?;
+    reserve_login_relay_with_permit(state, subscription_id, on_event, permit)
+}
+
+fn reserve_login_relay_with_permit(
+    state: &Arc<IpcHostState>, subscription_id: String, on_event: Channel<Value>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<std::sync::mpsc::SyncSender<(String, String, Arc<management_host::ManagementInstance>)>, String> {
     let relays = Arc::clone(&state.login_relays);
+    if relays.shutdown.load(Ordering::SeqCst) { return Err("login observer admission closed".into()); }
     relays.alive.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < LOGIN_MAX_RELAYS).then_some(n + 1))
         .map_err(|_| "login observer capacity exhausted".to_string())?;
     let slot = RelaySlot(Arc::clone(&relays.alive));
     let stop = Arc::new(AtomicBool::new(false));
-    let ack = Arc::new(crate::pi_ipc::SessionRelayAck::default());
+    let ack = Arc::new(crate::pi_ipc::SessionRelayAck::with_shutdown(Arc::clone(&relays.shutdown)));
     relays.insert(&subscription_id, LoginRelayHandle {
         stop: Arc::clone(&stop), flow_id: String::new(), task_handle: String::new(),
         tokens: Default::default(), ack: Arc::clone(&ack),
@@ -443,11 +476,19 @@ fn reserve_login_relay(
         .name(format!("ipc-login-{subscription_id}"))
         .spawn(move || {
             let _slot = slot;
+            let _permit = permit;
             let relays = thread_relays;
             let subscription_id = thread_id;
-            let Ok((flow_id, th, instance)) = rx.recv() else {
-                relays.remove(&subscription_id);
-                return;
+            let (flow_id, th, instance) = loop {
+                if relays.shutdown.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
+                    relays.remove(&subscription_id);
+                    return;
+                }
+                match rx.recv_timeout(crate::pi_ipc::RELAY_SHUTDOWN_POLL) {
+                    Ok(binding) => break binding,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => { relays.remove(&subscription_id); return; }
+                }
             };
             let mut frame_seq: u64 = 0;
             let mut since: u64 = 0;
@@ -464,13 +505,11 @@ fn reserve_login_relay(
                 return;
             }
             loop {
-                if stop.load(Ordering::SeqCst) {
-                    break;
+                let wake = std::time::Instant::now() + LOGIN_POLL_INTERVAL;
+                while std::time::Instant::now() < wake && !stop.load(Ordering::SeqCst) && !relays.shutdown.load(Ordering::SeqCst) {
+                    std::thread::sleep(wake.saturating_duration_since(std::time::Instant::now()).min(crate::pi_ipc::RELAY_SHUTDOWN_POLL));
                 }
-                std::thread::sleep(LOGIN_POLL_INTERVAL);
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
+                if stop.load(Ordering::SeqCst) || relays.shutdown.load(Ordering::SeqCst) { break; }
 
                 // 1. Inspect host task status (authoritative lease and lifecycle):
                 let snapshot = match instance.task_snapshot(&th) {
@@ -542,7 +581,7 @@ fn reserve_login_relay(
                     }
                 }
 
-                if stop.load(Ordering::SeqCst) { break; }
+                if stop.load(Ordering::SeqCst) || relays.shutdown.load(Ordering::SeqCst) { break; }
                 if heartbeat.elapsed() >= LOGIN_HEARTBEAT {
                     if !send(&mut frame_seq, "heartbeat", Value::Null) { break; }
                     heartbeat = std::time::Instant::now();
@@ -607,7 +646,14 @@ fn open_login_stream(
     if provider.is_empty() || provider.len() > 200 {
         return crate::pi_ipc::protocol_error("?", "invalid_args", "provider is required");
     }
+    let permit = match state.login_relays.reserve() {
+        Ok(permit) => permit,
+        Err(message) => return crate::pi_ipc::protocol_error("?", "busy", &message),
+    };
     let config = state.management_config.lock().unwrap().clone();
+    if state.login_relays.shutdown.load(Ordering::SeqCst) {
+        return crate::pi_ipc::protocol_error("?", "busy", "login observer admission closed");
+    }
     let Some(config) = config else {
         return crate::pi_ipc::protocol_error(
             "?",
@@ -623,11 +669,14 @@ fn open_login_stream(
     };
     let number = LOGIN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let subscription_id = format!("login-{number}");
-    let sender = match reserve_login_relay(state, subscription_id.clone(), on_event) {
+    let sender = match reserve_login_relay_with_permit(state, subscription_id.clone(), on_event, Arc::clone(&permit)) {
         Ok(sender) => sender,
         Err(message) => return crate::pi_ipc::protocol_error("?", "busy", &message),
     };
     let mut tasks = state.login_relays.tasks.lock().unwrap();
+    if state.login_relays.shutdown.load(Ordering::SeqCst) {
+        return crate::pi_ipc::protocol_error("?", "busy", "login observer admission closed");
+    }
     let (flow_id, task_handle) = match (flow_id, task_handle) {
         (Some(flow), Some(task)) => {
             let valid = tasks.get(&flow).is_some_and(|entry| entry.provider == provider
@@ -660,6 +709,9 @@ fn open_login_stream(
                 return crate::pi_ipc::protocol_error("?", "busy", "login task registry capacity exhausted");
             }
             let flow = format!("loginflow-{number}");
+            if state.login_relays.shutdown.load(Ordering::SeqCst) {
+                return crate::pi_ipc::protocol_error("?", "busy", "login observer admission closed");
+            }
             let task = match instance.start_task("auth.loginStart", json!({ "flowId": flow, "provider": provider }),
                 LOGIN_FLOW_DEADLINE, management_host::TaskKind::Mutation) {
                 Ok(task) => task,
@@ -697,6 +749,10 @@ pub(crate) fn unsubscribe_login_stream(state: &IpcHostState, subscription_id: &s
     true
 }
 
+
+#[cfg(test)]
+#[path = "provider_auth_shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {
