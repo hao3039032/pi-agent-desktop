@@ -26,6 +26,13 @@ pub fn session_report_fields(report: Option<&session_host::SessionShutdownReport
     })
 }
 
+pub fn relay_report_fields(report: Option<&crate::pi_ipc::RelayShutdownReport>) -> serde_json::Value {
+    serde_json::json!({
+        "relayReportStatus": if report.is_some() { "available" } else { "unknown" },
+        "relays": report,
+    })
+}
+
 fn publish_report<T>(
     tracked: &Mutex<TrackedShutdown>, name: &str, result: T,
     outcome: Result<(), String>, store: impl FnOnce(&mut TrackedShutdown, T),

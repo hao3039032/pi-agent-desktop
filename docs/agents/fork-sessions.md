@@ -456,14 +456,15 @@ or downstream Channel/Tauri buffers. Other
 direct stream subscription commands are not covered. These remain M5 work, not
 an end-to-end backpressure claim.
 
-The isolated static-host shutdown closes session, running and scheduled relay
+The isolated static-host shutdown closes session, running, scheduled and provider-auth relay
 admission before draining, including reservations still starting. ACK and quiet
 waits check a shutdown signal independently of registry locks. Its shared-deadline
 report records each kind's `inFlight` reservations and `registryBusy`; a blocked
 Channel send or lock remains unknown, not proof of cancellation. The reservation
 covers tracked application cleanup, not OS thread teardown, upstream listeners,
-or Tauri/WebView internal delivery. Auth relays and production shutdown are not
-covered; stopping an observer does not prove its session writer stopped.
+or Tauri/WebView internal delivery. Auth observer shutdown does not cancel or prove
+completion of the credential writer: SDK abort-raced flows and their ledger remain
+unknown. Production shutdown is not covered.
 
 | Layer | Enforced budget | Boundary of the claim |
 |---|---|---|

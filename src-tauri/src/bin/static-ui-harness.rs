@@ -427,6 +427,7 @@ fn main() {
                         }
                     };
                     let session_fields = pi_agent_desktop_lib::static_host::session_report_fields(report.sessions.as_ref());
+                    let relay_fields = pi_agent_desktop_lib::static_host::relay_report_fields(report.relays.as_ref());
                     json!({
                         "harness": "shutdown", "ok": result.is_ok(),
                         "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
@@ -441,9 +442,9 @@ fn main() {
                         "managementExited": report.management.as_ref().map(|r| &r.exited),
                         "managementUnknown": report.management.as_ref().map(|r| &r.unknown),
                         "indexChildren": report.index_children.as_ref(),
-                        "relayReportStatus": if report.relays.is_some() { "available" } else { "unknown" },
-                        "relays": report.relays.as_ref(),
-                        "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability", "auth stream relay shutdown", "upstream pi listeners", "Tauri/WebView internal delivery"]
+                        "relayReportStatus": relay_fields["relayReportStatus"],
+                        "relays": relay_fields["relays"],
+                        "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability", "SDK provider credential writer completion", "upstream pi listeners", "Tauri/WebView internal delivery"]
                     })
                 }
                 HostCall::Shutdown => {

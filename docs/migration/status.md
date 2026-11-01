@@ -1,12 +1,12 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至 `09029072` 三类 relay 关闭、`303da5bc` 账本／事件流及 `c4b46e72` 索引预算整合的状态（真实 MCP 链路仍未通过）。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至 `69a8d636` 四类 observer relay 关闭、`5e7a2a51` 本地 CLI 认证夹具、`303da5bc` 账本／事件流及 `c4b46e72` 索引预算整合的状态（真实 MCP 链路及其他本地 CLI 失败门槛仍未关闭）。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
 - 正式产品仍启动 Next；未删除旧后端、未启用正式 Rust 调度循环。
 - 静态前端沿用原组件/UI，不把安全拒绝或空占位当功能完成。
-- 已按用户重启前要求推送迁移主线与 lane 检查点；没有发布产品、修改更新仓库或签名策略。
+- 最近确认推送的迁移主线为 `13be8244`；之后的本轮整合尚未推送。没有发布产品、修改更新仓库或签名策略。
 - 本地托管 pi、SDK symlink、浏览器桥及 `tauri::test::mock_app` 都不是 standalone/native WebView/安装升级证明。
 
 ## 已集成的实现
@@ -16,8 +16,8 @@
 | 会话基础 | 原 UI 创建/发送/流式/停止/队列编辑与立即发送、重开历史；目录/上下文投影、普通 fork/clone/navigate、rename/search/export；扩展 pending UI/回复/取消、fleet、thinking、prompt 与有证据的状态 | 自动命名已接 live registry、运行中/队列兼容和持久 rename fence；DELETE、带摘要分支及其关联 Stop 尚未完成；历史工具图片 resolver/URL 生命周期与安全 bash 下载已接线，原生验收未做；RPC custom UI 不支持，不伪造替代 |
 | Chat | 解锁读写、继续到宿主已授权项目；旧 child 确认退出、固定短寿命文件 writer、source/target 持久 fence | 正式启动与 harness 默认拒绝解锁；原生主窗口/iframe ACL、Windows mutation、跨宿主排他及未决结果恢复未验/未完成 |
 | 模型 | 列表/默认/启用模型最小编辑、models.json 读写、catalog/discover/test/nonchat/refresh/provider usage | 保留手动目录刷新及原配置校验，真实账户/付费请求未参与测试 |
-| Provider 认证 | provider 列表/API key/类型安全删除/logout、OAuth 进度流及关联 task-input/取消 | SDK 内置 OAuth callback 仍在 Node；Rust loopback 尚未接内置 provider |
-| MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 超时/取消显示远端 token 不确定性，保留 15 秒期限及迟到本地写保护；canonical/legacy/config/generation 私有 admission 已接 JS，native ledger/reservation/ACK 验证尚在实施，不能据 JS 合同直接解除 pending；仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
+| Provider 认证 | provider 列表/API key/类型安全删除/logout、OAuth 进度流及关联 task-input/取消；有界观察、原 task 重连、当前交互恢复和实验 static-host observer 关闭报告 | SDK 内置 OAuth callback 仍在 Node；Rust loopback 尚未接内置 provider；SDK abort race 不证明底层 writer 停止，未决 flow/ledger 不释放；真实账户及 native/standalone 未验 |
+| MCP | 配置 CRUD/undo、项目 MCP 列表、本地 Test、OAuth start/status/input/cancel/signout；静态 IPC 的 OAuth loopback 由 Rust 持有、SDK 公共引擎处理协议；trust.set 与 fresh-folder 写入经过 policy 独占、受影响旧会话退出、持久 pending marker 和结果核对 | OAuth 超时/取消显示远端 token 不确定性，保留 15 秒期限及迟到本地写保护；canonical/legacy/config/generation 私有 admission 已接 JS，native ledger/reservation/probe receipt 消费已整合，但真实 MCP 链路仍失败，不能据 JS 合同或局部测试直接解除 pending；仅隔离 fake 服务及管理 child 验证，原生浏览器和跨平台待验；Next 路径仍为 SDK Node callback；非 Unix trust mutation 拒绝；重启后 pending 的产品恢复入口与跨宿主排他未完成 |
 | 插件/技能 | 列表/开关/批量技能禁用、搜索/check、install/update/remove 任务 UI/IPC | 不可取消的 SDK mutation 使用独占短寿命 pi；强停可能部分写入，结果 unknown；官方 skills CLI、真实 npm/git 安装及 Windows mutation 未验/未支持 |
 | 文件/资源 | Unix root grant 保留目录对象与身份、准入复核路径、beneath-walk、目录/index/精确会话引用；普通 add 不续授已替换根，显式 native picker 可重新授权；统一 pi-resource 协议、Range/TTL/revoke、宿主内部栅格 byte grant；FileViewer/Markdown 资源、PDF/HTML/DOCX 预览与变更轮询、原生 drop/import、浏览器上传；overwrite 原子替换目录项，不截断硬链接 inode | 消息 sessionId/图片接线与 bash 下载已集成；原生保存使用有界准入、独立偏移流式读取和原子替换；reveal 路径重命名竞态待统一复审；失败暂存项不自动 unlink，可能留残件；Windows roots/read/index/pi-resource 句柄源码已接但未目标编译或原生执行，save/bash 与根外精确 session 引用仍缺；Windows index 的 Git 可见性尚未完成，故持续标记截断；Windows/Unix fallback 已加总节点、目录句柄及路径字节预算，Unix Git stdout/派生目录/响应和 cache 已有字节预算；Git 直接 child 最多 8 个预留槽、单一 reaper、宿主分域关闭报告；pre-exec 外部停止可阻塞 spawn，5 秒不是整个扫描硬期限，Git 路径重解析及后代仍不在证明内；真实 dialogs/ACL 未验 |
 | Git/worktrees | status/diff/list/create/switch/delete/fetch、隔离 Git fixture | Windows runner fail-closed；macOS 尚未验证 |
@@ -25,7 +25,7 @@
 | 终端 | Linux 真 PTY、原 TerminalPanel、输入/resize/history/ACK/lease/reconnect/close/settings | macOS/Windows 安全 cwd-handle spawn 未完成，创建 fail-closed |
 | 调度器 | CRUD/preview/history/seen、marker 确认后的真实 RunSpawner、手动执行、事件、显式启动的 30s loop/租约/slot/overlap/catch-up、TS/Rust 共同事务门、scheduled-session index | 正式启动切换未做；最终关闭已区别于 pause，按共享 deadline 跟踪在途 run/claim 并保留 lease；普通 prompt 仍无请求级终态关联，正常 run 可能持续 unknown 并耗尽 128 条准入，不是调度兼容完成；旧二进制不参与新门，崩溃事务锁恢复未完 |
 | 桌面服务 | 宿主原生目录选择授权、已知会话目录验证、distro/status/configure、updates.check；seed 为宿主内部操作 | 正式 seed 启动未切换；真实更新安装未执行；cwd.validate 不再授予任意前端路径权限 |
-| 管理运行时 | 实例级结果 router、rid/nonce task、deadline/cancel/状态、关联输入、物理 scope 协调、插件独占实例 process-group 清理；Chat/session writer 与 trust 有持久拒绝标记 | 通用 task unknown 持久 ledger 正在实施，重启恢复未完；标记不是跨进程锁；`6dafa016` 已改为 16 个普通槽 + 4 个清理/ACK 槽立即准入或 busy，不再排队等待 semaphore，但请求字节、其他流及 Tauri/WebView 内部队列仍未完成全链有界验证 |
+| 管理运行时 | 实例级结果 router、rid/nonce task、deadline/cancel/状态、关联输入、物理 scope 协调、插件独占实例 process-group 清理；Chat/session writer 与 trust 有持久拒绝标记 | 通用 task unknown 持久 ledger 已整合，重启恢复未完；标记不是跨进程锁；`6dafa016` 已改为 16 个普通槽 + 4 个清理/ACK 槽立即准入或 busy，不再排队等待 semaphore，但请求字节、其他流及 Tauri/WebView 内部队列仍未完成全链有界验证 |
 
 ## 当前实施工作
 
@@ -36,16 +36,19 @@
 - **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
 - **未决结果与生命周期**：在 `073815f2` 基础上整合截至 `ca23c638` 的 registry/management/短 writer 关闭、内存 prompt receipt、已验证结果的 resolved fence 与 cleanupWarning，以及实验 static host 的 IPC drain、scheduler 和 child 关闭链。共用绝对 deadline；实际准入先关闭，报告/生命周期锁忙不阻塞、保留失败，重复调用不重放 FnOnce。若首次无法取得 callbacks，失败永久保留，不自动补清理。resolved 只证明运行时结果已知，不证明 SDK 数据断电耐久，也不授予恢复权。prompt receipt 尚非跨重启证据；`a38b2bf5` 保留原 exited/unknown 并增加结构化诊断，分别表达未决 receipt、leader 退出未确认及锁忙/在途范围。实验 harness 的 available 仅表示取得报告，缺报告返回 null/unknown，不是空成功。无关联 start/terminal 观测和 leader 退出均不清历史 unknown；旧宿主、脱管 writer、正式 bootstrap/seed/scheduler 和产品恢复仍未完成。
 - **PTY 关闭门禁（提案及测试，非生产实现）**：[pre-exec 身份绑定提案](pty-preexec-binding-proposal.md) 来自 `c06be727`，独立测试控制器 `d242addc` 已单独纳入；没有吸收 observation-only `shutdown()` 回退或 vendor 实现。Linux fixture 以 post-open nonce 验证独立 pidfd、实际观测 SIGSTOP，证实截止时间不使 spawn worker 自动回收，随后由测试控制器安全终止并等待线程完成。它依赖正常调度、内核调用返回和受信 fixture；不证明生产绑定前任意停止可回收。vendor fd sweep 的异步信号安全及 spawn-error FD 风险仍开放，不能把测试变成生产终止授权。
-- **Terra 并行续作**：八个隔离工作树继续生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。SDK 最小补丁分发与合作升级/非合作 CLI 支持边界已向用户求决，尚未获准，不默认放行。
+- **Terra 并行续作**：按领域使用隔离工作树实施生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git；本轮两路认证续作已交付并整合，不代表所有领域或验收完成。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。SDK 最小补丁分发与合作升级/非合作 CLI 支持边界已向用户求决，尚未获准，不默认放行。
 - **自动命名**：`963f20fd` 接通 live child 的实际 model registry 和专用纯 helper bundle，`50714c76` 恢复运行中及 queued follow-up 的原行为；同分支正常追加不作 stale，模型/树 ABA、名称或 child 实例变化拒绝。改名使用公开 `pi.setSessionName`，不调用只读 extension context 未暴露的写方法；写前持久 marker，只有关联成功或明确写前拒绝清除，ACK 丢失/append 异常保留。最多 64 KiB 的 source 前缀仅为诊断，不冻结已准入运行。真实 90 秒 deadline 和原生 UI 仍待验。
-- **独立打包与待整合续作**：生命周期与包装线至 `ca23c638` 的源码已整合，但不激活产品入口。固定官方 pi 的 relocation/manifest 和部分 session/cron/DOCX/OAuth 探针有 lane 证据，完整 standalone MCP 仍因第二 SDK 图 identity guard 失败，不得移除该 guard。transport `069e92e5` 的 management ledger/reservation/probe receipt 与部分流预算仍待父代理整合；重启后另并行推进 running/scheduled 流、结构化关闭诊断、索引字节预算和 PTY 测试。平台 `0c61b276` 已作为 `ef075806` 合入 Windows roots/read/index/资源句柄及 Unix 嵌套根回退修复；Windows 未目标编译。整合检查确认的空目录无界队列已在 `e099bbf3` 修复：最多物化 50,000 个条目、最多 64 个待处理目录句柄，当前目录及临时枚举句柄另计；耗尽保留 partial/truncated。该修复不代替 Windows 目标编译或原生验收。MCP lane `ff3157de` 提供 probe mode admission/局部 guard/私有 receipt，尚待 native 消费；stdio/provider-auth/`!command` 的宽 scope 不作为只读放行。这些均不是正式 bootstrap 或 M5 验收。
+- **独立打包与待整合续作**：生命周期与包装线至 `ca23c638` 的源码已整合，但不激活产品入口。固定官方 pi 的 relocation/manifest 和部分 session/cron/DOCX/OAuth 探针有 lane 证据，完整 standalone MCP 仍因第二 SDK 图 identity guard 失败，不得移除该 guard。transport 的 management ledger/reservation/probe receipt、running/scheduled 流预算、结构化关闭诊断、索引字节预算和 PTY 测试已分批整合（详见验证记录），但完整生命周期与原生验收仍未闭环。平台 `0c61b276` 已作为 `ef075806` 合入 Windows roots/read/index/资源句柄及 Unix 嵌套根回退修复；Windows 未目标编译。整合检查确认的空目录无界队列已在 `e099bbf3` 修复：最多物化 50,000 个条目、最多 64 个待处理目录句柄，当前目录及临时枚举句柄另计；耗尽保留 partial/truncated。该修复不代替 Windows 目标编译或原生验收。MCP lane 的 probe mode admission/局部 guard/私有 receipt 已接 native 消费，真实 MCP 测试仍未通过；stdio/provider-auth/`!command` 的宽 scope 不作为只读放行。这些均不是正式 bootstrap 或 M5 验收。
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
 
+- 整合 `27ed8685` 与修订 `69a8d636`：auth observer 与 session/running/scheduled 共用原始关闭 deadline；先关闭实际准入，计数覆盖 open/启动/绑定/登记清理，锁忙和阻塞 Channel 保留 unknown。增加 `auth.inFlight` / `auth.registryBusy`，缺报告仍 null/unknown；observer 结束不取消或证明 credential writer 已停。父级审阅发现登记前测试同步竞态，以及 unwind 可能留下 registration 却释放 permit；修订采用清理先于 reservation 释放的 RAII，poison 不二次 panic且保持不可检查。
+  - 父级合并树首跑 auth 关闭测试 **7 pass / 1 fail**（新建临时可执行脚本出现 `ETXTBSY`）；改用固定只读 `test-fixtures/auth-relay.py`，同时修复 poison 测试对两个计数释放顺序的瞬时假设。重跑 auth 关闭 **8 passed / 0 failed / 0 ignored**，既有三流关闭 **4 passed / 0 failed / 0 ignored**；harness 构建和生命周期 HTTP 测试 **1 passed / 0 skipped**。日志中的两处 controlled panic 是显式异常夹具。Rust 测试有 2 条 deprecated warnings，harness 构建另有 7 条 dead-code warnings；target 3.9 GiB。仅覆盖受跟踪应用清理与报告，不证明 OS 线程、SDK writer、上游监听器或 Tauri/WebView 队列回收，生产 `RunEvent::Exit` 未改。
+
 - 已整合 `5e7a2a51`，provider-auth 剩余两个本地真实 CLI 夹具改用小型 projection（lane 计量 5,630,803 bytes）与只读依赖；类型拒绝使用独立 agentDir，保留 Unknown 和凭据类型保护，不改变生产规则。父级在合并树分别以完整测试名 + `--exact` 运行，两项均 **1 passed / 0 failed / 0 ignored，无内部 skip**。未重跑旧输入测试或全套测试。子代理此前错误使用宽过滤词，误跑 31 项得到 **12 pass / 19 fail**，并违反禁止 SDK closure 复制的约束；父级保存了输出、核查列出的 staging 目录清理情况，完整失败清单与保留的 8 KiB Chat 残件见 [本地 CLI 失败记录](local-cli-failure-record.md)。除此次修复的 auth 项外，其余 **18 项失败未关闭**；不得把目标通过当整套通过。
 
-- Provider-auth relay 已整合 `f9e30118` / `0f86cc39` / `d0193e75`，保留 `36b5d027` 的输入关闭门禁。真实 invoke ACK 保存原 flow/task 身份；首 snapshot / subscription / epoch / 连续 seq 验证后才 ACK 与续命；截断历史用最多 16 个、≤60 KiB 的当前交互恢复，Node 再检查 token 活性。observer detach 不取消写任务；显式 Cancel 保留最佳努力 abort，但 SDK `Models.login` 的 abort race 不能证明底层 provider 已退出，未决 flow 不释放容量，**SDK取消闭环及 auth 最终 shutdown accounting 仍未完成**。
+- Provider-auth relay 已整合 `f9e30118` / `0f86cc39` / `d0193e75`，保留 `36b5d027` 的输入关闭门禁。真实 invoke ACK 保存原 flow/task 身份；首 snapshot / subscription / epoch / 连续 seq 验证后才 ACK 与续命；截断历史用最多 16 个、≤60 KiB 的当前交互恢复，Node 再检查 token 活性。observer detach 不取消写任务；显式 Cancel 保留最佳努力 abort，但 SDK `Models.login` 的 abort race 不能证明底层 provider 已退出，未决 flow 不释放容量，**SDK取消闭环仍未完成**；auth observer 最终关闭已由后续整合补齐（见上条），不等于 credential writer 完成性证明。
   - 父级合并树 JS 首轮 **56 pass / 1 fail**（旧断言要求原始 provider 错误）；改为明确验证脱敏错误及伪凭据不泄漏后 **57 pass / 0 fail / 0 skip**。静态及 source-only TypeScript、API inventory 检查通过。Next auth service/routes 无改动。
   - 父级 Linux Rust 定向输出为 9 pass，但其中 `login_input_bypasses_scope_mutation_isolation_and_enforces_task_guards` 内部因缺少 `PI_CLI_BIN` 返回，故只计 **8 项实际通过 + 1 内部跳过**；包含 Node login composition → fake RPC → Rust Channel → static service fixture，不是 native WebView/standalone。显式提供本地 CLI 单独运行该旧测试后 **1 fail**：`management agent directory differs from host agent directory`，未进入输入行为。当时该旧夹具还使用整树 staging；此失败作为历史记录保留，修复结果见下条，不把当时的失败回算为通过。另两项 `real_pi_*` 测试本轮未运行。两个 deprecated atomic warnings 保留。
   - 后续整合 `8696938a`，仅修复上述真实本地 CLI 输入夹具：host 绑定临时 agentDir；构建小型 projection 并只读引用本地依赖，不再复制 SDK closure，不放宽 managed-root/SDK identity 检查。正常、失败、取消分用隔离 agentDir，验证 pending 时阻止第二个 mutation、原 Running task 可继续输入，以及失败/取消保持 Unknown 和拒绝后续写入。当前真实 auth 准入不能构造“同 scope 一个 Running login 加另一个 Unknown mutation”，不为旧测试绕过 ledger，也不泛化到所有 management task 类型。
