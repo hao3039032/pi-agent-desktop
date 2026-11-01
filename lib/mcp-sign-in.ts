@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { McpRefusalReason, McpSignInFailure, McpSignInFlowInfo, McpSignInPhase, McpTestResult } from "./api-types";
 import {
   guardedCredentialStore,
+  guardMcpOAuthStateStore,
   mcpOAuthUrl,
   McpSignedOutError,
   mcpSignInKey,
@@ -378,17 +379,17 @@ function watchedStore(store: McpOAuthStateStore, flow: Flow, guard: McpSignInWri
     const value = isRecord(state) ? state.oauthState : undefined;
     flow.storedState = typeof value === "string" ? value : undefined;
   };
+  const guarded = guardMcpOAuthStateStore(store, guard);
   return {
     load: async () => {
-      guard();
-      const state = await store.load();
+      const state = await guarded.load();
       note(state);
       return state;
     },
     save: async (state) => {
-      guard();
+      const saved = guarded.save(state);
       note(state);
-      await store.save(state);
+      await saved;
     },
   };
 }

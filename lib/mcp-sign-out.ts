@@ -1,5 +1,5 @@
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
-import type { McpOAuthCredentialStore, McpOAuthServerStore, PiSdkInternals } from "./pi-sdk-internals";
+import type { McpOAuthCredentialStore, McpOAuthServerStore, McpOAuthStateStore, PiSdkInternals } from "./pi-sdk-internals";
 
 // What a sign-out of an MCP server bars (ADR 0006, Settings › MCP sign-in):
 // every connection Pi Web opened for the server before the sign-out, a
@@ -111,6 +111,18 @@ export function mcpSignOutGuard(name: string, url: string): McpSignInWriteGuard 
 }
 
 /**
+ * Wrap the exact store a management writer uses. Its load/save must complete
+ * their locked file operation synchronously before returning; an async deferred
+ * write would escape the generation check. Load may migrate legacy state.
+ */
+export function guardMcpOAuthStateStore(store: McpOAuthStateStore, guard: McpSignInWriteGuard): McpOAuthStateStore {
+  return {
+    load: () => { guard(); return store.load(); },
+    save: (state) => { guard(); return store.save(state); },
+  };
+}
+
+/**
  * The SDK's credential store over the same `mcp-auth.json`, whose writes call
  * `guard` first: the store a connection reads and refreshes tokens through, so
  * a refresh that is still on its way when the server is signed out cannot
@@ -126,14 +138,7 @@ export function guardedCredentialStore(
     forServer(name: string, serverUrl: string): McpOAuthServerStore {
       const store = super.forServer(name, serverUrl);
       return {
-        load: () => {
-          guard();
-          return store.load();
-        },
-        save: (state) => {
-          guard();
-          return store.save(state);
-        },
+        ...guardMcpOAuthStateStore(store, guard),
         withRefreshLock: (fn) => store.withRefreshLock(fn),
       };
     }
