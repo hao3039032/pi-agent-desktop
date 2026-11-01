@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -10,11 +10,14 @@ const binary = process.env.STATIC_UI_HARNESS_BIN;
 test("isolated static host drains IPC and reports tracked shutdown coverage", { skip: binary ? false : "STATIC_UI_HARNESS_BIN not set", timeout: 30000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "static-host-lifecycle-"));
   const agent = join(root, "agent");
+  const staticDir = join(root, "static");
   await mkdir(agent);
+  await mkdir(staticDir);
+  await writeFile(join(staticDir, "index.html"), "<!doctype html><title>fixture</title>");
   const token = "isolated-static-host-test-token-1234567890";
   const env = { ...process.env, HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: agent, STATIC_UI_HARNESS_TOKEN: token };
   for (const key of Object.keys(env)) if ((key.startsWith("PI_") && key !== "PI_CODING_AGENT_DIR") || key === "JITI_ALIAS") delete env[key];
-  const child = spawn(resolve(binary), ["--static-dir", resolve("desktop/frontend-static"), "--isolated-lifecycle-agent-dir", agent], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(resolve(binary), ["--static-dir", staticDir, "--isolated-lifecycle-agent-dir", agent], { env, stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const exited = new Promise((resolveExit) => child.once("exit", (code) => resolveExit(code)));
@@ -38,6 +41,7 @@ test("isolated static host drains IPC and reports tracked shutdown coverage", { 
     assert.equal(report.schedulerMayRepeatSessionDiagnostics, true);
     assert.deepEqual(report.sessionUnknown, []);
     assert.deepEqual(report.managementUnknown, []);
+    assert.deepEqual(report.indexChildren, { unknown: 0, trackerBusy: false });
     assert.deepEqual(report.writerUnknown, []);
     assert.deepEqual(report.writerCompleted, []);
     assert.ok(report.uncovered.includes("unregistered writers"));

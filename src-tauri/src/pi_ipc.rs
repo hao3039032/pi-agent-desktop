@@ -97,6 +97,9 @@ pub struct IpcHostState {
     pub authorized_save_destinations: Mutex<HashMap<String, std::time::Instant>>,
     /// Per-cwd cache for files.index.
     pub file_index_cache: Mutex<HashMap<String, crate::file_resources::CachedFileIndex>>,
+    pub(crate) index_children: crate::index_children::IndexChildOwner,
+    #[cfg(all(test, unix))]
+    pub(crate) index_git_executable: Mutex<Option<PathBuf>>,
     /// Paths the HOST itself proposed (session cwds, project roots from the
     /// session index, artifact locations). resource grants only ever accept
     /// members of this set — the frontend cannot mint its own.
@@ -240,6 +243,9 @@ impl IpcHostState {
             file_roots_init_error,
             authorized_save_destinations: Mutex::new(HashMap::new()),
             file_index_cache: Mutex::new(HashMap::new()),
+            index_children: crate::index_children::IndexChildOwner::default(),
+            #[cfg(all(test, unix))]
+            index_git_executable: Mutex::new(None),
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
             session_exports: Mutex::new(std::collections::VecDeque::new()),
@@ -257,6 +263,7 @@ impl IpcHostState {
     pub(crate) fn begin_static_shutdown(&self) {
         self.dispatch_gate.close();
         self.dispatch_control_gate.close();
+        self.index_children.begin_shutdown();
         self.begin_scheduler_shutdown();
         self.management.begin_shutdown();
         self.session_writers.begin_shutdown();

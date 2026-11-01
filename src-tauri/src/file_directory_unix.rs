@@ -10,6 +10,10 @@ pub(crate) fn directory_entries(directory: &std::fs::File) -> std::io::Result<Ve
 
 /// Limit materialized names, reporting whether another entry was present.
 pub(crate) fn directory_entries_bounded(directory: &std::fs::File, limit: usize) -> std::io::Result<(Vec<OsString>, bool)> {
+    directory_entries_path_bounded(directory, limit, usize::MAX, 0)
+}
+
+pub(crate) fn directory_entries_path_bounded(directory: &std::fs::File, limit: usize, byte_limit: usize, prefix_bytes: usize) -> std::io::Result<(Vec<OsString>, bool)> {
     // Open a new file description: dup() would share the directory cursor.
     let fd = unsafe { libc::openat(directory.as_raw_fd(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
@@ -23,6 +27,7 @@ pub(crate) fn directory_entries_bounded(directory: &std::fs::File, limit: usize)
     impl Drop for Dir { fn drop(&mut self) { unsafe { libc::closedir(self.0); } } }
     let stream = Dir(stream);
     let mut names = Vec::new();
+    let mut bytes = 0usize;
     loop {
         unsafe { *errno() = 0; }
         let entry = unsafe { libc::readdir(stream.0) };
@@ -33,7 +38,9 @@ pub(crate) fn directory_entries_bounded(directory: &std::fs::File, limit: usize)
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
-            if names.len() == limit { return Ok((names, true)); }
+            let cost = prefix_bytes.saturating_add(String::from_utf8_lossy(name).len());
+            if names.len() == limit || bytes.saturating_add(cost) > byte_limit { return Ok((names, true)); }
+            bytes += cost;
             names.push(OsString::from_vec(name.to_vec()));
         }
     }
