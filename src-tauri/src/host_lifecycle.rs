@@ -1,7 +1,8 @@
 //! Static bootstrap lifecycle. Cooperative ownership is not writer proof and
 //! never authorizes deletion, journal replay, seed, or scheduler startup.
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use crate::host_ownership::{HostOwnership, OwnershipMode};
 
@@ -14,6 +15,7 @@ pub enum PendingState { Clear, Pending, Uninspectable }
 pub struct RecoveryStatus {
     pub trust_policy: PendingState,
     pub session_writers: PendingState,
+    pub session_writer_cleanup: PendingState,
     pub deletion_journal: PendingState,
     pub management_operations: PendingState,
 }
@@ -21,20 +23,8 @@ pub struct RecoveryStatus {
 impl RecoveryStatus {
     pub fn is_clear(&self) -> bool {
         self.trust_policy == PendingState::Clear && self.session_writers == PendingState::Clear
-            && self.deletion_journal == PendingState::Clear && self.management_operations == PendingState::Clear
-    }
-}
-
-fn directory_pending(path: &Path) -> PendingState {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PendingState::Clear,
-        Err(_) => PendingState::Uninspectable,
-        Ok(meta) if !meta.file_type().is_dir() => PendingState::Uninspectable,
-        Ok(_) => match std::fs::read_dir(path).and_then(|mut entries| entries.next().transpose()) {
-            Ok(None) => PendingState::Clear,
-            Ok(Some(_)) => PendingState::Pending,
-            Err(_) => PendingState::Uninspectable,
-        },
+            && self.session_writer_cleanup == PendingState::Clear && self.deletion_journal == PendingState::Clear
+            && self.management_operations == PendingState::Clear
     }
 }
 
@@ -53,7 +43,7 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
             Err(_) => PendingState::Uninspectable,
         }
     };
-    let writers = if base_safe { directory_pending(&base.join("session-writer-fences")) } else { PendingState::Uninspectable };
+    let (writers, writer_cleanup) = if base_safe { crate::session_writer_fence::diagnostic(agent) } else { (PendingState::Uninspectable, PendingState::Uninspectable) };
     let journal = match crate::session_deletion_journal::has_pending(agent) {
         Ok(true) => PendingState::Pending,
         Ok(false) => PendingState::Clear,
@@ -75,7 +65,7 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
             }
         }
     };
-    RecoveryStatus { trust_policy: trust, session_writers: writers, deletion_journal: journal, management_operations: management }
+    RecoveryStatus { trust_policy: trust, session_writers: writers, session_writer_cleanup: writer_cleanup, deletion_journal: journal, management_operations: management }
 }
 
 /// Ordered shutdown phases. Register each actual service/controlled child
@@ -83,7 +73,7 @@ pub fn recovery_status(agent: &Path) -> RecoveryStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ShutdownStage { Admission, Scheduler, SessionChild, Management }
 
-type Shutdown = Box<dyn FnOnce() -> Result<(), String> + Send>;
+type Shutdown = Box<dyn FnOnce(std::time::Instant) -> Result<(), String> + Send>;
 struct Service { stage: ShutdownStage, name: String, shutdown: Shutdown }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownFailure { pub stage: ShutdownStage, pub name: String, pub error: String }
@@ -97,6 +87,8 @@ pub struct HostLifecycle {
     _ownership: HostOwnership,
     agent: PathBuf,
     inner: Mutex<Inner>,
+    closing: AtomicBool,
+    completed: OnceLock<LifecycleState>,
 }
 
 impl HostLifecycle {
@@ -104,7 +96,7 @@ impl HostLifecycle {
         let agent = agent.canonicalize().map_err(|e| format!("Cannot resolve agent directory: {e}"))?;
         let ownership = HostOwnership::acquire(&agent, OwnershipMode::Runtime)
             .map_err(|e| format!("Cannot acquire cooperative host ownership: {e}"))?;
-        Ok(Self { _ownership: ownership, agent, inner: Mutex::new(Inner { state: LifecycleState::Running, services: Vec::new() }) })
+        Ok(Self { _ownership: ownership, agent, inner: Mutex::new(Inner { state: LifecycleState::Running, services: Vec::new() }), closing: AtomicBool::new(false), completed: OnceLock::new() })
     }
 
     pub fn recovery_status(&self) -> RecoveryStatus { recovery_status(&self.agent) }
@@ -118,8 +110,16 @@ impl HostLifecycle {
 
     pub fn register<F>(&self, stage: ShutdownStage, name: impl Into<String>, shutdown: F) -> Result<(), String>
     where F: FnOnce() -> Result<(), String> + Send + 'static {
+        self.register_until(stage, name, move |_| shutdown())
+    }
+
+    /// The callback must honor the supplied shared absolute deadline. The
+    /// lifecycle cannot bound an arbitrary callback that ignores it.
+    pub fn register_until<F>(&self, stage: ShutdownStage, name: impl Into<String>, shutdown: F) -> Result<(), String>
+    where F: FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static {
+        if self.closing.load(Ordering::SeqCst) { return Err("Host is shutting down".into()); }
         let mut inner = self.inner.lock().map_err(|_| "Lifecycle lock poisoned")?;
-        if inner.state != LifecycleState::Running { return Err("Host is shutting down".into()); }
+        if self.closing.load(Ordering::SeqCst) || inner.state != LifecycleState::Running { return Err("Host is shutting down".into()); }
         let name = name.into();
         if name.is_empty() || inner.services.iter().any(|service| service.name == name) {
             return Err("Invalid or duplicate lifecycle service name".into());
@@ -129,16 +129,49 @@ impl HostLifecycle {
     }
 
     pub fn state(&self) -> LifecycleState {
-        self.inner.lock().map(|inner| inner.state.clone()).unwrap_or_else(|_| LifecycleState::Failed(vec![ShutdownFailure {
-            stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into(),
+        if let Some(state) = self.completed.get() { return state.clone(); }
+        self.inner.try_lock().map(|inner| {
+            if self.closing.load(Ordering::SeqCst) && inner.state == LifecycleState::Running {
+                LifecycleState::ShuttingDown
+            } else { inner.state.clone() }
+        }).unwrap_or_else(|_| LifecycleState::Failed(vec![ShutdownFailure {
+            stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; outcome unknown".into(),
         }]))
     }
 
     /// Execute every registered cleanup, even after a failure; failure remains
     /// explicit and never becomes proof of exit. Registration is closed first.
     pub fn shutdown(&self) -> Result<(), Vec<ShutdownFailure>> {
+        self.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(35))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_inner_for_test(&self, ready: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>) {
+        let _guard = self.inner.lock().unwrap();
+        let _ = ready.send(());
+        let _ = release.recv();
+    }
+
+    /// All callbacks receive the same absolute deadline, including callbacks
+    /// after an earlier phase consumed the remaining time.
+    pub fn shutdown_until(&self, deadline: std::time::Instant) -> Result<(), Vec<ShutdownFailure>> {
+        if self.closing.swap(true, Ordering::SeqCst) {
+            return match self.completed.get() {
+                Some(LifecycleState::Stopped) => Ok(()),
+                Some(LifecycleState::Failed(failures)) => Err(failures.clone()),
+                Some(_) => unreachable!(),
+                None => Err(vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Shutdown already in progress; outcome unknown".into() }]),
+            };
+        }
         let mut services = {
-            let mut inner = self.inner.lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into() }])?;
+            let mut inner = match self.inner.try_lock() {
+                Ok(inner) => inner,
+                Err(_) => {
+                    let failures = vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle state unavailable or busy; callbacks not claimed".into() }];
+                    let _ = self.completed.set(LifecycleState::Failed(failures.clone()));
+                    return Err(failures);
+                }
+            };
             match &inner.state {
                 LifecycleState::Stopped => return Ok(()),
                 LifecycleState::Failed(failures) => return Err(failures.clone()),
@@ -151,12 +184,18 @@ impl HostLifecycle {
         services.sort_by_key(|service| service.stage);
         let mut failures = Vec::new();
         for service in services {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(service.shutdown));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (service.shutdown)(deadline)));
             let error = match result { Ok(Ok(())) => continue, Ok(Err(error)) => error, Err(_) => "Shutdown callback panicked; outcome unknown".into() };
             failures.push(ShutdownFailure { stage: service.stage, name: service.name, error });
         }
-        let mut inner = self.inner.lock().map_err(|_| vec![ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle lock poisoned".into() }])?;
-        inner.state = if failures.is_empty() { LifecycleState::Stopped } else { LifecycleState::Failed(failures.clone()) };
+        match self.inner.try_lock() {
+            Ok(mut inner) => {
+                inner.state = if failures.is_empty() { LifecycleState::Stopped } else { LifecycleState::Failed(failures.clone()) };
+            }
+            Err(_) => failures.push(ShutdownFailure { stage: ShutdownStage::Admission, name: "lifecycle".into(), error: "Lifecycle result publication unavailable or busy; state unknown".into() }),
+        }
+        let final_state = if failures.is_empty() { LifecycleState::Stopped } else { LifecycleState::Failed(failures.clone()) };
+        let _ = self.completed.set(final_state);
         if failures.is_empty() { Ok(()) } else { Err(failures) }
     }
 }
@@ -197,7 +236,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("session-deletion-journal")).unwrap();
         std::fs::write(dir.path().join("session-deletion-journal/pending"), "journal").unwrap();
         let status = host.require_clean_start().unwrap_err();
-        assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, deletion_journal: PendingState::Pending, management_operations: PendingState::Clear });
+        assert_eq!(status, RecoveryStatus { trust_policy: PendingState::Pending, session_writers: PendingState::Pending, session_writer_cleanup: PendingState::Clear, deletion_journal: PendingState::Pending, management_operations: PendingState::Clear });
         assert_eq!(std::fs::read_to_string(marker).unwrap(), "unresolved");
     }
 
@@ -232,6 +271,57 @@ mod tests {
         std::fs::write(&key_path, b"broken").unwrap();
         assert_eq!(recovery_status(dir.path()).management_operations, PendingState::Uninspectable);
         assert_eq!(std::fs::read(key_path).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn shutdown_passes_one_deadline_to_each_registered_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = HostLifecycle::init(dir.path()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for stage in [ShutdownStage::SessionChild, ShutdownStage::Management] {
+            host.register_until(stage, format!("{stage:?}"), move |actual| {
+                assert_eq!(actual, deadline); Ok(())
+            }).unwrap();
+        }
+        host.shutdown_until(deadline).unwrap();
+    }
+
+    #[test]
+    fn busy_final_publication_preserves_failure_and_never_replays_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(HostLifecycle::init(dir.path()).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        host.register(ShutdownStage::Management, "fixture", move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            Err("original failure".into())
+        }).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_host = Arc::clone(&host);
+        let worker = std::thread::spawn(move || { let _ = result_tx.send(worker_host.shutdown_until(std::time::Instant::now() + std::time::Duration::from_millis(100))); });
+        entered_rx.recv().unwrap();
+        let concurrent = host.shutdown_until(std::time::Instant::now()).unwrap_err();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_host = Arc::clone(&host);
+        let holder = std::thread::spawn(move || holder_host.hold_inner_for_test(ready_tx, release_rx));
+        ready_rx.recv().unwrap();
+        continue_tx.send(()).unwrap();
+        let result = result_rx.recv_timeout(std::time::Duration::from_millis(500));
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        worker.join().unwrap();
+        let failures = result.expect("shutdown blocked publishing lifecycle state").unwrap_err();
+        assert!(concurrent[0].error.contains("in progress"));
+        assert!(failures.iter().any(|f| f.error == "original failure"));
+        assert!(failures.iter().any(|f| f.error.contains("publication unavailable")));
+        assert_eq!(host.shutdown_until(std::time::Instant::now()).unwrap_err(), failures);
+        assert_eq!(host.state(), LifecycleState::Failed(failures));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

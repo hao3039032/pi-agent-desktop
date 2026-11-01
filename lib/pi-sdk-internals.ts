@@ -8,9 +8,9 @@ import {
   type McpServerEntry,
   type McpTransportFactory,
 } from "@earendil-works/pi-coding-agent";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { findPackageJSON } from "node:module";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // MCP support the SDK ships but its package does not export (ADR 0006): the
@@ -296,10 +296,28 @@ function packageImportEntry(manifest: unknown): string | undefined {
  * SDK file that imports it: the copy runtime.js uses, whether npm nested it
  * under the SDK or hoisted it.
  */
-function resolveMcpClientEntry(packageDir: string): string {
-  const importer = pathToFileURL(join(packageDir, SDK_MODULES.mcpRuntime)).href;
-  const manifestPath = findPackageJSON(MCP_PACKAGE, importer);
+function resolveMcpClientEntry(packageDir: string, managedDir?: string): string {
+  const runtime = join(packageDir, SDK_MODULES.mcpRuntime);
+  let manifestPath = typeof findPackageJSON === "function" ? findPackageJSON(MCP_PACKAGE, pathToFileURL(runtime).href) : undefined;
+  // Standalone pi's Bun runtime does not implement Node's findPackageJSON.
+  // Search the normal dependency ancestors of this specific SDK importer.
+  if (!manifestPath && typeof findPackageJSON !== "function") {
+    let dir = dirname(runtime);
+    for (;;) {
+      const candidate = join(dir, "node_modules", MCP_PACKAGE, "package.json");
+      if (existsSync(candidate)) { manifestPath = candidate; break; }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
   if (!manifestPath) throw new Error(`cannot resolve ${MCP_PACKAGE}`);
+  if (managedDir) {
+    const within = relative(realpathSync(managedDir), realpathSync(manifestPath));
+    if (!within || within === ".." || within.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(within)) {
+      throw new Error(`${MCP_PACKAGE} resolved outside the managed tree`);
+    }
+  }
   const entry = packageImportEntry(JSON.parse(readFileSync(manifestPath, "utf8")));
   if (!entry) throw new Error(`${manifestPath} declares no import entry`);
   return join(manifestPath, "..", entry);
@@ -313,12 +331,12 @@ function resolvedSdkPackageDir(cwd: string): string {
   return realpathSync(join(manifestPath, ".."));
 }
 
-async function importSdkModules(packageDir: string): Promise<LoadedModules | string> {
+async function importSdkModules(packageDir: string, managedDir?: string): Promise<LoadedModules | string> {
   const paths = Object.fromEntries(
     Object.entries(SDK_MODULES).map(([name, path]) => [name, join(packageDir, path)]),
   ) as Record<SdkModuleName, string>;
   try {
-    paths.mcpClient = resolveMcpClientEntry(packageDir);
+    paths.mcpClient = resolveMcpClientEntry(packageDir, managedDir);
   } catch (error) {
     return `${MCP_PACKAGE}: ${errorMessage(error)}`;
   }
@@ -378,7 +396,10 @@ export async function importPiSdkInternals(options: {
   let packageDir: string;
   try {
     const managedDir = environment.PI_WEB_MANAGED_MODULES;
-    packageDir = managedDir ? realpathSync(join(managedDir, SDK_PACKAGE)) : realpathSync(getPackageDir());
+    const managedPackage = managedDir && existsSync(join(managedDir, "node_modules", SDK_PACKAGE))
+      ? join(managedDir, "node_modules", SDK_PACKAGE)
+      : managedDir && join(managedDir, SDK_PACKAGE);
+    packageDir = managedPackage ? realpathSync(managedPackage) : realpathSync(getPackageDir());
     const resolvedDir = managedDir ? packageDir : resolvedSdkPackageDir(cwd);
     if (!sameRealPath(packageDir, resolvedDir)) {
       return { ok: false, reason: `${SDK_PACKAGE} at ${packageDir} is not the package Pi Web resolves (${resolvedDir})` };
@@ -387,7 +408,7 @@ export async function importPiSdkInternals(options: {
     return { ok: false, reason: `cannot locate ${SDK_PACKAGE}: ${errorMessage(error)}` };
   }
 
-  const modules = await importSdkModules(packageDir);
+  const modules = await importSdkModules(packageDir, environment.PI_WEB_MANAGED_MODULES);
   if (typeof modules === "string") return { ok: false, reason: modules };
   // The SDK root pi-web imports normally must be the same module instance.
   if (modules.mcpExtension.createMcpExtension !== createMcpExtension) {

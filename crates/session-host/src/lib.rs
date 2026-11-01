@@ -27,6 +27,7 @@
 pub mod composer_outbox;
 pub mod history;
 pub mod machine;
+mod prompt_lifecycle;
 mod session_ui;
 pub mod spawn_plan;
 pub use history::{list_session_files, scan_session_file_info, scan_sessions, SessionIndex, SessionSummary};
@@ -203,7 +204,7 @@ impl RunningSignal {
     }
 }
 
-pub type SessionFenceChecker = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+pub type SessionFenceChecker = Arc<dyn Fn(&str, Option<&str>) -> Result<(), String> + Send + Sync>;
 
 pub struct Session {
     fence_checker: SessionFenceChecker,
@@ -241,10 +242,18 @@ pub struct Session {
     activity_gate: std::sync::RwLock<()>,
     /// Host-wide policy changes exclude prompt admission and queued delivery.
     policy_gate: Arc<std::sync::RwLock<()>>,
+    host_closing: Arc<std::sync::atomic::AtomicBool>,
+    prompt_receipts: Arc<Mutex<prompt_lifecycle::PromptLifecycle>>,
     /// Notified when a run settles (prompt waits) or the child exits.
     settle_cv: std::sync::Condvar,
     /// The registry-wide running-set signal (shared with the relay).
     running_signal: Arc<RunningSignal>,
+}
+
+/// Exclusive activity permit, bound to the Session which created it.
+pub struct SessionActivityGuard<'a> {
+    owner: &'a Session,
+    _guard: std::sync::RwLockWriteGuard<'a, ()>,
 }
 
 struct SessionState {
@@ -295,26 +304,37 @@ impl Session {
         data: Value,
         timeout: Option<Duration>,
     ) -> Result<Value, pi_host::PiRpcError> {
-        let _policy = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
+        let _policy = if matches!(command, "prompt" | "steer" | "follow_up" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.policy_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session policy change is in progress"))?)
         } else { None };
-        let _admission = if matches!(command, "prompt" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
+        let _admission = if matches!(command, "prompt" | "steer" | "follow_up" | "bash" | "compact" | "set_session_name" | "set_model" | "set_thinking_level") {
             Some(self.activity_gate.try_read().map_err(|_| pi_host::PiRpcError::invalid("session branch operation is in progress"))?)
         } else { None };
         if matches!(command, "abort" | "abort_bash") { self.cancel_ui(); }
         if _admission.is_some() {
-            (self.fence_checker)(&self.id).map_err(pi_host::PiRpcError::invalid)?;
+            if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(pi_host::PiRpcError::invalid("session host is shutting down")); }
+            (self.fence_checker)(&self.id, None).map_err(pi_host::PiRpcError::invalid)?;
         }
-        let result = self.client.command(command, data, timeout);
+        let result = if matches!(command, "prompt" | "steer" | "follow_up") {
+            self.submit_tracked_prompt(command, data, timeout)
+        } else { self.client.command(command, data, timeout) };
         self.touch();
         result
     }
 
+    pub(crate) fn submit_tracked_prompt(&self, command: &str, data: Value, timeout: Option<Duration>) -> Result<Value, pi_host::PiRpcError> {
+        let receipt = self.prompt_receipts.lock().map_err(|_| pi_host::PiRpcError::invalid("prompt receipt tracking unavailable"))?.begin();
+        let result = self.client.command(command, data, timeout);
+        if let Ok(mut receipts) = self.prompt_receipts.lock() { receipts.response(receipt, command, &result); }
+        result
+    }
+
     /// Hold across branch validation and mutation so admissions cannot race it.
-    pub fn try_branch_activity(&self) -> Result<std::sync::RwLockWriteGuard<'_, ()>, &'static str> {
+    pub fn try_branch_activity(&self) -> Result<SessionActivityGuard<'_>, &'static str> {
         let guard = self.activity_gate.try_write().map_err(|_| "session is busy")?;
-        (self.fence_checker)(&self.id).map_err(|_| "session has an unresolved writer outcome")?;
-        Ok(guard)
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err("session host is shutting down"); }
+        (self.fence_checker)(&self.id, None).map_err(|_| "session has an unresolved writer outcome")?;
+        Ok(SessionActivityGuard { owner: self, _guard: guard })
     }
 
     /// Whether the child transport is closing or has exited.
@@ -346,25 +366,44 @@ impl Session {
         let _admission = if op == "subagents.steer" {
             Some(self.activity_gate.try_read().map_err(|_| refusal("session branch operation is in progress".into()))?)
         } else { None };
-        if _admission.is_some() { (self.fence_checker)(&self.id).map_err(refusal)?; }
+        if _admission.is_some() {
+            if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(refusal("session host is shutting down".into())); }
+            (self.fence_checker)(&self.id, None).map_err(refusal)?;
+        }
         self.bridge.request(op, args, timeout)
     }
 
     /// Issue a branch mutation while the caller holds this session's activity
     /// guard. This avoids reacquiring the guard in composite host operations.
     pub fn bridge_request_with_activity(
-        &self, _guard: &std::sync::RwLockWriteGuard<'_, ()>, op: &str,
+        &self, guard: &SessionActivityGuard<'_>, op: &str,
         args: Option<Value>, timeout: Option<Duration>,
     ) -> Result<Value, pi_host::bridge::BridgeError> {
-        if !matches!(op, "tree.navigate" | "session.rename") {
+        if !std::ptr::eq(guard.owner, self) || !matches!(op, "tree.navigate" | "session.rename") {
             return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
                 op: op.to_string(), message: "invalid guarded branch operation".into(), code: Some("invalid_args".into()),
             }));
         }
-        (self.fence_checker)(&self.id).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+        (self.fence_checker)(&self.id, None).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
             op: op.to_string(), message, code: Some("busy".into()),
         }))?;
         self.bridge.request(op, args, timeout)
+    }
+
+    /// The activity owner may dispatch only its own persistently fenced title rename.
+    pub fn title_rename_with_owned_fence(
+        &self, guard: &SessionActivityGuard<'_>, operation_id: &str,
+        task_id: &str, name: &str, timeout: Option<Duration>,
+    ) -> Result<Value, pi_host::bridge::BridgeError> {
+        if !std::ptr::eq(guard.owner, self) {
+            return Err(pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+                op: "title.rename".into(), message: "activity guard belongs to another session".into(), code: Some("fence_refused".into()),
+            }));
+        }
+        (self.fence_checker)(&self.id, Some(operation_id)).map_err(|message| pi_host::bridge::BridgeError::Op(pi_host::bridge::BridgeOpError {
+            op: "title.rename".into(), message, code: Some("fence_refused".into()),
+        }))?;
+        self.bridge.request("title.rename", Some(json!({"id":task_id, "name": name})), timeout)
     }
 
     /// The exact custom base passed at spawn, not the composed run prompt.
@@ -523,6 +562,7 @@ impl Session {
     }
 
     fn fan_out(self: &Arc<Self>, record: Value) {
+        if let Ok(mut receipts) = self.prompt_receipts.lock() { receipts.observe(&record); }
         // 1. The state machine eats first (it may request follow-ups).
         let follow_up = {
             let mut machine = self.machine.lock().unwrap();
@@ -836,6 +876,46 @@ pub struct SessionRegistry {
     /// The running-set change signal the running stream derives on.
     running_signal: Arc<RunningSignal>,
     policy_gate: Arc<std::sync::RwLock<()>>,
+    host_closing: Arc<std::sync::atomic::AtomicBool>,
+    starts_in_flight: Mutex<HashMap<String, usize>>,
+    prompt_receipts: Mutex<HashMap<String, Arc<Mutex<prompt_lifecycle::PromptLifecycle>>>>,
+}
+
+struct SessionStart<'a> { registry: &'a SessionRegistry, id: String }
+impl Drop for SessionStart<'_> {
+    fn drop(&mut self) {
+        let mut starts = self.registry.starts_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = starts.get_mut(&self.id) { *count -= 1; if *count == 0 { starts.remove(&self.id); } }
+    }
+}
+
+pub use prompt_lifecycle::PromptReceiptPhase;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionShutdownDiagnostic {
+    PromptReceipt { session_id: String, receipt_id: u64, phase: PromptReceiptPhase, uncorrelated_start_seen: bool, uncorrelated_terminal_seen: bool },
+    LeaderExitUnconfirmed { session_id: String },
+    ScopeUnknown { scope: ShutdownScope, session_id: Option<String>, reason: ShutdownScopeReason },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownScope { Starts, StartLocks, ComposerQueue, PromptReceipts, Sessions, Activity, RunState, SessionState }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownScopeReason { UnavailableOrBusy, InFlight, PendingOrInFlight, Active, Pending, CapacityExceeded }
+
+/// Confirmation covers only tracked leaders; unknowns never authorize recovery.
+#[derive(Debug, Default)]
+pub struct SessionShutdownReport { pub exited: Vec<String>, pub unknown: Vec<String>, pub diagnostics: Vec<SessionShutdownDiagnostic> }
+impl SessionShutdownReport {
+    fn scope_unknown(&mut self, scope: ShutdownScope, id: Option<&str>, reason: ShutdownScopeReason) {
+        self.diagnostics.push(SessionShutdownDiagnostic::ScopeUnknown { scope, session_id: id.map(str::to_owned), reason });
+    }
+    fn receipts(&mut self, id: &str, receipts: &prompt_lifecycle::PromptLifecycle) {
+        self.unknown.extend(receipts.unknown().into_iter().map(|item| format!("{id}: {item}")));
+        self.diagnostics.extend(receipts.diagnostics(id));
+    }
 }
 
 impl Default for SessionRegistry {
@@ -846,7 +926,7 @@ impl Default for SessionRegistry {
 
 impl SessionRegistry {
     pub fn new() -> Self {
-        Self::with_fence_checker(Arc::new(|_| Err("session fence checker is not configured".into())))
+        Self::with_fence_checker(Arc::new(|_, _| Err("session fence checker is not configured".into())))
     }
 
     pub fn with_fence_checker(fence_checker: SessionFenceChecker) -> Self {
@@ -863,6 +943,9 @@ impl SessionRegistry {
             composer_outboxes: Mutex::new(HashMap::new()),
             running_signal: Arc::new(RunningSignal::default()),
             policy_gate,
+            host_closing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            starts_in_flight: Mutex::new(HashMap::new()),
+            prompt_receipts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -895,7 +978,8 @@ impl SessionRegistry {
     ) -> Result<T, SessionWriterError<E>> {
         let lock = self.start_lock_for(id);
         let _start = lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))?;
-        (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(SessionWriterError::Busy("session host is shutting down")); }
+        (self.fence_checker)(id, None).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         // Include exited entries: their in-flight delivery can still restore an
         // unknown message to the persistent outbox after the process exits.
         let session = self.sessions.lock().unwrap().get(id).cloned();
@@ -956,6 +1040,7 @@ impl SessionRegistry {
         let _starts: Vec<_> = locks.iter().map(|lock| {
             lock.try_lock().map_err(|_| SessionWriterError::Busy("session admission is in progress"))
         }).collect::<Result<_, _>>()?;
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(SessionWriterError::Busy("session host is shutting down")); }
         let sessions: Vec<_> = {
             let registry = self.sessions.lock().unwrap();
             ids.iter().map(|id| registry.get(id).cloned()).collect()
@@ -968,7 +1053,7 @@ impl SessionRegistry {
             });
         }
         for (id, session) in ids.iter().zip(&sessions) {
-            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+            (self.fence_checker)(id, None).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
             if self.composer_outbox_for(id).has_pending_or_in_flight()
                 || session.as_ref().is_some_and(|session| session.run_state().is_running()) {
                 return Err(SessionWriterError::Busy("session is running or has pending messages"));
@@ -994,7 +1079,7 @@ impl SessionRegistry {
             starts.push(lock.try_lock().map_err(|_| SessionWriterError::Busy("session writer is busy"))?);
         }
         for id in &ids {
-            (self.fence_checker)(id).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
+            (self.fence_checker)(id, None).map_err(|_| SessionWriterError::Busy("session has an unresolved writer outcome"))?;
         }
         operation().map_err(SessionWriterError::Operation)
     }
@@ -1048,10 +1133,17 @@ impl SessionRegistry {
         &self, id: &str, session_file: &Path, session_file_id: &str, cwd: &Path,
         plan: impl FnOnce() -> Result<SessionSpawnConfig, String>,
     ) -> Result<Arc<Session>, SessionHostError> {
+        let _start = {
+            let mut starts = self.starts_in_flight.lock().map_err(|_| SessionHostError::Spawn("session start tracking unavailable".into()))?;
+            if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(SessionHostError::Spawn("session host is shutting down".into())); }
+            *starts.entry(id.to_owned()).or_default() += 1;
+            SessionStart { registry: self, id: id.to_owned() }
+        };
         let _policy = self.policy_gate.try_read().map_err(|_| SessionHostError::Spawn("session policy change is in progress".to_string()))?;
         let lock = self.start_lock_for(id);
         let _guard = lock.lock().unwrap();
-        (self.fence_checker)(id).map_err(SessionHostError::Spawn)?;
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(SessionHostError::Spawn("session host is shutting down".into())); }
+        (self.fence_checker)(id, None).map_err(SessionHostError::Spawn)?;
         // Won the lock: re-check (another caller may have finished spawning).
         if let Some(existing) = self.get(id) {
             if existing.is_idle_expired() {
@@ -1075,9 +1167,14 @@ impl SessionRegistry {
             return Err(SessionHostError::Spawn("session file no longer exists".to_string()));
         }
         let config = plan().map_err(SessionHostError::Spawn)?;
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) { return Err(SessionHostError::Spawn("session host is shutting down".into())); }
         // The composer outbox comes from the session-id store: a resumed
         // session inherits the queue an evicted child left behind.
         let composer_outbox = self.composer_outbox_for(id);
+        let receipts = {
+            let mut all = self.prompt_receipts.lock().map_err(|_| SessionHostError::Spawn("prompt receipt tracking unavailable".into()))?;
+            Arc::clone(all.entry(id.to_string()).or_default())
+        };
         let session = spawn_session(
             id,
             session_file,
@@ -1088,9 +1185,93 @@ impl SessionRegistry {
             Arc::clone(&self.running_signal),
             Arc::clone(&self.policy_gate),
             Arc::clone(&self.fence_checker),
+            Arc::clone(&self.host_closing),
+            receipts,
         )?;
         self.sessions.lock().unwrap().insert(id.to_string(), Arc::clone(&session));
+        if self.host_closing.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = session.client.close_until(Instant::now() + Duration::from_secs(2));
+            return Err(SessionHostError::Spawn("session host is shutting down; child exit may be unknown".into()));
+        }
         Ok(session)
+    }
+
+    /// Fence new starts and mutating work on retained session references.
+    pub fn begin_shutdown(&self) {
+        self.host_closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stop new session work and close registered leaders without waiting on
+    /// registry/start locks. A start, activity, or lock still in flight is
+    /// reported unknown even if the leader was observed exiting.
+    pub fn shutdown_until(&self, deadline: Instant) -> SessionShutdownReport {
+        self.begin_shutdown();
+        let mut report = SessionShutdownReport::default();
+        match self.starts_in_flight.try_lock() {
+            Ok(starts) => for id in starts.keys() { report.unknown.push(format!("{id}: start in flight")); report.scope_unknown(ShutdownScope::Starts, Some(id), ShutdownScopeReason::InFlight); },
+            Err(_) => { report.unknown.push("session start tracking unavailable or busy".into()); report.scope_unknown(ShutdownScope::Starts, None, ShutdownScopeReason::UnavailableOrBusy); },
+        }
+        match self.start_locks.try_lock() {
+            Ok(locks) => for (id, lock) in locks.iter() {
+                if lock.try_lock().is_err() { report.unknown.push(format!("{id}: session writer or start lock busy")); report.scope_unknown(ShutdownScope::StartLocks, Some(id), ShutdownScopeReason::UnavailableOrBusy); }
+            },
+            Err(_) => { report.unknown.push("session writer lock registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::StartLocks, None, ShutdownScopeReason::UnavailableOrBusy); },
+        }
+        match self.composer_outboxes.try_lock() {
+            Ok(outboxes) => for (id, outbox) in outboxes.iter() {
+                match outbox.try_has_pending_or_in_flight() {
+                    Some(false) => {},
+                    Some(true) => { report.unknown.push(format!("{id}: composer queue pending or in flight")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(id), ShutdownScopeReason::PendingOrInFlight); },
+                    None => { report.unknown.push(format!("{id}: composer queue unavailable or busy")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(id), ShutdownScopeReason::UnavailableOrBusy); },
+                }
+            },
+            Err(_) => { report.unknown.push("composer queue registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::ComposerQueue, None, ShutdownScopeReason::UnavailableOrBusy); },
+        }
+        match self.prompt_receipts.try_lock() {
+            Ok(all) => for (id, receipts) in all.iter() {
+                match receipts.try_lock() {
+                    Ok(receipts) => report.receipts(id, &receipts),
+                    Err(_) => { report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")); report.scope_unknown(ShutdownScope::PromptReceipts, Some(id), ShutdownScopeReason::UnavailableOrBusy); },
+                }
+            },
+            Err(_) => { report.unknown.push("prompt receipt registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::PromptReceipts, None, ShutdownScopeReason::UnavailableOrBusy); },
+        }
+        let sessions: Vec<_> = match self.sessions.try_lock() {
+            Ok(sessions) => sessions.iter().map(|(id, session)| (id.clone(), Arc::clone(session))).collect(),
+            Err(_) => { report.unknown.push("session registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::Sessions, None, ShutdownScopeReason::UnavailableOrBusy); report.diagnostics.sort(); report.diagnostics.dedup(); return report; }
+        };
+        for (id, session) in sessions {
+            let activity = session.activity_gate.try_write();
+            if activity.is_err() { report.unknown.push(format!("{id}: activity in flight or lock unavailable")); report.scope_unknown(ShutdownScope::Activity, Some(&id), ShutdownScopeReason::UnavailableOrBusy); }
+            match session.machine.try_lock() {
+                Ok(machine) if machine.state.is_running() => { report.unknown.push(format!("{id}: projected run is active")); report.scope_unknown(ShutdownScope::RunState, Some(&id), ShutdownScopeReason::Active); },
+                Ok(_) => {},
+                Err(_) => { report.unknown.push(format!("{id}: run state unavailable or busy")); report.scope_unknown(ShutdownScope::RunState, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
+            }
+            match session.state.try_lock() {
+                Ok(state) if !state.ui.ids().is_empty() => { report.unknown.push(format!("{id}: extension UI pending")); report.scope_unknown(ShutdownScope::SessionState, Some(&id), ShutdownScopeReason::Pending); },
+                Ok(_) => {},
+                Err(_) => { report.unknown.push(format!("{id}: session state unavailable or busy")); report.scope_unknown(ShutdownScope::SessionState, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
+            }
+            // Recheck under the activity gate: a pre-shutdown submission or
+            // enqueue may have completed after the registry-wide snapshots.
+            match session.prompt_receipts.try_lock() {
+                Ok(receipts) => report.receipts(&id, &receipts),
+                Err(_) => { report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")); report.scope_unknown(ShutdownScope::PromptReceipts, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
+            }
+            match session.composer_outbox.try_has_pending_or_in_flight() {
+                Some(false) => {},
+                Some(true) => { report.unknown.push(format!("{id}: composer queue pending or in flight")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(&id), ShutdownScopeReason::PendingOrInFlight); },
+                None => { report.unknown.push(format!("{id}: composer queue unavailable or busy")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
+            }
+            let exited = session.client.close_until(deadline);
+            if exited { report.exited.push(id); }
+            else { report.unknown.push(format!("{id}: leader exit unconfirmed")); report.diagnostics.push(SessionShutdownDiagnostic::LeaderExitUnconfirmed { session_id: id }); }
+            session.settle_cv.notify_all();
+        }
+        report.exited.sort(); report.unknown.sort(); report.unknown.dedup();
+        report.diagnostics.sort(); report.diagnostics.dedup();
+        report
     }
 
     /// The running session for an id (if alive).
@@ -1210,6 +1391,8 @@ fn spawn_session(
     running_signal: Arc<RunningSignal>,
     policy_gate: Arc<std::sync::RwLock<()>>,
     fence_checker: SessionFenceChecker,
+    host_closing: Arc<std::sync::atomic::AtomicBool>,
+    prompt_receipts: Arc<Mutex<prompt_lifecycle::PromptLifecycle>>,
 ) -> Result<Arc<Session>, SessionHostError> {
     let nonce = uuid::Uuid::new_v4().to_string();
     let session_dir = config
@@ -1401,6 +1584,8 @@ fn spawn_session(
         composer_delivering: Mutex::new(false),
         activity_gate: std::sync::RwLock::new(()),
         policy_gate,
+        host_closing,
+        prompt_receipts,
         fence_checker,
         settle_cv: std::sync::Condvar::new(),
         running_signal,
@@ -2162,8 +2347,30 @@ mod dispatch_tests {
     struct SessionRegistry;
     impl SessionRegistry {
         fn new() -> super::SessionRegistry {
-            super::SessionRegistry::with_fence_checker(Arc::new(|_| Ok(())))
+            super::SessionRegistry::with_fence_checker(Arc::new(|_, _| Ok(())))
         }
+    }
+
+    #[test]
+    fn shutdown_reports_held_writer_and_pending_queue_without_waiting() {
+        let registry = SessionRegistry::new();
+        registry.composer_outbox_for("queued").enqueue("fixture", None).unwrap();
+        let gate = registry.start_lock_for("held");
+        let _guard = gate.lock().unwrap();
+        let report = registry.shutdown_until(Instant::now() + Duration::from_millis(20));
+        assert!(report.unknown.iter().any(|item| item.contains("held: session writer or start lock busy")), "{report:?}");
+        assert!(report.diagnostics.contains(&SessionShutdownDiagnostic::ScopeUnknown { scope: ShutdownScope::StartLocks, session_id: Some("held".into()), reason: ShutdownScopeReason::UnavailableOrBusy }));
+        assert!(report.unknown.iter().any(|item| item.contains("queued: composer queue pending")), "{report:?}");
+        assert!(matches!(registry.with_idle_session_writer("new", |_| Ok::<_, ()>(())), Err(SessionWriterError::Busy(_))));
+    }
+
+    #[test]
+    fn shutdown_reports_unavailable_session_registry_without_empty_success() {
+        let registry = SessionRegistry::new();
+        let _guard = registry.sessions.lock().unwrap();
+        let report = registry.shutdown_until(Instant::now());
+        assert!(!report.unknown.is_empty());
+        assert!(report.diagnostics.contains(&SessionShutdownDiagnostic::ScopeUnknown { scope: ShutdownScope::Sessions, session_id: None, reason: ShutdownScopeReason::UnavailableOrBusy }));
     }
 
     #[test]
@@ -2190,7 +2397,7 @@ mod dispatch_tests {
 
     #[test]
     fn snapshot_and_multi_writer_gates_refuse_busy_and_pending_without_waiting() {
-        let registry = super::SessionRegistry::with_fence_checker(Arc::new(|id| {
+        let registry = super::SessionRegistry::with_fence_checker(Arc::new(|id, _| {
             if id == "fenced" { Err("unknown".into()) } else { Ok(()) }
         }));
         let lock = registry.start_lock_for("held");
@@ -2203,7 +2410,7 @@ mod dispatch_tests {
 
     #[test]
     fn session_fence_refuses_offline_writers_and_starts() {
-        let checker: SessionFenceChecker = Arc::new(|id| {
+        let checker: SessionFenceChecker = Arc::new(|id, _owner| {
             if id == "blocked" { Err("unknown writer outcome".into()) } else { Ok(()) }
         });
         let registry = super::SessionRegistry::with_fence_checker(checker);

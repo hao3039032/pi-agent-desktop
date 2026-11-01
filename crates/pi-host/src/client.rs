@@ -230,6 +230,27 @@ impl Inner {
     }
 }
 
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn close_until_reports_busy_stdin_without_waiting_past_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-pi");
+        std::fs::write(&script, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let client = PiRpcClient::spawn(script.to_str().unwrap(), SpawnOptions::default()).unwrap();
+        let guard = client.shared.stdin.lock().unwrap();
+        let start = Instant::now();
+        assert!(!client.close_until(start + Duration::from_millis(30)));
+        assert!(start.elapsed() < Duration::from_millis(200));
+        drop(guard);
+        assert!(client.close_until(Instant::now() + Duration::from_secs(2)));
+    }
+}
+
 /// The JSONL RPC client. Cloned through `Arc`; see the module docs for the
 /// protocol contract.
 pub struct PiRpcClient {
@@ -616,6 +637,48 @@ impl PiRpcClient {
         }
         *self.shared.stdin.lock().unwrap() = None;
         self.wait_exit(Some(grace))
+    }
+
+    /// Ask the owned leader to exit and observe its watcher before one shared
+    /// deadline. A busy transport lock or expired deadline is unknown, never
+    /// proof of exit. This does not establish descendant termination.
+    pub fn close_until(&self, deadline: Instant) -> bool {
+        self.shared.exiting.store(true, Ordering::SeqCst);
+        loop {
+            match self.shared.inner.try_lock() {
+                Ok(mut inner) => {
+                    if inner.exited { return true; }
+                    inner.exiting = true;
+                    // Do not run arbitrary UI callbacks inside this deadline.
+                    // No dialog can be approved once the transport is closing.
+                    inner.ui_window = None;
+                    inner.ui_buffer.clear();
+                    break;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => return false,
+                Err(std::sync::TryLockError::WouldBlock) => {},
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { return false };
+            std::thread::sleep(left.min(Duration::from_millis(2)));
+        }
+        loop {
+            match self.shared.stdin.try_lock() {
+                Ok(mut stdin) => { *stdin = None; break; }
+                Err(std::sync::TryLockError::Poisoned(_)) => return false,
+                Err(std::sync::TryLockError::WouldBlock) => {},
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { return false };
+            std::thread::sleep(left.min(Duration::from_millis(2)));
+        }
+        loop {
+            match self.shared.inner.try_lock() {
+                Ok(inner) if inner.exited => return true,
+                Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {},
+                Err(std::sync::TryLockError::Poisoned(_)) => return false,
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { return false };
+            std::thread::sleep(left.min(Duration::from_millis(2)));
+        }
     }
 
     /// Immediate termination for shutdown deadlines.

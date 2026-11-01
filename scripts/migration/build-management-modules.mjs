@@ -32,6 +32,9 @@ const ROOT = resolve(HERE, "../..");
 // The exported surface the management extension consumes. Keep in step with
 // the ops in lib/pi-rpc/assets/pi-web-management.mjs.
 const ENTRY = `
+export { SessionManager as projectionSessionManager } from "@earendil-works/pi-coding-agent";
+export { McpOAuthProvider as projectionMcpOAuthProvider, MemoryOAuthStateStore as projectionMemoryOAuthStateStore } from "@earendil-works/pi-mcp/oauth";
+export { signInMcpWithHostedCallback } from "${ROOT}/lib/mcp-oauth-hosted.server.ts";
 export {
   buildSessionContext,
   sliceActiveBranch,
@@ -132,6 +135,24 @@ export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, ca
 `;
 
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
+export const TITLE_MODULE_NAME = "pi-web-session-title.mjs";
+
+/** Only pure title logic and the SDK's two pure transcript/model helpers may survive tree shaking. */
+export async function bundleTitleModule() {
+  const result = await build({
+    stdin: { contents: `export { generateSessionTitleFromRegistry } from "${ROOT}/lib/session-title.ts";`, resolveDir: ROOT, loader: "ts" },
+    bundle: true, format: "esm", platform: "node", target: "node20", write: false, metafile: true, legalComments: "none",
+  });
+  const outputs = Object.values(result.metafile.outputs);
+  if (outputs.length !== 1) throw new Error("unexpected title helper output");
+  const allowed = ["/lib/session-title.ts", "/@earendil-works/pi-ai/dist/models.js", "/@earendil-works/pi-ai/dist/utils/transcript.js"];
+  for (const [name, info] of Object.entries(outputs[0].inputs)) {
+    if (info.bytesInOutput > 0 && name !== "lib/session-title.ts" && !allowed.some((suffix) => name.replaceAll("\\", "/").endsWith(suffix))) {
+      throw new Error(`unexpected title helper dependency: ${name}`);
+    }
+  }
+  return result.outputFiles[0].text;
+}
 
 /** Bundle the projection entry; returns the output contents. */
 export async function bundleProjectionModules() {
@@ -143,14 +164,13 @@ export async function bundleProjectionModules() {
       sourcefile: "management-projection-entry.ts",
     },
     bundle: true,
-    // Jiti resolves its Babel transformer relative to its own package; bundling
-    // it relocates that lookup into the projection and breaks extensions.
-    external: ["jiti"],
+    // The extension loader resolves the SDK's public specifier to its own
+    // virtual module in the compiled pi; never bundle a second SDK graph.
     format: "esm",
     platform: "node",
     target: "node20",
     // MCP internals and the public SDK must resolve from the same managed tree.
-    external: ["@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
+    external: ["jiti", "@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph
@@ -173,6 +193,7 @@ export async function buildProjectionInto(outDir) {
   await mkdir(outDir, { recursive: true });
   const target = resolve(outDir, PROJECTION_MODULE_NAME);
   await writeFile(target, contents, "utf8");
+  await writeFile(resolve(outDir, TITLE_MODULE_NAME), await bundleTitleModule(), "utf8");
   return target;
 }
 
@@ -189,7 +210,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     process.exit(2);
   }
   let previous = null;
+  let previousTitle = null;
   if (check) {
+    previousTitle = await import("node:fs/promises").then((fs) => fs.readFile(resolve(outDir, TITLE_MODULE_NAME), "utf8")).catch(() => null);
     previous = await import("node:fs/promises")
       .then((fs) => fs.readFile(resolve(outDir, PROJECTION_MODULE_NAME), "utf8"))
       .catch(() => null);
@@ -198,7 +221,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   if (check) {
     const { readFile } = await import("node:fs/promises");
     const fresh = await readFile(target, "utf8");
-    if (previous !== null && previous !== fresh) {
+    const freshTitle = await readFile(resolve(outDir, TITLE_MODULE_NAME), "utf8");
+    if ((previous !== null && previous !== fresh) || (previousTitle !== null && previousTitle !== freshTitle)) {
       console.error(`[build-management-modules] ${target} is stale (differs from a fresh build)`);
       await rm(target, { force: true });
       process.exit(1);

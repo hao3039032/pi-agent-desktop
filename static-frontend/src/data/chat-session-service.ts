@@ -1,4 +1,5 @@
 import { IpcClient, IpcFailure } from "../ipc/client.ts";
+import { notifyCleanupWarning } from "./cleanup-warning.ts";
 import type { ChatAccessState, ContinuedChat } from "../../../lib/chat-session-service.ts";
 export type { ChatAccessState, ContinuedChat } from "../../../lib/chat-session-service.ts";
 
@@ -8,7 +9,9 @@ export function bindChatSessionService(bound: IpcClient): void { client = bound;
 async function request<T>(op: string, args: Record<string, unknown>): Promise<T> {
   if (!client) throw new Error("the chat-session IPC bridge is not configured");
   try {
-    return await client.request<T>(op, args, { timeoutMs: 40_000 });
+    const result = await client.request<T>(op, args, { timeoutMs: 40_000 });
+    notifyCleanupWarning(result);
+    return result;
   } catch (error) {
     if (error instanceof IpcFailure) throw new Error(error.error.message);
     throw error;

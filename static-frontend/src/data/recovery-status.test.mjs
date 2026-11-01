@@ -11,10 +11,10 @@ test("recovery status preserves pending and uninspectable without issuing a muta
   const transport = new MockTransport().on("desktop.recoveryStatus", (args) => {
     calls++;
     assert.equal(args, undefined);
-    return { trustPolicy: "pending", sessionWriters: "uninspectable", deletionJournal: "clear", managementOperations: "pending" };
+    return { trustPolicy: "pending", sessionWriters: "uninspectable", sessionWriterCleanup: "pending", deletionJournal: "clear", managementOperations: "pending" };
   });
   assert.deepEqual(await readRecoveryStatus(new IpcClient(transport)), {
-    trustPolicy: "pending", sessionWriters: "uninspectable", deletionJournal: "clear", managementOperations: "pending",
+    trustPolicy: "pending", sessionWriters: "uninspectable", sessionWriterCleanup: "pending", deletionJournal: "clear", managementOperations: "pending",
   });
   assert.equal(calls, 1);
   await readRecoveryStatus(new IpcClient(transport));

@@ -10,6 +10,35 @@ It never silently switches providers. A synchronous per-session guard prevents
 duplicate submissions; results refresh the sidebar but only update the active
 header when they still belong to that conversation.
 
+The static host starts a bounded title task in the owning pi child's bridge,
+using its live `ctx.model` and `ctx.modelRegistry.streamSimple` (including
+providers registered during `session_start`). The title helper is loaded from
+the fixed managed module tree; no credential or provider implementation crosses
+IPC and no second AgentSession is created. The host releases its session activity
+gate while the provider request runs. Before rename it reacquires the policy and
+activity gates and verifies the same child. The child then checks the captured
+model, tree/model epochs, original leaf ancestry and latest name-entry identity
+in one synchronous turn before appending the title. Normal same-branch entries,
+including a running response and queued continuation, do not invalidate it;
+navigation or model selection does, even if the user returns to the original
+state. Cancellation aborts only that title
+request; if a rename has already been dispatched its outcome is never called a
+confirmed cancellation. A durable session-writer fence is created before rename;
+only the matching owned operation can pass it, and an unknown reply leaves it
+in place across host restart. A proven pre-append refusal or confirmed success
+first replaces the fence atomically with a durable `phase: "resolved"` record
+(`outcome: "not_applied"` or `"applied"`), then attempts removal. Chat access,
+continue and staged fork use the same terminal-before-cleanup rule only after
+writer exit and result verification. The outcome records what was confirmed by the live operation; it does not
+assert that all SDK-managed session data is power-loss durable. A cleanup error
+reports the known outcome and a persistent warning, not an unknown mutation or
+an invitation to retry. A surviving resolved record still blocks writes and is reported separately from
+an unresolved record; it never grants recovery permission and is not auto-cleared.
+Its source prefix is bounded diagnostic data only and does not assert
+that an actively written file is frozen. A previously admitted run can continue
+writing; the fence prevents new host admissions. This does not add cross-process
+writer exclusion or automatic recovery.
+
 ## Editable composer outbox
 
 `lib/composer-queue.ts` owns individually identified pending composer messages, including images.
@@ -414,8 +443,8 @@ before the operation executes. An admitted call abandoned by its WebView is
 not cancelled and may have an unknown outcome. The separate control budget
 prevents ordinary saturation starving cleanup, but can itself saturate; neither
 budget bounds messages already buffered by Tauri or the WebView, request bytes,
-child queues, or unacknowledged channels. Session event relay threads have a
-separate 32-slot immediate admission cap, held until each relay really exits.
+child queues, or unacknowledged channels. Session event relays have a
+separate 32-slot immediate admission cap, held through tracked relay cleanup.
 Each session relay ingress has 16 frames of at most 256 KiB serialized event
 payload; overflow or an oversized event disconnects that ingress and emits a
 `reset` so the client must reconcile. A relay sends one frame at a time and
@@ -427,10 +456,19 @@ or downstream Channel/Tauri buffers. Other
 direct stream subscription commands are not covered. These remain M5 work, not
 an end-to-end backpressure claim.
 
+The isolated static-host shutdown closes session, running and scheduled relay
+admission before draining, including reservations still starting. ACK and quiet
+waits check a shutdown signal independently of registry locks. Its shared-deadline
+report records each kind's `inFlight` reservations and `registryBusy`; a blocked
+Channel send or lock remains unknown, not proof of cancellation. The reservation
+covers tracked application cleanup, not OS thread teardown, upstream listeners,
+or Tauri/WebView internal delivery. Auth relays and production shutdown are not
+covered; stopping an observer does not prove its session writer stopped.
+
 | Layer | Enforced budget | Boundary of the claim |
 |---|---|---|
 | Envelope dispatcher | 16 ordinary + 4 cleanup/ACK/Stop slots; no semaphore queue | After Tauri has decoded the request; not a request-byte bound |
-| Session event relay | 32 live threads; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
+| Session event relay | 32 reservations; 16 queued events per relay, at most 256 KiB serialized per event | Not a bound on Rust `Value` allocator overhead or the upstream pi listener |
 | Session Channel delivery | One frame awaiting client ACK, plus at most one terminal reset on failure | ACK means the JS callback ran, not rendering or WebView buffer release |
 | Management task registry | 128 retained tasks per instance | Not a global bound on instances, task-input requests or child buffers |
 | Management ledger | At most 128 records; pending and locally revoked evidence are not evicted | Agent-directory-local evidence, not a cross-process lock or recovery permission |

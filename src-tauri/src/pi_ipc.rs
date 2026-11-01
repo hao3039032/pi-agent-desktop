@@ -20,6 +20,10 @@ use tauri::{Manager, State};
 use management_host::{ManagementHost, ManagementSpawnConfig};
 use session_host::SessionRegistry;
 
+#[cfg(test)]
+#[path = "pi_ipc_relay_shutdown_tests.rs"]
+mod relay_shutdown_tests;
+
 // Terminal output frames carry base64 inside JSON Channels today; the
 // raw-bytes upgrade (protocol doc §4) lands with the M4 binary channel.
 
@@ -30,6 +34,33 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// The managed host state (one registry per app process). The registry and
 /// version counter are Arc-backed so stream relays (the running-set stream)
 /// outlive the request that opened them.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerShutdownReport {
+    pub stopped: bool,
+    pub active_unknown: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayShutdownStatus {
+    pub in_flight: usize,
+    pub registry_busy: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayShutdownReport {
+    pub session: RelayShutdownStatus,
+    pub running: RelayShutdownStatus,
+    pub scheduled: RelayShutdownStatus,
+}
+impl RelayShutdownReport {
+    pub fn is_complete(&self) -> bool {
+        [&self.session, &self.running, &self.scheduled].iter().all(|s| s.in_flight == 0 && !s.registry_busy)
+    }
+}
+
 pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
     /// Global policy transaction gate shared with session admission and drains.
@@ -49,16 +80,13 @@ pub struct IpcHostState {
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
     session_relay_gate: Arc<tokio::sync::Semaphore>,
     running_relay_gate: Arc<tokio::sync::Semaphore>,
+    relay_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// The provider-auth domain's login-stream relays (the same release
     /// contract: unsubscribe detaches only the observer). Kept in the
     /// domain's own map so the shared one stays untouched.
     pub(crate) login_relays: Arc<crate::provider_auth::LoginRelays>,
-    /// Running-set relay THREADS alive right now (the thread-lifetime
-    /// truth, distinct from `event_relays`, which the unsubscribe handler
-    /// clears itself): a relay that ignores its stop flag would hold this
-    /// count up — the leak the cancel contract (Terra P2-2) forbids, so the
-    /// tests watch THIS counter, not the map, to prove the threads really
-    /// end instead of merely being deregistered.
+    /// Running relay work, distinct from registrations removed by unsubscribe.
+    /// This diagnostic is not proof of OS thread teardown.
     running_relay_threads: Arc<AtomicUsize>,
     /// The terminal registry (portable-pty; crates/pty-host).
     pub terminals: Arc<pty_host::PtyHost>,
@@ -71,6 +99,7 @@ pub struct IpcHostState {
     /// resolved at startup; until then the models ops answer
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
+    pub session_writers: Arc<crate::session_writer_lifecycle::SessionWriterLifecycle>,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     mcp_signin_tasks: Mutex<BTreeSet<String>>,
     /// The scheduled-task store root (the agent dir the host runs against).
@@ -79,16 +108,21 @@ pub struct IpcHostState {
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
     pub(crate) scheduled_active: Arc<Mutex<BTreeSet<String>>>,
+    pub(crate) scheduled_lifecycle: Arc<crate::scheduled_lifecycle::ScheduledLifecycle>,
     pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
     pub(crate) native_drops: crate::native_drop::NativeDrops,
     /// The file access allow-list (the /api/files security boundary).
     pub file_roots: Mutex<crate::file_access::AllowedRoots>,
+    file_roots_init_error: Option<String>,
     /// Authorized save destinations (bound via native dialog selections).
     pub authorized_save_destinations: Mutex<HashMap<String, std::time::Instant>>,
     /// Per-cwd cache for files.index.
     pub file_index_cache: Mutex<HashMap<String, crate::file_resources::CachedFileIndex>>,
+    pub(crate) index_children: crate::index_children::IndexChildOwner,
+    #[cfg(all(test, unix))]
+    pub(crate) index_git_executable: Mutex<Option<PathBuf>>,
     /// Paths the HOST itself proposed (session cwds, project roots from the
     /// session index, artifact locations). resource grants only ever accept
     /// members of this set — the frontend cannot mint its own.
@@ -98,6 +132,7 @@ pub struct IpcHostState {
     pub projects: crate::session_view::ProjectResolver,
     /// Private exported HTML directories, removed on eviction or host exit.
     pub(crate) session_exports: Mutex<std::collections::VecDeque<tempfile::TempDir>>,
+    pub(crate) title_tasks: Mutex<HashMap<String, Option<Arc<Mutex<crate::session_title::TitleTask>>>>>,
     /// The catalogue's version counter (`invalidateSessionListCache` +
     /// `getSessionListVersion`): bumped by every host-visible mutation that
     /// changes the list a client holds (a create, a rename). Clients compare
@@ -107,6 +142,8 @@ pub struct IpcHostState {
     chat_unlock_policy: ChatUnlockPolicy,
     #[cfg(test)]
     pub(crate) session_writer_timeout: Mutex<Duration>,
+    #[cfg(test)]
+    pub(crate) title_rename_timeout: Mutex<Duration>,
     /// The bounded dispatch gate for the async entry
     /// ([`dispatch_envelope_gated`]); shared as an Arc so blocking tasks
     /// hold owned permits, never borrows of this state.
@@ -136,8 +173,12 @@ struct EventRelayHandle {
 pub(crate) struct SessionRelayAck {
     state: Mutex<(u64, u64)>, // sent, acknowledged
     wake: std::sync::Condvar,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 impl SessionRelayAck {
+    pub(crate) fn with_shutdown(shutdown: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { shutdown, ..Self::default() }
+    }
     pub(crate) fn acknowledge(&self, seq: u64) -> bool {
         let Ok(mut state) = self.state.lock() else { return false };
         if seq == 0 || seq > state.0 { return false; }
@@ -147,14 +188,21 @@ impl SessionRelayAck {
     }
     pub(crate) fn wake(&self) { self.wake.notify_all(); }
     pub(crate) fn forward(&self, channel: &Channel<Value>, frame: Value, seq: u64, stop: &std::sync::atomic::AtomicBool, timeout: Duration) -> bool {
+        if stop.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) { return false; }
         {
             let Ok(mut state) = self.state.lock() else { return false };
             state.0 = seq;
         }
         if channel.send(frame).is_err() { return false; }
-        let Ok(state) = self.state.lock() else { return false };
-        let Ok((state, _)) = self.wake.wait_timeout_while(state, timeout, |state| state.1 < seq && !stop.load(Ordering::SeqCst)) else { return false };
-        state.1 >= seq && !stop.load(Ordering::SeqCst)
+        let Ok(mut state) = self.state.lock() else { return false };
+        let deadline = std::time::Instant::now() + timeout;
+        while state.1 < seq && !stop.load(Ordering::SeqCst) && !self.shutdown.load(Ordering::SeqCst) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { break; }
+            let Ok((next, _)) = self.wake.wait_timeout(state, remaining.min(RELAY_SHUTDOWN_POLL)) else { return false };
+            state = next;
+        }
+        state.1 >= seq && !stop.load(Ordering::SeqCst) && !self.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -201,7 +249,7 @@ impl IpcHostState {
         let fence_agent_dir = Arc::clone(&task_agent_dir);
         let management_agent_dir = Arc::clone(&task_agent_dir);
         let admitted_agent_dir = Mutex::new(None::<PathBuf>);
-        let checker: session_host::SessionFenceChecker = Arc::new(move |id| {
+        let checker: session_host::SessionFenceChecker = Arc::new(move |id, owner| {
             let agent = fence_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?
                 .clone().ok_or_else(|| "Agent directory unavailable".to_string())?;
             let mut admitted = admitted_agent_dir.lock().map_err(|_| "Agent directory unavailable".to_string())?;
@@ -212,8 +260,13 @@ impl IpcHostState {
             if crate::trust_policy_fence::is_pending(&agent) {
                 return Err("Trust policy outcome is unresolved; session admission is blocked".into());
             }
-            crate::session_writer_fence::assert_session_writable(&agent, id)
+            match owner {
+                Some(operation_id) => crate::session_writer_fence::assert_owned_title_fence(&agent, id, operation_id),
+                None => crate::session_writer_fence::assert_session_writable(&agent, id),
+            }
         });
+        let mut initial_roots = crate::file_access::AllowedRoots::new();
+        let file_roots_init_error = std::env::var_os("HOME").and_then(|home| initial_roots.add_default_cwd_roots(Path::new(&home)).err().map(|e| e.to_string()));
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
@@ -228,6 +281,7 @@ impl IpcHostState {
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             session_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_SESSION_RELAYS)),
             running_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_RUNNING_RELAYS)),
+            relay_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             login_relays: Arc::new(Default::default()),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
@@ -235,6 +289,10 @@ impl IpcHostState {
             terminals,
             #[cfg(test)]
             terminal_test_shell: Mutex::new(None),
+            title_tasks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            title_rename_timeout: Mutex::new(Duration::from_secs(30)),
+            session_writers: Arc::new(Default::default()),
             management: ManagementHost::with_agent_dir_check(Arc::new(move |configured| {
                 let pinned = management_agent_dir.lock().map_err(|_| "agent directory unavailable")?;
                 if pinned.as_deref() != Some(configured) { return Err("management agent directory differs from host agent directory".into()); }
@@ -247,20 +305,17 @@ impl IpcHostState {
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
+            scheduled_lifecycle: Arc::new(crate::scheduled_lifecycle::ScheduledLifecycle::default()),
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             native_drops: crate::native_drop::NativeDrops::default(),
-            file_roots: {
-                let mut roots = crate::file_access::AllowedRoots::new();
-                // The legacy default-cwd layouts stay browsable across
-                // restarts (the /api/files scan behavior).
-                if let Some(home) = std::env::var_os("HOME") {
-                    roots.add_default_cwd_roots(Path::new(&home));
-                }
-                Mutex::new(roots)
-            },
+            file_roots: Mutex::new(initial_roots),
+            file_roots_init_error,
             authorized_save_destinations: Mutex::new(HashMap::new()),
             file_index_cache: Mutex::new(HashMap::new()),
+            index_children: crate::index_children::IndexChildOwner::default(),
+            #[cfg(all(test, unix))]
+            index_git_executable: Mutex::new(None),
             proposed_paths: Mutex::new(BTreeSet::new()),
             projects: crate::session_view::ProjectResolver::new(),
             session_exports: Mutex::new(std::collections::VecDeque::new()),
@@ -270,6 +325,48 @@ impl IpcHostState {
             chat_unlock_policy: ChatUnlockPolicy::Denied,
             #[cfg(test)]
             session_writer_timeout: Mutex::new(Duration::from_secs(60)),
+        }
+    }
+
+    /// Close both IPC lanes and fence tracked child starts before draining
+    /// already-admitted calls. This does not prove detached writers stopped.
+    pub(crate) fn begin_static_shutdown(&self) {
+        self.dispatch_gate.close();
+        self.dispatch_control_gate.close();
+        self.session_relay_gate.close();
+        self.running_relay_gate.close();
+        self.scheduled_events.begin_shutdown();
+        self.relay_shutdown.store(true, Ordering::SeqCst);
+        self.index_children.begin_shutdown();
+        self.begin_scheduler_shutdown();
+        self.management.begin_shutdown();
+        self.session_writers.begin_shutdown();
+    }
+
+    pub(crate) fn drain_static_ipc_until(&self, deadline: std::time::Instant) -> Result<(), String> {
+        loop {
+            let ordinary = IPC_MAX_CONCURRENT_DISPATCH - self.dispatch_gate.available_permits();
+            let control = IPC_MAX_CONCURRENT_CONTROL - self.dispatch_control_gate.available_permits();
+            if ordinary == 0 && control == 0 { return Ok(()); }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("IPC operations still in flight: {ordinary} ordinary, {control} control"));
+            }
+            std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));
+        }
+    }
+
+    /// Reservations include subscriptions still starting and all tracked relay
+    /// cleanup. They do not certify OS thread teardown or WebView delivery.
+    pub(crate) fn drain_stream_relays_until(&self, deadline: std::time::Instant) -> RelayShutdownReport {
+        loop {
+            let registry_busy = self.event_relays.try_lock().is_err();
+            let report = RelayShutdownReport {
+                session: RelayShutdownStatus { in_flight: IPC_MAX_SESSION_RELAYS - self.session_relay_gate.available_permits(), registry_busy },
+                running: RelayShutdownStatus { in_flight: IPC_MAX_RUNNING_RELAYS - self.running_relay_gate.available_permits(), registry_busy },
+                scheduled: RelayShutdownStatus { in_flight: self.scheduled_events.in_flight(), registry_busy: self.scheduled_events.registry_busy() },
+            };
+            if report.is_complete() || std::time::Instant::now() >= deadline { return report; }
+            std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));
         }
     }
 
@@ -302,8 +399,10 @@ impl IpcHostState {
 
     pub fn start_scheduler(self: &Arc<Self>) -> Result<(), String> {
         let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        if self.scheduled_lifecycle.is_closing() { return Err("Scheduler is shutting down".into()); }
         let mut current = self.scheduler_loop.lock().unwrap();
         if current.is_none() {
+            self.scheduled_lifecycle.prepare_start().map_err(str::to_string)?;
             *current = Some(crate::scheduler_tick::SchedulerLoop::start(Arc::clone(self), Duration::from_secs(30))?);
         }
         Ok(())
@@ -315,48 +414,77 @@ impl IpcHostState {
     }
 
     fn stop_scheduler_locked(&self) {
-        let mut current = self.scheduler_loop.lock().unwrap();
+        let scheduler = self.scheduler_loop.lock().unwrap().take();
         self.scheduler_owner.store(false, Ordering::SeqCst);
-        let scheduler = current.take();
-        drop(scheduler);
+        if let Some(mut scheduler) = scheduler { scheduler.stop(); }
         self.scheduler_owner.store(false, Ordering::SeqCst);
     }
 
-    /// Host shutdown: stop new claims, reap linked child sessions, then let
-    /// their workers persist outcomes before management instances are closed.
-    pub fn shutdown_scheduler(&self) -> Result<(), String> {
-        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
-        self.stop_scheduler_locked();
-        let repo = task_scheduler::task_repository::TaskRepository::new(self.agent_dir());
-        let deadline = std::time::Instant::now() + Duration::from_secs(35);
-        loop {
-            let active = self.scheduled_active.lock().unwrap().clone();
-            if active.is_empty() { return Ok(()); }
-            for task in repo.list()? {
-                let Some(task_id) = task["id"].as_str() else { continue };
-                for run in repo.runs(task_id)? {
-                    if run["runId"].as_str().is_some_and(|id| active.contains(id)) {
-                        if let Some(session_id) = run["sessionId"].as_str() {
-                            self.registry.remove(session_id, Duration::from_secs(5));
-                        }
-                    }
-                }
-            }
-            if std::time::Instant::now() >= deadline { return Err("Scheduled runs did not stop during host shutdown".into()); }
-            std::thread::sleep(Duration::from_millis(20));
+    /// Fence final scheduler and session admission without acquiring a lock.
+    pub fn begin_scheduler_shutdown(&self) {
+        self.scheduled_lifecycle.begin_shutdown();
+        self.registry.begin_shutdown();
+        if let Ok(current) = self.scheduler_loop.try_lock() {
+            if let Some(scheduler) = current.as_ref() { scheduler.begin_shutdown(); }
         }
+    }
+
+    /// Final host shutdown, distinct from pausing the scheduler. The session
+    /// registry's report includes prompt/child unknowns and uses this deadline.
+    pub fn shutdown_scheduler_until(&self, deadline: std::time::Instant) -> SchedulerShutdownReport {
+        self.begin_scheduler_shutdown();
+        let sessions = self.registry.shutdown_until(deadline);
+        let mut unknown = sessions.unknown;
+        loop {
+            let lifecycle_free = self.scheduler_lifecycle.try_lock().is_ok();
+            let timer_stopped = match self.scheduler_loop.try_lock() {
+                Ok(mut current) => match current.as_mut() {
+                    Some(timer) => timer.shutdown_until(std::time::Instant::now()),
+                    None => true,
+                },
+                Err(_) => false,
+            };
+            let active = self.scheduled_lifecycle.snapshot();
+            if lifecycle_free && timer_stopped && matches!(&active, Ok(entries) if entries.is_empty()) { break; }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                if !lifecycle_free { unknown.push("scheduler lifecycle busy".into()); }
+                if !timer_stopped { unknown.push("scheduler timer still running or unavailable".into()); }
+                match active {
+                    Ok(entries) => unknown.extend(entries.into_iter().map(|(id, session, unresolved, detail)| format!("{id}: {}{}{}", if unresolved { "scheduled outcome unresolved" } else { "scheduled run or start in flight" }, session.map(|id| format!(" (session {id})")).unwrap_or_default(), detail.map(|value| format!("; {value}")).unwrap_or_default()))),
+                    Err(error) => unknown.push(error.into()),
+                }
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        SchedulerShutdownReport { stopped: unknown.is_empty(), active_unknown: unknown }
+    }
+
+    pub fn shutdown_scheduler(&self) -> Result<(), String> {
+        let report = self.shutdown_scheduler_until(std::time::Instant::now() + Duration::from_secs(35));
+        if report.stopped { Ok(()) } else { Err(report.active_unknown.join("; ")) }
     }
 
     /// Record a path the HOST derived (a session cwd or project root from
     /// the index scan). Such paths become grantable resources and, for
     /// directories, browsable file roots — the /api/files semantics where
     /// roots derive from session data, never from a client-supplied path.
-    pub fn propose_path(&self, path: &Path) {
-        let text = path.to_string_lossy().into_owned();
-        self.proposed_paths.lock().unwrap().insert(text.clone());
-        if path.is_dir() {
-            self.file_roots.lock().unwrap().add(path);
+    pub fn propose_path(&self, path: &Path) -> std::io::Result<()> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => self.file_roots.lock().unwrap().add(path)?,
+            Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "workspace is not a directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.file_roots.lock().unwrap().add_missing(path),
+            Err(error) => return Err(error),
         }
+        self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
+        Ok(())
+    }
+
+    pub(crate) fn reauthorize_selected_path(&self, path: &Path) -> std::io::Result<()> {
+        self.file_roots.lock().unwrap().reauthorize(path)?;
+        self.proposed_paths.lock().unwrap().insert(path.to_string_lossy().into_owned());
+        Ok(())
     }
 
     /// Whether the host itself proposed this exact path.
@@ -366,21 +494,17 @@ impl IpcHostState {
 
     /// Recover a persisted workspace from the host's session headers even if
     /// cwd validation races the first sidebar scan. Frontend paths alone grant nothing.
-    fn discover_session_cwd(&self, cwd: &Path) {
-        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return; }
+    fn discover_session_cwd(&self, cwd: &Path) -> std::io::Result<()> {
+        if self.is_proposed(&cwd.to_string_lossy()) && self.file_roots.lock().unwrap().is_path_allowed(cwd) { return Ok(()); }
         let index = session_host::scan_sessions(&self.agent_dir());
         if index.projects.keys().any(|known| Path::new(known) == cwd) {
             let agent_dir = self.agent_dir();
             let is_chat = crate::session_view::is_chat_workspace_path(cwd, &agent_dir);
             let in_chat = crate::worktrees::is_chat_area(cwd, &agent_dir);
-            if cwd.exists() && is_chat != in_chat { return; }
-            self.propose_path(cwd);
-            if !cwd.exists() {
-                // A deleted session cwd is still a known lexical root for the
-                // read-only missing status; it cannot authorize existing files.
-                self.file_roots.lock().unwrap().add(cwd);
-            }
+            if cwd.exists() && is_chat != in_chat { return Ok(()); }
+            self.propose_path(cwd)?;
         }
+        Ok(())
     }
 
     /// The agent dir this host runs against (sessions.list, the task store).
@@ -592,11 +716,7 @@ fn resolve_managed_modules() -> Option<PathBuf> {
 /// config stays None and models ops answer management_unavailable).
 fn resolve_management_config(agent_dir: PathBuf) -> Option<ManagementSpawnConfig> {
     let executable = resolve_pi_executable()?;
-    let dev = Path::new("../lib/pi-rpc/assets/pi-web-management.mjs");
-    let extension = match dev.canonicalize() {
-        Ok(resolved) if resolved.is_file() => Some(resolved),
-        _ => None,
-    }?;
+    let extension = resolve_asset("pi-web-management.mjs", "PI_WEB_MANAGEMENT_EXTENSION")?;
     let managed = resolve_managed_modules()?;
     Some(ManagementSpawnConfig {
         executable: executable.to_string_lossy().into_owned(),
@@ -644,6 +764,7 @@ pub(crate) fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &s
 
 #[tauri::command]
 pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event: Channel<Value>) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     match state.scheduled_events.subscribe(on_event) {
         Ok(subscription_id) => json!({ "subscriptionId": subscription_id, "epoch": 1 }),
         Err(error) => protocol_error("?", "io", &error),
@@ -656,9 +777,10 @@ pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event:
 /// when the receiver unsubscribes (`agent.unsubscribeEvents`, page reload,
 /// window close) or the session leaves the registry; the relay thread then
 /// detaches — a dropped channel alone must not leak a thread.
-/// Session relay threads remain counted until their actual exit, even after
-/// unsubscribe. This cap does not bound channel transport buffers.
+/// Reservations remain counted through relay cleanup, even after unsubscribe.
+/// This cap does not bound channel transport buffers or prove OS thread exit.
 pub const IPC_MAX_SESSION_RELAYS: usize = 32;
+pub(crate) const RELAY_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
 #[tauri::command]
 pub fn pi_ipc_subscribe_events(
@@ -666,6 +788,7 @@ pub fn pi_ipc_subscribe_events(
     session: String,
     on_event: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     subscribe_session_events(&state, session, on_event)
 }
 
@@ -674,6 +797,8 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
         Ok(permit) => permit,
         Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"session stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
     };
+    let permit = Arc::new(permit);
+    if state.relay_shutdown.load(Ordering::SeqCst) { return protocol_error("?", "busy", "relay admission closed"); }
     let Some(session_handle) = state.registry.get(&session) else {
         return protocol_error("?", "not_found", &format!("no running session {session}"));
     };
@@ -687,7 +812,7 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ack = Arc::new(SessionRelayAck::default());
+    let ack = Arc::new(SessionRelayAck::with_shutdown(Arc::clone(&state.relay_shutdown)));
     let ack_for_relay = Arc::clone(&ack);
     let stop_for_relay = Arc::clone(&stop);
     let relays_for_thread = Arc::clone(&state.event_relays);
@@ -702,6 +827,9 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
         },
     );
 
+    // The reservation remains held across registration and all cleanup.
+    let relay_permit = Arc::clone(&permit);
+    let shutdown = Arc::clone(&state.relay_shutdown);
     // The relay: snapshot first, then every record in order. A closed
     // channel (send error) or the unsubscribe flag ends the loop and
     // detaches the subscriber.
@@ -709,13 +837,15 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
     let spawn = std::thread::Builder::new()
         .name(format!("ipc-events-{subscription_id}"))
         .spawn(move || {
-            let _permit = permit;
+            let _permit = relay_permit;
+            (move || {
             let session_handle = relay_session;
             let subscription_id = subscription_id_for_relay;
             let detach = |subscriber_id| {
                 session_handle.unsubscribe(subscriber_id);
                 relays_for_thread.lock().unwrap().remove(&subscription_for_cleanup);
             };
+            if shutdown.load(Ordering::SeqCst) { detach(subscriber_id); return; }
             let mut seq: u64 = 0;
             let snapshot = json!({
                 "epoch": session_handle.epoch(),
@@ -726,7 +856,7 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                 "pendingExtensionUiIds": pending_ui.iter().filter_map(|record| record.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
             });
             let send = |seq, kind, payload| ack_for_relay.forward(&on_event, stream_frame(&subscription_id, epoch, seq, kind, payload), seq, &stop_for_relay, Duration::from_secs(15));
-            let reset = |seq| { if !stop_for_relay.load(Ordering::SeqCst) { let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"}))); } };
+            let reset = |seq| { if !stop_for_relay.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) { let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"}))); } };
             seq += 1;
             if !send(seq, "snapshot", snapshot) {
                 reset(seq + 1);
@@ -742,17 +872,17 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                 }
             }
             loop {
-                if stop_for_relay.load(Ordering::SeqCst) {
+                if stop_for_relay.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                     detach(subscriber_id);
                     return;
                 }
                 if gap.load(Ordering::SeqCst) {
                     seq += 1;
-                    let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                    reset(seq);
                     detach(subscriber_id);
                     return;
                 }
-                match events.recv_timeout(Duration::from_millis(500)) {
+                match events.recv_timeout(RELAY_SHUTDOWN_POLL) {
                     Ok(record) => {
                         seq += 1;
                         if !send(seq, "event", record) {
@@ -765,13 +895,14 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         if gap.load(Ordering::SeqCst) {
                             seq += 1;
-                            let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                            reset(seq);
                         }
                         detach(subscriber_id);
                         return;
                     }
                 }
             }
+            })();
         });
     if let Err(error) = spawn {
         session_handle.unsubscribe(subscriber_id);
@@ -834,9 +965,7 @@ impl std::io::Write for RunningFrameSize {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-/// Drops of this guard are the relay thread's LAST act (every exit path):
-/// the alive count in `IpcHostState::running_relay_threads` therefore
-/// measures the thread's real lifetime, not its registration.
+/// Counts tracked running relay work independently of registration.
 struct RunningRelayAlive(Arc<AtomicUsize>);
 impl Drop for RunningRelayAlive {
     fn drop(&mut self) {
@@ -860,6 +989,7 @@ pub fn pi_ipc_subscribe_running(
     state: State<'_, Arc<IpcHostState>>,
     on_frame: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     subscribe_running(&state, on_frame, RUNNING_CHANNEL_PROBE)
 }
 
@@ -872,13 +1002,15 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
         Ok(permit) => permit,
         Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"running stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
     };
+    let permit = Arc::new(permit);
+    if state.relay_shutdown.load(Ordering::SeqCst) { return protocol_error("?", "busy", "relay admission closed"); }
     let mut nonce = [0u8; 16];
     if let Err(error) = getrandom::fill(&mut nonce) {
         return protocol_error("?", "io", &format!("running subscription identity unavailable: {error}"));
     }
     let subscription_id = format!("run-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ack = Arc::new(SessionRelayAck::default());
+    let ack = Arc::new(SessionRelayAck::with_shutdown(Arc::clone(&state.relay_shutdown)));
     state.event_relays.lock().unwrap().insert(
         subscription_id.clone(),
         EventRelayHandle {
@@ -894,20 +1026,22 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
     let running_signal = registry.running_signal();
     let relays_alive = Arc::clone(&state.running_relay_threads);
     let subscription_for_relay = subscription_id.clone();
-    // Counted the moment the thread exists; the guard's Drop (the thread's
-    // last act on every exit path) decrements it back.
+    let relay_permit = Arc::clone(&permit);
+    let shutdown = Arc::clone(&state.relay_shutdown);
+    // Count before spawn so even a starting relay remains observable.
     state.running_relay_threads.fetch_add(1, Ordering::SeqCst);
     let relay = std::thread::Builder::new()
         .name("ipc-running".into())
         .spawn(move || {
             let subscription_id = subscription_for_relay;
             let _alive = RunningRelayAlive(relays_alive);
-            let _permit = permit;
+            let _permit = relay_permit;
+            (move || {
             // Preflight the set before constructing the JSON frame; the
             // fixed envelope is substantially smaller than this reserve.
             let fits = |running: &Vec<String>| serde_json::to_writer(&mut RunningFrameSize(512), running).is_ok();
             let reset = |seq| {
-                if !stop.load(Ordering::SeqCst) {
+                if !stop.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
                     let _ = on_frame.send(stream_frame(&subscription_id, 1, seq, "reset", json!({"reason":"relay_gap"})));
                 }
             };
@@ -933,7 +1067,7 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
             let mut signal_epoch = running_signal.epoch();
             let mut replay_seq = running_signal.last_seq();
             loop {
-                if stop.load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                     detach();
                     return;
                 }
@@ -1012,7 +1146,7 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
                             // frame may leave after an unsubscribe lands —
                             // re-check the stop flag between frames so a
                             // multi-frame replay cannot outrun a cancel.
-                            if stop.load(Ordering::SeqCst) {
+                            if stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                                 detach();
                                 return;
                             }
@@ -1054,8 +1188,16 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
                 // settle, exit, removal) or a wake-only bump (a catalogue
                 // version change, an unsubscribe) moves the signal, or the
                 // probe deadline passes (the dead-channel reaper).
-                signal_epoch = running_signal.wait_for_change(signal_epoch, probe_after);
+                loop {
+                    let remaining = probe_after.saturating_sub(last_sent_at.elapsed());
+                    let next = running_signal.wait_for_change(signal_epoch, remaining.min(RELAY_SHUTDOWN_POLL));
+                    if next != signal_epoch || remaining.is_zero() || stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                        signal_epoch = next;
+                        break;
+                    }
+                }
             }
+            })();
         });
     match relay {
         Ok(_) => json!({ "subscriptionId": subscription_id }),
@@ -1085,6 +1227,7 @@ pub fn pi_ipc_subscribe_terminal(
     cursor: u64,
     on_output: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     let subscription_id = format!("term-{}", state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1);
     match state.terminal_streams.subscribe(&id, subscription_id.clone(), cursor, move |frame| on_output.send(frame).is_ok()) {
         Ok(()) => json!({ "subscriptionId": subscription_id }),
@@ -1185,6 +1328,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
     let Some(op) = envelope.get("op").and_then(Value::as_str) else {
         return protocol_error(&id, "invalid_args", "the request has no op");
     };
+    if let Some(error) = &state.file_roots_init_error { return protocol_error(&id, "io", error); }
     let args = envelope.get("args").cloned().unwrap_or(json!({}));
     if !args.is_object() {
         return protocol_error(&id, "invalid_args", "args must be an object");
@@ -1347,7 +1491,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             // The /api/files semantics: session cwds (and the chat roots)
             // become browsable roots, derived host-side.
             for (cwd, _) in index.projects.iter() {
-                state.propose_path(Path::new(cwd));
+                if let Err(error) = state.propose_path(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             }
             let mut data = session_host::history::index_json(&index);
             if let Some(object) = data.as_object_mut() {
@@ -1450,7 +1594,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             // Host-derived roots stay in step with the catalogue's cwds.
             for value in sessions.iter() {
                 if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
-                    state.propose_path(Path::new(cwd));
+                    if let Err(error) = state.propose_path(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                 }
             }
             // The hidden chat root (ensureChatWorkspace; the sidebar's new-chat
@@ -1460,7 +1604,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 .unwrap_or_else(|_| {
                     crate::session_view::chat_workspace_dir(&agent_dir).display().to_string()
                 });
-            state.propose_path(Path::new(&chat_root));
+            if let Err(error) = state.propose_path(Path::new(&chat_root)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             protocol_ok(
                 &id,
                 json!({
@@ -1477,7 +1621,18 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // lib/session-projection.ts bundle; this host owns resolution
         // (live child first, disk scan second), the live one-shot snapshot,
         // workspace classification and the git project identity.
-        "sessions.autoName" => protocol_error(&id, "not_supported", "Automatic session naming is unavailable until the live provider's request semantics can be preserved."),
+        "sessions.autoName" => match crate::session_title::start(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.autoNameStatus" => match crate::session_title::status(state, &args) {
+            Ok(data) => { if data.get("title").is_some() { bump_session_list_version(state); } protocol_ok(&id, data) },
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
+        "sessions.autoNameCancel" => match crate::session_title::cancel(state, &args) {
+            Ok(data) => protocol_ok(&id, data),
+            Err((code, message)) => protocol_error(&id, &code, &message),
+        },
         "agent.command" if args.get("type").and_then(Value::as_str) == Some("abort_branch_summary") => {
             protocol_error(&id, "not_supported", "Branch summaries are unavailable in the desktop session host.")
         }
@@ -1627,7 +1782,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         // gets proposed for browsing.
         "cwd.status" => {
             let Some(cwd) = args.get("cwd").and_then(Value::as_str) else { return protocol_error(&id, "invalid_args", "An absolute cwd is required"); };
-            state.discover_session_cwd(Path::new(cwd));
+            if let Err(error) = state.discover_session_cwd(Path::new(cwd)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
             match crate::workspace_status::status(&state.file_roots.lock().unwrap(), cwd) {
                 Ok(result) => protocol_ok(&id, result),
                 Err((code, message)) => protocol_error(&id, code, message),
@@ -1643,7 +1798,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let agent_dir = state.agent_dir();
             match crate::session_view::ensure_chat_workspace(&agent_dir) {
                 Ok(cwd) => {
-                    state.propose_path(&cwd);
+                    if let Err(error) = state.propose_path(&cwd) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     protocol_ok(&id, json!({ "cwd": cwd.display().to_string() }))
                 }
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
@@ -1660,7 +1815,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                 .join(format!("{year:04}{month:02}{day:02}"));
             match std::fs::create_dir_all(&dir) {
                 Ok(()) => {
-                    state.propose_path(&dir);
+                    if let Err(error) = state.propose_path(&dir) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     protocol_ok(&id, json!({ "cwd": dir.display().to_string() }))
                 }
                 Err(error) => protocol_error(&id, "io", &error.to_string()),
@@ -2524,46 +2679,41 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(unix)]
             let opened = {
                 let target_path = Path::new(path);
-                let scoped = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, target_path)
-                };
-                let scoped = if scoped.is_some() { scoped } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
+                let roots = state.file_roots.lock().unwrap();
+                if roots.is_path_allowed(target_path) {
+                    Some(roots.open_file(target_path))
+                } else if let Some(session) = args.get("sessionId").and_then(Value::as_str) {
                     if target_path.is_absolute() && !target_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                         match session_file_referenced(state, session, path) {
-                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| (resolved, PathBuf::from("/"))),
+                            Ok(true) => std::fs::canonicalize(target_path).ok().map(|resolved| crate::file_access::open_file_beneath_root(Path::new("/"), &resolved)),
                             Ok(false) => None,
                             Err((code, message)) => return protocol_error(&id, &code, &message),
                         }
                     } else { None }
-                } else { None };
-                scoped.map(|(target, root)| crate::file_access::open_file_beneath_root(&root, &target))
+                } else { None }
             };
             #[cfg(windows)]
-            let opened: Option<Result<std::fs::File, std::io::Error>> = None;
+            let opened = {
+                let roots = state.file_roots.lock().unwrap();
+                let target = Path::new(path);
+                if roots.is_path_allowed(target) { Some(roots.open_file(target)) } else { None }
+            };
             match opened {
                 Some(Ok(file)) => match state.resources.grant_open_file(file, Path::new(path), Duration::from_secs(600)) {
                     Ok(handle) => protocol_ok(&id, json!({ "handle": handle })),
                     Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
                 },
-                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                Some(Err(error)) => protocol_error(&id, if error.kind() == std::io::ErrorKind::PermissionDenied { "unauthorized_scope" } else { "io" }, &error.to_string()),
                 None => protocol_error(&id, "unauthorized_scope", "resource path is outside authorized roots"),
             }
         }
         "resources.grantPreview" => {
             let path = args.get("path").and_then(Value::as_str).unwrap_or_default();
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
-                let scoped = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, Path::new(path))
-                };
-                let Some((target, root)) = scoped else { return protocol_error(&id, "unauthorized_scope", "preview path is outside authorized roots"); };
-                let Some(parent) = target.parent() else { return protocol_error(&id, "invalid_args", "invalid preview path"); };
-                let Some(name) = target.file_name().and_then(|name| name.to_str()) else { return protocol_error(&id, "invalid_args", "invalid preview filename"); };
-                if crate::file_access::open_file_beneath_root(&root, &target).is_err() { return protocol_error(&id, "unauthorized_scope", "preview file cannot be opened safely"); }
-                let directory = match crate::file_access::open_directory_beneath_root(&root, parent) {
-                    Ok(directory) => directory,
+                let roots = state.file_roots.lock().unwrap();
+                let (directory, name) = match roots.open_preview_directory(Path::new(path)) {
+                    Ok(result) => result,
                     Err(error) => return protocol_error(&id, "unauthorized_scope", &error.to_string()),
                 };
                 match state.resources.grant_open_directory(directory, Duration::from_secs(600)) {
@@ -2571,7 +2721,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     Err(reason) => protocol_error(&id, denied_code(reason), &format!("{reason:?}")),
                 }
             }
-            #[cfg(windows)]
+            #[cfg(not(any(unix, windows)))]
             { let _ = path; protocol_error(&id, "unauthorized_scope", "preview resources are unavailable on this platform") }
         }
         "resources.metadata" => {
@@ -2646,7 +2796,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             match crate::worktrees::execute(op, &cwd, &args, &project) {
                 Ok((data, grants)) => {
                     for path in grants {
-                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) { state.propose_path(&path); }
+                        if !crate::worktrees::is_chat_area(&path, &state.agent_dir()) {
+                            if let Err(error) = state.propose_path(&path) { return protocol_error(&id, "unauthorized_scope", &format!("Worktree operation completed, but its root could not be authorized: {error}")); }
+                        }
                     }
                     if matches!(op, "worktrees.create" | "worktrees.switch" | "worktrees.delete") { state.projects.invalidate(); }
                     protocol_ok(&id, data)
@@ -2699,7 +2851,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     if !already_allowed {
                         // The operator explicitly chose to browse the target:
                         // a host-side root grant (propose_path records it).
-                        state.propose_path(std::path::Path::new(&target));
+                        if let Err(error) = state.propose_path(std::path::Path::new(&target)) { return protocol_error(&id, "unauthorized_scope", &error.to_string()); }
                     }
                     protocol_ok(
                         &id,
@@ -2724,16 +2876,14 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             #[cfg(unix)]
             let outcome = {
                 let roots = state.file_roots.lock().unwrap();
-                crate::file_access::resolved_read_target_with_root(&roots, &target)
-                    .map(|(resolved, root)| crate::file_access::read_beneath_root(&root, &resolved))
+                use std::io::Read;
+                Some(roots.open_file(&target).and_then(|mut file| { let mut bytes = Vec::new(); file.read_to_end(&mut bytes)?; Ok(bytes) }))
             };
             #[cfg(windows)]
             let outcome: Option<Result<Vec<u8>, std::io::Error>> = {
-                // Fail-closed until the handle-based implementation ships:
-                // the naive read re-opens by path and re-introduces the
-                // check→open race the Unix side closed.
-                let _ = &target;
-                None
+                use std::io::Read;
+                let roots = state.file_roots.lock().unwrap();
+                Some(roots.open_file(&target).and_then(|mut file| { let mut bytes = Vec::new(); file.read_to_end(&mut bytes)?; Ok(bytes) }))
             };
             match outcome {
                 None => protocol_error(&id, "unauthorized_scope", "the path is outside the allowed roots"),
@@ -2748,7 +2898,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
                     protocol_error(&id, "not_found", "no such file")
                 }
                 #[cfg(windows)]
-                Some(Err(error)) => protocol_error(&id, "io", &error.to_string()),
+                Some(Err(error)) => protocol_error(&id, if error.kind() == std::io::ErrorKind::PermissionDenied { "unauthorized_scope" } else { "io" }, &error.to_string()),
                 #[cfg(unix)]
                 Some(Err(error)) => protocol_error(
                     &id,
@@ -2795,15 +2945,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             let path = Path::new(args.get("cwd").and_then(Value::as_str).unwrap_or_default());
             #[cfg(unix)]
             {
-                let resolved = {
-                    let roots = state.file_roots.lock().unwrap();
-                    crate::file_access::resolved_read_target_with_root(&roots, path)
-                };
-                let Some((target, root)) = resolved else { return protocol_error(&id, "unauthorized_scope", "access-denied") };
-                if crate::file_access::open_directory_beneath_root(&root, &target).is_err() {
-                    return protocol_error(&id, "unauthorized_scope", "not-a-directory");
-                }
-                match crate::open_path_with_default_app(&target) {
+                let roots = state.file_roots.lock().unwrap();
+                if roots.open_directory(path).is_err() { return protocol_error(&id, "unauthorized_scope", "not-a-directory"); }
+                match crate::open_path_with_default_app(path) {
                     Ok(()) => protocol_ok(&id, json!({ "opened": true })),
                     Err(error) => protocol_error(&id, "io", &error),
                 }
@@ -4189,7 +4333,7 @@ pub(crate) fn create_session(
     )
     .map_err(|message| invalid(&message, command_type.as_deref()))?;
 
-    state.discover_session_cwd(&requested_cwd);
+    state.discover_session_cwd(&requested_cwd).map_err(|e| ("unauthorized_scope".to_string(), e.to_string(), None))?;
     let chat_root = crate::session_view::is_chat_root_path(&requested_cwd, &agent_dir);
     let chat_workspace = crate::session_view::is_chat_workspace_path(&requested_cwd, &agent_dir);
     if chat_workspace && !chat_root && (!state.is_proposed(&requested_cwd.to_string_lossy())
@@ -4269,7 +4413,7 @@ pub(crate) fn create_session(
     let (session_file, session_id) = session_host::create_session_file(&session_dir, &session_cwd)
         .map_err(|error| ("io".to_string(), error.to_string(), None))?;
     // A brand-new cwd is immediately browsable (allowFileRoot's contract).
-    state.propose_path(&session_cwd);
+    state.propose_path(&session_cwd).map_err(|e| ("unauthorized_scope".to_string(), format!("Session file created, but workspace authorization failed: {e}"), None))?;
 
     // 4. Spawn through the shared plan (kind, pin, prompts, model).
     let base = state
@@ -4657,7 +4801,7 @@ fn validate_cwd(state: &IpcHostState, args: &Value) -> Result<Value, (String, St
         return Err(("invalid_args".to_string(), "Path is required".to_string()));
     }
     let cwd = normalize_cwd(cwd_text).map_err(|message| ("invalid_args".to_string(), message))?;
-    state.discover_session_cwd(&cwd);
+    state.discover_session_cwd(&cwd).map_err(|e| ("unauthorized_scope".to_string(), e.to_string()))?;
 
     if crate::session_view::is_chat_workspace_path(&cwd, &agent_dir) {
         if !crate::session_view::is_chat_root_path(&cwd, &agent_dir)
@@ -5191,7 +5335,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             let result = send(&state, json!({"v":1,"id":"denied","op":op,"args":{"cwd":outside}}));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
         }
-        state.propose_path(&chat);
+        state.propose_path(&chat).expect("fixture root");
         for op in ["git.status", "worktrees.list", "worktrees.fetch"] {
             let result = send(&state, json!({"v":1,"id":"chat","op":op,"args":{"cwd":chat}}));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
@@ -5435,7 +5579,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&folder).expect("folder");
         std::fs::create_dir_all(dir.path().join("elsewhere")).expect("elsewhere");
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
-        state.propose_path(&folder);
+        state.propose_path(&folder).expect("fixture root");
 
         let dotted = format!(
             "{}/../chats/20260101-120000-abcd",
@@ -5460,7 +5604,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("project");
         std::fs::create_dir_all(&target).expect("target");
-        state.propose_path(&target);
+        state.propose_path(&target).expect("fixture root");
         let response = send(
             &state,
             json!({ "v": 1, "id": "cv1", "op": "cwd.validate", "args": { "cwd": target.to_string_lossy() } }),
@@ -5815,6 +5959,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         }
         let _shutdown = Shutdown(&state);
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        state.propose_path(&project).unwrap();
         let bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         let created = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"] })).expect("start session");
@@ -5893,8 +6038,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(types.iter().any(|kind| kind == "run_started"));
         assert!(types.iter().any(|kind| kind == "run_finished"));
         state.scheduled_events.unsubscribe(&subscription);
-        state.shutdown_scheduler().unwrap();
-        assert!(!agent.join("scheduled-tasks/scheduler.lock").exists());
+        let report = state.shutdown_scheduler_until(std::time::Instant::now() + Duration::from_secs(5));
+        assert!(report.active_unknown.iter().any(|item| item.contains("prompt")), "{report:?}");
+        assert!(agent.join("scheduled-tasks/scheduler.lock").exists());
         server.join().unwrap();
     }
 
@@ -6034,7 +6180,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(&png, vec![1u8; 300]).expect("write");
 
         // The host authorizes the directory; the handle is opaque.
-        state.file_roots.lock().unwrap().add(dir.path());
+        state.file_roots.lock().unwrap().add(dir.path()).expect("fixture root");
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -6111,7 +6257,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
 
         // The HOST grants the project root (the sessions.list path); reads
         // inside pass, outside stays refused even with traversal tricks.
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let read = send(
             &state,
             json!({ "v": 1, "id": "f3", "op": "files.read", "args": { "path": project.join("a.txt").display().to_string() } }),
@@ -6170,7 +6316,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // project/leak → outside/created-by-attack.txt (dangling: the victim
         // does not exist yet).
         std::os::unix::fs::symlink(&victim, project.join("leak")).expect("leak");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let evil = send(
             &state,
@@ -6205,7 +6351,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&project).expect("proj");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let roots = state.file_roots.lock().unwrap();
         let target = project.join("swapme.txt");
@@ -6239,7 +6385,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&sub).expect("sub");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let roots = state.file_roots.lock().unwrap();
         let target = sub.join("file.txt");
@@ -6277,7 +6423,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::fs::write(outside.join("secret.txt"), b"s").expect("secret");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
         let (resolved, root) = crate::file_access::resolved_read_target_with_root(&roots, &sub)
             .expect("the honest directory authorizes");
@@ -6312,7 +6458,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::write(project.join("doc.txt"), b"inside").expect("doc");
         let secret = dir.path().join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET").expect("secret");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
         let (resolved, root) = crate::file_access::resolved_read_target_with_root(
             &roots,
@@ -6352,7 +6498,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&b).expect("b");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let roots = state.file_roots.lock().unwrap();
 
         // Authorization passes on the honest layout — and SNAPSHOT the
@@ -6417,7 +6563,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).expect("proj");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let write = |name: &str, data: &str| {
             send(
                 &state,
@@ -6458,7 +6604,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         // new-path rule authorizes through the resolved parent, so the
         // resolved link target's parent (outside) fails containment.
         std::os::unix::fs::symlink(&outside, project.join("leak")).expect("leak");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let evil = send(
             &state,
@@ -6498,7 +6644,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert_eq!(denied["error"]["code"], "unauthorized_scope", "{denied}");
 
         // A host-authorized root permits its files, but never a symlink escape.
-        state.file_roots.lock().unwrap().add(dir.path());
+        state.file_roots.lock().unwrap().add(dir.path()).expect("fixture root");
         let grant = send(
             &state,
             json!({ "v": 1, "id": "g1", "op": "resources.grantFile", "args": { "path": png.display().to_string() } }),
@@ -6548,7 +6694,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
         assert_eq!(bare["error"]["code"], "invalid_args", "{bare}");
         // An allowed cwd: fine.
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let inside = send(
             &state,
             json!({ "v": 1, "id": "tc2", "op": "terminal.create", "args": { "id": "t-b", "cwd": project.display().to_string() } }),
@@ -6569,7 +6715,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let legacy = agent.join("chat-workspace/nested");
         std::fs::create_dir_all(&chat).unwrap();
         std::fs::create_dir_all(&legacy).unwrap();
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         for (i, path) in [agent.join("chats"), chat, legacy].iter().enumerate() {
             let result = send(&state, json!({ "v": 1, "id": format!("chat-{i}"), "op": "terminal.create", "args": { "id": format!("chat-{i}"), "cwd": path } }));
             assert_eq!(result["error"]["code"], "unauthorized_scope", "{result}");
@@ -6622,7 +6768,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.management_config.lock().unwrap() = None;
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path()).expect("dir");
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         let response = send(
             &state,
             json!({ "v": 1, "id": "m1", "op": "models.list", "args": { "cwd": dir.path().to_string_lossy() } }),
@@ -6698,7 +6844,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             extensions: vec![],
             env: vec![],
         });
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         let slow = tauri::async_runtime::spawn(dispatch_envelope_gated(
             Arc::clone(&state),
@@ -6725,6 +6871,23 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let slow = tauri::async_runtime::block_on(slow).expect("the slow dispatch joins");
         assert_eq!(slow["ok"], false, "the stub child exits: models.list answers its real failure");
         assert_eq!(slow["error"]["code"], "io", "{slow}");
+    }
+
+    #[test]
+    fn static_shutdown_drains_both_ipc_lanes_and_refuses_new_work() {
+        let state = Arc::new(state());
+        let ordinary = Arc::clone(&state.dispatch_gate).try_acquire_owned().unwrap();
+        let control = Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap();
+        state.begin_static_shutdown();
+        let error = state.drain_static_ipc_until(std::time::Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert!(error.contains("1 ordinary, 1 control"), "{error}");
+        let denied = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"after-close","op":"desktop.identity"}),
+        ));
+        assert_ne!(denied["ok"], true);
+        drop(ordinary);
+        drop(control);
+        state.drain_static_ipc_until(std::time::Instant::now() + Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -6868,7 +7031,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn skills_ops_validate_cwd_and_toggle_payload_before_management() {
         let state = state();
         let dir = tempfile::tempdir().expect("tempdir");
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         *state.management_config.lock().unwrap() = None;
         let cwd = dir.path().to_string_lossy();
         for args in [
@@ -6909,7 +7072,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("PI_AGENT_HOME".into(), dir.path().display().to_string())],
         });
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let cwd = project.to_string_lossy();
         let first = send(&state, json!({"v": 1, "id": "first", "op": "plugins.list", "args": {"cwd": cwd}}));
         assert_eq!(first["ok"], true, "{first}");
@@ -6951,7 +7114,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()],
             env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("FIXTURE_MARKER".into(), marker.display().to_string())],
         });
-        state.propose_path(&project); state.propose_path(&other);
+        state.propose_path(&project).expect("fixture root"); state.propose_path(&other).expect("fixture root");
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
         let first = call("plugins.install.start", json!({"cwd":project,"source":package,"scope":"global"}));
         assert_eq!(first["ok"], true, "{first}");
@@ -7013,7 +7176,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(std::process::Command::new("node").args(["../scripts/migration/build-management-modules.mjs", "--out"]).arg(&managed).status().unwrap().success());
         let state = state();
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig { executable, agent_dir: Some(agent), extensions: vec![std::path::Path::new("../lib/pi-rpc/assets/pi-web-management.mjs").canonicalize().unwrap()], env: vec![("PI_WEB_MANAGED_MODULES".into(), managed.display().to_string()), ("HOME".into(), dir.path().display().to_string()), ("USERPROFILE".into(), dir.path().display().to_string()), ("FIXTURE_MARKER".into(), marker.display().to_string())] });
-        state.propose_path(&project); state.propose_path(&other);
+        state.propose_path(&project).expect("fixture root"); state.propose_path(&other).expect("fixture root");
         let call = |op: &str, args: Value| send(&state, json!({"v":1,"id":"fixture","op":op,"args":args}));
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let started = call("plugins.install.start", json!({"cwd": project, "source":"npm:fixture", "scope":"global"}));
@@ -7089,7 +7252,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
                 ("XDG_STATE_HOME".into(), String::new()),
             ],
         });
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let cwd = project.to_string_lossy();
         let search = send(&state, json!({ "v": 1, "id": "search", "op": "skills.search", "args": { "cwd": cwd, "query": "demo" } }));
         assert_eq!(search["ok"], true, "{search}");
@@ -7130,7 +7293,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let fixture = std::path::Path::new("../lib/__fixtures__/mcp-env-server.mjs").canonicalize().unwrap();
         std::fs::write(project.join(".pi/mcp.json"), json!({"mcpServers": {"local": {"command": "node", "args": [fixture]}}}).to_string()).unwrap();
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let bridge = std::path::Path::new("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
@@ -7155,7 +7318,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let child_queued = child_session.composer_outbox.enqueue("descendant pending", None).unwrap();
         let unrelated = dir.path().join("unrelated");
         std::fs::create_dir_all(&unrelated).unwrap();
-        state.propose_path(&unrelated);
+        state.propose_path(&unrelated).expect("fixture root");
         let other = call("agent.create", json!({"cwd":unrelated,"type":"ensure_session"}));
         assert_eq!(other["ok"], true, "{other}");
         let other_id = other["data"]["sessionId"].as_str().unwrap().to_string();
@@ -7203,7 +7366,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(probe["data"]["result"]["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == "env_has" && tool["readOnly"] == true), "{probe}");
         let fresh = dir.path().join("fresh");
         std::fs::create_dir_all(&fresh).unwrap();
-        state.propose_path(&fresh);
+        state.propose_path(&fresh).expect("fixture root");
         let invalid = call("mcp.configAction", json!({"cwd":fresh,"action":"add","scope":"project","text":"","trustFolder":true}));
         assert_eq!(invalid["error"]["reason"], "import-failed", "{invalid}");
         assert!(!crate::trust_policy_fence::is_pending(&agent), "pre-write refusal releases the fence");
@@ -7415,7 +7578,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         )
         .expect("models.json");
         // The project must sit inside the allowed roots (the cwd gate).
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         // 1. models.list: the /api/models contract for the project cwd.
         let listed = send(
@@ -7476,7 +7639,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.management_config.lock().unwrap() = None;
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path()).expect("dir");
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         let cwd = dir.path().to_string_lossy().into_owned();
 
         // The op enum is closed: an unknown value never reaches an instance.
@@ -7850,7 +8013,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
             r#"{"enabledModels":["ghost-provider/ghost-model"]}"#,
         )
         .expect("settings.json");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
 
         // 1. The read: the exact EnabledModelsView through the cwd gate and
         //    the cwd-SCOPED instance.
@@ -7925,7 +8088,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
     fn terminal_roundtrip_over_the_dispatch_table() {
         let state = state();
         let dir = tempfile::tempdir().unwrap();
-        state.propose_path(dir.path());
+        state.propose_path(dir.path()).expect("fixture root");
         let cwd = dir.path().to_str().unwrap();
         let create = send(
             &state,
@@ -9836,6 +9999,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
 
+        state.propose_path(&cwd).expect("host-authorized fixture root");
+
         // Two sessions, both prompted at the stalled endpoint: each holds
         // the running set while its model call hangs.
         let mut ids: Vec<String> = Vec::new();
@@ -9995,6 +10160,8 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
 
+        state.propose_path(&cwd).expect("host-authorized fixture root");
+
         // The session exists (and its child is up) BEFORE the subscription,
         // so the first frame is a settled observation and the ONLY later
         // changes are the prompt's start and settle transitions.
@@ -10090,7 +10257,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         );
         assert_eq!(refused["error"]["code"], "unauthorized_scope");
 
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "l1", "op": "files.list", "args": { "path": project.display().to_string() } }),
@@ -10144,7 +10311,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(git(&["add", "."]).status.success());
         assert!(git(&["commit", "-qm", "init"]).status.success());
 
-        state.propose_path(&repo);
+        state.propose_path(&repo).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "gl1", "op": "files.list", "args": { "path": repo.display().to_string() } }),
@@ -10176,7 +10343,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         std::fs::create_dir_all(&other).expect("other");
         let link = project.join("linked");
         std::os::unix::fs::symlink(&outside, &link).expect("linked");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let send_allow = |id: &str, target: &std::path::Path| {
             send(
                 &state,
@@ -10241,7 +10408,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, project.join("linked")).expect("linked");
-        state.propose_path(&project);
+        state.propose_path(&project).expect("fixture root");
         let listed = send(
             &state,
             json!({ "v": 1, "id": "sl1", "op": "files.list", "args": { "path": project.display().to_string() } }),

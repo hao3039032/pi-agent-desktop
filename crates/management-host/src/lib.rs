@@ -59,6 +59,7 @@ pub struct ManagementInstance {
     instance_id: uuid::Uuid,
     client: Arc<PiRpcClient>,
     state: Arc<Mutex<InstanceState>>,
+    host_closing: Arc<std::sync::atomic::AtomicBool>,
     /// The management protocol nonce this child was spawned with. The HOST
     /// generates it at spawn (never accepted from the caller): a caller-
     /// supplied nonce — or worse, an empty one — would let a forged envelope
@@ -578,7 +579,7 @@ impl ManagementInstance {
         let (activity, evidence) = {
             let mut state = self.state.lock().unwrap();
             state.tasks.retain(|_, task| task.lock().unwrap().finished_at.map_or(true, |at| at.elapsed() < Duration::from_secs(600)));
-            if state.closing || self.client.has_exited() { return Err("management instance is closing".into()); }
+            if state.closing || self.host_closing.load(std::sync::atomic::Ordering::SeqCst) || self.client.has_exited() { return Err("management instance is closing".into()); }
             if state.tasks.len() >= 128 { return Err("management task capacity reached".into()); }
             if op.starts_with("plugins.") || op.starts_with("skills.") {
                 if kind == TaskKind::Mutation && !serial_scope { return Err("configuration mutation requires the physical scope slot".into()); }
@@ -646,7 +647,7 @@ impl ManagementInstance {
             let mut exclusive_clean_exit = false;
             let result = if let Some(mut config) = exclusive_config {
                 config.env.push(("PI_WEB_EXCLUSIVE_MUTATION".into(), "1".into()));
-                match spawn_management(&instance.scope, &config, instance.agent_dir_check.clone(), Arc::clone(&instance.admission)) {
+                match spawn_management(&instance.scope, &config, Arc::clone(&instance.host_closing), instance.agent_dir_check.clone(), Arc::clone(&instance.admission)) {
                     Ok(runner) => {
                         let cancelled = {
                             let mut record = worker_task.lock().unwrap();
@@ -988,7 +989,7 @@ impl ManagementInstance {
 
     fn admit(&self) -> Result<Activity, String> {
         let mut state = self.state.lock().unwrap();
-        if state.closing || self.client.has_exited() {
+        if state.closing || self.host_closing.load(std::sync::atomic::Ordering::SeqCst) || self.client.has_exited() {
             return Err("management instance is closing".into());
         }
         if state.active >= 128 {
@@ -1115,11 +1116,25 @@ pub struct ManagementHost {
     /// without it, two concurrent `instance()` calls for one scope both
     /// spawn a child and one becomes an orphan that is never recycled.
     start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    shutting_down: std::sync::atomic::AtomicBool,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    operations_in_flight: Mutex<HashMap<String, usize>>,
     agent_dir: Mutex<Option<PathBuf>>,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
 }
+
+struct HostOperation<'a> { host: &'a ManagementHost, scope: String }
+impl Drop for HostOperation<'_> {
+    fn drop(&mut self) {
+        let mut operations = self.host.operations_in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = operations.get_mut(&self.scope) { *count -= 1; if *count == 0 { operations.remove(&self.scope); } }
+    }
+}
+
+/// Leaders confirmed by the transport watcher; unknowns include in-flight work.
+/// Neither list proves descendant termination or mutation outcomes.
+#[derive(Debug, Default)]
+pub struct ManagementShutdownReport { pub exited: Vec<String>, pub unknown: Vec<String> }
 
 impl Default for ManagementHost {
     fn default() -> Self {
@@ -1132,11 +1147,19 @@ impl ManagementHost {
         Self {
             instances: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            operations_in_flight: Mutex::new(HashMap::new()),
             agent_dir: Mutex::new(None),
             agent_dir_check: None,
             admission: Arc::new(Mutex::new(ManagementAdmission::default())),
         }
+    }
+
+    fn begin_operation(&self, scope: &str) -> Result<HostOperation<'_>, String> {
+        let mut operations = self.operations_in_flight.lock().map_err(|_| "management admission unavailable")?;
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) { return Err("management host is shutting down".into()); }
+        *operations.entry(scope.to_string()).or_default() += 1;
+        Ok(HostOperation { host: self, scope: scope.to_string() })
     }
 
     /// Bind management admission to the host's independently pinned agent directory.
@@ -1151,6 +1174,7 @@ impl ManagementHost {
         scope: &str,
         config: &ManagementSpawnConfig,
     ) -> Result<Arc<ManagementInstance>, String> {
+        let _operation = self.begin_operation(scope)?;
         let agent_dir = config.agent_dir.as_ref().ok_or("management agent directory is not pinned")?;
         if let Some(check) = &self.agent_dir_check { check(agent_dir)?; }
         {
@@ -1174,13 +1198,14 @@ impl ManagementHost {
         if let Some(existing) = self.live_instance(&scope) {
             return Ok(existing);
         }
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) { return Err("management host is shutting down".into()); }
         let starting = {
             let mut admission = self.admission.try_lock().map_err(|_| "management admission busy")?;
             if admission.reservation.is_some() { return Err("management cooperative reservation is active".into()); }
             admission.starting_instances += 1;
             StartingInstance(Arc::clone(&self.admission))
         };
-        let instance = spawn_management(&scope, config, self.agent_dir_check.clone(), Arc::clone(&self.admission))?;
+        let instance = spawn_management(&scope, config, Arc::clone(&self.shutting_down), self.agent_dir_check.clone(), Arc::clone(&self.admission))?;
         let mut instances = self.instances.lock().unwrap();
         if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
             drop(instances);
@@ -1210,6 +1235,7 @@ impl ManagementHost {
 
     /// Recycle expired instances; returns the recycled scopes.
     pub fn recycle_expired(&self) -> Vec<String> {
+        let Ok(_operation) = self.begin_operation("recycle") else { return Vec::new() };
         let removed = {
             let mut instances = self.instances.lock().unwrap();
             let scopes: Vec<_> = instances.iter().filter(|(_, instance)| instance.retire_if_expired())
@@ -1229,6 +1255,52 @@ impl ManagementHost {
             .filter(|(_, instance)| !instance.client_has_exited())
             .map(|(scope, _)| scope.clone())
             .collect()
+    }
+
+    /// Fence new host operations and work on retained instance references.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Close tracked management leaders under one absolute deadline. Existing
+    /// tasks and spawned exclusive runners remain unknown unless separately
+    /// confirmed; their durable operation records are never cleared here.
+    pub fn shutdown_until(&self, deadline: Instant) -> ManagementShutdownReport {
+        self.begin_shutdown();
+        let mut report = ManagementShutdownReport::default();
+        match self.operations_in_flight.try_lock() {
+            Ok(operations) => report.unknown.extend(operations.keys().map(|scope| format!("{scope}: host operation in flight"))),
+            Err(_) => report.unknown.push("management admission tracking unavailable or busy".into()),
+        }
+        let instances: Vec<_> = match self.instances.try_lock() {
+            Ok(instances) => instances.iter().map(|(scope, instance)| (scope.clone(), Arc::clone(instance))).collect(),
+            Err(_) => { report.unknown.push("management registry unavailable or busy".into()); return report; }
+        };
+        // Fence every retained instance before waiting for any one of them.
+        for (_, instance) in &instances { instance.host_closing.store(true, std::sync::atomic::Ordering::SeqCst); }
+        for (scope, instance) in instances {
+            match instance.state.try_lock() {
+                Ok(mut state) => {
+                    state.closing = true;
+                    if state.active != 0 { report.unknown.push(format!("{scope}: {} operations in flight", state.active)); }
+                    for (id, task) in &state.tasks {
+                        match task.try_lock() {
+                            Ok(mut task) if task.finished_at.is_none() => {
+                                task.snapshot.status = TaskStatus::Unknown;
+                                report.unknown.push(format!("{scope}: task {id} outcome or runner unconfirmed"));
+                            }
+                            Ok(_) => {},
+                            Err(_) => report.unknown.push(format!("{scope}: task {id} lock unavailable")),
+                        }
+                    }
+                }
+                Err(_) => report.unknown.push(format!("{scope}: instance state unavailable or busy")),
+            }
+            if instance.client.close_until(deadline) { report.exited.push(scope); }
+            else { report.unknown.push(format!("{scope}: leader exit unconfirmed")); }
+        }
+        report.exited.sort(); report.unknown.sort();
+        report
     }
 
     /// Shut every live instance down (stdin EOF then a grace kill) and drop
@@ -1318,10 +1390,11 @@ fn canonical_scope(scope: &str) -> String {
 fn spawn_management(
     scope: &str,
     config: &ManagementSpawnConfig,
+    host_closing: Arc<std::sync::atomic::AtomicBool>,
     check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
 ) -> Result<Arc<ManagementInstance>, String> {
-    spawn_management_with_environment(scope, config, false, check, admission)
+    spawn_management_with_environment(scope, config, false, host_closing, check, admission)
 }
 
 /// Dedicated host-owned process for the synchronous session-file operations.
@@ -1346,13 +1419,14 @@ pub fn spawn_session_file_writer(config: &ManagementSpawnConfig) -> Result<Sessi
         || config.env.len() != 1 || config.env[0].0 != "PI_WEB_MANAGED_MODULES" {
         return Err("invalid session writer configuration".into());
     }
-    spawn_management_with_environment("session-file-writer", config, true, None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
+    spawn_management_with_environment("session-file-writer", config, true, Arc::new(std::sync::atomic::AtomicBool::new(false)), None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
 }
 
 fn spawn_management_with_environment(
     scope: &str,
     config: &ManagementSpawnConfig,
     restricted: bool,
+    host_closing: Arc<std::sync::atomic::AtomicBool>,
     check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
 ) -> Result<Arc<ManagementInstance>, String> {
@@ -1408,6 +1482,7 @@ fn spawn_management_with_environment(
         client,
         pending,
         _notify_subscription: Arc::new(notify_subscription),
+        host_closing,
         state: Arc::new(Mutex::new(InstanceState {
             lease_until: Instant::now() + IDLE_RECYCLE,
             last_used: Instant::now(),
@@ -1548,6 +1623,85 @@ fn civil_days_from(y: i64, m: i64, d: i64) -> i64 {
 mod tests {
     use super::*;
     use task_scheduler::CronOracle as _;
+
+    #[cfg(unix)]
+    fn fake_shutdown_config(dir: &std::path::Path) -> ManagementSpawnConfig {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-management");
+        std::fs::write(&script, "#!/bin/sh\nwhile IFS= read -r line; do :; done\nsleep 0.3\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ManagementSpawnConfig { executable: script.to_string_lossy().into_owned(), agent_dir: Some(dir.to_path_buf()), extensions: vec![], env: vec![] }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_until_uses_one_deadline_and_preserves_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fake_shutdown_config(dir.path());
+        let host = ManagementHost::new();
+        for scope in ["one", "two", "three"] { host.instance(scope, &config).unwrap(); }
+        let start = Instant::now();
+        let report = host.shutdown_until(start + Duration::from_millis(60));
+        assert!(start.elapsed() < Duration::from_millis(220), "shutdown exceeded shared budget");
+        assert_eq!(report.unknown.iter().filter(|entry| entry.contains("leader exit unconfirmed")).count(), 3, "{report:?}");
+        assert!(host.instance("new", &config).is_err());
+        std::thread::sleep(Duration::from_millis(400));
+        let report = host.shutdown_until(Instant::now() + Duration::from_secs(1));
+        assert_eq!(report.exited.len(), 3, "{report:?}");
+        assert!(report.unknown.is_empty(), "{report:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_until_reports_busy_instance_without_waiting_for_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fake_shutdown_config(dir.path());
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).unwrap();
+        let guard = instance.state.lock().unwrap();
+        let start = Instant::now();
+        let report = host.shutdown_until(start + Duration::from_millis(30));
+        assert!(start.elapsed() < Duration::from_millis(200));
+        assert!(report.unknown.iter().any(|entry| entry.contains("instance state unavailable or busy")), "{report:?}");
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(350));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_until_fences_retained_instance_even_if_registry_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fake_shutdown_config(dir.path());
+        let host = ManagementHost::new();
+        let instance = host.instance("global", &config).unwrap();
+        let guard = host.instances.lock().unwrap();
+        let report = host.shutdown_until(Instant::now() + Duration::from_millis(20));
+        assert!(report.unknown.iter().any(|entry| entry.contains("registry unavailable or busy")), "{report:?}");
+        assert!(instance.admit().is_err());
+        drop(guard);
+        let _ = host.shutdown_until(Instant::now() + Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_until_reports_start_waiting_for_scope_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fake_shutdown_config(dir.path());
+        let host = Arc::new(ManagementHost::new());
+        let lock = Arc::new(Mutex::new(()));
+        host.start_locks.lock().unwrap().insert("global".into(), lock.clone());
+        let guard = lock.lock().unwrap();
+        let worker = { let host = host.clone(); std::thread::spawn(move || host.instance("global", &config)) };
+        let until = Instant::now() + Duration::from_secs(2);
+        while !host.operations_in_flight.lock().unwrap().contains_key("global") {
+            assert!(Instant::now() < until); std::thread::sleep(Duration::from_millis(1));
+        }
+        let report = host.shutdown_until(Instant::now() + Duration::from_millis(20));
+        assert!(report.unknown.iter().any(|entry| entry.contains("host operation in flight")), "{report:?}");
+        drop(guard);
+        assert!(worker.join().unwrap().is_err());
+        assert!(host.scopes().is_empty());
+    }
 
     #[test]
     fn notify_router_correlates_concurrent_replies() {
@@ -1769,7 +1923,10 @@ readline.createInterface({input: process.stdin}).on('line', line => {
   pending.push([rid, payload.op]);
   if (pending.length === 2) {
     for (const [id, op] of pending.reverse()) {
-      const body = {rid:id, nonce:op === 'bad' ? 'wrong' : process.env.PI_WEB_MGMT_NONCE, ok:true, result:op};
+      if (op === 'cron.preview') {
+        emit({type:'extension_ui_request', id, method:'notify', message:'PI_WEB_MGMT_V1 ' + JSON.stringify({rid:id, nonce:'wrong', ok:true, result:'forged'})});
+      }
+      const body = {rid:id, nonce:process.env.PI_WEB_MGMT_NONCE, ok:true, result:op};
       emit({type:'extension_ui_request', id, method:'notify', message:'PI_WEB_MGMT_V1 ' + JSON.stringify(body)});
     }
     pending.length = 0;
@@ -1780,14 +1937,14 @@ readline.createInterface({input: process.stdin}).on('line', line => {
         let config = ManagementSpawnConfig { executable: executable.to_string_lossy().into_owned(), agent_dir: Some(dir.path().join("agent")), extensions: vec![], env: vec![] };
         let host = ManagementHost::new();
         let instance = host.instance("global", &config).unwrap();
-        let a = instance.start_task("good", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
-        let b = instance.start_task("bad", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let a = instance.start_task("sys.capabilities", json!({}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
+        let b = instance.start_task("cron.preview", json!({}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
         while (instance.task_snapshot(&a).unwrap().status == TaskStatus::Running || instance.task_snapshot(&b).unwrap().status == TaskStatus::Running) && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
-        assert_eq!(instance.task_snapshot(&a).unwrap().result, Some(json!("good")));
-        let bad = instance.task_snapshot(&b).unwrap();
-        assert_eq!(bad.status, TaskStatus::Unknown);
-        assert!(bad.error.unwrap().contains("wrong nonce"));
+        assert_eq!(instance.task_snapshot(&a).unwrap().result, Some(json!("sys.capabilities")));
+        let after_forged = instance.task_snapshot(&b).unwrap();
+        assert_eq!(after_forged.status, TaskStatus::Succeeded);
+        assert_eq!(after_forged.result, Some(json!("cron.preview")), "wrong nonce must neither resolve nor consume the pending request");
         host.shutdown_all(Duration::from_secs(1));
     }
 
@@ -1808,9 +1965,9 @@ export default function(pi) {
    if (payload.op === '__cancel') { tasks.get(payload.args.rid)?.abort(); return; }
    const controller = new AbortController(); tasks.set(rid, controller);
    void (async () => {
-     for (let i=0; i<1000 && payload.op === 'slow'; i++) ctx.ui.notify('PI_WEB_MGMT_PROGRESS_V1 ' + JSON.stringify({rid, nonce, progress: {i}}), 'info');
+     for (let i=0; i<1000 && payload.args.behavior === 'slow'; i++) ctx.ui.notify('PI_WEB_MGMT_PROGRESS_V1 ' + JSON.stringify({rid, nonce, progress: {i}}), 'info');
      if (payload.op !== 'sys.capabilities') await new Promise(resolve => setTimeout(resolve, 500));
-     const cancelled = controller.signal.aborted && payload.op !== 'ignore';
+     const cancelled = controller.signal.aborted && payload.args.behavior !== 'ignore';
      ctx.ui.notify('PI_WEB_MGMT_V1 ' + JSON.stringify({rid, nonce, ok: !cancelled, ...(cancelled ? {code:'cancelled', error:'cancelled'} : {result: payload.op})}), 'info');
      tasks.delete(rid);
    })();
@@ -1820,8 +1977,11 @@ export default function(pi) {
         let config = ManagementSpawnConfig { executable, agent_dir: Some(agent_dir), extensions: vec![fixture], env: vec![] };
         let host = ManagementHost::new();
         let instance = host.instance("global", &config).unwrap();
-        let a = instance.start_task("slow", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
-        let b = instance.start_task("slow", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        // Concurrency/cancellation here is read-only. Persistent mutation
+        // uncertainty is covered separately by ledger_tests and never cleared
+        // merely because a late response arrives.
+        let a = instance.start_task("cron.preview", json!({"behavior":"slow"}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
+        let b = instance.start_task("cron.preview", json!({"behavior":"slow"}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
         let read = instance.start_task("sys.capabilities", json!({}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
         let until = Instant::now() + Duration::from_secs(10);
         while instance.task_snapshot(&a).unwrap().progress.is_none() && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
@@ -1831,18 +1991,18 @@ export default function(pi) {
         assert_eq!(instance.task_snapshot(&a).unwrap().status, TaskStatus::Cancelled);
         assert_eq!(instance.task_snapshot(&b).unwrap().status, TaskStatus::Succeeded);
         assert_eq!(instance.task_snapshot(&read).unwrap().status, TaskStatus::Succeeded);
-        let unknown = instance.start_task("ignore", json!({}), Duration::from_millis(30), TaskKind::Mutation).unwrap();
+        let unknown = instance.start_task("cron.preview", json!({"behavior":"ignore"}), Duration::from_millis(30), TaskKind::ReadOnly).unwrap();
         while instance.task_snapshot(&unknown).unwrap().status == TaskStatus::Running && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
         assert_eq!(instance.task_snapshot(&unknown).unwrap().status, TaskStatus::Unknown);
         while !instance.task_snapshot(&unknown).unwrap().cancel_requested && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
         assert!(instance.task_snapshot(&unknown).unwrap().cancel_requested);
-        assert!(instance.start_task("slow", json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
-        assert!(instance.start_task("slow", json!({}), Duration::from_secs(1), TaskKind::ReadOnly).is_err());
+        assert!(instance.start_task("unclassified", json!({}), Duration::from_secs(1), TaskKind::Mutation).is_err());
+        assert!(instance.start_task("modelsConfig.put", json!({}), Duration::from_secs(1), TaskKind::ReadOnly).is_err());
         instance.expire_for_tests();
         assert!(host.recycle_expired().is_empty());
         while instance.task_snapshot(&unknown).unwrap().status == TaskStatus::Unknown && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
         assert_eq!(instance.task_snapshot(&unknown).unwrap().status, TaskStatus::Succeeded);
-        let exited = instance.start_task("ignore", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let exited = instance.start_task("cron.preview", json!({"behavior":"ignore"}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
         instance.client.kill();
         while instance.task_snapshot(&exited).unwrap().status == TaskStatus::Running && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
         assert_eq!(instance.task_snapshot(&exited).unwrap().status, TaskStatus::Unknown);
@@ -1851,7 +2011,7 @@ export default function(pi) {
         host.shutdown_all(Duration::from_secs(1));
         let host = ManagementHost::new();
         let instance = host.instance("global", &config).unwrap();
-        let running = instance.start_task("ignore", json!({}), Duration::from_secs(5), TaskKind::Mutation).unwrap();
+        let running = instance.start_task("cron.preview", json!({"behavior":"ignore"}), Duration::from_secs(5), TaskKind::ReadOnly).unwrap();
         host.shutdown_all(Duration::from_millis(100));
         assert_eq!(instance.task_snapshot(&running).unwrap().status, TaskStatus::Unknown);
         assert!(instance.start_task("sys.capabilities", json!({}), Duration::from_secs(1), TaskKind::ReadOnly).is_err());
@@ -1877,8 +2037,8 @@ export default function(pi) {
         let config = ManagementSpawnConfig { executable, agent_dir: Some(agent_dir), extensions: vec![fixture], env: vec![] };
         let host = ManagementHost::new();
         let instance = host.instance("global", &config).unwrap();
-        let error = instance.management_call("test", json!({}), Duration::from_millis(20)).unwrap_err();
-        assert!(error.contains("outcome unknown"));
+        let error = instance.management_call("cron.preview", json!({}), Duration::from_millis(20)).unwrap_err();
+        assert!(error.contains("outcome unknown"), "{error}");
         instance.expire_for_tests();
         assert!(host.recycle_expired().is_empty());
         let deadline = Instant::now() + Duration::from_secs(10);

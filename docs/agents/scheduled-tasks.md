@@ -50,6 +50,34 @@ d  does not count against the task, and a run past its time limit is aborted.
 - Routes: `app/api/scheduled-tasks/**` (list, create, edit, delete, run now, runs, seen, cron
   preview, SSE). Writes use `isApiRequestAllowed` and `hasJsonContentType` like the other settings routes.
 
+## Static-host final shutdown
+
+`IpcHostState::begin_scheduler_shutdown()` fences scheduler and session
+admission; `shutdown_scheduler_until(deadline)` returns `SchedulerShutdownReport
+{ stopped, active_unknown }` using the caller's absolute deadline and the
+session registry's leader/prompt report. It is a **final host shutdown**, not
+the scheduler pause operation: it begins shutdown of all registered sessions.
+In-flight manual and timer starts are registered before the claim; unresolved
+claim/runner outcomes remain tracked and are not reclassified as orphans.
+Busy tracking, an unfinished timer, prompt uncertainty or an unconfirmed child
+exit reports unknown rather than an empty active set. Final shutdown leaves
+the lease in place; it does not authorize recovery or prove descendant exit.
+Ordinary pause still stops the timer and releases its own lease. If runs are
+active, release is deferred until their verified completion; an unresolved
+claim retains it. Restart cancels a deferred release, or refuses while a
+release is in progress or unresolved. This changes release timing during an
+active run to avoid dropping its lease under final shutdown.
+
+A successful write of a `failed`, `aborted`, or `succeeded` run record does not
+prove the submitted prompt ended or the controlled child stopped writing. The
+shutdown report keeps ledger, prompt attribution, and writer state separate.
+The installed RPC does not correlate `agent_settled` to a specific request;
+even an apparently normal terminal event therefore remains uncorrelated. Such
+runs retain their tracking and lease, and can eventually exhaust the 128-entry
+admission cap. This is a known functional gate, not normal-run compatibility:
+closing it requires the proposed SDK-correlated prompt lifecycle (and separate
+proof of controlled-writer termination), not fabricated terminal attribution.
+
 ## Client
 - `hooks/useScheduledTasks.ts`: one store shared by the sidebar badge and the page, fed by
   `lib/scheduled-tasks/shared-stream.ts` (one stream per browser, led by one tab; see the ADR). Events
