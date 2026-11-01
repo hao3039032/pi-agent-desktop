@@ -284,6 +284,15 @@ impl AllowedRoots {
     pub(crate) fn open_directory(&self, target: &Path) -> std::io::Result<std::fs::File> { self.open_windows_target(target, true) }
     #[cfg(windows)]
     pub(crate) fn open_file(&self, target: &Path) -> std::io::Result<std::fs::File> { self.open_windows_target(target, false) }
+    #[cfg(windows)]
+    pub(crate) fn open_preview_directory(&self, target: &Path) -> std::io::Result<(std::fs::File, String)> {
+        if has_parent_segment(target) { return Err(std::io::ErrorKind::PermissionDenied.into()); }
+        let parent = target.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+        let name = target.file_name().and_then(|name| name.to_str()).ok_or(std::io::ErrorKind::InvalidInput)?;
+        let directory = self.open_directory(parent)?;
+        let _file = file_handle_windows::open_child(&directory, std::ffi::OsStr::new(name), false)?;
+        Ok((directory, name.to_owned()))
+    }
 
     /// Open an already-authorized directory without following swapped path
     /// components. The returned descriptor pins the directory across spawn.

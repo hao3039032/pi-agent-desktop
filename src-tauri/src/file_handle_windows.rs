@@ -1,18 +1,14 @@
 //! NT relative opens for a directory handle already authorized by the host.
 //! Opening or authorizing the initial root is deliberately not done here.
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::io;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows_sys::Wdk::Storage::FileSystem::{NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT};
-use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
+pub(crate) use resource_protocol::windows_handle::open_child;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE};
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
-use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 
 #[derive(Debug, Clone)]
 pub(super) struct PinnedRoot {
@@ -82,48 +78,6 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Open exactly one child of a pinned, authorized directory. Reparse points
-/// are opened themselves, inspected by handle, and refused before use.
-pub(crate) fn open_child(parent: &std::fs::File, name: &OsStr, directory: bool) -> io::Result<std::fs::File> {
-    let parent_meta = parent.metadata()?;
-    if !parent_meta.is_dir() || parent_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "invalid parent handle"));
-    }
-    let mut wide: Vec<u16> = name.encode_wide().collect();
-    if wide.is_empty() || wide.len() > (u16::MAX as usize / 2)
-        || wide == [b'.' as u16] || wide == [b'.' as u16, b'.' as u16]
-        || wide.iter().any(|&c| c == 0 || c == b'/' as u16 || c == b'\\' as u16 || c == b':' as u16)
-    {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid child name"));
-    }
-    let bytes = (wide.len() * 2) as u16;
-    let unicode = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.as_raw_handle() as isize,
-        ObjectName: &unicode,
-        Attributes: OBJ_CASE_INSENSITIVE as u32,
-        SecurityDescriptor: std::ptr::null(),
-        SecurityQualityOfService: std::ptr::null(),
-    };
-    let mut result = 0;
-    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-    let options = FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
-        | if directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE };
-    let status = unsafe { NtCreateFile(&mut result, FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        &attributes, &mut status_block, std::ptr::null(), 0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, options, std::ptr::null(), 0) };
-    if status < 0 { return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)); }
-    let file = unsafe { std::fs::File::from_raw_handle(result as _) };
-    let meta = file.metadata()?;
-    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || if directory { !meta.is_dir() } else { !meta.is_file() }
-    {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "reparse point or unexpected file kind"));
-    }
-    Ok(file)
-}
-
 /// Enumerate a new handle to the same directory object, never a pathname.
 pub(crate) fn entries(directory: &std::fs::File) -> io::Result<Vec<(OsString, bool, bool)>> {
     use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
@@ -174,6 +128,7 @@ pub(crate) fn entries(directory: &std::fs::File) -> io::Result<Vec<(OsString, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
 
@@ -207,6 +162,31 @@ mod tests {
         assert_eq!(content, "old");
         state.file_roots.lock().unwrap().reauthorize(&root).unwrap();
         assert!(state.file_roots.lock().unwrap().open_file(&root.join("文件.txt")).is_ok());
+    }
+
+    #[test]
+    fn resource_grants_read_files_and_preview_assets_from_authorized_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("page.html"), b"0123456789").unwrap();
+        std::fs::write(project.join("style.css"), b"body{}").unwrap();
+        let state = crate::pi_ipc::IpcHostState::new();
+        state.file_roots.lock().unwrap().add(&project).unwrap();
+        let call = |op: &str, args: serde_json::Value| crate::pi_ipc::dispatch_envelope(&state, serde_json::json!({"v":1,"id":"fixture","op":op,"args":args}));
+        let file = call("resources.grantFile", serde_json::json!({"path":project.join("page.html")}));
+        assert_eq!(file["ok"], true, "{file}");
+        let handle = file["data"]["handle"].as_str().unwrap();
+        let read = call("resources.read", serde_json::json!({"handle":handle,"start":2,"end":4}));
+        assert_eq!(read["data"]["data"], "MjM0", "{read}");
+        let preview = call("resources.grantPreview", serde_json::json!({"path":project.join("page.html")}));
+        assert_eq!(preview["ok"], true, "{preview}");
+        let handle = preview["data"]["handle"].as_str().unwrap();
+        let css = call("resources.read", serde_json::json!({"handle":handle,"subpath":"style.css"}));
+        assert_eq!(css["data"]["data"], "Ym9keXt9", "{css}");
+        assert_eq!(call("resources.read", serde_json::json!({"handle":handle,"subpath":"../outside"}))["ok"], false);
+        assert_eq!(call("resources.revoke", serde_json::json!({"handle":handle}))["data"]["revoked"], true);
+        assert_eq!(call("resources.read", serde_json::json!({"handle":handle,"subpath":"style.css"}))["ok"], false);
     }
 
     #[test]
