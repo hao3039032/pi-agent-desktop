@@ -9,28 +9,28 @@ mod tests;
 
 struct GitCwd {
     path: PathBuf,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     directory: std::fs::File,
 }
 impl GitCwd {
     fn open(roots: &AllowedRoots, cwd: &Path) -> Result<Self, String> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             let (path, directory) = roots.open_terminal_directory(cwd).ok_or("Git cwd is not authorized")?;
             Ok(Self { path, directory })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         { let _ = roots; Ok(Self { path: cwd.to_path_buf() }) }
     }
     fn git(&self, args: &[&str]) -> Result<String, String> {
         let mut argv = vec!["--literal-pathspecs"];
         argv.extend_from_slice(args);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         { crate::worktrees::git_in_directory(&self.directory, &argv, Duration::from_secs(10)) }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         { crate::worktrees::git(&self.path, &argv, Duration::from_secs(10)) }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn pin_repository(&self, roots: &AllowedRoots, root: &Path) -> Result<Self, String> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
@@ -48,7 +48,7 @@ impl GitCwd {
         if (a.dev(), a.ino()) != (b.dev(), b.ino()) { return Err("Git repository identity changed".into()); }
         Ok(Self { path: resolved, directory })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     fn pin_repository(&self, roots: &AllowedRoots, root: &Path) -> Result<Self, String> { Self::open(roots, root) }
     fn pathspec(&self, root: &Path, path: &Path) -> Option<String> {
         let prefix = self.path.strip_prefix(root).ok()?;

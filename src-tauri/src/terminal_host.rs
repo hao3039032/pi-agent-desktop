@@ -40,7 +40,7 @@ pub fn authorize_cwd(
 
 /// Pin the directory and recheck the descriptor's resolved identity before
 /// handing it to portable-pty. Subsequent path replacement cannot retarget it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn pin_cwd(
     roots: &AllowedRoots,
     agent_dir: &Path,
@@ -50,8 +50,19 @@ pub fn pin_cwd(
     let (resolved, directory) = roots
         .open_terminal_directory(cwd)
         .ok_or("unauthorized_scope")?;
+    #[cfg(target_os = "linux")]
     let actual = std::fs::canonicalize(format!("/proc/self/fd/{}", directory.as_raw_fd()))
         .map_err(|_| "unauthorized_scope")?;
+    #[cfg(target_os = "macos")]
+    let actual = {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = [0u8; libc::PATH_MAX as usize];
+        if unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+            return Err("unauthorized_scope");
+        }
+        let end = buffer.iter().position(|byte| *byte == 0).ok_or("unauthorized_scope")?;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..end]))
+    };
     if actual != resolved || actual != cwd {
         return Err("unauthorized_scope");
     }
@@ -530,6 +541,37 @@ mod tests {
         // Shell prompts may also print cwd; inspect only marked fd targets.
         assert!(!output.contains(&format!("<FD>{}</FD>", moved.join("work").display())), "{output:?}");
         host.close("pinned");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn terminal_pinned_cwd_survives_directory_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("marker"), "HELD_DIRECTORY_MARKER\n").unwrap();
+        let agent = dir.path().join("agent");
+        let mut roots = AllowedRoots::new(); roots.add(dir.path());
+        let authorized = authorize_cwd(&roots, &agent, cwd.to_str().unwrap()).unwrap();
+        let handle = pin_cwd(&roots, &agent, &authorized).unwrap();
+        std::fs::rename(&cwd, &moved).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("marker"), "REPLACEMENT_MARKER\n").unwrap();
+        let host = pty_host::PtyHost::new();
+        let pty = host.create("renamed", Some(&authorized), pty_host::PtyOptions {
+            shell: Some((PathBuf::from("/bin/sh"), vec!["-c".into(), "cat marker".into()])),
+            cwd_handle: Some(handle), ..Default::default()
+        }).unwrap();
+        assert_eq!(pty.wait_exit(Duration::from_secs(10)), Some(Some(0)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pty.output_closed() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(10)); }
+        let output = match pty.read_since(0) {
+            pty_host::ReadOutcome::Suffix { text, .. } | pty_host::ReadOutcome::Reset { text, .. } => text,
+        };
+        assert!(output.contains("HELD_DIRECTORY_MARKER"), "{output:?}");
+        assert!(!output.contains("REPLACEMENT_MARKER"), "{output:?}");
+        host.close("renamed");
     }
 
     #[test]
