@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use serde_json::{json, Value};
 use tauri::ipc::Channel;
-use crate::pi_ipc::SessionRelayAck;
+use crate::pi_ipc::{SessionRelayAck, RELAY_SHUTDOWN_POLL};
 
 const MAX_RELAYS: usize = 32;
 const MAX_FRAMES: usize = 256;
@@ -13,11 +13,19 @@ const MAX_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
 pub struct ScheduledEvents {
     next: AtomicU64,
     alive: Arc<AtomicUsize>,
+    gate: Arc<tokio::sync::Semaphore>,
+    shutdown: Arc<AtomicBool>,
     subscribers: Arc<Mutex<HashMap<String, Subscriber>>>,
+}
+impl Default for ScheduledEvents {
+    fn default() -> Self {
+        Self { next: AtomicU64::new(0), alive: Arc::new(AtomicUsize::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(MAX_RELAYS)),
+            shutdown: Arc::new(AtomicBool::new(false)), subscribers: Arc::new(Mutex::new(HashMap::new())) }
+    }
 }
 struct Subscriber {
     tx: mpsc::SyncSender<(Value, usize)>,
@@ -38,6 +46,19 @@ impl std::io::Write for SizeCounter {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 impl ScheduledEvents {
+    pub(crate) fn begin_shutdown(&self) {
+        self.gate.close();
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn in_flight(&self) -> usize { MAX_RELAYS - self.gate.available_permits() }
+    pub(crate) fn registry_busy(&self) -> bool { self.subscribers.try_lock().is_err() }
+    #[cfg(test)]
+    pub(crate) fn hold_registry_for_test(&self, ready: mpsc::Sender<()>, release: mpsc::Receiver<()>) {
+        let _guard = self.subscribers.lock().unwrap();
+        let _ = ready.send(());
+        let _ = release.recv();
+    }
+
     pub fn emit(&self, event: Value) {
         let mut counter = SizeCounter(0);
         let size = if serde_json::to_writer(&mut counter, &event).is_ok() { counter.0 } else { MAX_EVENT_BYTES + 1 };
@@ -71,36 +92,47 @@ impl ScheduledEvents {
         epoch == 1 && self.subscribers.lock().unwrap().get(id).is_some_and(|subscriber| subscriber.ack.acknowledge(seq))
     }
     pub fn subscribe(&self, channel: Channel<Value>) -> Result<String, String> {
-        self.alive.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_RELAYS).then_some(n + 1)).map_err(|_| "scheduled stream capacity exhausted".to_string())?;
+        let permit = Arc::new(Arc::clone(&self.gate).try_acquire_owned().map_err(|_| "scheduled stream capacity exhausted or closed".to_string())?);
+        if self.shutdown.load(Ordering::SeqCst) { return Err("scheduled stream admission closed".into()); }
+        self.alive.fetch_add(1, Ordering::SeqCst);
         let alive = Alive(Arc::clone(&self.alive));
         let id = format!("tasks-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1);
         let (tx, rx) = mpsc::sync_channel(MAX_FRAMES);
         let bytes = Arc::new(AtomicUsize::new(0));
         let overflowed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let ack = Arc::new(SessionRelayAck::default());
+        let ack = Arc::new(SessionRelayAck::with_shutdown(Arc::clone(&self.shutdown)));
         self.subscribers.lock().unwrap().insert(id.clone(), Subscriber { tx, bytes: Arc::clone(&bytes), overflowed: Arc::clone(&overflowed), stop: Arc::clone(&stop), ack: Arc::clone(&ack) });
         let thread_id = id.clone();
         let subscribers = Arc::clone(&self.subscribers);
+        let relay_permit = Arc::clone(&permit);
+        let shutdown = Arc::clone(&self.shutdown);
         if let Err(error) = std::thread::Builder::new().name(format!("scheduled-events-{id}")).spawn(move || {
             let _alive = alive;
+            let _permit = relay_permit;
+            (move || {
+            if shutdown.load(Ordering::SeqCst) { subscribers.lock().unwrap().remove(&thread_id); return; }
             let mut seq = 1u64;
             let send = |seq, kind, payload| ack.forward(&channel, json!({ "subscriptionId": thread_id, "epoch": 1, "seq": seq, "kind": kind, "payload": payload }), seq, &stop, ACK_TIMEOUT);
             let mut ok = send(seq, "snapshot", json!({}));
-            while ok && !stop.load(Ordering::SeqCst) && !overflowed.load(Ordering::SeqCst) {
-                let (kind, event) = match rx.recv_timeout(Duration::from_secs(10)) {
+            let mut heartbeat = std::time::Instant::now() + Duration::from_secs(10);
+            while ok && !stop.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) && !overflowed.load(Ordering::SeqCst) {
+                let (kind, event) = match rx.recv_timeout(heartbeat.saturating_duration_since(std::time::Instant::now()).min(RELAY_SHUTDOWN_POLL)) {
                     Ok((event, size)) => { bytes.fetch_sub(size, Ordering::SeqCst); ("event", event) },
+                    Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < heartbeat => continue,
                     Err(mpsc::RecvTimeoutError::Timeout) => ("heartbeat", Value::Null),
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                if stop.load(Ordering::SeqCst) || overflowed.load(Ordering::SeqCst) { break; }
+                if stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) || overflowed.load(Ordering::SeqCst) { break; }
                 seq += 1;
                 ok = send(seq, kind, event);
+                heartbeat = std::time::Instant::now() + Duration::from_secs(10);
             }
-            if !stop.load(Ordering::SeqCst) {
+            if !stop.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
                 let _ = channel.send(json!({ "subscriptionId": thread_id, "epoch": 1, "seq": seq + 1, "kind": "reset", "payload": { "reason": "relay_gap" } }));
             }
             subscribers.lock().unwrap().remove(&thread_id);
+            })();
         }) {
             self.unsubscribe(&id);
             return Err(error.to_string());

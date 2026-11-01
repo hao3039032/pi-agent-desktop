@@ -13,6 +13,7 @@ pub struct TrackedShutdown {
     pub session_writers: Option<crate::session_writer_lifecycle::SessionWriterShutdownReport>,
     pub management: Option<management_host::ManagementShutdownReport>,
     pub index_children: Option<crate::index_children::IndexChildShutdownReport>,
+    pub relays: Option<crate::pi_ipc::RelayShutdownReport>,
 }
 
 /// Availability describes publication only; it does not certify a clean shutdown.
@@ -64,6 +65,13 @@ impl IsolatedStaticHost {
         })?;
         let host = Arc::clone(&state);
         let report = Arc::clone(&tracked);
+        lifecycle.register_until(ShutdownStage::Admission, "stream-relays", move |deadline| {
+            let result = host.drain_stream_relays_until(deadline);
+            let outcome = if result.is_complete() { Ok(()) } else { Err(format!("stream relay reservations or registries unknown: {result:?}")) };
+            publish_report(&report, "stream relay", result, outcome, |report, value| report.relays = Some(value))
+        })?;
+        let host = Arc::clone(&state);
+        let report = Arc::clone(&tracked);
         lifecycle.register_until(ShutdownStage::SessionChild, "index-children", move |deadline| {
             let result = host.index_children.shutdown_until(deadline);
             let outcome = if result.unknown == 0 && !result.tracker_busy { Ok(()) } else { Err(format!("index children unknown: {}, tracker busy: {}", result.unknown, result.tracker_busy)) };
@@ -109,8 +117,8 @@ impl IsolatedStaticHost {
 
     /// Reports cover registered operations and leaders. Scheduler unknowns may
     /// repeat session diagnostics; they are not additive process counts. PTYs,
-    /// detached descendants, unregistered writers, and long-lived stream relay
-    /// shutdown/Channel delivery remain uncovered.
+    /// detached descendants and unregistered writers remain uncovered. Relay
+    /// reports cover tracked application work, not WebView internal delivery.
     pub fn shutdown_until(&self, deadline: Instant) -> Result<(), Vec<ShutdownFailure>> {
         // Admission is fenced before the lifecycle state lock can be contended.
         self.state.begin_static_shutdown();

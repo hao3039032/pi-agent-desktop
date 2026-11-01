@@ -20,6 +20,10 @@ use tauri::{Manager, State};
 use management_host::{ManagementHost, ManagementSpawnConfig};
 use session_host::SessionRegistry;
 
+#[cfg(test)]
+#[path = "pi_ipc_relay_shutdown_tests.rs"]
+mod relay_shutdown_tests;
+
 // Terminal output frames carry base64 inside JSON Channels today; the
 // raw-bytes upgrade (protocol doc §4) lands with the M4 binary channel.
 
@@ -35,6 +39,26 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 pub struct SchedulerShutdownReport {
     pub stopped: bool,
     pub active_unknown: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayShutdownStatus {
+    pub in_flight: usize,
+    pub registry_busy: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayShutdownReport {
+    pub session: RelayShutdownStatus,
+    pub running: RelayShutdownStatus,
+    pub scheduled: RelayShutdownStatus,
+}
+impl RelayShutdownReport {
+    pub fn is_complete(&self) -> bool {
+        [&self.session, &self.running, &self.scheduled].iter().all(|s| s.in_flight == 0 && !s.registry_busy)
+    }
 }
 
 pub struct IpcHostState {
@@ -56,16 +80,13 @@ pub struct IpcHostState {
     event_relays: Arc<Mutex<BTreeMap<String, EventRelayHandle>>>,
     session_relay_gate: Arc<tokio::sync::Semaphore>,
     running_relay_gate: Arc<tokio::sync::Semaphore>,
+    relay_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// The provider-auth domain's login-stream relays (the same release
     /// contract: unsubscribe cancels the flow host-side). Kept in the
     /// domain's own map so the shared one stays untouched.
     pub(crate) login_relays: Arc<crate::provider_auth::LoginRelays>,
-    /// Running-set relay THREADS alive right now (the thread-lifetime
-    /// truth, distinct from `event_relays`, which the unsubscribe handler
-    /// clears itself): a relay that ignores its stop flag would hold this
-    /// count up — the leak the cancel contract (Terra P2-2) forbids, so the
-    /// tests watch THIS counter, not the map, to prove the threads really
-    /// end instead of merely being deregistered.
+    /// Running relay work, distinct from registrations removed by unsubscribe.
+    /// This diagnostic is not proof of OS thread teardown.
     running_relay_threads: Arc<AtomicUsize>,
     /// The terminal registry (portable-pty; crates/pty-host).
     pub terminals: Arc<pty_host::PtyHost>,
@@ -152,8 +173,12 @@ struct EventRelayHandle {
 pub(crate) struct SessionRelayAck {
     state: Mutex<(u64, u64)>, // sent, acknowledged
     wake: std::sync::Condvar,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 impl SessionRelayAck {
+    pub(crate) fn with_shutdown(shutdown: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { shutdown, ..Self::default() }
+    }
     pub(crate) fn acknowledge(&self, seq: u64) -> bool {
         let Ok(mut state) = self.state.lock() else { return false };
         if seq == 0 || seq > state.0 { return false; }
@@ -163,14 +188,21 @@ impl SessionRelayAck {
     }
     pub(crate) fn wake(&self) { self.wake.notify_all(); }
     pub(crate) fn forward(&self, channel: &Channel<Value>, frame: Value, seq: u64, stop: &std::sync::atomic::AtomicBool, timeout: Duration) -> bool {
+        if stop.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) { return false; }
         {
             let Ok(mut state) = self.state.lock() else { return false };
             state.0 = seq;
         }
         if channel.send(frame).is_err() { return false; }
-        let Ok(state) = self.state.lock() else { return false };
-        let Ok((state, _)) = self.wake.wait_timeout_while(state, timeout, |state| state.1 < seq && !stop.load(Ordering::SeqCst)) else { return false };
-        state.1 >= seq && !stop.load(Ordering::SeqCst)
+        let Ok(mut state) = self.state.lock() else { return false };
+        let deadline = std::time::Instant::now() + timeout;
+        while state.1 < seq && !stop.load(Ordering::SeqCst) && !self.shutdown.load(Ordering::SeqCst) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { break; }
+            let Ok((next, _)) = self.wake.wait_timeout(state, remaining.min(RELAY_SHUTDOWN_POLL)) else { return false };
+            state = next;
+        }
+        state.1 >= seq && !stop.load(Ordering::SeqCst) && !self.shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -249,6 +281,7 @@ impl IpcHostState {
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             session_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_SESSION_RELAYS)),
             running_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_RUNNING_RELAYS)),
+            relay_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             login_relays: Arc::new(Default::default()),
             running_relay_threads: Arc::new(AtomicUsize::new(0)),
             terminal_streams: crate::terminal_host::TerminalStreams::new(Arc::clone(&terminals)),
@@ -300,6 +333,10 @@ impl IpcHostState {
     pub(crate) fn begin_static_shutdown(&self) {
         self.dispatch_gate.close();
         self.dispatch_control_gate.close();
+        self.session_relay_gate.close();
+        self.running_relay_gate.close();
+        self.scheduled_events.begin_shutdown();
+        self.relay_shutdown.store(true, Ordering::SeqCst);
         self.index_children.begin_shutdown();
         self.begin_scheduler_shutdown();
         self.management.begin_shutdown();
@@ -314,6 +351,21 @@ impl IpcHostState {
             if std::time::Instant::now() >= deadline {
                 return Err(format!("IPC operations still in flight: {ordinary} ordinary, {control} control"));
             }
+            std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));
+        }
+    }
+
+    /// Reservations include subscriptions still starting and all tracked relay
+    /// cleanup. They do not certify OS thread teardown or WebView delivery.
+    pub(crate) fn drain_stream_relays_until(&self, deadline: std::time::Instant) -> RelayShutdownReport {
+        loop {
+            let registry_busy = self.event_relays.try_lock().is_err();
+            let report = RelayShutdownReport {
+                session: RelayShutdownStatus { in_flight: IPC_MAX_SESSION_RELAYS - self.session_relay_gate.available_permits(), registry_busy },
+                running: RelayShutdownStatus { in_flight: IPC_MAX_RUNNING_RELAYS - self.running_relay_gate.available_permits(), registry_busy },
+                scheduled: RelayShutdownStatus { in_flight: self.scheduled_events.in_flight(), registry_busy: self.scheduled_events.registry_busy() },
+            };
+            if report.is_complete() || std::time::Instant::now() >= deadline { return report; }
             std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));
         }
     }
@@ -725,9 +777,10 @@ pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event:
 /// when the receiver unsubscribes (`agent.unsubscribeEvents`, page reload,
 /// window close) or the session leaves the registry; the relay thread then
 /// detaches — a dropped channel alone must not leak a thread.
-/// Session relay threads remain counted until their actual exit, even after
-/// unsubscribe. This cap does not bound channel transport buffers.
+/// Reservations remain counted through relay cleanup, even after unsubscribe.
+/// This cap does not bound channel transport buffers or prove OS thread exit.
 pub const IPC_MAX_SESSION_RELAYS: usize = 32;
+pub(crate) const RELAY_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 
 #[tauri::command]
 pub fn pi_ipc_subscribe_events(
@@ -744,6 +797,8 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
         Ok(permit) => permit,
         Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"session stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
     };
+    let permit = Arc::new(permit);
+    if state.relay_shutdown.load(Ordering::SeqCst) { return protocol_error("?", "busy", "relay admission closed"); }
     let Some(session_handle) = state.registry.get(&session) else {
         return protocol_error("?", "not_found", &format!("no running session {session}"));
     };
@@ -757,7 +812,7 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
     session_handle.lease();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ack = Arc::new(SessionRelayAck::default());
+    let ack = Arc::new(SessionRelayAck::with_shutdown(Arc::clone(&state.relay_shutdown)));
     let ack_for_relay = Arc::clone(&ack);
     let stop_for_relay = Arc::clone(&stop);
     let relays_for_thread = Arc::clone(&state.event_relays);
@@ -772,6 +827,9 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
         },
     );
 
+    // The reservation remains held across registration and all cleanup.
+    let relay_permit = Arc::clone(&permit);
+    let shutdown = Arc::clone(&state.relay_shutdown);
     // The relay: snapshot first, then every record in order. A closed
     // channel (send error) or the unsubscribe flag ends the loop and
     // detaches the subscriber.
@@ -779,13 +837,15 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
     let spawn = std::thread::Builder::new()
         .name(format!("ipc-events-{subscription_id}"))
         .spawn(move || {
-            let _permit = permit;
+            let _permit = relay_permit;
+            (move || {
             let session_handle = relay_session;
             let subscription_id = subscription_id_for_relay;
             let detach = |subscriber_id| {
                 session_handle.unsubscribe(subscriber_id);
                 relays_for_thread.lock().unwrap().remove(&subscription_for_cleanup);
             };
+            if shutdown.load(Ordering::SeqCst) { detach(subscriber_id); return; }
             let mut seq: u64 = 0;
             let snapshot = json!({
                 "epoch": session_handle.epoch(),
@@ -796,7 +856,7 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                 "pendingExtensionUiIds": pending_ui.iter().filter_map(|record| record.get("id").and_then(Value::as_str)).collect::<Vec<_>>(),
             });
             let send = |seq, kind, payload| ack_for_relay.forward(&on_event, stream_frame(&subscription_id, epoch, seq, kind, payload), seq, &stop_for_relay, Duration::from_secs(15));
-            let reset = |seq| { if !stop_for_relay.load(Ordering::SeqCst) { let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"}))); } };
+            let reset = |seq| { if !stop_for_relay.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) { let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"}))); } };
             seq += 1;
             if !send(seq, "snapshot", snapshot) {
                 reset(seq + 1);
@@ -812,17 +872,17 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                 }
             }
             loop {
-                if stop_for_relay.load(Ordering::SeqCst) {
+                if stop_for_relay.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                     detach(subscriber_id);
                     return;
                 }
                 if gap.load(Ordering::SeqCst) {
                     seq += 1;
-                    let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                    reset(seq);
                     detach(subscriber_id);
                     return;
                 }
-                match events.recv_timeout(Duration::from_millis(500)) {
+                match events.recv_timeout(RELAY_SHUTDOWN_POLL) {
                     Ok(record) => {
                         seq += 1;
                         if !send(seq, "event", record) {
@@ -835,13 +895,14 @@ fn subscribe_session_events(state: &IpcHostState, session: String, on_event: Cha
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         if gap.load(Ordering::SeqCst) {
                             seq += 1;
-                            let _ = on_event.send(stream_frame(&subscription_id, epoch, seq, "reset", json!({"reason":"relay_gap"})));
+                            reset(seq);
                         }
                         detach(subscriber_id);
                         return;
                     }
                 }
             }
+            })();
         });
     if let Err(error) = spawn {
         session_handle.unsubscribe(subscriber_id);
@@ -904,9 +965,7 @@ impl std::io::Write for RunningFrameSize {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-/// Drops of this guard are the relay thread's LAST act (every exit path):
-/// the alive count in `IpcHostState::running_relay_threads` therefore
-/// measures the thread's real lifetime, not its registration.
+/// Counts tracked running relay work independently of registration.
 struct RunningRelayAlive(Arc<AtomicUsize>);
 impl Drop for RunningRelayAlive {
     fn drop(&mut self) {
@@ -943,13 +1002,15 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
         Ok(permit) => permit,
         Err(_) => return protocol_error_value("?", json!({"code":"busy","message":"running stream capacity exhausted; subscription was not admitted","reason":"stream_not_admitted","retryable":true})),
     };
+    let permit = Arc::new(permit);
+    if state.relay_shutdown.load(Ordering::SeqCst) { return protocol_error("?", "busy", "relay admission closed"); }
     let mut nonce = [0u8; 16];
     if let Err(error) = getrandom::fill(&mut nonce) {
         return protocol_error("?", "io", &format!("running subscription identity unavailable: {error}"));
     }
     let subscription_id = format!("run-{}", nonce.iter().map(|b| format!("{b:02x}")).collect::<String>());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ack = Arc::new(SessionRelayAck::default());
+    let ack = Arc::new(SessionRelayAck::with_shutdown(Arc::clone(&state.relay_shutdown)));
     state.event_relays.lock().unwrap().insert(
         subscription_id.clone(),
         EventRelayHandle {
@@ -965,20 +1026,22 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
     let running_signal = registry.running_signal();
     let relays_alive = Arc::clone(&state.running_relay_threads);
     let subscription_for_relay = subscription_id.clone();
-    // Counted the moment the thread exists; the guard's Drop (the thread's
-    // last act on every exit path) decrements it back.
+    let relay_permit = Arc::clone(&permit);
+    let shutdown = Arc::clone(&state.relay_shutdown);
+    // Count before spawn so even a starting relay remains observable.
     state.running_relay_threads.fetch_add(1, Ordering::SeqCst);
     let relay = std::thread::Builder::new()
         .name("ipc-running".into())
         .spawn(move || {
             let subscription_id = subscription_for_relay;
             let _alive = RunningRelayAlive(relays_alive);
-            let _permit = permit;
+            let _permit = relay_permit;
+            (move || {
             // Preflight the set before constructing the JSON frame; the
             // fixed envelope is substantially smaller than this reserve.
             let fits = |running: &Vec<String>| serde_json::to_writer(&mut RunningFrameSize(512), running).is_ok();
             let reset = |seq| {
-                if !stop.load(Ordering::SeqCst) {
+                if !stop.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
                     let _ = on_frame.send(stream_frame(&subscription_id, 1, seq, "reset", json!({"reason":"relay_gap"})));
                 }
             };
@@ -1004,7 +1067,7 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
             let mut signal_epoch = running_signal.epoch();
             let mut replay_seq = running_signal.last_seq();
             loop {
-                if stop.load(Ordering::SeqCst) {
+                if stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                     detach();
                     return;
                 }
@@ -1083,7 +1146,7 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
                             // frame may leave after an unsubscribe lands —
                             // re-check the stop flag between frames so a
                             // multi-frame replay cannot outrun a cancel.
-                            if stop.load(Ordering::SeqCst) {
+                            if stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
                                 detach();
                                 return;
                             }
@@ -1125,8 +1188,16 @@ fn subscribe_running_with_timeout(state: &IpcHostState, on_frame: Channel<Value>
                 // settle, exit, removal) or a wake-only bump (a catalogue
                 // version change, an unsubscribe) moves the signal, or the
                 // probe deadline passes (the dead-channel reaper).
-                signal_epoch = running_signal.wait_for_change(signal_epoch, probe_after);
+                loop {
+                    let remaining = probe_after.saturating_sub(last_sent_at.elapsed());
+                    let next = running_signal.wait_for_change(signal_epoch, remaining.min(RELAY_SHUTDOWN_POLL));
+                    if next != signal_epoch || remaining.is_zero() || stop.load(Ordering::SeqCst) || shutdown.load(Ordering::SeqCst) {
+                        signal_epoch = next;
+                        break;
+                    }
+                }
             }
+            })();
         });
     match relay {
         Ok(_) => json!({ "subscriptionId": subscription_id }),
