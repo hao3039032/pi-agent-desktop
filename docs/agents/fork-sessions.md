@@ -26,7 +26,15 @@ request; if a rename has already been dispatched its outcome is never called a
 confirmed cancellation. A durable session-writer fence is created before rename;
 only the matching owned operation can pass it, and an unknown reply leaves it
 in place across host restart. A proven pre-append refusal or confirmed success
-clears it. Its source prefix is bounded diagnostic data only and does not assert
+first replaces the fence atomically with a durable `phase: "resolved"` record
+(`outcome: "not_applied"` or `"applied"`), then attempts removal. Chat access,
+continue and staged fork use the same terminal-before-cleanup rule only after
+writer exit and result verification. The outcome records what was confirmed by the live operation; it does not
+assert that all SDK-managed session data is power-loss durable. A cleanup error
+reports the known outcome and a persistent warning, not an unknown mutation or
+an invitation to retry. A surviving resolved record still blocks writes and is reported separately from
+an unresolved record; it never grants recovery permission and is not auto-cleared.
+Its source prefix is bounded diagnostic data only and does not assert
 that an actively written file is frozen. A previously admitted run can continue
 writing; the fence prevents new host admissions. This does not add cross-process
 writer exclusion or automatic recovery.

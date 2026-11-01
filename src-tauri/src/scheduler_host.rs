@@ -88,6 +88,7 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
         }
         "tasks.takeover" => {
             let _lifecycle = state.scheduler_lifecycle.lock().unwrap();
+            if state.scheduled_lifecycle.is_closing() { return Err(err("busy", "Scheduler is shutting down")); }
             if state.scheduler_loop.lock().unwrap().is_none() { return Err(err("not_supported", "Scheduler host is not started")); }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| err("io", e.to_string()))?.as_millis() as i64;
             let owner = task_scheduler::lease::acquire(&state.agent_dir(), std::process::id(), now, crate::scheduler_tick::pid_alive).map_err(|e| err("io", e))?;
@@ -99,7 +100,7 @@ pub fn dispatch(state: &IpcHostState, op: &str, args: &Value) -> Result<Value, H
         "tasks.run" => {
             let result = crate::scheduled_runner::run_now(state, id(args)?).map_err(|e| {
                 if e == "Task not found" { err("not_found", e) }
-                else if e == "This task is already running" || e == "Scheduler is not the owner" { err("busy", e) }
+                else if e == "This task is already running" || e == "Scheduler is not the owner" || e == "Scheduler is shutting down" { err("busy", e) }
                 else { err("io", e) }
             })?;
             Ok(json!({ "run": result }))

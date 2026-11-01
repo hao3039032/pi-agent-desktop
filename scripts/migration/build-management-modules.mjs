@@ -32,6 +32,9 @@ const ROOT = resolve(HERE, "../..");
 // The exported surface the management extension consumes. Keep in step with
 // the ops in lib/pi-rpc/assets/pi-web-management.mjs.
 const ENTRY = `
+export { SessionManager as projectionSessionManager } from "@earendil-works/pi-coding-agent";
+export { McpOAuthProvider as projectionMcpOAuthProvider, MemoryOAuthStateStore as projectionMemoryOAuthStateStore } from "@earendil-works/pi-mcp/oauth";
+export { signInMcpWithHostedCallback } from "${ROOT}/lib/mcp-oauth-hosted.server.ts";
 export {
   buildSessionContext,
   sliceActiveBranch,
@@ -161,14 +164,13 @@ export async function bundleProjectionModules() {
       sourcefile: "management-projection-entry.ts",
     },
     bundle: true,
-    // Jiti resolves its Babel transformer relative to its own package; bundling
-    // it relocates that lookup into the projection and breaks extensions.
-    external: ["jiti"],
+    // The extension loader resolves the SDK's public specifier to its own
+    // virtual module in the compiled pi; never bundle a second SDK graph.
     format: "esm",
     platform: "node",
     target: "node20",
     // MCP internals and the public SDK must resolve from the same managed tree.
-    external: ["@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
+    external: ["jiti", "@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph

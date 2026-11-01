@@ -30,6 +30,13 @@ pub const IPC_PROTOCOL_VERSION: i64 = 1;
 /// The managed host state (one registry per app process). The registry and
 /// version counter are Arc-backed so stream relays (the running-set stream)
 /// outlive the request that opened them.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulerShutdownReport {
+    pub stopped: bool,
+    pub active_unknown: Vec<String>,
+}
+
 pub struct IpcHostState {
     pub registry: Arc<SessionRegistry>,
     /// Global policy transaction gate shared with session admission and drains.
@@ -69,6 +76,7 @@ pub struct IpcHostState {
     /// resolved at startup; until then the models ops answer
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
+    pub session_writers: Arc<crate::session_writer_lifecycle::SessionWriterLifecycle>,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     mcp_signin_tasks: Mutex<BTreeSet<String>>,
     /// The scheduled-task store root (the agent dir the host runs against).
@@ -77,6 +85,7 @@ pub struct IpcHostState {
     pub(crate) scheduler_loop: Mutex<Option<crate::scheduler_tick::SchedulerLoop>>,
     pub(crate) scheduler_owner: std::sync::atomic::AtomicBool,
     pub(crate) scheduled_active: Arc<Mutex<BTreeSet<String>>>,
+    pub(crate) scheduled_lifecycle: Arc<crate::scheduled_lifecycle::ScheduledLifecycle>,
     pub(crate) scheduler_lifecycle: Mutex<()>,
     /// The preview resource registry (capability-less handles).
     pub resources: ResourceRegistry,
@@ -215,6 +224,7 @@ impl IpcHostState {
             #[cfg(test)]
             title_rename_timeout: Mutex::new(Duration::from_secs(30)),
             management: ManagementHost::new(),
+            session_writers: Arc::new(Default::default()),
             management_config: Mutex::new(resolve_management_config()),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir,
@@ -222,6 +232,7 @@ impl IpcHostState {
             scheduler_loop: Mutex::new(None),
             scheduler_owner: std::sync::atomic::AtomicBool::new(false),
             scheduled_active: Arc::new(Mutex::new(BTreeSet::new())),
+            scheduled_lifecycle: Arc::new(crate::scheduled_lifecycle::ScheduledLifecycle::default()),
             scheduler_lifecycle: Mutex::new(()),
             resources: ResourceRegistry::new(),
             native_drops: crate::native_drop::NativeDrops::default(),
@@ -238,6 +249,28 @@ impl IpcHostState {
             chat_unlock_policy: ChatUnlockPolicy::Denied,
             #[cfg(test)]
             session_writer_timeout: Mutex::new(Duration::from_secs(60)),
+        }
+    }
+
+    /// Close both IPC lanes and fence tracked child starts before draining
+    /// already-admitted calls. This does not prove detached writers stopped.
+    pub(crate) fn begin_static_shutdown(&self) {
+        self.dispatch_gate.close();
+        self.dispatch_control_gate.close();
+        self.begin_scheduler_shutdown();
+        self.management.begin_shutdown();
+        self.session_writers.begin_shutdown();
+    }
+
+    pub(crate) fn drain_static_ipc_until(&self, deadline: std::time::Instant) -> Result<(), String> {
+        loop {
+            let ordinary = IPC_MAX_CONCURRENT_DISPATCH - self.dispatch_gate.available_permits();
+            let control = IPC_MAX_CONCURRENT_CONTROL - self.dispatch_control_gate.available_permits();
+            if ordinary == 0 && control == 0 { return Ok(()); }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("IPC operations still in flight: {ordinary} ordinary, {control} control"));
+            }
+            std::thread::sleep(Duration::from_millis(2).min(deadline.saturating_duration_since(std::time::Instant::now())));
         }
     }
 
@@ -270,8 +303,10 @@ impl IpcHostState {
 
     pub fn start_scheduler(self: &Arc<Self>) -> Result<(), String> {
         let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
+        if self.scheduled_lifecycle.is_closing() { return Err("Scheduler is shutting down".into()); }
         let mut current = self.scheduler_loop.lock().unwrap();
         if current.is_none() {
+            self.scheduled_lifecycle.prepare_start().map_err(str::to_string)?;
             *current = Some(crate::scheduler_tick::SchedulerLoop::start(Arc::clone(self), Duration::from_secs(30))?);
         }
         Ok(())
@@ -283,36 +318,56 @@ impl IpcHostState {
     }
 
     fn stop_scheduler_locked(&self) {
-        let mut current = self.scheduler_loop.lock().unwrap();
+        let scheduler = self.scheduler_loop.lock().unwrap().take();
         self.scheduler_owner.store(false, Ordering::SeqCst);
-        let scheduler = current.take();
-        drop(scheduler);
+        if let Some(mut scheduler) = scheduler { scheduler.stop(); }
         self.scheduler_owner.store(false, Ordering::SeqCst);
     }
 
-    /// Host shutdown: stop new claims, reap linked child sessions, then let
-    /// their workers persist outcomes before management instances are closed.
-    pub fn shutdown_scheduler(&self) -> Result<(), String> {
-        let _lifecycle = self.scheduler_lifecycle.lock().unwrap();
-        self.stop_scheduler_locked();
-        let repo = task_scheduler::task_repository::TaskRepository::new(self.agent_dir());
-        let deadline = std::time::Instant::now() + Duration::from_secs(35);
-        loop {
-            let active = self.scheduled_active.lock().unwrap().clone();
-            if active.is_empty() { return Ok(()); }
-            for task in repo.list()? {
-                let Some(task_id) = task["id"].as_str() else { continue };
-                for run in repo.runs(task_id)? {
-                    if run["runId"].as_str().is_some_and(|id| active.contains(id)) {
-                        if let Some(session_id) = run["sessionId"].as_str() {
-                            self.registry.remove(session_id, Duration::from_secs(5));
-                        }
-                    }
-                }
-            }
-            if std::time::Instant::now() >= deadline { return Err("Scheduled runs did not stop during host shutdown".into()); }
-            std::thread::sleep(Duration::from_millis(20));
+    /// Fence final scheduler and session admission without acquiring a lock.
+    pub fn begin_scheduler_shutdown(&self) {
+        self.scheduled_lifecycle.begin_shutdown();
+        self.registry.begin_shutdown();
+        if let Ok(current) = self.scheduler_loop.try_lock() {
+            if let Some(scheduler) = current.as_ref() { scheduler.begin_shutdown(); }
         }
+    }
+
+    /// Final host shutdown, distinct from pausing the scheduler. The session
+    /// registry's report includes prompt/child unknowns and uses this deadline.
+    pub fn shutdown_scheduler_until(&self, deadline: std::time::Instant) -> SchedulerShutdownReport {
+        self.begin_scheduler_shutdown();
+        let sessions = self.registry.shutdown_until(deadline);
+        let mut unknown = sessions.unknown;
+        loop {
+            let lifecycle_free = self.scheduler_lifecycle.try_lock().is_ok();
+            let timer_stopped = match self.scheduler_loop.try_lock() {
+                Ok(mut current) => match current.as_mut() {
+                    Some(timer) => timer.shutdown_until(std::time::Instant::now()),
+                    None => true,
+                },
+                Err(_) => false,
+            };
+            let active = self.scheduled_lifecycle.snapshot();
+            if lifecycle_free && timer_stopped && matches!(&active, Ok(entries) if entries.is_empty()) { break; }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                if !lifecycle_free { unknown.push("scheduler lifecycle busy".into()); }
+                if !timer_stopped { unknown.push("scheduler timer still running or unavailable".into()); }
+                match active {
+                    Ok(entries) => unknown.extend(entries.into_iter().map(|(id, session, unresolved, detail)| format!("{id}: {}{}{}", if unresolved { "scheduled outcome unresolved" } else { "scheduled run or start in flight" }, session.map(|id| format!(" (session {id})")).unwrap_or_default(), detail.map(|value| format!("; {value}")).unwrap_or_default()))),
+                    Err(error) => unknown.push(error.into()),
+                }
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        SchedulerShutdownReport { stopped: unknown.is_empty(), active_unknown: unknown }
+    }
+
+    pub fn shutdown_scheduler(&self) -> Result<(), String> {
+        let report = self.shutdown_scheduler_until(std::time::Instant::now() + Duration::from_secs(35));
+        if report.stopped { Ok(()) } else { Err(report.active_unknown.join("; ")) }
     }
 
     /// Record a path the HOST derived (a session cwd or project root from
@@ -565,11 +620,7 @@ fn resolve_managed_modules() -> Option<PathBuf> {
 /// config stays None and models ops answer management_unavailable).
 fn resolve_management_config() -> Option<ManagementSpawnConfig> {
     let executable = resolve_pi_executable()?;
-    let dev = Path::new("../lib/pi-rpc/assets/pi-web-management.mjs");
-    let extension = match dev.canonicalize() {
-        Ok(resolved) if resolved.is_file() => Some(resolved),
-        _ => None,
-    }?;
+    let extension = resolve_asset("pi-web-management.mjs", "PI_WEB_MANAGEMENT_EXTENSION")?;
     let managed = resolve_managed_modules()?;
     Some(ManagementSpawnConfig {
         executable: executable.to_string_lossy().into_owned(),
@@ -617,6 +668,7 @@ pub(crate) fn stream_frame(subscription_id: &str, epoch: u64, seq: u64, kind: &s
 
 #[tauri::command]
 pub fn pi_ipc_subscribe_scheduled(state: State<'_, Arc<IpcHostState>>, on_event: Channel<Value>) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     match state.scheduled_events.subscribe(on_event) {
         Ok(subscription_id) => json!({ "subscriptionId": subscription_id, "epoch": 1 }),
         Err(error) => protocol_error("?", "io", &error),
@@ -635,6 +687,7 @@ pub fn pi_ipc_subscribe_events(
     session: String,
     on_event: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     let Some(session_handle) = state.registry.get(&session) else {
         return protocol_error("?", "not_found", &format!("no running session {session}"));
     };
@@ -787,6 +840,7 @@ pub fn pi_ipc_subscribe_running(
     state: State<'_, Arc<IpcHostState>>,
     on_frame: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     subscribe_running(&state, on_frame, RUNNING_CHANNEL_PROBE)
 }
 
@@ -975,6 +1029,7 @@ pub fn pi_ipc_subscribe_terminal(
     cursor: u64,
     on_output: Channel<Value>,
 ) -> Value {
+    let Ok(_permit) = state.dispatch_gate.try_acquire() else { return protocol_error("?", "busy", "IPC admission closed or full"); };
     let subscription_id = format!("term-{}", state.subscription_counter.fetch_add(1, Ordering::Relaxed) + 1);
     match state.terminal_streams.subscribe(&id, subscription_id.clone(), cursor, move |frame| on_output.send(frame).is_ok()) {
         Ok(()) => json!({ "subscriptionId": subscription_id }),
@@ -5580,6 +5635,7 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         }
         let _shutdown = Shutdown(&state);
         *state.task_agent_dir.lock().unwrap() = Some(agent.clone());
+        state.propose_path(&project).unwrap();
         let bridge = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lib/pi-rpc/assets/pi-web-bridge.mjs").canonicalize().unwrap();
         *state.spawn_base.lock().unwrap() = Some(spawn_base(&executable, bridge));
         let created = create_session(&state, &json!({ "cwd": project, "type": "ensure_session", "toolNames": ["read", "grep", "find", "ls"] })).expect("start session");
@@ -5655,8 +5711,9 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(types.iter().any(|kind| kind == "run_started"));
         assert!(types.iter().any(|kind| kind == "run_finished"));
         state.scheduled_events.unsubscribe(&subscription);
-        state.shutdown_scheduler().unwrap();
-        assert!(!agent.join("scheduled-tasks/scheduler.lock").exists());
+        let report = state.shutdown_scheduler_until(std::time::Instant::now() + Duration::from_secs(5));
+        assert!(report.active_unknown.iter().any(|item| item.contains("prompt")), "{report:?}");
+        assert!(agent.join("scheduled-tasks/scheduler.lock").exists());
         server.join().unwrap();
     }
 
@@ -6487,6 +6544,23 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         let slow = tauri::async_runtime::block_on(slow).expect("the slow dispatch joins");
         assert_eq!(slow["ok"], false, "the stub child exits: models.list answers its real failure");
         assert_eq!(slow["error"]["code"], "io", "{slow}");
+    }
+
+    #[test]
+    fn static_shutdown_drains_both_ipc_lanes_and_refuses_new_work() {
+        let state = Arc::new(state());
+        let ordinary = Arc::clone(&state.dispatch_gate).try_acquire_owned().unwrap();
+        let control = Arc::clone(&state.dispatch_control_gate).try_acquire_owned().unwrap();
+        state.begin_static_shutdown();
+        let error = state.drain_static_ipc_until(std::time::Instant::now() + Duration::from_millis(10)).unwrap_err();
+        assert!(error.contains("1 ordinary, 1 control"), "{error}");
+        let denied = tauri::async_runtime::block_on(dispatch_envelope_gated(
+            Arc::clone(&state), json!({"v":1,"id":"after-close","op":"desktop.identity"}),
+        ));
+        assert_ne!(denied["ok"], true);
+        drop(ordinary);
+        drop(control);
+        state.drain_static_ipc_until(std::time::Instant::now() + Duration::from_secs(1)).unwrap();
     }
 
     #[test]

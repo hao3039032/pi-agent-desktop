@@ -294,6 +294,7 @@ fn content_type(path: &str) -> &'static str {
 fn main() {
     let mut static_dir: Option<PathBuf> = None;
     let mut scheduler_agent_dir: Option<PathBuf> = None;
+    let mut isolated_lifecycle_agent_dir: Option<PathBuf> = None;
     let mut port: u16 = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -301,6 +302,7 @@ fn main() {
             "--static-dir" => static_dir = args.next().map(PathBuf::from),
             "--port" => port = args.next().and_then(|value| value.parse().ok()).unwrap_or(0),
             "--scheduler-agent-dir" => scheduler_agent_dir = args.next().map(PathBuf::from),
+            "--isolated-lifecycle-agent-dir" => isolated_lifecycle_agent_dir = args.next().map(PathBuf::from),
             other => {
                 eprintln!("[harness] unknown argument: {other}");
                 std::process::exit(2);
@@ -356,7 +358,17 @@ fn main() {
     // on the UI thread. `State<'_, Arc<IpcHostState>>` only exists there.
     // Envelope requests share the state Arc directly and dispatch through
     // the product's gated entry from their connection threads.
-    let host_state = Arc::new(IpcHostState::new());
+    if isolated_lifecycle_agent_dir.is_some() && scheduler_agent_dir.is_some() {
+        panic!("isolated lifecycle does not start or own the scheduler");
+    }
+    let isolated_host = isolated_lifecycle_agent_dir.map(|agent| {
+        let configured = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok()).expect("isolated agent environment is required");
+        assert_eq!(agent.canonicalize().expect("agent exists"), configured, "agent environment mismatch");
+        pi_agent_desktop_lib::static_host::IsolatedStaticHost::init(&agent).expect("isolated lifecycle init")
+    });
+    let host_state = isolated_host.as_ref().map(|host| Arc::clone(&host.state))
+        .unwrap_or_else(|| Arc::new(IpcHostState::new()));
     if let Some(root) = std::env::var_os("STATIC_UI_HARNESS_FIXTURE_ROOT") {
         let root = PathBuf::from(root).canonicalize().expect("fixture root exists");
         let temp = std::env::temp_dir().canonicalize().expect("temporary directory resolves");
@@ -399,6 +411,32 @@ fn main() {
                 }
                 HostCall::SubscribeScheduled { cb } => {
                     pi_ipc_subscribe_scheduled(app.state::<Arc<IpcHostState>>(), bridge_for_host.channel(cb))
+                }
+                HostCall::Shutdown if isolated_host.is_some() => {
+                    let host = isolated_host.as_ref().unwrap();
+                    let result = host.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                    let report = match host.tracked() {
+                        Ok(report) => report,
+                        Err(error) => {
+                            let _ = reply.send(json!({ "harness": "shutdown", "ok": false,
+                                "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
+                                "reportError": error }));
+                            continue;
+                        }
+                    };
+                    json!({
+                        "harness": "shutdown", "ok": result.is_ok(),
+                        "failures": result.err().unwrap_or_default().iter().map(|f| format!("{}: {}", f.name, f.error)).collect::<Vec<_>>(),
+                        "scheduler": report.scheduler.as_ref(),
+                        "schedulerMayRepeatSessionDiagnostics": true,
+                        "sessionExited": report.sessions.as_ref().map(|r| &r.exited),
+                        "sessionUnknown": report.sessions.as_ref().map(|r| &r.unknown),
+                        "writerCompleted": report.session_writers.as_ref().map(|r| &r.exited),
+                        "writerUnknown": report.session_writers.as_ref().map(|r| &r.unknown),
+                        "managementExited": report.management.as_ref().map(|r| &r.exited),
+                        "managementUnknown": report.management.as_ref().map(|r| &r.unknown),
+                        "uncovered": ["unregistered writers", "scheduler prompt correlation and lease recovery", "terminals", "detached descendants", "cross-restart writer durability"]
+                    })
                 }
                 HostCall::Shutdown => {
                     // Orderly teardown, the same paths the product uses per
@@ -471,26 +509,22 @@ fn main() {
                             return;
                         }
                         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Value>();
-                        if host_tx.send((HostCall::Shutdown, reply_tx)).is_err()
-                            || reply_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err()
-                        {
-                            eprintln!("[harness] the host thread did not shut down in time");
-                            let _ = write_response(
-                                &mut stream,
-                                "500 Internal Server Error",
-                                "application/json",
-                                b"{\"error\":\"shutdown timeout\"}",
-                            );
-                            std::process::exit(1);
+                        if host_tx.send((HostCall::Shutdown, reply_tx)).is_err() {
+                            let _ = write_response(&mut stream, "500 Internal Server Error", "application/json", b"{\"error\":\"host unavailable\"}");
+                            return;
                         }
-                        // The reply is flushed before the process ends; the
-                        // driver falls back to a group kill if it misses it.
-                        let _ = write_response(
-                            &mut stream,
-                            "200 OK",
-                            "application/json",
-                            b"{\"harness\":\"stopping\"}",
-                        );
+                        let result = match reply_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                            Ok(result) => result,
+                            Err(_) => { let _ = write_response(&mut stream, "500 Internal Server Error", "application/json", b"{\"error\":\"shutdown timeout\"}"); return; }
+                        };
+                        if result.get("ok") == Some(&Value::Bool(false)) {
+                            let body = serde_json::to_vec(&result).unwrap();
+                            let _ = write_response(&mut stream, "500 Internal Server Error", "application/json", &body);
+                            return;
+                        }
+                        // The isolated lifecycle reports its limited coverage explicitly.
+                        let body = if result.get("ok").is_some() { serde_json::to_vec(&result).unwrap() } else { b"{\"harness\":\"stopping\"}".to_vec() };
+                        let _ = write_response(&mut stream, "200 OK", "application/json", &body);
                         eprintln!("[harness] shutdown complete; exiting");
                         std::process::exit(0);
                     }
