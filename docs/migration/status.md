@@ -43,6 +43,8 @@
 
 ## 集成验证记录（不是全量/跨平台验收）
 
+- 已整合 `5e7a2a51`，provider-auth 剩余两个本地真实 CLI 夹具改用小型 projection（lane 计量 5,630,803 bytes）与只读依赖；类型拒绝使用独立 agentDir，保留 Unknown 和凭据类型保护，不改变生产规则。父级在合并树分别以完整测试名 + `--exact` 运行，两项均 **1 passed / 0 failed / 0 ignored，无内部 skip**。未重跑旧输入测试或全套测试。子代理此前错误使用宽过滤词，误跑 31 项得到 **12 pass / 19 fail**，并违反禁止 SDK closure 复制的约束；父级保存了输出、核查列出的 staging 目录清理情况，完整失败清单与保留的 8 KiB Chat 残件见 [本地 CLI 失败记录](local-cli-failure-record.md)。除此次修复的 auth 项外，其余 **18 项失败未关闭**；不得把目标通过当整套通过。
+
 - Provider-auth relay 已整合 `f9e30118` / `0f86cc39` / `d0193e75`，保留 `36b5d027` 的输入关闭门禁。真实 invoke ACK 保存原 flow/task 身份；首 snapshot / subscription / epoch / 连续 seq 验证后才 ACK 与续命；截断历史用最多 16 个、≤60 KiB 的当前交互恢复，Node 再检查 token 活性。observer detach 不取消写任务；显式 Cancel 保留最佳努力 abort，但 SDK `Models.login` 的 abort race 不能证明底层 provider 已退出，未决 flow 不释放容量，**SDK取消闭环及 auth 最终 shutdown accounting 仍未完成**。
   - 父级合并树 JS 首轮 **56 pass / 1 fail**（旧断言要求原始 provider 错误）；改为明确验证脱敏错误及伪凭据不泄漏后 **57 pass / 0 fail / 0 skip**。静态及 source-only TypeScript、API inventory 检查通过。Next auth service/routes 无改动。
   - 父级 Linux Rust 定向输出为 9 pass，但其中 `login_input_bypasses_scope_mutation_isolation_and_enforces_task_guards` 内部因缺少 `PI_CLI_BIN` 返回，故只计 **8 项实际通过 + 1 内部跳过**；包含 Node login composition → fake RPC → Rust Channel → static service fixture，不是 native WebView/standalone。显式提供本地 CLI 单独运行该旧测试后 **1 fail**：`management agent directory differs from host agent directory`，未进入输入行为。当时该旧夹具还使用整树 staging；此失败作为历史记录保留，修复结果见下条，不把当时的失败回算为通过。另两项 `real_pi_*` 测试本轮未运行。两个 deprecated atomic warnings 保留。

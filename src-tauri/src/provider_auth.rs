@@ -1048,28 +1048,6 @@ export default function(pi) {
         assert!(dispatch(&state, "models.list", "x", &json!({})).is_none());
     }
 
-    /// Stage the vendored management tree (the pi_ipc test module's own
-    /// helper, invoked through the same script).
-    fn stage_managed_tree(dir: &std::path::Path) -> std::path::PathBuf {
-        let managed = dir.join("managed").join("node_modules");
-        let script = std::path::Path::new("../scripts/migration/stage-managed-tree.mjs")
-            .canonicalize()
-            .expect("the staging script resolves");
-        let output = std::process::Command::new("node")
-            .arg(script)
-            .arg("--out")
-            .arg(&managed)
-            .output()
-            .expect("node runs the staging script");
-        assert!(
-            output.status.success(),
-            "staging failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        managed
-    }
-
     /// Build only the local projection; link read-only dependencies instead
     /// of copying the installed SDK closure. This is not standalone evidence.
     fn local_managed_tree(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1135,9 +1113,25 @@ export default function(pi) {
         };
         let state = crate::pi_ipc::IpcHostState::new();
         let dir = tempfile::tempdir().expect("tempdir");
+        let _cleanup = StopFixtureManagement(&state);
         let agent_dir = dir.path().join("agent");
-        let managed = stage_managed_tree(dir.path());
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = local_managed_tree(dir.path());
         write_fixture_auth(&agent_dir, "sk-host-fixture-key-9d21be");
+        std::fs::create_dir_all(agent_dir.join("extensions")).unwrap();
+        std::fs::write(agent_dir.join("extensions/fixture.js"), r#"
+export default function(pi) {
+  pi.registerProvider({ id: 'fixture-oauth', name: 'Fixture', auth: { oauth: {
+    name: 'Fixture',
+    login: async (interaction) => {
+      await interaction.prompt({ type: 'manual_code', message: 'Fixture code' });
+      return { type: 'oauth', access: 'fixture-access', refresh: 'fixture-refresh', expires: Date.now() + 3600000 };
+    },
+    refresh: async () => ({ access: 'fixture-access', refresh: 'fixture-refresh', expires: Date.now() + 3600000 }),
+    toAuth: async (cred) => ({ apiKey: cred.access }),
+  } }, getModels: () => [{ id: 'fixture', name: 'Fixture' }], models: [{ id: 'fixture', name: 'Fixture' }] });
+}
+"#).unwrap();
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable,
             agent_dir: Some(agent_dir.clone()),
@@ -1194,18 +1188,7 @@ export default function(pi) {
         assert_eq!(gated["error"]["code"], "invalid_args", "{gated}");
         assert_eq!(gated["error"]["message"], "apiKey is required", "{gated}");
 
-        // 3. The type-gated delete carries the route's 409 message and
-        //    removes nothing.
-        let refused = send("auth.apiKeyDelete", json!({ "provider": "anthropic" }));
-        assert_eq!(refused["ok"], false, "{refused}");
-        assert_eq!(
-            refused["error"]["message"],
-            "anthropic is authenticated with OAuth, not an API key",
-            "{refused}"
-        );
-        assert_eq!(read_auth(&agent_dir)["anthropic"]["type"], "oauth", "the refusal removed nothing");
-
-        // 4. The API-key store writes through the provider's own login.
+        // 3. The API-key store persists the new credential.
         let stored = send(
             "auth.apiKeyStore",
             json!({ "provider": "openai", "apiKey": format!("{secret}-2") }),
@@ -1213,14 +1196,14 @@ export default function(pi) {
         assert_eq!(stored["ok"], true, "{stored}");
         assert_eq!(read_auth(&agent_dir)["openai"]["key"], format!("{secret}-2"));
 
-        // 5. logout removes only the OAuth credential; the API key survives.
+        // 4. logout removes only the OAuth credential; the API key survives.
         let logged_out = send("auth.logout", json!({ "provider": "anthropic" }));
         assert_eq!(logged_out["ok"], true, "{logged_out}");
         let after_logout = read_auth(&agent_dir);
         assert_eq!(after_logout.get("anthropic"), None, "the OAuth credential is gone");
         assert_eq!(after_logout["openai"]["type"], "api_key", "the API key survived");
 
-        // 6. The delete removes the key and the refreshed list agrees.
+        // 5. The delete removes the key and the refreshed list agrees.
         let removed = send("auth.apiKeyDelete", json!({ "provider": "openai" }));
         assert_eq!(removed["ok"], true, "{removed}");
         let relisted = send("auth.providers", json!({}));
@@ -1233,23 +1216,23 @@ export default function(pi) {
             .clone();
         assert_eq!(openai_relisted["configured"], false, "{openai_relisted}");
 
-        // 7. auth.loginManualCode with unknown token surfaces not_found.
+        // 6. auth.loginManualCode with unknown token surfaces not_found.
         let code_refused = send("auth.loginManualCode", json!({ "provider": "openai", "token": "openai-bad", "code": "123" }));
         assert_eq!(code_refused["ok"], false, "{code_refused}");
         assert_eq!(code_refused["error"]["code"], "not_found", "{code_refused}");
 
-        // 8. auth.loginCancel for unknown flow answers cancelled: false.
+        // 7. auth.loginCancel for unknown flow answers cancelled: false.
         let cancel_res = send("auth.loginCancel", json!({ "flowId": "nonexistent-flow" }));
         assert_eq!(cancel_res["ok"], true, "{cancel_res}");
         assert_eq!(cancel_res["data"]["cancelled"], false, "{cancel_res}");
 
-        // 9. Start a login task via start_task on the real instance, inspect snapshot, and cancel:
+        // 8. Start a fake-provider login on the real instance and cancel it.
         let config = state.management_config.lock().unwrap().clone().unwrap();
         let instance = state.management.instance("global", &config).unwrap();
         let task_handle = instance
             .start_task(
                 "auth.loginStart",
-                json!({ "flowId": "flow-test-real-1", "provider": "anthropic" }),
+                json!({ "flowId": "flow-test-real-1", "provider": "fixture-oauth" }),
                 LOGIN_FLOW_DEADLINE,
                 management_host::TaskKind::Mutation,
             )
@@ -1266,7 +1249,43 @@ export default function(pi) {
             "status: {:?}",
             snap.status
         );
-        let _ = instance.cancel_task(&task_handle);
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let poll = instance.management_call_kind("auth.loginPoll", json!({"flowId":"flow-test-real-1"}), Duration::from_secs(5), management_host::TaskKind::ReadOnly).unwrap();
+            if poll["events"].as_array().unwrap().iter().any(|event| event["event"]["token"].is_string()) { break; }
+            assert_eq!(instance.task_snapshot(&task_handle).unwrap().status, management_host::TaskStatus::Running);
+            assert!(std::time::Instant::now() < until, "fixture login prompt missing");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        instance.cancel_task(&task_handle).unwrap();
+        while instance.task_snapshot(&task_handle).unwrap().status == management_host::TaskStatus::Running {
+            assert!(std::time::Instant::now() < until, "fixture cancellation did not settle");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(instance.task_snapshot(&task_handle).unwrap().status, management_host::TaskStatus::Unknown);
+
+        // A rejected mutation leaves an unknown ledger, so exercise the type
+        // refusal in its own agent directory rather than bypassing admission.
+        let refused_state = crate::pi_ipc::IpcHostState::new();
+        let refused_dir = tempfile::tempdir().unwrap();
+        let _refused_cleanup = StopFixtureManagement(&refused_state);
+        let refused_agent = refused_dir.path().join("agent");
+        write_fixture_auth(&refused_agent, secret);
+        *refused_state.task_agent_dir.lock().unwrap() = Some(refused_agent.clone());
+        let mut refused_config = config;
+        refused_config.agent_dir = Some(refused_agent.clone());
+        *refused_state.management_config.lock().unwrap() = Some(refused_config);
+        let refused = crate::pi_ipc::dispatch_envelope(&refused_state, json!({
+            "v": 1, "id": "pa-refused", "op": "auth.apiKeyDelete", "args": {"provider": "anthropic"}
+        }));
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["message"], "anthropic is authenticated with OAuth, not an API key", "{refused}");
+        assert_eq!(read_auth(&refused_agent)["anthropic"]["type"], "oauth", "the refusal removed nothing");
+        let blocked = crate::pi_ipc::dispatch_envelope(&refused_state, json!({
+            "v": 1, "id": "pa-blocked", "op": "auth.apiKeyStore", "args": {"provider": "openai", "apiKey": "fixture"}
+        }));
+        assert_eq!(blocked["ok"], false, "{blocked}");
+        assert_eq!(blocked["error"]["message"], "management scope has an unknown outcome", "{blocked}");
     }
 
     fn assert_real_login_unknown(executable: &str, managed: &std::path::Path, source: &str, cancel: bool) {
@@ -1506,8 +1525,10 @@ export default function(pi) {
         };
         let state = crate::pi_ipc::IpcHostState::new();
         let dir = tempfile::tempdir().expect("tempdir");
+        let _cleanup = StopFixtureManagement(&state);
         let agent_dir = dir.path().join("agent");
-        let managed = stage_managed_tree(dir.path());
+        *state.task_agent_dir.lock().unwrap() = Some(agent_dir.clone());
+        let managed = local_managed_tree(dir.path());
         *state.management_config.lock().unwrap() = Some(management_host::ManagementSpawnConfig {
             executable,
             agent_dir: Some(agent_dir.clone()),
