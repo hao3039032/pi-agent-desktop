@@ -1,6 +1,6 @@
 # 静态宿主迁移实施状态
 
-此表记录主分支 `migrate/static-tauri-host` 截至 `ca23c638` 生命周期／实验关闭链增量整合的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
+此表记录主分支 `migrate/static-tauri-host` 截至 `a38b2bf5` 生命周期／结构化关闭报告增量整合的状态。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
 ## 目前没有发生的切换
 
@@ -34,7 +34,7 @@
 - **会话删除**：group journal、严格 scheduled 引用、session admission、直接子 header 重写、传递 subagent 级联、共享/独占 Chat 文件夹规则已整合。生产破坏性删除许可和 journal 恢复许可彼此独立，均默认不授予；DELETE 返回 `busy`，reason 为 `session_deletion_exclusive_maintenance_required`。活动的其他受影响会话、跨目录直接 fork child、无法核验的 cwd/引用仍保守拒绝，尚未达到完整旧行为。
 - **会话资源消费者**：已合并工具图片 resolver、late-result revoke、Markdown sessionId 和安全 bash 下载；历史图片投影已配套启用。继续保留真实原生窗口/预览 ACL、对话框与平台验收门槛。
 - **Fork/clone writer 修复**：`47a386ee` 已替换共享 child 的 `session.fork`：同门只读 live snapshot、受限短寿命 writer 私有 staging、预绑定目标和两端持久 fence、退出确认后的无覆盖发布；保留 fork_branch 的源 child/active leaf。group journal 已引入此基线，并在隔离 real-pi fixture 中验证其 pending fence 交互；policy 写锁仍不能代替未知 writer 的终止证明，跨宿主排他与用户恢复未完成。
-- **未决结果与生命周期**：在 `073815f2` 基础上整合截至 `ca23c638` 的 registry/management/短 writer 关闭、内存 prompt receipt、已验证结果的 resolved fence 与 cleanupWarning，以及实验 static host 的 IPC drain、scheduler 和 child 关闭链。共用绝对 deadline；实际准入先关闭，报告/生命周期锁忙不阻塞、保留失败，重复调用不重放 FnOnce。若首次无法取得 callbacks，失败永久保留，不自动补清理。resolved 只证明运行时结果已知，不证明 SDK 数据断电耐久，也不授予恢复权。prompt receipt 尚非跨重启证据；旧宿主、脱管 writer、正式 bootstrap/seed/scheduler 和产品恢复仍未完成。
+- **未决结果与生命周期**：在 `073815f2` 基础上整合截至 `ca23c638` 的 registry/management/短 writer 关闭、内存 prompt receipt、已验证结果的 resolved fence 与 cleanupWarning，以及实验 static host 的 IPC drain、scheduler 和 child 关闭链。共用绝对 deadline；实际准入先关闭，报告/生命周期锁忙不阻塞、保留失败，重复调用不重放 FnOnce。若首次无法取得 callbacks，失败永久保留，不自动补清理。resolved 只证明运行时结果已知，不证明 SDK 数据断电耐久，也不授予恢复权。prompt receipt 尚非跨重启证据；`a38b2bf5` 保留原 exited/unknown 并增加结构化诊断，分别表达未决 receipt、leader 退出未确认及锁忙/在途范围。实验 harness 的 available 仅表示取得报告，缺报告返回 null/unknown，不是空成功。无关联 start/terminal 观测和 leader 退出均不清历史 unknown；旧宿主、脱管 writer、正式 bootstrap/seed/scheduler 和产品恢复仍未完成。
 - **PTY 关闭门禁（仅设计记录）**：[pre-exec 身份绑定提案](pty-preexec-binding-proposal.md) 来自 lane `c06be727`，未吸收其 observation-only `shutdown()` 回退或 vendor 实现。身份绑定前的 `SIGSTOP` 可使 `std::Command::spawn()` worker 无法回收；限制线程数不解决回收。既有 vendor fd sweep 还需审计异步信号安全及内部 spawn-error FD。未具备所有失败路径下可安全清理的独立测试控制器，因此没有运行 SIGSTOP 注入，也没有新增运行测试通过的证据。下一步先验证控制器/清理设计，再决定生产实现，不把该提案当作终止能力或授权扩展。
 - **Terra 并行续作**：八个隔离工作树继续生命周期、会话 SDK、OAuth、独立打包、平台文件、传输、自动命名和 PTY/Git。小提交不等于功能交付；源码未接生产调用者的 primitive 不列已完成。SDK 最小补丁分发与合作升级/非合作 CLI 支持边界已向用户求决，尚未获准，不默认放行。
 - **自动命名**：`963f20fd` 接通 live child 的实际 model registry 和专用纯 helper bundle，`50714c76` 恢复运行中及 queued follow-up 的原行为；同分支正常追加不作 stale，模型/树 ABA、名称或 child 实例变化拒绝。改名使用公开 `pi.setSessionName`，不调用只读 extension context 未暴露的写方法；写前持久 marker，只有关联成功或明确写前拒绝清除，ACK 丢失/append 异常保留。最多 64 KiB 的 source 前缀仅为诊断，不冻结已准入运行。真实 90 秒 deadline 和原生 UI 仍待验。
@@ -42,6 +42,8 @@
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- `a38b2bf5` 结构化关闭报告：父代理审阅 receipt phase/去重、原字段兼容、缺报告序列化和锁文件（只增加已有 serde 的直接依赖/derive），确认合并后代码目录与 lane 完全一致。lane shutdown **8**、prompt lifecycle **2**、static-host **10**、harness **1** 通过；harness 首次因固定静态 bundle 缺失失败，改为测试自有空静态目录后通过，仅验证报告 HTTP 接线、不验证静态资源；序列化补充断言另行重跑。父代理未重复相同 Rust 构建，这些不证明 SDK 终态关联或 native 验收。
 
 - `ca23c638` 生命周期／实验关闭链整合：父代理确认合并后 `crates/`、`src-tauri/`、`lib/`、`scripts/`、`static-frontend/` 与该固定 lane 提交一致，未重复未变的 Rust 重构建。父代理定向 JS **18 passed / 0 failed / 0 skipped**，静态 tsc 与 root source-only tsc 通过；其中 3 个 session-action 测试只是待实现 SDK 合同 fixture，不是已实现分支取消证明。lane 锁竞争回归 lifecycle **5**、static host **9**，均无失败/忽略，library+harness check 通过（7 条 dead-code warning）。先前 lane fence **10**、cleanup/recovery JS **3**、mock harness **1** 是分别执行的证据；全部不代表正式 bootstrap、standalone MCP 或原生安装验收。
 

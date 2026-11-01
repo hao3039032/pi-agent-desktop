@@ -14,6 +14,16 @@ pub struct TrackedShutdown {
     pub management: Option<management_host::ManagementShutdownReport>,
 }
 
+/// Availability describes publication only; it does not certify a clean shutdown.
+pub fn session_report_fields(report: Option<&session_host::SessionShutdownReport>) -> serde_json::Value {
+    serde_json::json!({
+        "sessionReportStatus": if report.is_some() { "available" } else { "unknown" },
+        "sessionExited": report.map(|r| &r.exited),
+        "sessionUnknown": report.map(|r| &r.unknown),
+        "sessionDiagnostics": report.map(|r| &r.diagnostics),
+    })
+}
+
 fn publish_report<T>(
     tracked: &Mutex<TrackedShutdown>, name: &str, result: T,
     outcome: Result<(), String>, store: impl FnOnce(&mut TrackedShutdown, T),
@@ -117,6 +127,32 @@ mod tests {
         assert!(host.state.registry.start_with_plan("late", dir, "late", dir, || panic!("spawn plan must not run")).is_err());
         let config = management_host::ManagementSpawnConfig { executable: "unused".into(), agent_dir: None, extensions: vec![], env: vec![] };
         assert!(host.state.management.instance("late", &config).is_err());
+    }
+
+    #[test]
+    fn missing_session_report_is_explicitly_unknown_in_serialized_fields() {
+        let fields = session_report_fields(None);
+        assert_eq!(fields["sessionReportStatus"], "unknown");
+        assert!(fields["sessionExited"].is_null());
+        assert!(fields["sessionUnknown"].is_null());
+        assert!(fields["sessionDiagnostics"].is_null());
+        let fields = session_report_fields(Some(&session_host::SessionShutdownReport::default()));
+        assert_eq!(fields["sessionReportStatus"], "available");
+        assert_eq!(fields["sessionDiagnostics"], serde_json::json!([]));
+        let report = session_host::SessionShutdownReport {
+            exited: vec!["fixture".into()], unknown: vec!["fixture: prompt unknown".into()],
+            diagnostics: vec![session_host::SessionShutdownDiagnostic::PromptReceipt {
+                session_id: "fixture".into(), receipt_id: 1,
+                phase: session_host::PromptReceiptPhase::AcknowledgedStarted,
+                uncorrelated_start_seen: false, uncorrelated_terminal_seen: true,
+            }],
+        };
+        let fields = session_report_fields(Some(&report));
+        assert_eq!(fields["sessionExited"], serde_json::json!(["fixture"]));
+        assert_eq!(fields["sessionDiagnostics"][0]["kind"], "prompt_receipt");
+        assert_eq!(fields["sessionDiagnostics"][0]["phase"], "acknowledged_started");
+        assert_eq!(fields["sessionDiagnostics"][0]["uncorrelated_terminal_seen"], true);
+        assert_eq!(fields["sessionUnknown"], serde_json::json!(["fixture: prompt unknown"]));
     }
 
     #[test]

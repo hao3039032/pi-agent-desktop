@@ -833,9 +833,34 @@ impl Drop for SessionStart<'_> {
     }
 }
 
+pub use prompt_lifecycle::PromptReceiptPhase;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionShutdownDiagnostic {
+    PromptReceipt { session_id: String, receipt_id: u64, phase: PromptReceiptPhase, uncorrelated_start_seen: bool, uncorrelated_terminal_seen: bool },
+    LeaderExitUnconfirmed { session_id: String },
+    ScopeUnknown { scope: ShutdownScope, session_id: Option<String>, reason: ShutdownScopeReason },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownScope { Starts, StartLocks, ComposerQueue, PromptReceipts, Sessions, Activity, RunState, SessionState }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownScopeReason { UnavailableOrBusy, InFlight, PendingOrInFlight, Active, Pending, CapacityExceeded }
+
 /// Confirmation covers only tracked leaders; unknowns never authorize recovery.
 #[derive(Debug, Default)]
-pub struct SessionShutdownReport { pub exited: Vec<String>, pub unknown: Vec<String> }
+pub struct SessionShutdownReport { pub exited: Vec<String>, pub unknown: Vec<String>, pub diagnostics: Vec<SessionShutdownDiagnostic> }
+impl SessionShutdownReport {
+    fn scope_unknown(&mut self, scope: ShutdownScope, id: Option<&str>, reason: ShutdownScopeReason) {
+        self.diagnostics.push(SessionShutdownDiagnostic::ScopeUnknown { scope, session_id: id.map(str::to_owned), reason });
+    }
+    fn receipts(&mut self, id: &str, receipts: &prompt_lifecycle::PromptLifecycle) {
+        self.unknown.extend(receipts.unknown().into_iter().map(|item| format!("{id}: {item}")));
+        self.diagnostics.extend(receipts.diagnostics(id));
+    }
+}
 
 impl Default for SessionRegistry {
     fn default() -> Self {
@@ -1127,68 +1152,69 @@ impl SessionRegistry {
         self.begin_shutdown();
         let mut report = SessionShutdownReport::default();
         match self.starts_in_flight.try_lock() {
-            Ok(starts) => report.unknown.extend(starts.keys().map(|id| format!("{id}: start in flight"))),
-            Err(_) => report.unknown.push("session start tracking unavailable or busy".into()),
+            Ok(starts) => for id in starts.keys() { report.unknown.push(format!("{id}: start in flight")); report.scope_unknown(ShutdownScope::Starts, Some(id), ShutdownScopeReason::InFlight); },
+            Err(_) => { report.unknown.push("session start tracking unavailable or busy".into()); report.scope_unknown(ShutdownScope::Starts, None, ShutdownScopeReason::UnavailableOrBusy); },
         }
         match self.start_locks.try_lock() {
             Ok(locks) => for (id, lock) in locks.iter() {
-                if lock.try_lock().is_err() { report.unknown.push(format!("{id}: session writer or start lock busy")); }
+                if lock.try_lock().is_err() { report.unknown.push(format!("{id}: session writer or start lock busy")); report.scope_unknown(ShutdownScope::StartLocks, Some(id), ShutdownScopeReason::UnavailableOrBusy); }
             },
-            Err(_) => report.unknown.push("session writer lock registry unavailable or busy".into()),
+            Err(_) => { report.unknown.push("session writer lock registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::StartLocks, None, ShutdownScopeReason::UnavailableOrBusy); },
         }
         match self.composer_outboxes.try_lock() {
             Ok(outboxes) => for (id, outbox) in outboxes.iter() {
                 match outbox.try_has_pending_or_in_flight() {
                     Some(false) => {},
-                    Some(true) => report.unknown.push(format!("{id}: composer queue pending or in flight")),
-                    None => report.unknown.push(format!("{id}: composer queue unavailable or busy")),
+                    Some(true) => { report.unknown.push(format!("{id}: composer queue pending or in flight")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(id), ShutdownScopeReason::PendingOrInFlight); },
+                    None => { report.unknown.push(format!("{id}: composer queue unavailable or busy")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(id), ShutdownScopeReason::UnavailableOrBusy); },
                 }
             },
-            Err(_) => report.unknown.push("composer queue registry unavailable or busy".into()),
+            Err(_) => { report.unknown.push("composer queue registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::ComposerQueue, None, ShutdownScopeReason::UnavailableOrBusy); },
         }
         match self.prompt_receipts.try_lock() {
             Ok(all) => for (id, receipts) in all.iter() {
                 match receipts.try_lock() {
-                    Ok(receipts) => report.unknown.extend(receipts.unknown().into_iter().map(|item| format!("{id}: {item}"))),
-                    Err(_) => report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")),
+                    Ok(receipts) => report.receipts(id, &receipts),
+                    Err(_) => { report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")); report.scope_unknown(ShutdownScope::PromptReceipts, Some(id), ShutdownScopeReason::UnavailableOrBusy); },
                 }
             },
-            Err(_) => report.unknown.push("prompt receipt registry unavailable or busy".into()),
+            Err(_) => { report.unknown.push("prompt receipt registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::PromptReceipts, None, ShutdownScopeReason::UnavailableOrBusy); },
         }
         let sessions: Vec<_> = match self.sessions.try_lock() {
             Ok(sessions) => sessions.iter().map(|(id, session)| (id.clone(), Arc::clone(session))).collect(),
-            Err(_) => { report.unknown.push("session registry unavailable or busy".into()); return report; }
+            Err(_) => { report.unknown.push("session registry unavailable or busy".into()); report.scope_unknown(ShutdownScope::Sessions, None, ShutdownScopeReason::UnavailableOrBusy); report.diagnostics.sort(); report.diagnostics.dedup(); return report; }
         };
         for (id, session) in sessions {
             let activity = session.activity_gate.try_write();
-            if activity.is_err() { report.unknown.push(format!("{id}: activity in flight or lock unavailable")); }
+            if activity.is_err() { report.unknown.push(format!("{id}: activity in flight or lock unavailable")); report.scope_unknown(ShutdownScope::Activity, Some(&id), ShutdownScopeReason::UnavailableOrBusy); }
             match session.machine.try_lock() {
-                Ok(machine) if machine.state.is_running() => report.unknown.push(format!("{id}: projected run is active")),
+                Ok(machine) if machine.state.is_running() => { report.unknown.push(format!("{id}: projected run is active")); report.scope_unknown(ShutdownScope::RunState, Some(&id), ShutdownScopeReason::Active); },
                 Ok(_) => {},
-                Err(_) => report.unknown.push(format!("{id}: run state unavailable or busy")),
+                Err(_) => { report.unknown.push(format!("{id}: run state unavailable or busy")); report.scope_unknown(ShutdownScope::RunState, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
             }
             match session.state.try_lock() {
-                Ok(state) if !state.ui.ids().is_empty() => report.unknown.push(format!("{id}: extension UI pending")),
+                Ok(state) if !state.ui.ids().is_empty() => { report.unknown.push(format!("{id}: extension UI pending")); report.scope_unknown(ShutdownScope::SessionState, Some(&id), ShutdownScopeReason::Pending); },
                 Ok(_) => {},
-                Err(_) => report.unknown.push(format!("{id}: session state unavailable or busy")),
+                Err(_) => { report.unknown.push(format!("{id}: session state unavailable or busy")); report.scope_unknown(ShutdownScope::SessionState, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
             }
             // Recheck under the activity gate: a pre-shutdown submission or
             // enqueue may have completed after the registry-wide snapshots.
             match session.prompt_receipts.try_lock() {
-                Ok(receipts) => report.unknown.extend(receipts.unknown().into_iter().map(|item| format!("{id}: {item}"))),
-                Err(_) => report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")),
+                Ok(receipts) => report.receipts(&id, &receipts),
+                Err(_) => { report.unknown.push(format!("{id}: prompt receipt tracking unavailable or busy")); report.scope_unknown(ShutdownScope::PromptReceipts, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
             }
             match session.composer_outbox.try_has_pending_or_in_flight() {
                 Some(false) => {},
-                Some(true) => report.unknown.push(format!("{id}: composer queue pending or in flight")),
-                None => report.unknown.push(format!("{id}: composer queue unavailable or busy")),
+                Some(true) => { report.unknown.push(format!("{id}: composer queue pending or in flight")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(&id), ShutdownScopeReason::PendingOrInFlight); },
+                None => { report.unknown.push(format!("{id}: composer queue unavailable or busy")); report.scope_unknown(ShutdownScope::ComposerQueue, Some(&id), ShutdownScopeReason::UnavailableOrBusy); },
             }
             let exited = session.client.close_until(deadline);
             if exited { report.exited.push(id); }
-            else { report.unknown.push(format!("{id}: leader exit unconfirmed")); }
+            else { report.unknown.push(format!("{id}: leader exit unconfirmed")); report.diagnostics.push(SessionShutdownDiagnostic::LeaderExitUnconfirmed { session_id: id }); }
             session.settle_cv.notify_all();
         }
         report.exited.sort(); report.unknown.sort(); report.unknown.dedup();
+        report.diagnostics.sort(); report.diagnostics.dedup();
         report
     }
 
@@ -2258,8 +2284,18 @@ mod dispatch_tests {
         let _guard = gate.lock().unwrap();
         let report = registry.shutdown_until(Instant::now() + Duration::from_millis(20));
         assert!(report.unknown.iter().any(|item| item.contains("held: session writer or start lock busy")), "{report:?}");
+        assert!(report.diagnostics.contains(&SessionShutdownDiagnostic::ScopeUnknown { scope: ShutdownScope::StartLocks, session_id: Some("held".into()), reason: ShutdownScopeReason::UnavailableOrBusy }));
         assert!(report.unknown.iter().any(|item| item.contains("queued: composer queue pending")), "{report:?}");
         assert!(matches!(registry.with_idle_session_writer("new", |_| Ok::<_, ()>(())), Err(SessionWriterError::Busy(_))));
+    }
+
+    #[test]
+    fn shutdown_reports_unavailable_session_registry_without_empty_success() {
+        let registry = SessionRegistry::new();
+        let _guard = registry.sessions.lock().unwrap();
+        let report = registry.shutdown_until(Instant::now());
+        assert!(!report.unknown.is_empty());
+        assert!(report.diagnostics.contains(&SessionShutdownDiagnostic::ScopeUnknown { scope: ShutdownScope::Sessions, session_id: None, reason: ShutdownScopeReason::UnavailableOrBusy }));
     }
 
     #[test]

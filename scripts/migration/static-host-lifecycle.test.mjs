@@ -14,7 +14,8 @@ test("isolated static host drains IPC and reports tracked shutdown coverage", { 
   const token = "isolated-static-host-test-token-1234567890";
   const env = { ...process.env, HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: agent, STATIC_UI_HARNESS_TOKEN: token };
   for (const key of Object.keys(env)) if ((key.startsWith("PI_") && key !== "PI_CODING_AGENT_DIR") || key === "JITI_ALIAS") delete env[key];
-  const child = spawn(resolve(binary), ["--static-dir", resolve("desktop/frontend-static"), "--isolated-lifecycle-agent-dir", agent], { env, stdio: ["ignore", "pipe", "pipe"] });
+  // This test exercises only the bridge and shutdown report, not static assets.
+  const child = spawn(resolve(binary), ["--static-dir", root, "--isolated-lifecycle-agent-dir", agent], { env, stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const exited = new Promise((resolveExit) => child.once("exit", (code) => resolveExit(code)));
@@ -36,7 +37,9 @@ test("isolated static host drains IPC and reports tracked shutdown coverage", { 
     assert.equal(report.scheduler.stopped, true);
     assert.deepEqual(report.scheduler.activeUnknown, []);
     assert.equal(report.schedulerMayRepeatSessionDiagnostics, true);
+    assert.equal(report.sessionReportStatus, "available");
     assert.deepEqual(report.sessionUnknown, []);
+    assert.deepEqual(report.sessionDiagnostics, []);
     assert.deepEqual(report.managementUnknown, []);
     assert.deepEqual(report.writerUnknown, []);
     assert.deepEqual(report.writerCompleted, []);

@@ -532,9 +532,12 @@ fn shutdown_until_distinguishes_handled_and_ack_without_terminal() {
         let session = registry.start(&id, &file, &id, &cwd, &config).unwrap();
         session.command("prompt", json!({"message":"fixture"}), Some(Duration::from_secs(2))).unwrap();
         let report = registry.shutdown_until(std::time::Instant::now() + Duration::from_secs(2));
-        assert_eq!(report.exited, vec![id]);
-        if disposition == "handled" { assert!(report.unknown.is_empty(), "{report:?}"); }
-        else { assert!(report.unknown.iter().any(|entry| entry.contains("acknowledged started")), "{report:?}"); }
+        assert_eq!(report.exited, vec![id.clone()]);
+        if disposition == "handled" { assert!(report.unknown.is_empty(), "{report:?}"); assert!(report.diagnostics.is_empty()); }
+        else {
+            assert!(report.unknown.iter().any(|entry| entry.contains("acknowledged started")), "{report:?}");
+            assert!(report.diagnostics.iter().any(|entry| matches!(entry, session_host::SessionShutdownDiagnostic::PromptReceipt { session_id, phase: session_host::PromptReceiptPhase::AcknowledgedStarted, .. } if session_id == &id)), "{report:?}");
+        }
     }
 }
 
