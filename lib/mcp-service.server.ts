@@ -43,7 +43,7 @@ import {
 import { MCP_EXPOSURES, isMcpExposure, suggestFreeName } from "./mcp-import";
 import { mcpOAuthUrl, signOutMcpServer } from "./mcp-sign-in";
 import { mcpEntryConfigKey } from "./mcp-config-key";
-import { mcpSignInKey, mcpSignOutCount } from "./mcp-sign-out";
+import { mcpOAuthStoreKeys, mcpSignOutCount } from "./mcp-sign-out";
 import { forgetMcpEntryStatuses } from "./mcp-status";
 import { findWebPasswordField } from "./mcp-transport";
 import { holdRemovedEntry, returnRemovedEntry, takeRemovedEntry } from "./mcp-undo";
@@ -375,15 +375,15 @@ async function privateCredentialContext(options: PrivateCredentialRequest) {
 export async function managedMcpCredentialTarget(options: PrivateCredentialRequest) {
   const { agentDir, project, internals, server } = await privateCredentialContext(options);
   const entry = resolveSignOutEntry(agentDir, project, internals, server);
-  const canonicalKey = mcpSignInKey(server.name, entry.url);
-  return { schema: 1 as const, canonicalKey, configKey: entry.configKey, generation: mcpSignOutCount(canonicalKey) };
+  const { key: canonicalKey, legacyKey } = mcpOAuthStoreKeys(server.name, entry.url);
+  return { schema: 1 as const, admissionSchema: 1 as const, canonicalKey, legacyKey, configKey: entry.configKey, generation: mcpSignOutCount(canonicalKey) };
 }
 
 /** Host-only: the caller holds same-target admission until this operation is known complete. */
 export async function signOutMcpCooperative(options: PrivateCredentialRequest & { expectedCanonicalKey: string; expectedConfigKey: string }) {
   const { agentDir, project, internals, server } = await privateCredentialContext(options);
   const entry = resolveSignOutEntry(agentDir, project, internals, server);
-  const canonicalKey = mcpSignInKey(server.name, entry.url);
+  const { key: canonicalKey, legacyKey } = mcpOAuthStoreKeys(server.name, entry.url);
   if (canonicalKey !== options.expectedCanonicalKey || entry.configKey !== options.expectedConfigKey) {
     throw new McpServiceError(409, "invalid-request", "MCP credential target or configuration changed");
   }
@@ -392,7 +392,7 @@ export async function signOutMcpCooperative(options: PrivateCredentialRequest & 
   const generation = mcpSignOutCount(canonicalKey);
   forgetMcpEntryStatuses({ scope: server.scope, sourcePath: entry.sourcePath, name: server.name });
   const result = await buildOverview(agentDir, project, { signedOut: { ...server, removed } });
-  return { schema: 1 as const, result, revocation: { canonicalKey, configKey: entry.configKey, generation } };
+  return { schema: 1 as const, result, revocation: { canonicalKey, legacyKey, configKey: entry.configKey, generation } };
 }
 
 function namesInFile(agentDir: string, project: Project | undefined, scope: McpScope, internals: PiSdkInternals): string[] {

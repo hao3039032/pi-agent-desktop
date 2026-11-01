@@ -53,12 +53,25 @@ test("real management pi reads and edits MCP without starting configured servers
     const identity = await call("mcp.credentialTarget", { scope: "global", name: "oauth" });
     const revoked = await call("mcp.signOutCooperative", { scope: "global", name: "oauth", expectedCanonicalKey: identity.canonicalKey, expectedConfigKey: identity.configKey });
     assert.equal(identity.schema, 1);
+    assert.equal(identity.admissionSchema, 1);
     assert.equal(identity.canonicalKey, "mcp__oauth|http://127.0.0.1:9/mcp?token=fixture-secret");
+    assert.equal(identity.legacyKey, "http://127.0.0.1:9/mcp?token=fixture-secret");
     assert.equal(revoked.schema, 1);
     assert.equal(revoked.revocation.canonicalKey, identity.canonicalKey);
+    assert.equal(revoked.revocation.legacyKey, identity.legacyKey);
     assert.equal(revoked.revocation.configKey, identity.configKey);
     assert.equal(revoked.revocation.generation, identity.generation + 1);
     assert.doesNotMatch(JSON.stringify(revoked.result), /fixture-secret/);
+    const fresh = await call("mcp.credentialTarget", { scope: "global", name: "oauth" });
+    const withoutLegacy = { ...fresh };
+    delete withoutLegacy.legacyKey;
+    for (const op of ["mcp.test", "mcp.signInStart"]) {
+      for (const admission of [identity, withoutLegacy, { ...fresh, legacyKey: "wrong" }]) {
+        const refused = await call(op, { scope: "global", name: "oauth", credentialAdmission: admission });
+        assert.equal(refused.mcpRefusal.reason, "invalid-request");
+        assert.doesNotMatch(JSON.stringify(refused), /fixture-secret/);
+      }
+    }
     assert.doesNotMatch(JSON.stringify(progress), /fixture-secret/);
     assert.doesNotMatch(JSON.stringify(logs), /fixture-secret/);
     const added = await call("mcp.configAction", { cwd, action: "add", scope: "global", text: "node fixture.js", name: "fixture" });

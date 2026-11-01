@@ -1,6 +1,7 @@
 import { isMcpDisabledByOperator } from "./builtin-extensions";
 import { isMcpEntryRefusal, mcpProjectTrustRefusal, readConnectableMcpBody } from "./mcp-entry-request";
 import { McpServiceError } from "./mcp-service.server";
+import { McpCredentialAdmissionError } from "./mcp-sign-out";
 import { signInMcpWithHostedCallback, type McpHostedCallbackFactory } from "./mcp-oauth-hosted.server";
 export { McpOAuthBroker } from "./mcp-oauth-broker.server";
 import {
@@ -14,7 +15,7 @@ import {
 } from "./mcp-sign-in";
 
 /** Start against a disk entry checked with the host's authorized roots. */
-export async function startManagedMcpSignIn(options: { body: unknown; agentDir: string; allowedRoots: Set<string>; callbackFactory?: McpHostedCallbackFactory }) {
+export async function startManagedMcpSignIn(options: { body: unknown; agentDir: string; allowedRoots: Set<string>; callbackFactory?: McpHostedCallbackFactory; credentialAdmission?: unknown }) {
   const entry = await readConnectableMcpBody(options.body, options);
   if (isMcpEntryRefusal(entry)) {
     const { error, reason, ...params } = entry.body;
@@ -30,8 +31,13 @@ export async function startManagedMcpSignIn(options: { body: unknown; agentDir: 
     const factory = options.callbackFactory;
     deps.signIn = (request, signal, onTokenRequest) => signInMcpWithHostedCallback(request, factory, signal, onTokenRequest);
   }
-  const { flow, joined } = startMcpSignIn({ scope, name, sourcePath, configKey, config, cwd, url, mayConnect }, deps);
-  return { ...flow, ...(joined ? { joined: true as const } : {}) };
+  try {
+    const { flow, joined } = startMcpSignIn({ scope, name, sourcePath, configKey, config, cwd, url, mayConnect }, deps, { credentialAdmission: options.credentialAdmission });
+    return { ...flow, ...(joined ? { joined: true as const } : {}) };
+  } catch (error) {
+    if (error instanceof McpCredentialAdmissionError) throw new McpServiceError(409, "invalid-request", error.message);
+    throw error;
+  }
 }
 
 const UNKNOWN = "No sign-in has that id: it ended over a minute ago, or Pi Web restarted";
