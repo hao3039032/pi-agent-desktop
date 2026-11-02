@@ -31,6 +31,13 @@ fn preview_navigation_allowed(url: &tauri::Url) -> bool {
         || (url.scheme() == "http" && url.host_str() == Some("pi-resource.localhost"))
 }
 
+fn preview_close_quits(quit: bool) -> Result<(), String> {
+    if quit { Ok(()) } else { Err("Hiding the window to the tray is not supported in Static Preview".into()) }
+}
+
+#[tauri::command]
+fn set_close_quits(quit: bool) -> Result<(), String> { preview_close_quits(quit) }
+
 pub fn run_static_preview() {
     let app = tauri::Builder::default()
         .on_webview_event(|webview, event| {
@@ -64,7 +71,7 @@ pub fn run_static_preview() {
             crate::provider_auth::pi_ipc_login_stream,
             crate::open_external_url, crate::open_path, crate::open_log_dir,
             crate::reveal_item_in_dir, crate::list_apps_for_file, crate::open_path_with,
-            shell::popup::show_popup_menu, shell::set_close_quits, shell::quit_app,
+            shell::popup::show_popup_menu, set_close_quits, shell::quit_app,
             shell::show_main_window_cmd, shell::app_ready, shell::window_painted,
             crate::native_prefs::set_ui_theme, crate::native_prefs::clear_app_cache
         ])
@@ -97,7 +104,8 @@ pub fn run_static_preview() {
                 if let Err(errors) = host.shutdown_until(Instant::now() + Duration::from_secs(5)) {
                     eprintln!("Static Preview shutdown uncertain: {errors:?}");
                 }
-                host.state.terminals.shutdown();
+                // Preview denies terminal.create before admission, so this host
+                // cannot own a PTY. Do not invoke the unbounded PTY shutdown.
             }
         }
     });
@@ -106,6 +114,45 @@ pub fn run_static_preview() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_close_behavior_rejects_unsupported_tray_mode() {
+        assert!(preview_close_quits(true).is_ok());
+        assert!(preview_close_quits(false).unwrap_err().contains("not supported"));
+    }
+
+    #[test]
+    fn preview_generated_acl_grants_registered_commands_and_keeps_login_local() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/acl-manifests.json"))).unwrap();
+        let capabilities: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/capabilities.json"))).unwrap();
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let selected = serde_json::to_value(&context.config().app.security.capabilities).unwrap();
+        let selected = selected.as_array().unwrap();
+        assert!(selected.iter().any(|entry| entry == "desktop-pi-ipc"));
+        let capability = &capabilities["desktop-pi-ipc"];
+        assert_eq!(capability["local"], true);
+        assert_eq!(capability["windows"], serde_json::json!(["main"]));
+        assert!(capability.get("remote").is_none_or(serde_json::Value::is_null));
+        assert!(capability["permissions"].as_array().unwrap().iter().any(|p| p == "allow-pi-ipc-login-stream"));
+        let permissions = manifest["__app-acl__"]["permissions"].as_object().unwrap();
+        assert_eq!(permissions["allow-pi-ipc-login-stream"]["commands"]["allow"], serde_json::json!(["pi_ipc_login_stream"]));
+        for (id, other) in capabilities.as_object().unwrap() {
+            if id != "desktop-pi-ipc" {
+                assert!(!other["permissions"].as_array().unwrap().iter().any(|p| p == "allow-pi-ipc-login-stream"));
+            }
+        }
+        let source = include_str!("preview.rs");
+        let handler = source.split(".invoke_handler(tauri::generate_handler![").nth(1).unwrap().split("])").next().unwrap();
+        for item in handler.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            let command = item.rsplit("::").next().unwrap();
+            let allowed = selected.iter().filter_map(serde_json::Value::as_str).any(|name| {
+                capabilities[name]["permissions"].as_array().is_some_and(|grants| grants.iter().filter_map(serde_json::Value::as_str).any(|grant| {
+                    permissions.get(grant).and_then(|permission| permission["commands"]["allow"].as_array()).is_some_and(|commands| commands.iter().any(|value| value == command))
+                }))
+            });
+            assert!(allowed, "registered Preview command {command} has no selected generated app ACL permission");
+        }
+    }
+
     #[test]
     fn preview_navigation_keeps_external_origins_out_of_the_webview() {
         let app = if cfg!(windows) { "http://tauri.localhost/index.html" } else { "tauri://localhost/index.html" };

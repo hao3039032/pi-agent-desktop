@@ -1350,7 +1350,7 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         return protocol_error(&id, "invalid_args", "the request has no op");
     };
     if let Some(error) = &state.file_roots_init_error { return protocol_error(&id, "io", error); }
-    if state.preview_home.is_some() && matches!(op, "updates.check" | "tasks.run" | "tasks.takeover") {
+    if state.preview_home.is_some() && matches!(op, "updates.check" | "tasks.run" | "tasks.takeover" | "terminal.create") {
         return protocol_error(&id, "not_supported", "This operation is disabled in Static Preview");
     }
     let args = envelope.get("args").cloned().unwrap_or(json!({}));

@@ -284,6 +284,9 @@ mod tests {
             let response = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"fixture","op":op,"args":{}}));
             assert_eq!(response["error"]["code"], "not_supported", "{response}");
         }
+        let terminal = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"fixture","op":"terminal.create","args":{"id":"fixture","cwd":home}}));
+        assert_eq!(terminal["error"]["code"], "not_supported", "{terminal}");
+        assert!(host.state.terminals.get("fixture").is_none(), "Preview must not create a PTY");
         assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(5)).is_ok());
     }
 

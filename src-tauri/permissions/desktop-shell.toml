@@ -112,3 +112,8 @@ commands.allow = ["pi_ipc_subscribe_terminal"]
 identifier = "allow-pi-ipc-subscribe-scheduled"
 description = "Allows the app WebView to subscribe scheduled-task change events over a Tauri Channel."
 commands.allow = ["pi_ipc_subscribe_scheduled"]
+
+[[permission]]
+identifier = "allow-pi-ipc-login-stream"
+description = "Allows the trusted static app window to observe a provider login over a Tauri Channel."
+commands.allow = ["pi_ipc_login_stream"]
