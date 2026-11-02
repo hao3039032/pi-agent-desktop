@@ -62,8 +62,14 @@ mod session_deletion_journal;
 mod terminal_host;
 mod host_ownership;
 pub mod host_lifecycle;
-#[cfg(any(test, feature = "harness"))]
+#[cfg(any(test, feature = "harness", feature = "static-preview"))]
 pub mod static_host;
+#[cfg(feature = "static-preview")]
+mod preview_bundle;
+#[cfg(feature = "static-preview")]
+mod preview;
+#[cfg(feature = "static-preview")]
+pub use preview::run_static_preview;
 #[cfg(any(test, feature = "harness"))]
 pub mod development_management_sdk;
 pub mod session_writer_lifecycle;

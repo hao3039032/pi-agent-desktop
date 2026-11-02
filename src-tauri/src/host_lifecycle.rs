@@ -93,7 +93,11 @@ pub struct HostLifecycle {
 
 impl HostLifecycle {
     pub fn init(agent: &Path) -> Result<Self, String> {
+        #[cfg(windows)]
+        let ownership = HostOwnership::acquire(agent, OwnershipMode::Runtime)
+            .map_err(|e| format!("Cannot acquire cooperative host ownership: {e}"))?;
         let agent = agent.canonicalize().map_err(|e| format!("Cannot resolve agent directory: {e}"))?;
+        #[cfg(not(windows))]
         let ownership = HostOwnership::acquire(&agent, OwnershipMode::Runtime)
             .map_err(|e| format!("Cannot acquire cooperative host ownership: {e}"))?;
         Ok(Self { _ownership: ownership, agent, inner: Mutex::new(Inner { state: LifecycleState::Running, services: Vec::new() }), closing: AtomicBool::new(false), completed: OnceLock::new() })

@@ -2388,6 +2388,7 @@ dependencies = [
  "sha2 0.11.0",
  "task-scheduler",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

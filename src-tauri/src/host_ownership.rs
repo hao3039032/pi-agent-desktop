@@ -14,6 +14,8 @@ pub(crate) enum OwnershipMode {
 /// file is never unlinked: replacing a locked inode would split ownership.
 pub(crate) struct HostOwnership {
     _file: std::fs::File,
+    #[cfg(windows)]
+    _directories: Vec<std::fs::File>,
     mode: OwnershipMode,
 }
 
@@ -51,12 +53,78 @@ impl HostOwnership {
         Ok(Self { _file: file, mode })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    pub(crate) fn acquire(agent: &Path, mode: OwnershipMode) -> io::Result<Self> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use std::path::{Component, PathBuf};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        if !agent.is_absolute() { return Err(io::ErrorKind::InvalidInput.into()); }
+        let mut components = agent.components();
+        let prefix = match components.next() { Some(Component::Prefix(prefix)) => prefix.as_os_str(), _ => return Err(io::ErrorKind::InvalidInput.into()) };
+        if !matches!(components.next(), Some(Component::RootDir)) { return Err(io::ErrorKind::InvalidInput.into()); }
+        let mut path = PathBuf::from(prefix);
+        path.push("\\");
+        let open_directory = |path: &Path| -> io::Result<std::fs::File> {
+            let file = std::fs::OpenOptions::new().read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
+            let meta = file.metadata()?;
+            if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe ownership directory"));
+            }
+            Ok(file)
+        };
+        let mut directories = vec![open_directory(&path)?];
+        for component in components {
+            match component { Component::Normal(name) => path.push(name), _ => return Err(io::ErrorKind::InvalidInput.into()) }
+            directories.push(open_directory(&path)?);
+        }
+        path.push("pi-web");
+        match std::fs::create_dir(&path) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error),
+        }
+        directories.push(open_directory(&path)?);
+        path.push("host-ownership.lock");
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
+            .share_mode(0).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(&path)?;
+        let metadata = file.metadata()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || unsafe { GetFileInformationByHandle(file.as_raw_handle() as isize, &mut info) } == 0
+            || info.nNumberOfLinks != 1 || info.dwVolumeSerialNumber == 0 || (info.nFileIndexHigh == 0 && info.nFileIndexLow == 0) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe ownership lock"));
+        }
+        Ok(Self { _file: file, _directories: directories, mode })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub(crate) fn acquire(_agent: &Path, _mode: OwnershipMode) -> io::Result<Self> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "host ownership is unavailable on this platform"))
     }
 
     pub(crate) fn mode(&self) -> OwnershipMode { self.mode }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_is_exclusive_and_keeps_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = HostOwnership::acquire(dir.path(), OwnershipMode::Runtime).unwrap();
+        assert!(HostOwnership::acquire(dir.path(), OwnershipMode::Runtime).is_err());
+        assert!(HostOwnership::acquire(dir.path(), OwnershipMode::Maintenance).is_err());
+        assert!(dir.path().join("pi-web/host-ownership.lock").exists());
+        drop(first);
+        assert!(HostOwnership::acquire(dir.path(), OwnershipMode::Runtime).is_ok());
+    }
 }
 
 #[cfg(all(test, unix))]

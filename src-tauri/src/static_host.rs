@@ -60,6 +60,7 @@ impl IsolatedStaticHost {
     }
 
     /// Explicit development-only runtime; invalid binding fails without legacy fallback.
+    #[cfg(any(test, feature = "harness"))]
     pub fn init_development_sdk(agent: &Path, config: crate::development_management_sdk::DevelopmentManagementSdk) -> Result<Self, String> {
         let selected = crate::pi_ipc::resolve_pi_executable().ok_or("selected CLI unavailable")?;
         let (runtime, executable) = config.verify(&selected)?;
@@ -77,11 +78,46 @@ impl IsolatedStaticHost {
         if agent == temp || !agent.starts_with(&temp) || !agent.is_dir() {
             return Err("isolated static host requires a temporary agent directory".into());
         }
-        let lifecycle = HostLifecycle::init(&agent)?;
+        Self::initialize(&agent, state, config)
+    }
+
+    #[cfg(feature = "static-preview")]
+    pub(crate) fn init_preview(home: &Path, bundle: crate::preview_bundle::PreviewBundle) -> Result<Self, String> {
+        if !home.is_absolute() || !home.is_dir() { return Err("invalid preview home".into()); }
+        let agent = home.join(".pi/agent");
+        for dir in [home.join(".pi"), agent.clone()] {
+            match std::fs::create_dir(&dir) { Ok(()) => (), Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (), Err(e) => return Err(e.to_string()) }
+            let meta = std::fs::symlink_metadata(&dir).map_err(|e| e.to_string())?;
+            if !meta.is_dir() || meta.file_type().is_symlink() { return Err("unsafe preview agent directory".into()); }
+            #[cfg(windows)] { use std::os::windows::fs::MetadataExt; if meta.file_attributes() & 0x400 != 0 { return Err("unsafe preview agent directory".into()); } }
+        }
+        let runtime = bundle.runtime;
+        let state = IpcHostState::new_with_preview_home(Some(runtime.clone()), Some(home.to_path_buf()));
+        *state.spawn_base.lock().map_err(|_| "spawn configuration unavailable")? = Some(crate::pi_ipc::SpawnBase {
+            executable: bundle.cli.to_string_lossy().into_owned(), bridge_asset: bundle.bridge,
+            artifacts_asset: Some(bundle.artifacts), chat_asset: Some(bundle.chat),
+        });
+        let config = management_host::ManagementSpawnConfig {
+            executable: bundle.cli.to_string_lossy().into_owned(), agent_dir: Some(agent.clone()),
+            extensions: vec![runtime.entry.parent().ok_or("preview entry unavailable")?.join("pi-web-management.mjs")],
+            env: vec![("PI_WEB_MANAGED_MODULES".into(), runtime.projection_root.to_string_lossy().into_owned()),
+                ("HOME".into(), home.to_string_lossy().into_owned()), ("USERPROFILE".into(), home.to_string_lossy().into_owned()),
+                ("PI_AGENT_HOME".into(), home.to_string_lossy().into_owned()),
+                ("APPDATA".into(), home.join(".config").to_string_lossy().into_owned()),
+                ("LOCALAPPDATA".into(), home.join(".local").to_string_lossy().into_owned()),
+                ("XDG_CONFIG_HOME".into(), home.join(".config").to_string_lossy().into_owned()),
+                ("XDG_STATE_HOME".into(), home.join(".local/state").to_string_lossy().into_owned()),
+                ("XDG_CACHE_HOME".into(), home.join(".cache").to_string_lossy().into_owned())],
+        };
+        Self::initialize(&agent, state, Some(config))
+    }
+
+    fn initialize(agent: &Path, state: IpcHostState, config: Option<management_host::ManagementSpawnConfig>) -> Result<Self, String> {
+        let lifecycle = HostLifecycle::init(agent)?;
         let state = Arc::new(state);
-        *state.task_agent_dir.lock().map_err(|_| "agent directory lock poisoned")? = Some(agent.clone());
+        *state.task_agent_dir.lock().map_err(|_| "agent directory lock poisoned")? = Some(agent.to_path_buf());
         if let Some(mut config) = config {
-            config.agent_dir = Some(agent);
+            config.agent_dir = Some(agent.to_path_buf());
             *state.management_config.lock().map_err(|_| "management configuration lock poisoned")? = Some(config);
         }
         let tracked = Arc::new(Mutex::new(TrackedShutdown::default()));
@@ -196,6 +232,62 @@ mod tests {
         let report = host.state.session_writers.shutdown_until(std::time::Instant::now() + Duration::from_secs(5));
         assert!(report.unknown.is_empty(), "{report:?}");
         host.state.management.shutdown_until(std::time::Instant::now() + Duration::from_secs(5));
+    }
+
+    #[cfg(all(feature = "static-preview", unix))]
+    #[test]
+    fn preview_host_starts_real_cli_and_independent_sdk_with_isolated_data() {
+        use serde_json::json;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("preview-home"); let project = temp.path().join("project"); let projection = temp.path().join("projection");
+        std::fs::create_dir(&home).unwrap(); std::fs::create_dir(&project).unwrap();
+        let node = std::path::PathBuf::from(std::env::var("PI_WEB_TEST_NODE").expect("PI_WEB_TEST_NODE required")).canonicalize().unwrap();
+        let cli = std::path::PathBuf::from(std::env::var("PI_CLI_BIN").expect("PI_CLI_BIN required")).canonicalize().unwrap();
+        let built = std::process::Command::new(&node).arg(repo.join("scripts/migration/build-management-modules.mjs"))
+            .args(["--sdk-runtime", "--out"]).arg(&projection).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        let assets = repo.join("lib/pi-rpc/assets");
+        let bundle = crate::preview_bundle::PreviewBundle {
+            runtime: management_host::ManagementSdkRuntime { node, entry: assets.join("management-sdk-entry.mjs"), dependency_root: repo.join("node_modules").canonicalize().unwrap(), projection_root: projection, cli_version: "1.4.0".into() },
+            cli, bridge: assets.join("pi-web-bridge.mjs"), artifacts: assets.join("pi-web-artifacts.mjs"), chat: assets.join("pi-web-chat.mjs"),
+        };
+        let host = IsolatedStaticHost::init_preview(&home, bundle).unwrap();
+        assert_eq!(crate::pi_ipc::management_call(&host.state, "sys.capabilities", json!({})).unwrap()["version"], 1);
+        host.state.propose_path(&project).unwrap();
+        let created = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"create","op":"agent.create","args":{"cwd":project,"type":"ensure_session"}}));
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["sessionId"].as_str().unwrap();
+        assert!(host.state.registry.get(id).is_some());
+        assert!(host.state.agent_dir().starts_with(&home));
+        let outer_home = std::path::PathBuf::from(std::env::var_os("HOME").expect("isolated outer HOME required"));
+        assert!(!outer_home.join(".pi/agent").exists(), "preview touched the outer agent directory");
+        assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(10)).is_ok());
+    }
+
+    #[cfg(feature = "static-preview")]
+    #[test]
+    fn preview_state_uses_isolated_home_and_refuses_updates() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("preview-home");
+        std::fs::create_dir(&home).unwrap();
+        let runtime = management_host::ManagementSdkRuntime { node: dir.path().join("node"), entry: dir.path().join("assets/management-sdk-entry.mjs"), dependency_root: dir.path().join("sdk"), projection_root: dir.path().join("projection"), cli_version: "1.4.0".into() };
+        let bundle = crate::preview_bundle::PreviewBundle { runtime, cli: dir.path().join("pi.exe"), bridge: dir.path().join("bridge"), artifacts: dir.path().join("artifacts"), chat: dir.path().join("chat") };
+        let host = IsolatedStaticHost::init_preview(&home, bundle).unwrap();
+        assert_eq!(host.state.agent_dir(), home.join(".pi/agent"));
+        let config = host.state.management_config.lock().unwrap().clone().unwrap();
+        for key in ["HOME", "USERPROFILE", "PI_AGENT_HOME"] {
+            assert_eq!(config.env.iter().find(|(name, _)| name == key).unwrap().1, home.to_string_lossy());
+        }
+        for op in ["updates.check", "tasks.run", "tasks.takeover"] {
+            let response = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"fixture","op":op,"args":{}}));
+            assert_eq!(response["error"]["code"], "not_supported", "{response}");
+        }
+        let terminal = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"fixture","op":"terminal.create","args":{"id":"fixture","cwd":home}}));
+        assert_eq!(terminal["error"]["code"], "not_supported", "{terminal}");
+        assert!(host.state.terminals.get("fixture").is_none(), "Preview must not create a PTY");
+        assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(5)).is_ok());
     }
 
     fn assert_admission_closed(host: &IsolatedStaticHost, dir: &Path) {

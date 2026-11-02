@@ -11,6 +11,7 @@
     "allow-pi-ipc-subscribe-events",
     "allow-pi-ipc-subscribe-running",
     "allow-pi-ipc-subscribe-terminal",
-    "allow-pi-ipc-subscribe-scheduled"
+    "allow-pi-ipc-subscribe-scheduled",
+    "allow-pi-ipc-login-stream"
   ]
 }
