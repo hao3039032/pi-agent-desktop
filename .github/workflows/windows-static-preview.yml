@@ -51,7 +51,7 @@ jobs:
           $env:USERPROFILE = $env:HOME
           New-Item -ItemType Directory -Force $env:HOME | Out-Null
           Remove-Item Env:PI_PACKAGE_DIR,Env:PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT,Env:JITI_ALIAS,Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue
-          node --test scripts/migration/static-bundle-manifest.test.mjs scripts/migration/windows-static-preview.test.mjs scripts/migration/preview-smoke-probe.test.mjs
+          node --test scripts/migration/static-bundle-manifest.test.mjs scripts/migration/windows-static-preview.test.mjs scripts/migration/preview-smoke-probe.test.mjs scripts/migration/management-entry-paths.test.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Download checksum-verified official pi distribution
         shell: pwsh

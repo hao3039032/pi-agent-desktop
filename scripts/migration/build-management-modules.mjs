@@ -31,40 +31,42 @@ const ROOT = resolve(HERE, "../..");
 
 // The exported surface the management extension consumes. Keep in step with
 // the ops in lib/pi-rpc/assets/pi-web-management.mjs.
-const ENTRY = `
+export function projectionEntry(root = ROOT) {
+  const importRoot = JSON.stringify(root).slice(1, -1);
+  return `
 export { SessionManager as projectionSessionManager } from "@earendil-works/pi-coding-agent";
 export { McpOAuthProvider as projectionMcpOAuthProvider, MemoryOAuthStateStore as projectionMemoryOAuthStateStore } from "@earendil-works/pi-mcp/oauth";
-export { signInMcpWithHostedCallback } from "${ROOT}/lib/mcp-oauth-hosted.server.ts";
+export { signInMcpWithHostedCallback } from "${importRoot}/lib/mcp-oauth-hosted.server.ts";
 export {
   buildSessionContext,
   sliceActiveBranch,
   getLatestModelChange,
   getLatestResponseModel,
-} from "${ROOT}/lib/session-projection.ts";
-export { projectTreeForResponse, toSummaryTree } from "${ROOT}/lib/project-tree.ts";
-export { computeSessionStats } from "${ROOT}/lib/session-stats.ts";
-export { extractActiveSystemPrompt } from "${ROOT}/lib/system-prompt-snapshot.ts";
-export { isBashOutputPathReferencedByEntries, isValidSessionId } from "${ROOT}/lib/session-file-references-core.ts";
-export { resolveBashOutputPath } from "${ROOT}/lib/bash-output.ts";
-export { searchSessionContents } from "${ROOT}/lib/session-search.ts";
-export { isFilePathReferencedByEntries } from "${ROOT}/lib/session-file-references-core.ts";
-export { formatSessionReference } from "${ROOT}/lib/session-reference.ts";
-export { patchExportHtml } from "${ROOT}/lib/session-export-html.ts";
-export { computeSessionTotalActiveMs } from "${ROOT}/lib/session-timing.ts";
+} from "${importRoot}/lib/session-projection.ts";
+export { projectTreeForResponse, toSummaryTree } from "${importRoot}/lib/project-tree.ts";
+export { computeSessionStats } from "${importRoot}/lib/session-stats.ts";
+export { extractActiveSystemPrompt } from "${importRoot}/lib/system-prompt-snapshot.ts";
+export { isBashOutputPathReferencedByEntries, isValidSessionId } from "${importRoot}/lib/session-file-references-core.ts";
+export { resolveBashOutputPath } from "${importRoot}/lib/bash-output.ts";
+export { searchSessionContents } from "${importRoot}/lib/session-search.ts";
+export { isFilePathReferencedByEntries } from "${importRoot}/lib/session-file-references-core.ts";
+export { formatSessionReference } from "${importRoot}/lib/session-reference.ts";
+export { patchExportHtml } from "${importRoot}/lib/session-export-html.ts";
+export { computeSessionTotalActiveMs } from "${importRoot}/lib/session-timing.ts";
 export {
   readSubagentRun,
   SUBAGENT_META_TYPE,
-} from "${ROOT}/lib/subagents.ts";
+} from "${importRoot}/lib/subagents.ts";
 export {
   readSessionToolSelection,
   validateSessionToolSelection,
-} from "${ROOT}/lib/session-tool-selection.ts";
-export { chatWorkspacePrompt } from "${ROOT}/lib/chat-workspace-prompt.ts";
-export { copyChatToProject, setOfflineChatUnlock } from "${ROOT}/lib/chat-continue.ts";
+} from "${importRoot}/lib/session-tool-selection.ts";
+export { chatWorkspacePrompt } from "${importRoot}/lib/chat-workspace-prompt.ts";
+export { copyChatToProject, setOfflineChatUnlock } from "${importRoot}/lib/chat-continue.ts";
 export {
   contextFilesSystemPrompt,
   CHAT_ONLY_RESOURCE_LOADER_OPTIONS,
-} from "${ROOT}/lib/chat-only.ts";
+} from "${importRoot}/lib/chat-only.ts";
 export {
   composeModelsData,
   loadScopedModelsData,
@@ -73,34 +75,34 @@ export {
   ProjectScopeShadowError,
   ModelNotAvailableError,
   EMPTY_MODELS,
-} from "${ROOT}/lib/models-service.server.ts";
+} from "${importRoot}/lib/models-service.server.ts";
 export {
   loadEnabledModelsView,
   applyEnabledModelsEdit,
   parseEnabledModelsMutation,
   EnabledModelsRefusalError,
-} from "${ROOT}/lib/enabled-models-service.server.ts";
-export { getTerminalSettings, setTerminalShell, resolveTerminalShell } from "${ROOT}/lib/terminal-settings.ts";
-export { readRedactedModelsConfig } from "${ROOT}/lib/models-config-store.ts";
-export { readDistroServiceStatus, applyDistroServiceConfig } from "${ROOT}/lib/distro/service-config.ts";
-export { seedAgentDir } from "${ROOT}/lib/distro/seed.ts";
-export { saveModelsConfig, ModelsConfigReadError } from "${ROOT}/lib/models-config-service.server.ts";
+} from "${importRoot}/lib/enabled-models-service.server.ts";
+export { getTerminalSettings, setTerminalShell, resolveTerminalShell } from "${importRoot}/lib/terminal-settings.ts";
+export { readRedactedModelsConfig } from "${importRoot}/lib/models-config-store.ts";
+export { readDistroServiceStatus, applyDistroServiceConfig } from "${importRoot}/lib/distro/service-config.ts";
+export { seedAgentDir } from "${importRoot}/lib/distro/seed.ts";
+export { saveModelsConfig, ModelsConfigReadError } from "${importRoot}/lib/models-config-service.server.ts";
 export {
   composeProviderLists,
   storeProviderApiKey,
   removeProviderApiKey,
   logoutProvider,
   ProviderAuthRefusalError,
-} from "${ROOT}/lib/provider-auth-service.server.ts";
+} from "${importRoot}/lib/provider-auth-service.server.ts";
 export {
   startLoginFlow,
   pollLoginFlow,
   submitLoginCode,
   cancelLoginFlow,
-} from "${ROOT}/lib/provider-auth-login.server.ts";
-export { loadModelsWithCache, invalidateModelsCache } from "${ROOT}/lib/models-cache.ts";
-export { resolveVisibleModels } from "${ROOT}/lib/model-scope.ts";
-export { projectTrustReloadOptions, getProjectTrustStatus } from "${ROOT}/lib/project-trust.ts";
+} from "${importRoot}/lib/provider-auth-login.server.ts";
+export { loadModelsWithCache, invalidateModelsCache } from "${importRoot}/lib/models-cache.ts";
+export { resolveVisibleModels } from "${importRoot}/lib/model-scope.ts";
+export { projectTrustReloadOptions, getProjectTrustStatus } from "${importRoot}/lib/project-trust.ts";
 export {
   queryModelCatalog,
   discoverModels,
@@ -108,19 +110,19 @@ export {
   loadNonChatModels,
   refreshProviderCatalogs,
   queryProviderUsageReport,
-} from "${ROOT}/lib/models-extras-service.server.ts";
-export { loadSkillsWithInstallInfo } from "${ROOT}/lib/skills-service.ts";
-export { setVisibleSkillsDisabled } from "${ROOT}/lib/skills-management.server.ts";
-export { readPlugins, managePlugins } from "${ROOT}/lib/plugins-service.server.ts";
-export { runPluginMutationTask } from "${ROOT}/lib/plugins-mutation-task.server.ts";
-export { runSkillMutationTask } from "${ROOT}/lib/skills-mutation-task.server.ts";
-export { searchSkills } from "${ROOT}/lib/skills-search.server.ts";
-export { checkManagedPluginUpdates, checkManagedSkillUpdates } from "${ROOT}/lib/updates-management.server.ts";
+} from "${importRoot}/lib/models-extras-service.server.ts";
+export { loadSkillsWithInstallInfo } from "${importRoot}/lib/skills-service.ts";
+export { setVisibleSkillsDisabled } from "${importRoot}/lib/skills-management.server.ts";
+export { readPlugins, managePlugins } from "${importRoot}/lib/plugins-service.server.ts";
+export { runPluginMutationTask } from "${importRoot}/lib/plugins-mutation-task.server.ts";
+export { runSkillMutationTask } from "${importRoot}/lib/skills-mutation-task.server.ts";
+export { searchSkills } from "${importRoot}/lib/skills-search.server.ts";
+export { checkManagedPluginUpdates, checkManagedSkillUpdates } from "${importRoot}/lib/updates-management.server.ts";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 registerBunOAuthFlows();
-export { validateCron, nextCronRuns, nextCronRun, systemTimezone } from "${ROOT}/lib/scheduled-tasks/cron.ts";
-export { buildTask, applyTaskPatch } from "${ROOT}/lib/scheduled-tasks/task-input.ts";
-export { decideSlot } from "${ROOT}/lib/scheduled-tasks/catch-up.ts";
+export { validateCron, nextCronRuns, nextCronRun, systemTimezone } from "${importRoot}/lib/scheduled-tasks/cron.ts";
+export { buildTask, applyTaskPatch } from "${importRoot}/lib/scheduled-tasks/task-input.ts";
+export { decideSlot } from "${importRoot}/lib/scheduled-tasks/catch-up.ts";
 export {
   McpServiceError,
   getMcpConfig,
@@ -129,18 +131,23 @@ export {
   signOutMcpCooperative,
   getProjectMcpListing,
   trustProjectFolder,
-} from "${ROOT}/lib/mcp-service.server.ts";
-export { probeMcpServer, managedMcpProbeTarget } from "${ROOT}/lib/mcp-probe-service.server.ts";
-export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn, McpOAuthBroker } from "${ROOT}/lib/mcp-sign-in-service.server.ts";
+} from "${importRoot}/lib/mcp-service.server.ts";
+export { probeMcpServer, managedMcpProbeTarget } from "${importRoot}/lib/mcp-probe-service.server.ts";
+export { startManagedMcpSignIn, readManagedMcpSignIn, submitManagedMcpSignIn, cancelManagedMcpSignIn, waitManagedMcpSignIn, McpOAuthBroker } from "${importRoot}/lib/mcp-sign-in-service.server.ts";
 `;
 
+}
 export const PROJECTION_MODULE_NAME = "pi-web-session-projection.mjs";
 export const TITLE_MODULE_NAME = "pi-web-session-title.mjs";
+
+export function titleEntry(root = ROOT) {
+  return `export { generateSessionTitleFromRegistry } from ${JSON.stringify(`${root}/lib/session-title.ts`)};`;
+}
 
 /** Only pure title logic and the SDK's two pure transcript/model helpers may survive tree shaking. */
 export async function bundleTitleModule() {
   const result = await build({
-    stdin: { contents: `export { generateSessionTitleFromRegistry } from "${ROOT}/lib/session-title.ts";`, resolveDir: ROOT, loader: "ts" },
+    stdin: { contents: titleEntry(), resolveDir: ROOT, loader: "ts" },
     bundle: true, format: "esm", platform: "node", target: "node20", write: false, metafile: true, legalComments: "none",
   });
   const outputs = Object.values(result.metafile.outputs);
@@ -158,7 +165,7 @@ export async function bundleTitleModule() {
 export async function bundleProjectionModules({ sdkRuntime = false } = {}) {
   const result = await build({
     stdin: {
-      contents: ENTRY,
+      contents: projectionEntry(),
       resolveDir: ROOT,
       loader: "ts",
       sourcefile: "management-projection-entry.ts",
