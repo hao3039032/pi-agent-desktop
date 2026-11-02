@@ -21,9 +21,13 @@
 //!   user session files.
 
 pub mod ledger;
+#[cfg(windows)]
+mod windows_storage;
 pub mod target_key;
 #[cfg(all(test, target_os = "linux"))]
 mod ledger_tests;
+#[cfg(all(test, windows))]
+mod windows_ledger_tests;
 #[cfg(all(test, unix))]
 mod task_input_shutdown_tests;
 

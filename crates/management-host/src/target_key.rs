@@ -50,7 +50,33 @@ impl ManagementTargetKey {
         file.read_exact(&mut bytes).map_err(|e| format!("cannot read management key: {e}"))?;
         Ok(Self(bytes))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    pub fn load_or_create(agent_dir: &Path) -> Result<Self, String> {
+        use std::io::{Read, Write};
+        let _guard = KEY_LOCK.lock().map_err(|_| "management key lock poisoned")?;
+        let base = crate::windows_storage::PinnedDirectory::open(agent_dir, false, true).map_err(|e| e.to_string())?.ok_or("management key directory missing")?;
+        let _transaction = base.transaction().map_err(|e| format!("management transaction unavailable: {e}"))?;
+        let mut file = match base.file("management-target-key.v1", false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(base.path.join("management-operations")) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Ok(_) => return Err("management target key missing with existing ledger".into()),
+                    Err(error) => return Err(error.to_string()),
+                }
+                let mut bytes = [0u8; 32];
+                getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
+                let mut file = base.file("management-target-key.v1", true).map_err(|e| e.to_string())?;
+                file.write_all(&bytes).and_then(|_| file.sync_all()).and_then(|_| base.directory.sync_all()).map_err(|e| format!("cannot persist management key: {e}"))?;
+                return Ok(Self(bytes));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if file.metadata().map_err(|e| e.to_string())?.len() != 32 { return Err("unsafe or corrupt management target key".into()); }
+        let mut bytes = [0; 32]; file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(Self(bytes))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     pub fn load_or_create(_agent_dir: &Path) -> Result<Self, String> { Err("safe management target key is unavailable on this platform".into()) }
 
     /// Inspect an existing key without creating or changing anything.
@@ -77,7 +103,18 @@ impl ManagementTargetKey {
         if !m.is_file() || m.len() != 32 || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 || m.nlink() != 1 { return Err("unsafe or corrupt management target key".into()); }
         Ok(true)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    pub fn inspect(agent_dir: &Path) -> Result<bool, String> {
+        let Some(base) = crate::windows_storage::PinnedDirectory::open(agent_dir, false, false).map_err(|e| e.to_string())? else { return Ok(false) };
+        let file = match base.file("management-target-key.v1", false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.to_string()),
+        };
+        if file.metadata().map_err(|e| e.to_string())?.len() != 32 { return Err("unsafe or corrupt management target key".into()); }
+        Ok(true)
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     pub fn inspect(_agent_dir: &Path) -> Result<bool, String> { Err("safe management target key is unavailable on this platform".into()) }
 
     pub fn fingerprint(&self, canonical_key: &str) -> Result<String, String> {

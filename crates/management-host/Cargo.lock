@@ -197,6 +197,7 @@ dependencies = [
  "task-scheduler",
  "tempfile",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
