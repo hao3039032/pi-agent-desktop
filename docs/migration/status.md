@@ -8,17 +8,17 @@
 
 - `c06e0761` 已整合 `18e7b900`／`7335bd79`／`45cbda86`：独立管理 SDK 已接入显式 development-package harness 配置与共享受限会话 writer。开发 CLI 绑定通过受信 checkout lock/pins、安装包 name/version/bin 与实际 CLI 路径交叉核验，不只信自报版本；不是 standalone 来源认证。
 - `e7e5de88` 已整合 `392157f0`：自动化设置失败后的状态回同步改走现有数据接口，静态使用 IPC、Next 保留 HTTP；会话切换／卸载时拒绝迟到结果。
-- `4190f1e6` 已整合 Windows Preview CI／清单准备至 `1add5581`。独立 app identifier、主程序名、NSIS 资源清理路径及 artifact-only workflow 已定义；尚未推送或触发该 workflow，尚无 Windows 编译或安装包验收结果。
+- `4190f1e6` 已整合 Windows Preview CI／清单准备至 `1add5581`。后续门禁提交 `6a23b2e3f17b5bffe94ed6d587991636d2e0e1dc` 已推送独立 `preview/windows-static` 并通过 ls-remote 核验；[首次 Actions 41506970519](https://github.com/hao3039032/pi-agent-desktop/actions/runs/41506970519) 已启动、当前运行中，尚无 Windows 编译或安装包验收结果。独立 app identifier、主程序名、NSIS 资源清理路径及 artifact-only 边界不变。
 - `04bde47d` 已整合原生入口至 `ad76f0d4`：真实 Tauri WebView/IPC/Channels/pi-resource，固定 packaged CLI 与独立管理 SDK，持久 Preview home/agent，独立身份，拒绝 updater 入口。修复了真实原生 OAuth stream 缺少 app ACL 授权的问题；只给 local-only main capability。Preview 明确拒绝 terminal.create、托盘隐藏、调度执行/接管，不把这些拒绝算作功能完成；退出不再追加无 deadline 的 PTY shutdown，也不宣称整个进程退出已证明有界。
 - `3092a05c` 已整合 Windows target-key/ledger 至 `43feff98`，不再仅停在 `5a58cae8` WIP：目录句柄、实际句柄 ACL/身份、协作事务锁、文件内容 flush 后同卷发布，失败/残留拒绝及 Unknown 保留。无跨卷复制 fallback；WRITE_THROUGH 同卷 rename 不等同 POSIX 目录 fsync，突然断电耐久性未证明。**实现整合不等于 Windows 编译或功能已通过**。
-- 新接入 Windows 精确门禁：11 项 storage 与 10 项 ownership/manifest/ACL/Preview 状态及 staged Rust→SDK 假 key store/delete→CLI ensure_session 夹具。先核验测试发现结果，再逐个 --exact 且要求 1 passed/0 failed/0 ignored；隐藏 checkout node_modules，不发 prompt、不访问真实账户。失败保留运行时夹具目录。尚待 Actions 实际执行；打包成功也不代表原生窗口、iframe 或安装升级通过。
+- 新接入 Windows 精确门禁：11 项 storage 与 10 项 ownership/manifest/ACL/Preview 状态及 staged Rust→SDK 假 key store/delete→CLI ensure_session 夹具。先核验测试发现结果，再逐个 --exact 且要求 1 passed/0 failed/0 ignored；隐藏 checkout node_modules，不发 prompt、不访问真实账户。失败保留运行时夹具目录。首次 Actions 已启动，尚待实际测试结果；打包成功也不代表原生窗口、iframe 或安装升级通过。
 - 历史暂停状态及资源限制见 [管理 SDK 暂停交接](pause-handoff-management-sdk.md)，其未合并状态以本节为准。
 
 ## 目前没有发生的切换
 
 - 正式产品仍启动 Next；未删除旧后端、未启用正式 Rust 调度循环。
 - 静态前端沿用原组件/UI，不把安全拒绝或空占位当功能完成。
-- 上次暂停已核验推送主线 `5f322f56`、desktop-services `7335bd79`、mcp `69a8d636`。恢复后的整合尚未推送；Windows Preview workflow 尚未运行。没有发布产品、修改更新仓库或签名策略。
+- 上次暂停已核验推送主线 `5f322f56`、desktop-services `7335bd79`、mcp `69a8d636`。恢复后的整合现通过独立 Preview 分支 `6a23b2e3` 推送并启动 Actions，没有 force-push，也未更新生产默认分支、发布产品、修改更新仓库或签名策略。
 - 本地托管 pi、SDK symlink、浏览器桥及 `tauri::test::mock_app` 都不是 standalone/native WebView/安装升级证明。
 
 ## 最新架构决定（尚待实现验证）
