@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { readFileSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
+import semver from "semver";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
 
@@ -13,6 +14,11 @@ test("Windows preview overlay isolates identity, payload, updater and upgrade cl
   const config = JSON.parse(read("src-tauri/tauri.preview.conf.json"));
   assert.equal(config.identifier, "com.hao.pi-agent-lw.preview");
   assert.equal(config.productName, "Pi Agent LW Preview");
+  assert.equal(config.mainBinaryName, "pi-agent-lw-preview");
+  const production = JSON.parse(read("src-tauri/tauri.conf.json"));
+  assert.notEqual(config.productName, production.productName);
+  assert.notEqual(config.identifier, production.identifier);
+  assert.notEqual(config.mainBinaryName, "pi-agent-desktop");
   assert.equal(config.build.frontendDist, "../desktop/frontend-static");
   assert.deepEqual(config.bundle.resources, { "resources/static-preview/": "static-preview/" });
   assert.equal(config.bundle.createUpdaterArtifacts, false);
@@ -20,7 +26,13 @@ test("Windows preview overlay isolates identity, payload, updater and upgrade cl
   assert.ok(!config.app.security.capabilities.includes("desktop-updater"));
   assert.equal(config.bundle.windows.nsis.installerHooks, "installer-preview-hooks.nsh");
   const hook = read("src-tauri/installer-preview-hooks.nsh");
-  assert.deepEqual([...hook.matchAll(/RMDir \/r "([^"]+)"/g)].map((match) => match[1]), ["$INSTDIR\\resources\\static-preview"]);
+  // Tauri's Windows resource_dir is the executable directory ($INSTDIR),
+  // not $INSTDIR/resources. Derive the deletion from the overlay target.
+  const target = Object.values(config.bundle.resources)[0];
+  const installedPayload = win32.join("$INSTDIR", target);
+  assert.equal(installedPayload, "$INSTDIR\\static-preview\\");
+  const canonical = (path) => win32.normalize(path).replace(/\\+$/, "");
+  assert.deepEqual([...hook.matchAll(/RMDir \/r "([^"]+)"/g)].map((match) => canonical(match[1])), [canonical(installedPayload)]);
 });
 
 test("Windows preview workflow is artifact-only and requires real SDK/static host", () => {
@@ -36,6 +48,10 @@ test("Windows preview workflow is artifact-only and requires real SDK/static hos
   assert.match(text, /if \(\$LASTEXITCODE -ne 0\)/);
   assert.match(text, /Rename-Item node_modules node_modules\.preview-hidden/);
   assert.match(text, /finally\s*\{/);
+  assert.match(text, /preview\.g\$\(\$env:GITHUB_SHA\.Substring\(0, 12\)\)/);
+  assert.equal(semver.valid("0.0.1-preview.000000000001"), null);
+  assert.equal(semver.valid("0.0.1-preview.g000000000001"), "0.0.1-preview.g000000000001");
+  for (const item of ["$stageBytes", "$targetBytes", "$frontendBytes", "$downloadBytes", "exceedsFormerLocalBudget", "GITHUB_STEP_SUMMARY"]) assert.ok(text.includes(item), item);
 });
 
 test("staged smoke refuses ancestor node_modules before executing a bundle", () => {
