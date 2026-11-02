@@ -56,7 +56,11 @@ jobs:
       - name: Download checksum-verified official pi distribution
         shell: pwsh
         run: |
-          node scripts/pi-cli-release.mjs --target x86_64-pc-windows-msvc --download-dir "$env:RUNNER_TEMP/pi-download" --github-env "$env:GITHUB_ENV"
+          $piVersion = node -p "require('./scripts/release-component-pins.json').pi.version"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($piVersion -ne '1.4.0') { throw 'Unexpected Preview CLI pin' }
+          $releaseBase = "https://github.com/earendil-works/pi/releases/download/v$piVersion"
+          node scripts/pi-cli-release.mjs --target x86_64-pc-windows-msvc --download-dir "$env:RUNNER_TEMP/pi-download" --github-env "$env:GITHUB_ENV" --base "$releaseBase"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build real static frontend
         shell: pwsh

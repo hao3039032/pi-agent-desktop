@@ -45,6 +45,12 @@ test("Windows preview workflow is artifact-only and requires real SDK/static hos
   assert.equal(workflow.jobs.preview.env.CARGO_BUILD_JOBS, 2);
   for (const required of ["npm ci", "npm run check:deps", "npm ci --prefix static-frontend", "--target x86_64-pc-windows-msvc", "--github-env", "npm run build --prefix static-frontend", "--management-sdk", "smoke-static-preview.mjs", "--features static-preview", "-- --locked", "--no-sign", "if-no-files-found: error"]) assert.ok(text.includes(required), required);
   for (const forbidden of ["pull_request_target", "desktop:prepare", "next build", "tauri-action", "secrets.", "gh release", "latest.json", "static-ui-harness"]) assert.ok(!text.includes(forbidden), forbidden);
+  const download = workflow.jobs.preview.steps.find((step) => step.name === "Download checksum-verified official pi distribution").run;
+  assert.ok(download.includes("require('./scripts/release-component-pins.json').pi.version"));
+  assert.ok(download.includes("if ($piVersion -ne '1.4.0')"));
+  assert.ok(download.includes('https://github.com/earendil-works/pi/releases/download/v$piVersion'));
+  assert.ok(download.includes('--base "$releaseBase"'));
+  assert.ok(!download.includes('/latest/'));
   assert.match(text, /if \(\$LASTEXITCODE -ne 0\)/);
   assert.match(text, /Rename-Item node_modules node_modules\.preview-hidden/);
   assert.match(text, /finally\s*\{/);

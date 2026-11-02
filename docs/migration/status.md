@@ -8,10 +8,10 @@
 
 - `c06e0761` 已整合 `18e7b900`／`7335bd79`／`45cbda86`：独立管理 SDK 已接入显式 development-package harness 配置与共享受限会话 writer。开发 CLI 绑定通过受信 checkout lock/pins、安装包 name/version/bin 与实际 CLI 路径交叉核验，不只信自报版本；不是 standalone 来源认证。
 - `e7e5de88` 已整合 `392157f0`：自动化设置失败后的状态回同步改走现有数据接口，静态使用 IPC、Next 保留 HTTP；会话切换／卸载时拒绝迟到结果。
-- `4190f1e6` 已整合 Windows Preview CI／清单准备至 `1add5581`。后续门禁提交 `6a23b2e3f17b5bffe94ed6d587991636d2e0e1dc` 已推送独立 `preview/windows-static` 并通过 ls-remote 核验；[首次 Actions 41506970519](https://github.com/hao3039032/pi-agent-desktop/actions/runs/41506970519) 已启动、当前运行中，尚无 Windows 编译或安装包验收结果。独立 app identifier、主程序名、NSIS 资源清理路径及 artifact-only 边界不变。
+- `4190f1e6` 已整合 Windows Preview CI／清单准备至 `1add5581`。后续门禁提交 `6a23b2e3f17b5bffe94ed6d587991636d2e0e1dc` 已推送独立 `preview/windows-static` 并通过 ls-remote 核验；[首次 Actions 41506970519](https://github.com/hao3039032/pi-agent-desktop/actions/runs/41506970519) 已失败：通用 downloader 默认 latest 取到 CLI 1.5.0，staging 的 1.4.0 版本检查正确拒绝继续；Windows Rust、NSIS、artifact 步骤均未执行。修复仅令 Preview 从 pins 选择官方 v1.4.0 tag 的资产与 SHA256SUMS，不升级 SDK、不改正式 downloader 默认、不 fallback latest。官方 release 元数据已核验有 Windows x64 zip 与 SHA256SUMS；待修订运行，尚无 Windows 编译或安装包验收结果。独立 app identifier、主程序名、NSIS 资源清理路径及 artifact-only 边界不变。
 - `04bde47d` 已整合原生入口至 `ad76f0d4`：真实 Tauri WebView/IPC/Channels/pi-resource，固定 packaged CLI 与独立管理 SDK，持久 Preview home/agent，独立身份，拒绝 updater 入口。修复了真实原生 OAuth stream 缺少 app ACL 授权的问题；只给 local-only main capability。Preview 明确拒绝 terminal.create、托盘隐藏、调度执行/接管，不把这些拒绝算作功能完成；退出不再追加无 deadline 的 PTY shutdown，也不宣称整个进程退出已证明有界。
 - `3092a05c` 已整合 Windows target-key/ledger 至 `43feff98`，不再仅停在 `5a58cae8` WIP：目录句柄、实际句柄 ACL/身份、协作事务锁、文件内容 flush 后同卷发布，失败/残留拒绝及 Unknown 保留。无跨卷复制 fallback；WRITE_THROUGH 同卷 rename 不等同 POSIX 目录 fsync，突然断电耐久性未证明。**实现整合不等于 Windows 编译或功能已通过**。
-- 新接入 Windows 精确门禁：11 项 storage 与 10 项 ownership/manifest/ACL/Preview 状态及 staged Rust→SDK 假 key store/delete→CLI ensure_session 夹具。先核验测试发现结果，再逐个 --exact 且要求 1 passed/0 failed/0 ignored；隐藏 checkout node_modules，不发 prompt、不访问真实账户。失败保留运行时夹具目录。首次 Actions 已启动，尚待实际测试结果；打包成功也不代表原生窗口、iframe 或安装升级通过。
+- 新接入 Windows 精确门禁：11 项 storage 与 10 项 ownership/manifest/ACL/Preview 状态及 staged Rust→SDK 假 key store/delete→CLI ensure_session 夹具。先核验测试发现结果，再逐个 --exact 且要求 1 passed/0 failed/0 ignored；隐藏 checkout node_modules，不发 prompt、不访问真实账户。失败保留运行时夹具目录。首次 Actions 在 staging 版本检查处失败，以上 Windows Rust 门禁尚未执行；打包成功也不代表原生窗口、iframe 或安装升级通过。
 - 历史暂停状态及资源限制见 [管理 SDK 暂停交接](pause-handoff-management-sdk.md)，其未合并状态以本节为准。
 
 ## 目前没有发生的切换
@@ -59,6 +59,8 @@
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- 首次 Windows Actions `41506970519`：依赖安装、SDK 前置检查、下载 SHA256SUMS 校验和真实 Vite 构建通过；Node migration contracts **15 passed / 0 failed / 0 skipped**。staging 实测 latest CLI 1.5.0 与固定 1.4.0 不符，拒绝打包；不是 Windows Rust 测试失败，因为这些门禁尚未执行。无 NSIS/artifact，不重跑未修复的相同提交。
 
 - 原生入口至 `ad76f0d4` 的 lane Linux 定向验证包括资源清单 4 项、隔离状态/禁用操作 1 项、导航 1 项、child env 1 项及本地 CLI+SDK 不发 prompt 的竖向夹具 1 项；修订 ACL/关闭模式/PTY 拒绝三个精确测试各 1 passed，无 ignored。不是 Windows 或原生窗口证据。存储 `43feff98` 的两个 Linux 精确回归通过，Windows 11 项尚未编译/执行，普通退出测试不是强杀或断电。
 - 父级补齐 Windows CI 精确门禁与真实 staged fake-key 夹具，并修正 manifest 测试对 Windows canonical 路径前缀的比较。父级 `windows-static-preview.test.mjs` **4 passed / 0 failed / 0 skipped**，`git diff --check` 通过；仅 Node 配置/接线检查，新增 Windows Rust 夹具与 PowerShell 执行仍待 runner 验证。
