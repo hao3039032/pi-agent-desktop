@@ -9,7 +9,9 @@
 - `c06e0761` 已整合 `18e7b900`／`7335bd79`／`45cbda86`：独立管理 SDK 已接入显式 development-package harness 配置与共享受限会话 writer。开发 CLI 绑定通过受信 checkout lock/pins、安装包 name/version/bin 与实际 CLI 路径交叉核验，不只信自报版本；不是 standalone 来源认证。
 - `e7e5de88` 已整合 `392157f0`：自动化设置失败后的状态回同步改走现有数据接口，静态使用 IPC、Next 保留 HTTP；会话切换／卸载时拒绝迟到结果。
 - `4190f1e6` 已整合 Windows Preview CI／清单准备至 `1add5581`。独立 app identifier、主程序名、NSIS 资源清理路径及 artifact-only workflow 已定义；尚未推送或触发该 workflow，尚无 Windows 编译或安装包验收结果。
-- 原生 `static-preview` 入口、持久 Preview 数据隔离、packaged 资源绑定与 updater 全入口禁用仍由 desktop-services lane 实施。Windows 管理 target-key／persistent ledger 目前因平台未支持而阻断凭据保存和登录；已批准补齐 Windows 实现，不能以绕过 ledger 或只读壳代替可用 Preview。
+- `04bde47d` 已整合原生入口至 `ad76f0d4`：真实 Tauri WebView/IPC/Channels/pi-resource，固定 packaged CLI 与独立管理 SDK，持久 Preview home/agent，独立身份，拒绝 updater 入口。修复了真实原生 OAuth stream 缺少 app ACL 授权的问题；只给 local-only main capability。Preview 明确拒绝 terminal.create、托盘隐藏、调度执行/接管，不把这些拒绝算作功能完成；退出不再追加无 deadline 的 PTY shutdown，也不宣称整个进程退出已证明有界。
+- `3092a05c` 已整合 Windows target-key/ledger 至 `43feff98`，不再仅停在 `5a58cae8` WIP：目录句柄、实际句柄 ACL/身份、协作事务锁、文件内容 flush 后同卷发布，失败/残留拒绝及 Unknown 保留。无跨卷复制 fallback；WRITE_THROUGH 同卷 rename 不等同 POSIX 目录 fsync，突然断电耐久性未证明。**实现整合不等于 Windows 编译或功能已通过**。
+- 新接入 Windows 精确门禁：11 项 storage 与 10 项 ownership/manifest/ACL/Preview 状态及 staged Rust→SDK 假 key store/delete→CLI ensure_session 夹具。先核验测试发现结果，再逐个 --exact 且要求 1 passed/0 failed/0 ignored；隐藏 checkout node_modules，不发 prompt、不访问真实账户。失败保留运行时夹具目录。尚待 Actions 实际执行；打包成功也不代表原生窗口、iframe 或安装升级通过。
 - 历史暂停状态及资源限制见 [管理 SDK 暂停交接](pause-handoff-management-sdk.md)，其未合并状态以本节为准。
 
 ## 目前没有发生的切换
@@ -57,6 +59,9 @@
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- 原生入口至 `ad76f0d4` 的 lane Linux 定向验证包括资源清单 4 项、隔离状态/禁用操作 1 项、导航 1 项、child env 1 项及本地 CLI+SDK 不发 prompt 的竖向夹具 1 项；修订 ACL/关闭模式/PTY 拒绝三个精确测试各 1 passed，无 ignored。不是 Windows 或原生窗口证据。存储 `43feff98` 的两个 Linux 精确回归通过，Windows 11 项尚未编译/执行，普通退出测试不是强杀或断电。
+- 父级补齐 Windows CI 精确门禁与真实 staged fake-key 夹具，并修正 manifest 测试对 Windows canonical 路径前缀的比较。父级 `windows-static-preview.test.mjs` **4 passed / 0 failed / 0 skipped**，`git diff --check` 通过；仅 Node 配置/接线检查，新增 Windows Rust 夹具与 PowerShell 执行仍待 runner 验证。
 
 - 恢复后的开发管理 SDK 与 writer：整合至 `45cbda86`，父级审阅了显式 launcher、路径／版本绑定、受限 writer 接线、输入槽释放和模式环境剥离。修复普通 128 槽挤占控制通路的问题，Node 另留 4 控制槽；credential_type_mismatch 使用固定脱敏提示。lane 本轮精确 Node 3 项与 Rust 4 项各实际通过，library+harness check 通过；更早的 `7335bd79` 最小链路另有 Node 7／Rust 1 的 lane 证据，不合并为独立场景总数。首次 auth 夹具超时和 legacy 环境剥离测试失败保留在交付报告；父级没有把未重复运行的相同 Rust 测试称为父级执行。Windows 原生／standalone 尚未验证。
 - `392157f0` 前端自动化：lane 相关 Node 17 项通过、无 skip，静态 TypeScript 通过；首次修复前 2 fail／1 cancellation 如实保留。使用真实数据接口加 fake IPC／hook harness，不是原生 WebView。父级审阅后整合，未重跑未变化的同一测试集。

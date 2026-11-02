@@ -54,6 +54,27 @@ test("Windows preview workflow is artifact-only and requires real SDK/static hos
   for (const item of ["$stageBytes", "$targetBytes", "$frontendBytes", "$downloadBytes", "exceedsFormerLocalBudget", "GITHUB_STEP_SUMMARY"]) assert.ok(text.includes(item), item);
 });
 
+test("Windows platform gate names exact real tests and refuses zero-test green", () => {
+  const script = read("scripts/migration/test-windows-preview.ps1");
+  const names = [...script.matchAll(/^    '([^']+)'/gm)].map((match) => match[1]);
+  assert.equal(names.length, 21);
+  assert.equal(new Set(names).size, names.length);
+  const sources = new Map([
+    ["windows_ledger_tests::", "crates/management-host/src/windows_ledger_tests.rs"],
+    ["host_ownership::windows_tests::", "src-tauri/src/host_ownership.rs"],
+    ["preview_bundle::tests::", "src-tauri/src/preview_bundle.rs"],
+    ["preview::tests::", "src-tauri/src/preview.rs"],
+    ["static_host::tests::", "src-tauri/src/static_host.rs"],
+  ]);
+  for (const name of names) {
+    const entry = [...sources].find(([prefix]) => name.startsWith(prefix));
+    assert.ok(entry, name);
+    assert.ok(read(entry[1]).includes(`fn ${name.slice(entry[0].length)}()`), name);
+  }
+  for (const required of ["$IsWindows", "--list", "-cnotin $available", "--exact", "1 passed; 0 failed; 0 ignored;", "PI_PREVIEW_TEST_BUNDLE", "CARGO_HOME", "RUSTUP_HOME"]) assert.ok(script.includes(required), required);
+  assert.ok(read(".github/workflows/windows-static-preview.yml").includes("& ./scripts/migration/test-windows-preview.ps1"));
+});
+
 test("staged smoke refuses ancestor node_modules before executing a bundle", () => {
   const root = mkdtempSync(join(tmpdir(), "preview-ambient-"));
   try {

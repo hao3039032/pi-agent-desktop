@@ -201,7 +201,7 @@ mod tests {
     fn preview_bundle_binds_roles_files_and_mixed_sdk_versions() {
         let (dir, _) = fixture();
         let bundle = verify(dir.path()).unwrap();
-        assert_eq!(bundle.cli, dir.path().join("pi/pi.exe"));
+        assert_eq!(bundle.cli, dir.path().canonicalize().unwrap().join("pi/pi.exe"));
         fs::write(dir.path().join("pi/pi.exe"), "changed").unwrap();
         assert!(verify(dir.path()).is_err());
     }

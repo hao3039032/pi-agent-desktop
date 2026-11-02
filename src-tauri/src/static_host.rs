@@ -265,6 +265,47 @@ mod tests {
         assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(10)).is_ok());
     }
 
+    // Windows CI supplies the verified staged tree, not checkout SDK modules.
+    // No prompt or provider request is sent; the only credential is a fake key.
+    #[cfg(all(feature = "static-preview", windows))]
+    #[test]
+    fn preview_staged_windows_runtime_stores_fake_key_and_starts_cli() {
+        use serde_json::json;
+        let root = std::path::PathBuf::from(std::env::var_os("PI_PREVIEW_TEST_BUNDLE").expect("staged preview bundle required"));
+        let bundle = crate::preview_bundle::verify(&root).unwrap();
+        // Keep evidence even if an assertion fails while a child is still alive.
+        let retained = tempfile::tempdir().unwrap().keep();
+        eprintln!("Windows Preview fixture (retained on failure): {}", retained.display());
+        let home = retained.join("preview-home");
+        let project = retained.join("project");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        let host = IsolatedStaticHost::init_preview(&home, bundle).unwrap();
+        let call = |op: &str, args: serde_json::Value| {
+            let response = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"preview-windows-fixture","op":op,"args":args}));
+            assert_eq!(response["ok"], true, "{response}");
+            response["data"].clone()
+        };
+        assert_eq!(crate::pi_ipc::management_call(&host.state, "sys.capabilities", json!({})).unwrap()["version"], 1);
+        let fake = "fixture-preview-not-a-real-api-key";
+        call("auth.apiKeyStore", json!({"provider":"openai","apiKey":fake}));
+        let auth = home.join(".pi/agent/auth.json");
+        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert_eq!(stored["openai"]["type"], "api_key");
+        assert_eq!(stored["openai"]["key"], fake);
+        host.state.propose_path(&project).unwrap();
+        let created = call("agent.create", json!({"cwd":project,"type":"ensure_session"}));
+        assert!(host.state.registry.get(created["sessionId"].as_str().unwrap()).is_some());
+        call("auth.apiKeyDelete", json!({"provider":"openai"}));
+        let removed: serde_json::Value = serde_json::from_slice(&std::fs::read(&auth).unwrap()).unwrap();
+        assert!(removed.get("openai").is_none());
+        assert!(!management_host::ledger::OperationLedger::inspect_unresolved(&home.join(".pi/agent")).unwrap());
+        assert_eq!(host.state.agent_dir(), home.join(".pi/agent"));
+        assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(15)).is_ok());
+        drop(host);
+        std::fs::remove_dir_all(&retained).unwrap();
+    }
+
     #[cfg(feature = "static-preview")]
     #[test]
     fn preview_state_uses_isolated_home_and_refuses_updates() {
