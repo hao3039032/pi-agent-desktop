@@ -2,15 +2,21 @@
 
 此表记录主分支 `migrate/static-tauri-host` 截至 `69a8d636` 四类 observer relay 关闭、`5e7a2a51` 本地 CLI 认证夹具、`303da5bc` 账本／事件流及 `c4b46e72` 索引预算整合的状态（真实 MCP 链路及其他本地 CLI 失败门槛仍未关闭）。**不是 M5 验收报告。** README 中较早的测试计数、未迁移列表和 PoC 表是历史记录，以本表为当前状态；API 全量目标仍由 `api-inventory.json` 定义。
 
-## 当前暂停点
+## 当前工作点：Windows Preview 优先
 
-用户要求暂停至明日。主线已集成工作与未合并的独立管理 SDK 检查点分支分别保存；恢复步骤、测试证据、未完成审阅及资源限制见 [管理 SDK 暂停交接](pause-handoff-management-sdk.md)。`7335bd79` 尚未合入主线：已有 Rust→Node→独立 SDK 的最小运行链，但 Tauri 配置和专用 writer 尚未接入，不能称迁移完成。
+用户已恢复实施，并明确 **Windows 是本轮主要交付平台，Linux 暂无发行版本**。Linux 保留本地开发／测试用途；Linux/macOS 发包验收不作为 Windows Preview 的前置条件。允许新增独立 Windows Preview GitHub Actions，产物仅为测试 artifact，不发布正式 Release／tag／updater，也不切换默认生产入口。
+
+- `c06e0761` 已整合 `18e7b900`／`7335bd79`／`45cbda86`：独立管理 SDK 已接入显式 development-package harness 配置与共享受限会话 writer。开发 CLI 绑定通过受信 checkout lock/pins、安装包 name/version/bin 与实际 CLI 路径交叉核验，不只信自报版本；不是 standalone 来源认证。
+- `e7e5de88` 已整合 `392157f0`：自动化设置失败后的状态回同步改走现有数据接口，静态使用 IPC、Next 保留 HTTP；会话切换／卸载时拒绝迟到结果。
+- `4190f1e6` 已整合 Windows Preview CI／清单准备至 `1add5581`。独立 app identifier、主程序名、NSIS 资源清理路径及 artifact-only workflow 已定义；尚未推送或触发该 workflow，尚无 Windows 编译或安装包验收结果。
+- 原生 `static-preview` 入口、持久 Preview 数据隔离、packaged 资源绑定与 updater 全入口禁用仍由 desktop-services lane 实施。Windows 管理 target-key／persistent ledger 目前因平台未支持而阻断凭据保存和登录；已批准补齐 Windows 实现，不能以绕过 ledger 或只读壳代替可用 Preview。
+- 历史暂停状态及资源限制见 [管理 SDK 暂停交接](pause-handoff-management-sdk.md)，其未合并状态以本节为准。
 
 ## 目前没有发生的切换
 
 - 正式产品仍启动 Next；未删除旧后端、未启用正式 Rust 调度循环。
 - 静态前端沿用原组件/UI，不把安全拒绝或空占位当功能完成。
-- 本次暂停按用户要求保存并推送主线与相关 lane 检查点，具体 HEAD 以 Git 远端核验为准；未合并的管理 SDK 实现保留在独立分支，不等于已验收。没有发布产品、修改更新仓库或签名策略。
+- 上次暂停已核验推送主线 `5f322f56`、desktop-services `7335bd79`、mcp `69a8d636`。恢复后的整合尚未推送；Windows Preview workflow 尚未运行。没有发布产品、修改更新仓库或签名策略。
 - 本地托管 pi、SDK symlink、浏览器桥及 `tauri::test::mock_app` 都不是 standalone/native WebView/安装升级证明。
 
 ## 最新架构决定（尚待实现验证）
@@ -51,6 +57,10 @@
 - **Composer 技能列表**：已复用 `skills-client` seam（Next fetch / 静态 IPC），保留 cwd 与取消守卫，不再在组件里直接请求 `/api/skills`。
 
 ## 集成验证记录（不是全量/跨平台验收）
+
+- 恢复后的开发管理 SDK 与 writer：整合至 `45cbda86`，父级审阅了显式 launcher、路径／版本绑定、受限 writer 接线、输入槽释放和模式环境剥离。修复普通 128 槽挤占控制通路的问题，Node 另留 4 控制槽；credential_type_mismatch 使用固定脱敏提示。lane 本轮精确 Node 3 项与 Rust 4 项各实际通过，library+harness check 通过；更早的 `7335bd79` 最小链路另有 Node 7／Rust 1 的 lane 证据，不合并为独立场景总数。首次 auth 夹具超时和 legacy 环境剥离测试失败保留在交付报告；父级没有把未重复运行的相同 Rust 测试称为父级执行。Windows 原生／standalone 尚未验证。
+- `392157f0` 前端自动化：lane 相关 Node 17 项通过、无 skip，静态 TypeScript 通过；首次修复前 2 fail／1 cancellation 如实保留。使用真实数据接口加 fake IPC／hook harness，不是原生 WebView。父级审阅后整合，未重跑未变化的同一测试集。
+- Windows Preview CI 准备至 `1add5581`：父级退回并核对修正了 NSIS 资源清理路径、独立主程序名、probe 输出预算及真实退出确认、SHA 版本后缀和 CI 产物统计。lane 最终相关 8 项通过、无 skip，最后 workflow 修改另跑 3 项；manifest 异版本校验另有此前 6 项通过证据，不重复累计。首次 js-yaml 导入错误及 Windows 路径断言失败保留。CI 的 staging 树仍有 1 GiB 上限；完整 Cargo/Tauri target 等另计并报告，不能把该上限称为整个 runner 峰值磁盘上限。本机唯一旧 bundle 未修改；没有运行 Actions、Windows 编译或安装升级。
 
 - 整合 `27ed8685` 与修订 `69a8d636`：auth observer 与 session/running/scheduled 共用原始关闭 deadline；先关闭实际准入，计数覆盖 open/启动/绑定/登记清理，锁忙和阻塞 Channel 保留 unknown。增加 `auth.inFlight` / `auth.registryBusy`，缺报告仍 null/unknown；observer 结束不取消或证明 credential writer 已停。父级审阅发现登记前测试同步竞态，以及 unwind 可能留下 registration 却释放 permit；修订采用清理先于 reservation 释放的 RAII，poison 不二次 panic且保持不可检查。
   - 父级合并树首跑 auth 关闭测试 **7 pass / 1 fail**（新建临时可执行脚本出现 `ETXTBSY`）；改用固定只读 `test-fixtures/auth-relay.py`，同时修复 poison 测试对两个计数释放顺序的瞬时假设。重跑 auth 关闭 **8 passed / 0 failed / 0 ignored**，既有三流关闭 **4 passed / 0 failed / 0 ignored**；harness 构建和生命周期 HTTP 测试 **1 passed / 0 skipped**。日志中的两处 controlled panic 是显式异常夹具。Rust 测试有 2 条 deprecated warnings，harness 构建另有 7 条 dead-code warnings；target 3.9 GiB。仅覆盖受跟踪应用清理与报告，不证明 OS 线程、SDK writer、上游监听器或 Tauri/WebView 队列回收，生产 `RunEvent::Exit` 未改。
@@ -130,6 +140,6 @@ Tauri 自定义协议接受缓冲 body，不是流。当前预算只覆盖读取
 3. IPC 真正有界准入、会话流背压/ACK/原子快照、未知副作用重启恢复与可见状态、所有退出/取消资源清理。
 4. 本应用管理的调度器／协作实例运行协调、崩溃事务门安全恢复、后台/隐藏窗口运行和退出中的 active run 语义。引用检查和删除不能分离到门外；用户自行启动的非协作外部 writer 风险按已批准支持边界处理，不要求普遍排他证明。
 5. Rust 拥有 OAuth loopback：MCP 静态路径已采用公开协议引擎及 Rust listener，仍需原生和平台验收；provider SDK 当前未暴露 callback 注入点，provider PoC 不算接入。
-6. Windows/macOS 缺失的安全文件/进程/PTY 实现与实际平台证据。
-7. 固定 SDK 管理树的 genuine standalone 布局、原生 WebView/preview ACL、官方安装工具行为、系统 dialogs、升级与状态迁移验收。
+6. Windows 缺失的安全存储／文件／进程／PTY 实现与实际平台证据为本轮重点；Preview 对尚未支持项必须如实提示，不以 Linux 测试代替 Windows 证明。macOS 后续单独验收，不阻塞本轮 Windows Preview。
+7. Windows 固定 SDK 管理树的 genuine standalone 布局、原生 WebView/preview ACL、官方安装工具行为、系统 dialogs、NSIS 升级与状态迁移验收。Linux 不作为本轮发行目标。
 8. 完成统一 review/修复和回归后，才切换产品启动、启用正式 Rust scheduler、删 Next/backend-only 依赖与代码。当前没有声称到达此步。
