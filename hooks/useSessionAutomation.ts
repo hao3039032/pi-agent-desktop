@@ -4,8 +4,9 @@
 // steering / follow-up delivery) and the retry-backoff cancel. Kept out of
 // hooks/useAgentSession.ts (upstream-owned) so upstream merges stay clean.
 
-import { useCallback, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
+import { useCallback, useEffect, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
+import { fetchAgentRunningState } from "@/lib/session-view-service";
 
 export interface SessionAutomation {
   autoCompactionEnabled: boolean | null;
@@ -62,6 +63,19 @@ interface SessionAutomationActionsOptions<State> {
 export function useSessionAutomationActions<State>({
   sessionIdRef, setAutomation, addNotice, resync,
 }: SessionAutomationActionsOptions<State>) {
+  const identityRef = useRef({ sid: sessionIdRef.current, generation: 0 });
+  if (identityRef.current.sid !== sessionIdRef.current) {
+    identityRef.current = { sid: sessionIdRef.current, generation: identityRef.current.generation + 1 };
+  }
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      identityRef.current.generation += 1;
+    };
+  }, []);
+
   /** Cancel an auto-retry backoff (0.86) without stopping the whole session. */
   const handleAbortRetry = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -77,6 +91,8 @@ export function useSessionAutomationActions<State>({
   const handleSetAutomation = useCallback(async (change: SessionAutomationChange) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+    const generation = identityRef.current.generation;
+    const isCurrent = () => mountedRef.current && sessionIdRef.current === sid && identityRef.current.generation === generation;
     // Optimistic: revert if the command fails.
     setAutomation((prev) => ({
       autoCompactionEnabled: change.autoCompaction ?? prev.autoCompactionEnabled,
@@ -99,12 +115,12 @@ export function useSessionAutomationActions<State>({
       }
     } catch (e) {
       console.error("Failed to apply automation setting:", e);
+      if (!isCurrent()) return;
       addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
-      // Re-sync from the server's actual state.
+      // Re-sync from the runtime's actual state through the selected transport.
       try {
-        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
-        const d = await res.json() as { state?: State };
-        resync(d.state);
+        const result = await fetchAgentRunningState(sid);
+        if (result && isCurrent()) resync(result.state as State | undefined);
       } catch { /* leave optimistic value; next reconcile fixes it */ }
     }
   }, [addNotice, resync, sessionIdRef, setAutomation]);
