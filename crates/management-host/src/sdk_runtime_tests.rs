@@ -2,6 +2,48 @@ use super::*;
 use serde_json::json;
 use std::{fs, io::{BufRead, BufReader}, process::{Child, Command, Stdio}, time::Duration};
 
+#[cfg(unix)]
+#[test]
+fn legacy_launcher_removes_sdk_mode_selectors() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("legacy-child");
+    let marker = temp.path().join("environment");
+    fs::write(&script, "#!/bin/sh\nprintf '%s|%s|%s' \"${PI_WEB_MANAGEMENT_SDK_ROOT-unset}\" \"${PI_WEB_MANAGEMENT_CLI_VERSION-unset}\" \"$PI_WEB_MANAGED_MODULES\" > \"$FIXTURE_MARKER\"\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let host = ManagementHost::new();
+    let config = ManagementSpawnConfig {
+        executable: script.display().to_string(), agent_dir: Some(temp.path().to_path_buf()), extensions: vec![],
+        env: vec![("PI_WEB_MANAGEMENT_SDK_ROOT".into(), "/untrusted".into()), ("PI_WEB_MANAGEMENT_CLI_VERSION".into(), "9.9.9".into()),
+            ("PI_WEB_MANAGED_MODULES".into(), "legacy-tree".into()), ("FIXTURE_MARKER".into(), marker.display().to_string())],
+    };
+    let _instance = host.instance("legacy", &config).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let observed = loop {
+        if let Ok(value) = fs::read_to_string(&marker) { if !value.is_empty() { break value; } }
+        assert!(std::time::Instant::now() < deadline, "legacy child did not report environment");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(observed, "unset|unset|legacy-tree");
+    host.shutdown_until(std::time::Instant::now() + Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_sdk_runtime_never_falls_back_to_legacy() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("legacy-child");
+    let marker = temp.path().join("started");
+    fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = ManagementSdkRuntime { node: script.clone(), entry: script.clone(), dependency_root: temp.path().to_path_buf(), projection_root: temp.path().to_path_buf(), cli_version: "9.0.0".into() };
+    let host = ManagementHost::with_sdk_runtime(runtime, Arc::new(|_| Ok(())));
+    let config = ManagementSpawnConfig { executable: script.display().to_string(), agent_dir: Some(temp.path().to_path_buf()), extensions: vec![], env: vec![] };
+    assert!(host.instance("global", &config).is_err());
+    assert!(!marker.exists());
+}
+
 struct FakeServer(Child);
 impl Drop for FakeServer {
     fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }

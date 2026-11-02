@@ -57,7 +57,7 @@ pub(crate) fn writer_config(state: &IpcHostState) -> Result<management_host::Man
 pub(crate) fn run_writer(state: &IpcHostState, guard: &mut crate::session_writer_lifecycle::WriterGuard, op: &str, args: Value) -> Result<Value, (String, String)> {
     let config = writer_config(state).map_err(|e| error("outcome_unknown", format!("Session writer outcome unknown; do not retry: {}", e.1)))?;
     guard.before_spawn().map_err(|e| error("outcome_unknown", e))?;
-    let writer = management_host::spawn_session_file_writer(&config).map_err(|e| error("outcome_unknown", e))?;
+    let writer = management_host::spawn_session_file_writer_with_sdk(&config, state.management_sdk_runtime.clone()).map_err(|e| error("outcome_unknown", e))?;
     let pid = writer.pid();
     #[cfg(test)]
     let timeout = *state.session_writer_timeout.lock().unwrap();

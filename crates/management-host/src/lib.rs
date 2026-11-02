@@ -1458,11 +1458,15 @@ impl SessionFileWriter {
 }
 
 pub fn spawn_session_file_writer(config: &ManagementSpawnConfig) -> Result<SessionFileWriter, String> {
+    spawn_session_file_writer_with_sdk(config, None)
+}
+
+pub fn spawn_session_file_writer_with_sdk(config: &ManagementSpawnConfig, runtime: Option<ManagementSdkRuntime>) -> Result<SessionFileWriter, String> {
     if config.extensions.len() != 1 || config.agent_dir.is_none()
         || config.env.len() != 1 || config.env[0].0 != "PI_WEB_MANAGED_MODULES" {
         return Err("invalid session writer configuration".into());
     }
-    spawn_management_with_environment("session-file-writer", config, true, None, Arc::new(std::sync::atomic::AtomicBool::new(false)), None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
+    spawn_management_with_environment("session-file-writer", config, true, runtime, Arc::new(std::sync::atomic::AtomicBool::new(false)), None, Arc::new(Mutex::new(ManagementAdmission::default()))).map(SessionFileWriter)
 }
 
 fn spawn_management_with_environment(
@@ -1504,8 +1508,14 @@ fn spawn_management_with_environment(
         env = env.set("PI_CODING_AGENT_DIR", agent_dir.to_string_lossy().into_owned());
     }
     for (key, value) in &config.env {
+        if matches!(key.as_str(), "PI_WEB_MANAGEMENT_SDK_ROOT" | "PI_WEB_MANAGEMENT_CLI_VERSION") { continue; }
         if sdk_runtime.is_some() && matches!(key.as_str(), "PI_CODING_AGENT_DIR" | "PI_PACKAGE_DIR" | "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT" | "JITI_ALIAS" | "NODE_OPTIONS" | "NODE_PATH") { continue; }
         env = env.set(key, value.clone());
+    }
+    // Mode selectors are exclusively host-owned, even if inherited or supplied
+    // in legacy config.env. Only an explicit SDK runtime may set them again.
+    for key in ["PI_WEB_MANAGEMENT_SDK_ROOT", "PI_WEB_MANAGEMENT_CLI_VERSION"] {
+        env = env.remove_var(key);
     }
     env = env.set("PI_WEB_MGMT_NONCE", nonce.clone());
     let client = if let Some(runtime) = &sdk_runtime {

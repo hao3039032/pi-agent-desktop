@@ -56,14 +56,34 @@ impl IsolatedStaticHost {
     /// Only an existing directory below the OS temporary directory may be
     /// used by the harness. This is not a production ownership policy.
     pub fn init(agent: &Path) -> Result<Self, String> {
+        Self::init_with_state(agent, IpcHostState::new(), None)
+    }
+
+    /// Explicit development-only runtime; invalid binding fails without legacy fallback.
+    pub fn init_development_sdk(agent: &Path, config: crate::development_management_sdk::DevelopmentManagementSdk) -> Result<Self, String> {
+        let selected = crate::pi_ipc::resolve_pi_executable().ok_or("selected CLI unavailable")?;
+        let (runtime, executable) = config.verify(&selected)?;
+        let asset = runtime.entry.parent().ok_or("management entry directory unavailable")?.join("pi-web-management.mjs");
+        let spawn = management_host::ManagementSpawnConfig {
+            executable: executable.to_string_lossy().into_owned(), agent_dir: None,
+            extensions: vec![asset], env: vec![("PI_WEB_MANAGED_MODULES".into(), runtime.projection_root.to_string_lossy().into_owned())],
+        };
+        Self::init_with_state(agent, IpcHostState::new_with_management_sdk(Some(runtime)), Some(spawn))
+    }
+
+    fn init_with_state(agent: &Path, state: IpcHostState, config: Option<management_host::ManagementSpawnConfig>) -> Result<Self, String> {
         let agent = agent.canonicalize().map_err(|e| e.to_string())?;
         let temp = std::env::temp_dir().canonicalize().map_err(|e| e.to_string())?;
         if agent == temp || !agent.starts_with(&temp) || !agent.is_dir() {
             return Err("isolated static host requires a temporary agent directory".into());
         }
         let lifecycle = HostLifecycle::init(&agent)?;
-        let state = Arc::new(IpcHostState::new());
-        *state.task_agent_dir.lock().map_err(|_| "agent directory lock poisoned")? = Some(agent);
+        let state = Arc::new(state);
+        *state.task_agent_dir.lock().map_err(|_| "agent directory lock poisoned")? = Some(agent.clone());
+        if let Some(mut config) = config {
+            config.agent_dir = Some(agent);
+            *state.management_config.lock().map_err(|_| "management configuration lock poisoned")? = Some(config);
+        }
         let tracked = Arc::new(Mutex::new(TrackedShutdown::default()));
         let host = Arc::clone(&state);
         lifecycle.register_until(ShutdownStage::Admission, "ipc", move |deadline| {
@@ -141,6 +161,43 @@ impl IsolatedStaticHost {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn development_sdk_host_and_fenced_chat_writer_use_same_runtime() {
+        use serde_json::json;
+        use std::path::PathBuf;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("agent");
+        let chat = agent.join("chats/fixture");
+        let project = temp.path().join("project");
+        let projection = temp.path().join("projection");
+        std::fs::create_dir_all(&chat).unwrap(); std::fs::create_dir_all(&project).unwrap();
+        let node = PathBuf::from(std::env::var("PI_WEB_TEST_NODE").expect("PI_WEB_TEST_NODE required")).canonicalize().unwrap();
+        let build = std::process::Command::new(&node).arg(repo.join("scripts/migration/build-management-modules.mjs"))
+            .args(["--sdk-runtime", "--out"]).arg(&projection).output().unwrap();
+        assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
+        let config = crate::development_management_sdk::DevelopmentManagementSdk {
+            checkout: repo.clone(), node, entry: repo.join("lib/pi-rpc/assets/management-sdk-entry.mjs"),
+            sdk_root: repo.join("node_modules").canonicalize().unwrap(), projection,
+        };
+        let source_dir = crate::session_view::default_session_dir(&agent, &chat);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let file = source_dir.join("source.jsonl");
+        std::fs::write(&file, format!("{}\n{}\n", json!({"type":"session","version":3,"id":"source","timestamp":"2026-01-01T00:00:00.000Z","cwd":chat}), json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"hello"}}))).unwrap();
+        let host = IsolatedStaticHost::init_development_sdk(&agent, config).unwrap();
+        let caps = crate::pi_ipc::management_call(&host.state, "sys.capabilities", json!({})).unwrap();
+        assert_eq!(caps["version"], 1);
+        host.state.propose_path(&project).unwrap();
+        let copied = crate::chat_sessions::continue_in_project(&host.state, &json!({"session":"source", "cwd":project})).unwrap();
+        assert!(Path::new(copied["path"].as_str().unwrap()).is_file());
+        assert!(crate::session_writer_fence::assert_session_writable(&agent, "source").is_ok());
+        let report = host.state.session_writers.shutdown_until(std::time::Instant::now() + Duration::from_secs(5));
+        assert!(report.unknown.is_empty(), "{report:?}");
+        host.state.management.shutdown_until(std::time::Instant::now() + Duration::from_secs(5));
+    }
+
     fn assert_admission_closed(host: &IsolatedStaticHost, dir: &Path) {
         let response = tauri::async_runtime::block_on(crate::pi_ipc::dispatch_envelope_gated(
             Arc::clone(&host.state), serde_json::json!({"v":1,"id":"after","op":"desktop.identity"}),

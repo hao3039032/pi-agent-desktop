@@ -100,6 +100,7 @@ pub struct IpcHostState {
     /// resolved at startup; until then the models ops answer
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
+    pub(crate) management_sdk_runtime: Option<management_host::ManagementSdkRuntime>,
     pub session_writers: Arc<crate::session_writer_lifecycle::SessionWriterLifecycle>,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
     mcp_signin_tasks: Mutex<BTreeSet<String>>,
@@ -243,6 +244,10 @@ impl IpcHostState {
     }
 
     pub fn new() -> Self {
+        Self::new_with_management_sdk(None)
+    }
+
+    pub(crate) fn new_with_management_sdk(runtime: Option<management_host::ManagementSdkRuntime>) -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
         let policy_gate = Arc::new(std::sync::RwLock::new(()));
         let agent_dir = default_agent_dir();
@@ -268,6 +273,15 @@ impl IpcHostState {
         });
         let mut initial_roots = crate::file_access::AllowedRoots::new();
         let file_roots_init_error = std::env::var_os("HOME").and_then(|home| initial_roots.add_default_cwd_roots(Path::new(&home)).err().map(|e| e.to_string()));
+        let management_check: Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync> = Arc::new(move |configured| {
+            let pinned = management_agent_dir.lock().map_err(|_| "agent directory unavailable")?;
+            if pinned.as_deref() != Some(configured) { return Err("management agent directory differs from host agent directory".into()); }
+            Ok(())
+        });
+        let management = match runtime.clone() {
+            Some(runtime) => ManagementHost::with_sdk_runtime(runtime, management_check),
+            None => ManagementHost::with_agent_dir_check(management_check),
+        };
         Self {
             registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
             policy_gate,
@@ -294,11 +308,8 @@ impl IpcHostState {
             #[cfg(test)]
             title_rename_timeout: Mutex::new(Duration::from_secs(30)),
             session_writers: Arc::new(Default::default()),
-            management: ManagementHost::with_agent_dir_check(Arc::new(move |configured| {
-                let pinned = management_agent_dir.lock().map_err(|_| "agent directory unavailable")?;
-                if pinned.as_deref() != Some(configured) { return Err("management agent directory differs from host agent directory".into()); }
-                Ok(())
-            })),
+            management,
+            management_sdk_runtime: runtime,
             management_config: Mutex::new(resolve_management_config(agent_dir)),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir,
@@ -539,7 +550,7 @@ fn bump_session_list_version(state: &IpcHostState) -> u64 {
 /// minus the PATH fallthrough: a Rust host must name an absolute binary —
 /// an implicit PATH lookup would make the packaged app depend on the
 /// machine's PATH, which the desktop bundle never does).
-fn resolve_pi_executable() -> Option<PathBuf> {
+pub(crate) fn resolve_pi_executable() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PI_CLI_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {
