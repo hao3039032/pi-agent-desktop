@@ -11,7 +11,7 @@ impl Drop for SecurityDescriptor { fn drop(&mut self) { unsafe { LocalFree(self.
 
 /// Fail closed on null DACL, unexpected ACE types, or write access by a SID
 /// other than the current user, local SYSTEM or local administrators.
-fn check_acl(file: &File) -> io::Result<()> {
+fn check_acl(file: &File, private: bool) -> io::Result<()> {
     unsafe {
         let mut token = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 { return Err(io::Error::last_os_error()); }
@@ -44,7 +44,7 @@ fn check_acl(file: &File) -> io::Result<()> {
             if header.AceType == 1 { continue; }
             if header.AceType != 0 || (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() { return Err(err("unsupported storage ACE")); }
             let ace = &*(raw as *const ACCESS_ALLOWED_ACE);
-            let write_mask = GENERIC_ALL | GENERIC_WRITE | 0x000f_0156;
+            let write_mask = GENERIC_ALL | GENERIC_WRITE | 0x000f_0156 | if private { 0x8000_0089 } else { 0 };
             if ace.Mask & write_mask != 0 && !trusted((&ace.SidStart as *const u32).cast_mut().cast()) { return Err(err("untrusted storage writer")); }
         }
         Ok(())
@@ -54,15 +54,13 @@ fn check_acl(file: &File) -> io::Result<()> {
 fn check_file(file: &File, directory: bool) -> io::Result<()> {
     let meta = file.metadata()?;
     if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || if directory { !meta.is_dir() } else { !meta.is_file() } { return Err(err("unsafe storage entry")); }
-    if !directory {
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 { return Err(io::Error::last_os_error()); }
-        if info.nNumberOfLinks != 1 || info.dwVolumeSerialNumber == 0 || (info.nFileIndexHigh == 0 && info.nFileIndexLow == 0) { return Err(err("unsafe storage file identity")); }
-    }
-    check_acl(file)
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 { return Err(io::Error::last_os_error()); }
+    if (!directory && info.nNumberOfLinks != 1) || info.dwVolumeSerialNumber == 0 || (info.nFileIndexHigh == 0 && info.nFileIndexLow == 0) { return Err(err("unsafe storage identity")); }
+    check_acl(file, !directory)
 }
-fn open_dir(path: &Path, writable: bool) -> io::Result<File> {
-    let file = OpenOptions::new().read(true).write(writable).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+fn open_dir(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
     let meta = file.metadata()?;
     if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return Err(err("unsafe storage directory")); }
@@ -77,10 +75,10 @@ impl PinnedDirectory {
         let prefix = match components.next() { Some(Component::Prefix(v)) => v.as_os_str(), _ => return Err(io::ErrorKind::InvalidInput.into()) };
         if !matches!(components.next(), Some(Component::RootDir)) { return Err(io::ErrorKind::InvalidInput.into()); }
         let mut path = PathBuf::from(prefix); path.push("\\");
-        let mut ancestors = vec![open_dir(&path, false)?];
+        let mut ancestors = vec![open_dir(&path)?];
         for part in components {
             match part { Component::Normal(name) => path.push(name), _ => return Err(io::ErrorKind::InvalidInput.into()) }
-            ancestors.push(open_dir(&path, false)?);
+            ancestors.push(open_dir(&path)?);
         }
         check_file(ancestors.last().ok_or_else(|| err("missing agent root"))?, true)?;
         let names: &[&str] = if ledger { &["pi-web", "management-operations"] } else { &["pi-web"] };
@@ -89,7 +87,7 @@ impl PinnedDirectory {
             if create {
                 match fs::create_dir(&path) { Ok(()) => (), Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (), Err(e) => return Err(e) }
             }
-            let dir = match open_dir(&path, true) { Ok(v) => v, Err(e) if !create && e.kind() == io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(e) };
+            let dir = match open_dir(&path) { Ok(v) => v, Err(e) if !create && e.kind() == io::ErrorKind::NotFound => return Ok(None), Err(e) => return Err(e) };
             check_file(&dir, true)?; ancestors.push(dir);
         }
         let directory = ancestors.pop().ok_or_else(|| err("missing storage directory"))?;
@@ -100,6 +98,18 @@ impl PinnedDirectory {
         let mut options = OpenOptions::new(); options.read(true).share_mode(FILE_SHARE_READ).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         if create { options.write(true).create_new(true); }
         let file = options.open(self.path.join(name))?; check_file(&file, false)?; Ok(file)
+    }
+    /// Publish a flushed same-directory file without cross-volume copy fallback.
+    /// Microsoft documents WRITE_THROUGH flushing for copy-and-delete moves;
+    /// this same-volume rename has no claimed directory-fsync or power-loss guarantee.
+    pub fn publish(&self, source: &str, target: &str, replace: bool) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+        let from: Vec<u16> = self.path.join(source).as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = self.path.join(target).as_os_str().encode_wide().chain(Some(0)).collect();
+        let flags = MOVEFILE_WRITE_THROUGH | if replace { MOVEFILE_REPLACE_EXISTING } else { 0 };
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 { return Err(io::Error::last_os_error()); }
+        Ok(())
     }
     pub fn transaction(&self) -> io::Result<File> { self.open_transaction(true) }
     pub fn existing_transaction(&self) -> io::Result<File> { self.open_transaction(false) }

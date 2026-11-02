@@ -113,6 +113,8 @@ impl OperationLedger {
     }
     #[cfg(windows)]
     pub fn open(agent_dir: &Path) -> Result<Self, String> {
+        let base = crate::windows_storage::PinnedDirectory::open(agent_dir, false, true).map_err(|e| e.to_string())?.ok_or("management key directory missing")?;
+        let _transaction = base.transaction().map_err(|e| e.to_string())?;
         let pinned = crate::windows_storage::PinnedDirectory::open(agent_dir, true, true).map_err(|e| e.to_string())?.ok_or("management ledger directory missing")?;
         let directory = pinned.directory.try_clone().map_err(|e| e.to_string())?;
         let path = pinned.path.clone();
@@ -274,29 +276,26 @@ impl OperationLedger {
         if records.iter().any(|(record, phase)| *phase == LedgerPhase::Pending && !allowed.contains(&record.operation_id)) { return Err("management outcome unresolved; mutation not admitted".into()); }
         if records.iter().filter(|(_, phase)| *phase != LedgerPhase::Succeeded).count() >= MAX_PENDING { return Err("management ledger capacity reached".into()); }
         for (record, phase) in records { if phase == LedgerPhase::Succeeded { std::fs::remove_file(self.path.join(format!("{}.json", record.operation_id))).map_err(|e| e.to_string())?; } }
-        self.directory.sync_all().map_err(|e| e.to_string())?;
         let scope = match &descriptor.scope { OperationScope::Global => "global", OperationScope::Project { path } if Path::new(path).is_absolute() && path.len() <= 4096 => path, _ => return Err("invalid management scope".into()) };
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
         let mut value = json!({"version":1,"operationId":id,"operation":descriptor.operation,"scope":scope,"target":target_name(descriptor.target),"phase":"pending","createdAtMs":timestamp});
         if let Some(target) = &descriptor.mcp_target { value["mcpTarget"] = json!({"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()}); }
-        let mut file = self.pinned.file(&format!("{id}.json"), true).map_err(|e| e.to_string())?;
-        file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).and_then(|_| self.directory.sync_all()).map_err(|e| format!("cannot persist management ledger: {e}"))?;
+        let temporary = format!(".{}.tmp", uuid::Uuid::new_v4());
+        let mut file = self.pinned.file(&temporary, true).map_err(|e| e.to_string())?;
+        file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| format!("cannot persist management ledger: {e}"))?;
+        drop(file);
+        self.pinned.publish(&temporary, &format!("{id}.json"), false).map_err(|e| format!("cannot publish management ledger: {e}"))?;
         Ok(id)
     }
 
     #[cfg(windows)]
     fn replace_record(&self, id: &str, value: &Value) -> Result<(), String> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
         let name = format!(".{}.tmp", uuid::Uuid::new_v4());
         let mut file = self.pinned.file(&name, true).map_err(|e| e.to_string())?;
         file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).map_err(|e| e.to_string())?;
         drop(file);
-        let source: Vec<u16> = self.path.join(name).as_os_str().encode_wide().chain(Some(0)).collect();
-        let target: Vec<u16> = self.path.join(format!("{id}.json")).as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 { return Err(std::io::Error::last_os_error().to_string()); }
-        self.directory.sync_all().map_err(|e| e.to_string())
+        self.pinned.publish(&name, &format!("{id}.json"), true).map_err(|e| e.to_string())
     }
 
     #[cfg(windows)]
