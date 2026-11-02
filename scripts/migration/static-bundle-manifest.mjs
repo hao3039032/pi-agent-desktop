@@ -65,7 +65,7 @@ function verifyManagementRuntime(root, manifest, actual, pi) {
   // packages imported directly by the management projection.
   const seen = new Map();
   function checkPackage(name, version) {
-    if (!/^@earendil-works\/pi-[a-z0-9-]+$/.test(name) || version !== expected.piVersion) throw new Error("invalid management SDK dependency");
+    if (!/^@earendil-works\/pi-[a-z0-9-]+$/.test(name) || typeof version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) throw new Error("invalid management SDK dependency");
     if (seen.has(name)) {
       if (seen.get(name) !== version) throw new Error("conflicting management SDK dependency");
       return;

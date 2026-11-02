@@ -1,0 +1,118 @@
+name: Windows static migration preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [preview/windows-static]
+
+permissions:
+  contents: read
+
+jobs:
+  preview:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      PI_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run check:deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ci --prefix static-frontend
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Require the integrated SDK and native preview
+        shell: pwsh
+        run: |
+          if (-not (Test-Path lib/pi-rpc/assets/management-sdk-entry.mjs) -or -not (Test-Path lib/pi-rpc/assets/management-stdio.mjs)) { throw 'Integrate the management SDK lane first' }
+          if (-not (Select-String -Quiet -SimpleMatch 'sdkRuntime = false' scripts/migration/build-management-modules.mjs)) { throw 'Integrate SDK projection support first' }
+          if (-not (Select-String -Quiet -Pattern '^static-preview\s*=' src-tauri/Cargo.toml)) { throw 'Integrate the real native static-preview feature first' }
+          node -e "const p=require('./scripts/release-component-pins.json').pi.version; const l=require('./package-lock.json').packages['node_modules/@earendil-works/pi-coding-agent'].version; const i=require('./node_modules/@earendil-works/pi-coding-agent/package.json').version; if(p!=='1.4.0'||p!==l||p!==i) throw Error('SDK pin/lock/install mismatch')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify migration contract tests
+        shell: pwsh
+        run: |
+          $env:HOME = Join-Path $env:RUNNER_TEMP 'preview-test-home'
+          $env:USERPROFILE = $env:HOME
+          New-Item -ItemType Directory -Force $env:HOME | Out-Null
+          Remove-Item Env:PI_PACKAGE_DIR,Env:PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT,Env:JITI_ALIAS,Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue
+          node --test scripts/migration/static-bundle-manifest.test.mjs scripts/migration/windows-static-preview.test.mjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Download checksum-verified official pi distribution
+        shell: pwsh
+        run: |
+          node scripts/pi-cli-release.mjs --target x86_64-pc-windows-msvc --download-dir "$env:RUNNER_TEMP/pi-download" --github-env "$env:GITHUB_ENV"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build real static frontend
+        shell: pwsh
+        run: |
+          npm run build --prefix static-frontend
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stage and verify one preview resource tree
+        shell: pwsh
+        run: |
+          $env:HOME = Join-Path $env:RUNNER_TEMP 'preview-stage-home'
+          $env:USERPROFILE = $env:HOME
+          New-Item -ItemType Directory -Force $env:HOME | Out-Null
+          Remove-Item Env:PI_PACKAGE_DIR,Env:PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT,Env:JITI_ALIAS,Env:NODE_OPTIONS,Env:NODE_PATH -ErrorAction SilentlyContinue
+          $node = (Get-Command node).Source
+          $npmDir = Join-Path (Split-Path $node) 'node_modules/npm'
+          node scripts/migration/prepare-static-bundle.mjs --out src-tauri/resources/static-preview --pi-dir "$env:PI_CLI_DISTRIBUTION_DIR" --node "$node" --npm-dir "$npmDir" --frontend desktop/frontend-static --management-sdk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/migration/verify-static-bundle.mjs src-tauri/resources/static-preview --management-sdk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bytes = (Get-ChildItem src-tauri/resources/static-preview -File -Recurse | Measure-Object -Property Length -Sum).Sum
+          if ($bytes -gt 1GB) { throw "Preview resource tree exceeds 1 GiB: $bytes" }
+          Rename-Item node_modules node_modules.preview-hidden
+          try {
+            node scripts/migration/smoke-static-preview.mjs src-tauri/resources/static-preview
+            if ($LASTEXITCODE -ne 0) { throw "Staged offline smoke failed: $LASTEXITCODE" }
+          } finally {
+            Rename-Item node_modules.preview-hidden node_modules
+          }
+      - name: Compute isolated preview version
+        shell: pwsh
+        run: |
+          $number = [int]$env:GITHUB_RUN_NUMBER
+          if ($number -lt 1 -or $number -gt 65535 -or $env:GITHUB_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Invalid preview version inputs' }
+          $version = "0.0.$number-preview.$($env:GITHUB_SHA.Substring(0, 12))"
+          @{ version = $version } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 "$env:RUNNER_TEMP/preview-version.json"
+          "PREVIEW_VERSION=$version" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+      - name: Build Windows NSIS preview
+        shell: pwsh
+        run: |
+          Remove-Item Env:PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY,Env:TAURI_SIGNING_PRIVATE_KEY,Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+          node node_modules/@tauri-apps/cli/tauri.js build --ci --no-sign --target x86_64-pc-windows-msvc --bundles nsis --features static-preview --config src-tauri/tauri.preview.conf.json --config "$env:RUNNER_TEMP/preview-version.json" -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record preview artifacts
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe -File)
+          if ($files.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($files.Count)" }
+          $size = (Get-ChildItem src-tauri/resources/static-preview -File -Recurse | Measure-Object -Property Length -Sum).Sum + $files[0].Length
+          if ($size -gt 1GB) { throw "Preview resource tree plus installer exceeds 1 GiB: $size" }
+          New-Item -ItemType Directory -Force preview-artifact | Out-Null
+          $hash = (Get-FileHash -Algorithm SHA256 $files[0].FullName).Hash.ToLowerInvariant()
+          "$hash  $($files[0].Name)" | Set-Content -Encoding utf8 preview-artifact/SHA256SUMS.txt
+          @{ version = $env:PREVIEW_VERSION; commit = $env:GITHUB_SHA; target = 'x86_64-pc-windows-msvc'; piVersion = '1.4.0'; installer = $files[0].Name; sha256 = $hash } | ConvertTo-Json | Set-Content -Encoding utf8 preview-artifact/preview.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-static-preview-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            preview-artifact/SHA256SUMS.txt
+            preview-artifact/preview.json
+          if-no-files-found: error
+          retention-days: 14

@@ -80,6 +80,18 @@ test("management SDK bundle binds roles, graph and distribution to hashed files"
   } finally { f.cleanup(); }
 });
 
+test("SDK dependency versions follow each declaring manifest, not the CLI pin", () => {
+  const f = sdkFixture();
+  try {
+    f.put("managed/node_modules/@earendil-works/pi-coding-agent/package.json", { name: "@earendil-works/pi-coding-agent", version: "1.4.0", dependencies: { "@earendil-works/pi-ai": "2.1.0", "@earendil-works/pi-mcp": "1.3.0" } });
+    f.put("managed/node_modules/@earendil-works/pi-ai/package.json", { name: "@earendil-works/pi-ai", version: "2.1.0", dependencies: { "@earendil-works/pi-mcp": "1.3.0" } });
+    f.put("managed/node_modules/@earendil-works/pi-mcp/package.json", { name: "@earendil-works/pi-mcp", version: "1.3.0" });
+    f.refresh(); verifyBundle(f.root, f.manifest, { requireManagementSdk: true });
+    f.put("managed/node_modules/@earendil-works/pi-ai/package.json", { name: "@earendil-works/pi-ai", version: "2.1.0", dependencies: { "@earendil-works/pi-mcp": "1.2.0" } });
+    f.refresh(); assert.throws(() => verifyBundle(f.root, f.manifest), /conflicting management SDK dependency|package mismatch/);
+  } finally { f.cleanup(); }
+});
+
 test("Windows resources use exact role spelling and reject Windows path aliases", () => {
   const f = sdkFixture(true);
   try {
@@ -140,7 +152,7 @@ test("management SDK rejects malformed distribution and dependency manifests eve
     rmSync(join(f.root, "managed/node_modules/@earendil-works/pi-ai/package.json")); f.refresh();
     assert.throws(() => verifyBundle(f.root, f.manifest), /runtime missing/);
     f.put("managed/node_modules/@earendil-works/pi-ai/package.json", { name: "@earendil-works/pi-ai", version: "1.4.0", dependencies: { "@earendil-works/pi-mcp": "1.3.0" } }); f.refresh();
-    assert.throws(() => verifyBundle(f.root, f.manifest), /invalid management SDK dependency/);
+    assert.throws(() => verifyBundle(f.root, f.manifest), /conflicting management SDK dependency|package mismatch/);
     if (process.platform !== "win32") {
       rmSync(join(f.root, "managed/node_modules/@earendil-works/pi-ai/package.json"));
       symlinkSync("/outside", join(f.root, "managed/node_modules/@earendil-works/pi-ai/package.json"));
