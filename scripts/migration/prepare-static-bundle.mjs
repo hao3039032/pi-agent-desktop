@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { stagePiDistribution } from "../pi-cli-distribution.mjs";
 import { stageManagedTree } from "./stage-managed-tree.mjs";
 import { buildProjectionInto } from "./build-management-modules.mjs";
-import { bundleFiles, verifyBundle } from "./static-bundle-manifest.mjs";
+import { bundleFiles, managementRuntimeDescription, verifyBundle } from "./static-bundle-manifest.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const args = process.argv.slice(2);
@@ -18,6 +18,10 @@ const piDir = arg("--pi-dir");
 const node = arg("--node");
 const npm = arg("--npm-dir");
 const frontend = arg("--frontend");
+const sdkRuntime = args.includes("--management-sdk");
+// The SDK implementation lives on a separate integration lane. Fail before
+// staging rather than silently building the legacy projection when absent.
+if (sdkRuntime && (!existsSync(join(root, "lib/pi-rpc/assets/management-sdk-entry.mjs")) || !existsSync(join(root, "lib/pi-rpc/assets/management-stdio.mjs")) || !readFileSync(join(root, "scripts/migration/build-management-modules.mjs"), "utf8").includes("sdkRuntime = false"))) throw new Error("management SDK entry and sdkRuntime projection builder must be integrated first");
 if (existsSync(out)) throw new Error("output must not already exist");
 if (!existsSync(join(frontend, "index.html")) || !existsSync(join(npm, "bin", "npm-cli.js"))) throw new Error("missing frontend or npm runtime");
 const expected = JSON.parse(readFileSync(join(root, "scripts/release-component-pins.json"), "utf8")).pi.version;
@@ -36,13 +40,14 @@ cpSync(join(root, "lib/pi-rpc/assets"), join(out, "server/lib/pi-rpc/assets"), {
 await stageManagedTree(join(out, "managed/node_modules"));
 unlinkSync(join(out, "managed/node_modules/pi-web-session-projection.mjs"));
 unlinkSync(join(out, "managed/node_modules/pi-web-session-title.mjs"));
-await buildProjectionInto(join(out, "managed"));
+await buildProjectionInto(join(out, "managed"), sdkRuntime ? { sdkRuntime: true } : undefined);
 // npm's installation-time .bin link is not a module dependency. In this
 // checkout cpSync preserves it as an absolute link into the build machine.
 const yamlBin = join(out, "managed/node_modules/@earendil-works/pi-coding-agent/node_modules/.bin/yaml");
 if (existsSync(yamlBin) && lstatSync(yamlBin).isSymbolicLink()) unlinkSync(yamlBin);
 const files = bundleFiles(out);
 const manifest = { version: 1, piVersion: expected, files };
+if (sdkRuntime) manifest.managementRuntime = managementRuntimeDescription(process.platform === "win32" ? "pi.exe" : "pi", process.platform === "win32" ? "node/node.exe" : "node/node");
 writeFileSync(join(out, "bundle-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-verifyBundle(out, manifest);
+verifyBundle(out, manifest, { requireManagementSdk: sdkRuntime });
 console.log(`Staged ${files.length} files, ${files.reduce((n, f) => n + f.size, 0)} bytes in ${out}; not a native package or platform acceptance.`);
