@@ -44,6 +44,26 @@ fn valid_path(path: &str) -> bool {
             && !part.contains(['\\', ':', '\0'])
     })
 }
+#[cfg(windows)]
+fn reject_windows_aliases(names: &mut [String]) -> Result<(), String> {
+    use std::{cmp::Ordering, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN};
+    let compare = |a: &str, b: &str| {
+        let a: Vec<u16> = std::ffi::OsStr::new(a).encode_wide().collect();
+        let b: Vec<u16> = std::ffi::OsStr::new(b).encode_wide().collect();
+        unsafe { CompareStringOrdinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1) }
+    };
+    let mut invalid = false;
+    names.sort_unstable_by(|a, b| match compare(a, b) {
+        CSTR_LESS_THAN => Ordering::Less,
+        CSTR_GREATER_THAN => Ordering::Greater,
+        CSTR_EQUAL => Ordering::Equal,
+        _ => { invalid = true; a.cmp(b) }
+    });
+    if invalid || names.windows(2).any(|pair| compare(&pair[0], &pair[1]) != CSTR_LESS_THAN) { return Err("preview path alias".into()); }
+    Ok(())
+}
+
 fn hash(path: &Path) -> Result<(u64, String), String> {
     let meta = fs::symlink_metadata(path).map_err(|_| "preview file unavailable")?;
     if !regular(&meta) { return Err("invalid preview file".into()); }
@@ -84,20 +104,29 @@ pub(crate) fn verify(root: &Path) -> Result<PreviewBundle, String> {
             return Err("invalid preview file manifest".into());
         }
     }
-    let mut stack = vec![root.clone()]; let mut actual = BTreeSet::new(); let mut dirs = 0usize;
+    let mut stack = vec![root.clone()]; let mut actual = BTreeSet::new();
+    let mut walked = 0usize; let mut walked_bytes = 0usize; let mut walked_names = BTreeSet::new();
+    #[cfg(windows)]
+    let mut windows_names = Vec::new();
     while let Some(dir) = stack.pop() {
-        dirs += 1; if dirs > MAX_FILES { return Err("preview directory limit exceeded".into()); }
         for entry in fs::read_dir(&dir).map_err(|_| "preview directory unreadable")? {
             let entry = entry.map_err(|_| "preview directory unreadable")?; let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(|_| "preview file unavailable")?;
-            if directory(&meta) { stack.push(path); if stack.len() > MAX_FILES { return Err("preview directory limit exceeded".into()); } continue; }
-            if !regular(&meta) { return Err("preview contains a link or non-file".into()); }
             let rel = path.strip_prefix(&root).map_err(|_| "preview path escape")?.to_str().ok_or("invalid preview path")?.replace('\\', "/");
+            walked = walked.checked_add(1).ok_or("preview entry limit exceeded")?;
+            walked_bytes = walked_bytes.checked_add(rel.len()).ok_or("preview path limit exceeded")?;
+            if walked > MAX_FILES || walked_bytes > MAX_PATH_BYTES || !valid_path(&rel) || !walked_names.insert(rel.to_lowercase()) { return Err("invalid or excessive preview paths".into()); }
+            #[cfg(windows)]
+            windows_names.push(rel.clone());
+            let meta = fs::symlink_metadata(&path).map_err(|_| "preview file unavailable")?;
+            if directory(&meta) { stack.push(path); continue; }
+            if !regular(&meta) { return Err("preview contains a link or non-file".into()); }
             if rel == "bundle-manifest.json" { continue; }
             let expected_entry = expected.get(&rel).ok_or("unexpected preview file")?;
             if !actual.insert(rel) || hash(&path)? != *expected_entry { return Err("preview file mismatch".into()); }
         }
     }
+    #[cfg(windows)]
+    reject_windows_aliases(&mut windows_names)?;
     if actual.len() != expected.len() { return Err("preview file missing".into()); }
     for name in ["node/node.exe", "pi/pi.exe", "pi/pi-distribution.json", "managed/pi-web-session-projection.mjs", "server/lib/pi-rpc/assets/management-sdk-entry.mjs", "server/lib/pi-rpc/assets/management-stdio.mjs", "server/lib/pi-rpc/assets/pi-web-management.mjs", "server/lib/pi-rpc/assets/pi-web-bridge.mjs", "server/lib/pi-rpc/assets/pi-web-artifacts.mjs", "server/lib/pi-rpc/assets/pi-web-chat.mjs"] {
         if !actual.contains(name) { return Err("required preview file missing".into()); }
@@ -175,6 +204,26 @@ mod tests {
         assert_eq!(bundle.cli, dir.path().join("pi/pi.exe"));
         fs::write(dir.path().join("pi/pi.exe"), "changed").unwrap();
         assert!(verify(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_bundle_rejects_symlinked_resource() {
+        use std::os::unix::fs::symlink;
+        let (dir, _) = fixture();
+        let node = dir.path().join("node/node.exe");
+        let original = dir.path().join("original-node");
+        fs::rename(&node, &original).unwrap(); symlink(&original, &node).unwrap();
+        assert!(verify(dir.path()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preview_bundle_rejects_windows_ordinal_path_aliases() {
+        let mut names = vec!["Managed/Ä.txt".to_string(), "managed/ä.TXT".to_string()];
+        assert!(reject_windows_aliases(&mut names).is_err());
+        let mut distinct = vec!["managed/a.txt".to_string(), "managed/b.txt".to_string()];
+        assert!(reject_windows_aliases(&mut distinct).is_ok());
     }
 
     #[test]
