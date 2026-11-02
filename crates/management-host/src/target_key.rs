@@ -56,6 +56,11 @@ impl ManagementTargetKey {
         let _guard = KEY_LOCK.lock().map_err(|_| "management key lock poisoned")?;
         let base = crate::windows_storage::PinnedDirectory::open(agent_dir, false, true).map_err(|e| e.to_string())?.ok_or("management key directory missing")?;
         let _transaction = base.transaction().map_err(|e| format!("management transaction unavailable: {e}"))?;
+        for entry in std::fs::read_dir(&base.path).map_err(|e| e.to_string())? {
+            if entry.map_err(|e| e.to_string())?.file_name().to_string_lossy().starts_with(".management-target-key-") {
+                return Err("unfinished management key publication".into());
+            }
+        }
         let mut file = match base.file("management-target-key.v1", false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -66,8 +71,11 @@ impl ManagementTargetKey {
                 }
                 let mut bytes = [0u8; 32];
                 getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
-                let mut file = base.file("management-target-key.v1", true).map_err(|e| e.to_string())?;
-                file.write_all(&bytes).and_then(|_| file.sync_all()).and_then(|_| base.directory.sync_all()).map_err(|e| format!("cannot persist management key: {e}"))?;
+                let temporary = format!(".management-target-key-{}.tmp", uuid::Uuid::new_v4());
+                let mut file = base.file(&temporary, true).map_err(|e| e.to_string())?;
+                file.write_all(&bytes).and_then(|_| file.sync_all()).map_err(|e| format!("cannot persist management key: {e}"))?;
+                drop(file);
+                base.publish(&temporary, "management-target-key.v1", false).map_err(|e| format!("cannot publish management key: {e}"))?;
                 return Ok(Self(bytes));
             }
             Err(error) => return Err(error.to_string()),
