@@ -361,11 +361,27 @@ fn main() {
     if isolated_lifecycle_agent_dir.is_some() && scheduler_agent_dir.is_some() {
         panic!("isolated lifecycle does not start or own the scheduler");
     }
+    let management_mode = std::env::var("STATIC_UI_MANAGEMENT_MODE").unwrap_or_else(|_| "legacy".into());
+    if management_mode != "legacy" && isolated_lifecycle_agent_dir.is_none() {
+        panic!("management SDK mode requires isolated lifecycle");
+    }
     let isolated_host = isolated_lifecycle_agent_dir.map(|agent| {
         let configured = std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from)
             .and_then(|path| path.canonicalize().ok()).expect("isolated agent environment is required");
         assert_eq!(agent.canonicalize().expect("agent exists"), configured, "agent environment mismatch");
-        pi_agent_desktop_lib::static_host::IsolatedStaticHost::init(&agent).expect("isolated lifecycle init")
+        match management_mode.as_str() {
+            "legacy" => pi_agent_desktop_lib::static_host::IsolatedStaticHost::init(&agent),
+            "development-package" => {
+                let path = |key| PathBuf::from(std::env::var_os(key).expect("development management path required"));
+                let config = pi_agent_desktop_lib::development_management_sdk::DevelopmentManagementSdk {
+                    checkout: path("STATIC_UI_MANAGEMENT_CHECKOUT"), node: path("STATIC_UI_MANAGEMENT_NODE"),
+                    entry: path("STATIC_UI_MANAGEMENT_ENTRY"), sdk_root: path("STATIC_UI_MANAGEMENT_SDK_ROOT"),
+                    projection: path("STATIC_UI_MANAGEMENT_PROJECTION"),
+                };
+                pi_agent_desktop_lib::static_host::IsolatedStaticHost::init_development_sdk(&agent, config)
+            }
+            _ => panic!("unsupported management mode"),
+        }.expect("isolated lifecycle init")
     });
     let host_state = isolated_host.as_ref().map(|host| Arc::clone(&host.state))
         .unwrap_or_else(|| Arc::new(IpcHostState::new()));

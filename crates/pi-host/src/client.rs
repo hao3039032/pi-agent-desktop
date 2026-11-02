@@ -262,8 +262,17 @@ static COMMAND_COUNTER: AtomicU64 = AtomicU64::new(0);
 impl PiRpcClient {
     /// Spawn `executable --mode rpc` with the given options.
     pub fn spawn(executable: &str, options: SpawnOptions) -> Result<Arc<Self>, PiRpcError> {
+        Self::spawn_with_rpc_prefix(executable, options, true)
+    }
+
+    /// Spawn a fixed non-pi RPC program without adding CLI arguments.
+    pub fn spawn_program(executable: &str, options: SpawnOptions) -> Result<Arc<Self>, PiRpcError> {
+        Self::spawn_with_rpc_prefix(executable, options, false)
+    }
+
+    fn spawn_with_rpc_prefix(executable: &str, options: SpawnOptions, pi_rpc: bool) -> Result<Arc<Self>, PiRpcError> {
         let mut command = Command::new(executable);
-        command.arg("--mode").arg("rpc");
+        if pi_rpc { command.arg("--mode").arg("rpc"); }
         command.args(&options.args);
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(cwd) = &options.cwd {

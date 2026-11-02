@@ -155,7 +155,7 @@ export async function bundleTitleModule() {
 }
 
 /** Bundle the projection entry; returns the output contents. */
-export async function bundleProjectionModules() {
+export async function bundleProjectionModules({ sdkRuntime = false } = {}) {
   const result = await build({
     stdin: {
       contents: ENTRY,
@@ -170,7 +170,7 @@ export async function bundleProjectionModules() {
     platform: "node",
     target: "node20",
     // MCP internals and the public SDK must resolve from the same managed tree.
-    external: ["jiti", "@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
+    external: sdkRuntime ? ["jiti", "@earendil-works/*"] : ["jiti", "@earendil-works/pi-coding-agent", "@earendil-works/pi-mcp/oauth"],
     write: false,
     legalComments: "none",
     // The models seam (lib/models-service.ts) pulls in the SDK's CJS graph
@@ -188,8 +188,8 @@ export async function bundleProjectionModules() {
 }
 
 /** Build into a directory (creates it). Returns the written path. */
-export async function buildProjectionInto(outDir) {
-  const contents = await bundleProjectionModules();
+export async function buildProjectionInto(outDir, options) {
+  const contents = await bundleProjectionModules(options);
   await mkdir(outDir, { recursive: true });
   const target = resolve(outDir, PROJECTION_MODULE_NAME);
   await writeFile(target, contents, "utf8");
@@ -217,7 +217,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       .then((fs) => fs.readFile(resolve(outDir, PROJECTION_MODULE_NAME), "utf8"))
       .catch(() => null);
   }
-  const target = await buildProjectionInto(outDir);
+  const target = await buildProjectionInto(outDir, { sdkRuntime: args.includes("--sdk-runtime") });
   if (check) {
     const { readFile } = await import("node:fs/promises");
     const fresh = await readFile(target, "utf8");
