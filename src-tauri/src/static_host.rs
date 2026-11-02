@@ -234,6 +234,37 @@ mod tests {
         host.state.management.shutdown_until(std::time::Instant::now() + Duration::from_secs(5));
     }
 
+    #[cfg(all(feature = "static-preview", unix))]
+    #[test]
+    fn preview_host_starts_real_cli_and_independent_sdk_with_isolated_data() {
+        use serde_json::json;
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").canonicalize().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("preview-home"); let project = temp.path().join("project"); let projection = temp.path().join("projection");
+        std::fs::create_dir(&home).unwrap(); std::fs::create_dir(&project).unwrap();
+        let node = std::path::PathBuf::from(std::env::var("PI_WEB_TEST_NODE").expect("PI_WEB_TEST_NODE required")).canonicalize().unwrap();
+        let cli = std::path::PathBuf::from(std::env::var("PI_CLI_BIN").expect("PI_CLI_BIN required")).canonicalize().unwrap();
+        let built = std::process::Command::new(&node).arg(repo.join("scripts/migration/build-management-modules.mjs"))
+            .args(["--sdk-runtime", "--out"]).arg(&projection).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        let assets = repo.join("lib/pi-rpc/assets");
+        let bundle = crate::preview_bundle::PreviewBundle {
+            runtime: management_host::ManagementSdkRuntime { node, entry: assets.join("management-sdk-entry.mjs"), dependency_root: repo.join("node_modules").canonicalize().unwrap(), projection_root: projection, cli_version: "1.4.0".into() },
+            cli, bridge: assets.join("pi-web-bridge.mjs"), artifacts: assets.join("pi-web-artifacts.mjs"), chat: assets.join("pi-web-chat.mjs"),
+        };
+        let host = IsolatedStaticHost::init_preview(&home, bundle).unwrap();
+        assert_eq!(crate::pi_ipc::management_call(&host.state, "sys.capabilities", json!({})).unwrap()["version"], 1);
+        host.state.propose_path(&project).unwrap();
+        let created = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"create","op":"agent.create","args":{"cwd":project,"type":"ensure_session"}}));
+        assert_eq!(created["ok"], true, "{created}");
+        let id = created["data"]["sessionId"].as_str().unwrap();
+        assert!(host.state.registry.get(id).is_some());
+        assert!(host.state.agent_dir().starts_with(&home));
+        let outer_home = std::path::PathBuf::from(std::env::var_os("HOME").expect("isolated outer HOME required"));
+        assert!(!outer_home.join(".pi/agent").exists(), "preview touched the outer agent directory");
+        assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(10)).is_ok());
+    }
+
     #[cfg(feature = "static-preview")]
     #[test]
     fn preview_state_uses_isolated_home_and_refuses_updates() {
