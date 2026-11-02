@@ -100,6 +100,7 @@ pub struct IpcHostState {
     /// resolved at startup; until then the models ops answer
     /// management_unavailable rather than pretending.
     pub management: ManagementHost,
+    pub(crate) preview_home: Option<PathBuf>,
     pub(crate) management_sdk_runtime: Option<management_host::ManagementSdkRuntime>,
     pub session_writers: Arc<crate::session_writer_lifecycle::SessionWriterLifecycle>,
     pub management_config: Mutex<Option<ManagementSpawnConfig>>,
@@ -248,9 +249,13 @@ impl IpcHostState {
     }
 
     pub(crate) fn new_with_management_sdk(runtime: Option<management_host::ManagementSdkRuntime>) -> Self {
+        Self::new_with_preview_home(runtime, None)
+    }
+
+    pub(crate) fn new_with_preview_home(runtime: Option<management_host::ManagementSdkRuntime>, preview_home: Option<PathBuf>) -> Self {
         let terminals = Arc::new(pty_host::PtyHost::new());
         let policy_gate = Arc::new(std::sync::RwLock::new(()));
-        let agent_dir = default_agent_dir();
+        let agent_dir = preview_home.as_ref().map(|home| home.join(".pi/agent")).unwrap_or_else(default_agent_dir);
         let task_agent_dir = Arc::new(Mutex::new(Some(agent_dir.clone())));
         let fence_agent_dir = Arc::clone(&task_agent_dir);
         let management_agent_dir = Arc::clone(&task_agent_dir);
@@ -272,7 +277,8 @@ impl IpcHostState {
             }
         });
         let mut initial_roots = crate::file_access::AllowedRoots::new();
-        let file_roots_init_error = std::env::var_os("HOME").and_then(|home| initial_roots.add_default_cwd_roots(Path::new(&home)).err().map(|e| e.to_string()));
+        let roots_home = preview_home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        let file_roots_init_error = roots_home.and_then(|home| initial_roots.add_default_cwd_roots(&home).err().map(|e| e.to_string()));
         let management_check: Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync> = Arc::new(move |configured| {
             let pinned = management_agent_dir.lock().map_err(|_| "agent directory unavailable")?;
             if pinned.as_deref() != Some(configured) { return Err("management agent directory differs from host agent directory".into()); }
@@ -283,7 +289,7 @@ impl IpcHostState {
             None => ManagementHost::with_agent_dir_check(management_check),
         };
         Self {
-            registry: Arc::new(SessionRegistry::with_policy_gate_and_fence_checker(Arc::clone(&policy_gate), checker)),
+            registry: Arc::new(SessionRegistry::with_preview_home(Arc::clone(&policy_gate), checker, preview_home.clone())),
             policy_gate,
             #[cfg(test)]
             deletion_recovery_exclusive: std::sync::atomic::AtomicBool::new(false),
@@ -291,7 +297,7 @@ impl IpcHostState {
             deletion_write_exclusive: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             deletion_use_app_trash: std::sync::atomic::AtomicBool::new(false),
-            spawn_base: Mutex::new(resolve_session_spawn_base()),
+            spawn_base: Mutex::new(if preview_home.is_some() { None } else { resolve_session_spawn_base() }),
             subscription_counter: AtomicU64::new(0),
             event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             session_relay_gate: Arc::new(tokio::sync::Semaphore::new(IPC_MAX_SESSION_RELAYS)),
@@ -309,8 +315,9 @@ impl IpcHostState {
             title_rename_timeout: Mutex::new(Duration::from_secs(30)),
             session_writers: Arc::new(Default::default()),
             management,
+            preview_home: preview_home.clone(),
             management_sdk_runtime: runtime,
-            management_config: Mutex::new(resolve_management_config(agent_dir)),
+            management_config: Mutex::new(if preview_home.is_some() { None } else { resolve_management_config(agent_dir) }),
             mcp_signin_tasks: Mutex::new(BTreeSet::new()),
             task_agent_dir,
             scheduled_events: Arc::new(crate::scheduled_events::ScheduledEvents::default()),
@@ -1343,6 +1350,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         return protocol_error(&id, "invalid_args", "the request has no op");
     };
     if let Some(error) = &state.file_roots_init_error { return protocol_error(&id, "io", error); }
+    if state.preview_home.is_some() && matches!(op, "updates.check" | "tasks.run" | "tasks.takeover") {
+        return protocol_error(&id, "not_supported", "This operation is disabled in Static Preview");
+    }
     let args = envelope.get("args").cloned().unwrap_or(json!({}));
     if !args.is_object() {
         return protocol_error(&id, "invalid_args", "args must be an object");
@@ -1803,9 +1813,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
             }
         }
         "cwd.home" => {
-            let home = std::env::var("HOME")
+            let home = state.preview_home.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".to_string());
+                .unwrap_or_else(|_| ".".to_string()));
             protocol_ok(&id, json!({ "home": home }))
         }
         "chats.workspaceState" => {
@@ -1820,9 +1830,9 @@ pub fn dispatch_envelope(state: &IpcHostState, raw: Value) -> Value {
         }
         "cwd.createDefault" => {
             // ~/pi-cwd/<local YYYYMMDD>, created on demand (defaultCwdPath).
-            let home = std::env::var("HOME")
+            let home = state.preview_home.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".to_string());
+                .unwrap_or_else(|_| ".".to_string()));
             let (year, month, day, _, _, _) = crate::session_view::local_now_parts_pub();
             let dir = PathBuf::from(&home)
                 .join("pi-cwd")

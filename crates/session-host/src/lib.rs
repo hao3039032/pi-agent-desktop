@@ -862,6 +862,7 @@ pub enum SessionWriterError<E> {
 
 /// The registry: one child per active session id, shared concurrent starts.
 pub struct SessionRegistry {
+    preview_home: Option<PathBuf>,
     fence_checker: SessionFenceChecker,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// One in-flight spawn per id (rpc-manager's `__piStartLocks`): the
@@ -936,7 +937,12 @@ impl SessionRegistry {
     pub fn with_policy_gate_and_fence_checker(
         policy_gate: Arc<std::sync::RwLock<()>>, fence_checker: SessionFenceChecker,
     ) -> Self {
+        Self::with_preview_home(policy_gate, fence_checker, None)
+    }
+
+    pub fn with_preview_home(policy_gate: Arc<std::sync::RwLock<()>>, fence_checker: SessionFenceChecker, preview_home: Option<PathBuf>) -> Self {
         Self {
+            preview_home,
             fence_checker,
             sessions: Mutex::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
@@ -1181,6 +1187,7 @@ impl SessionRegistry {
             session_file_id,
             cwd,
             &config,
+            self.preview_home.as_deref(),
             composer_outbox,
             Arc::clone(&self.running_signal),
             Arc::clone(&self.policy_gate),
@@ -1387,6 +1394,7 @@ fn spawn_session(
     session_file_id: &str,
     cwd: &Path,
     config: &SessionSpawnConfig,
+    preview_home: Option<&Path>,
     composer_outbox: Arc<composer_outbox::ComposerOutbox>,
     running_signal: Arc<RunningSignal>,
     policy_gate: Arc<std::sync::RwLock<()>>,
@@ -1414,6 +1422,13 @@ fn spawn_session(
         session_dir.to_string_lossy().into_owned(),
     ];
     let mut env = EnvPolicy::inherit().set("PI_WEB_BRIDGE_NONCE", nonce.clone());
+    if let Some(home) = preview_home {
+        let home = home.to_string_lossy().into_owned();
+        env = env.set("HOME", home.clone()).set("USERPROFILE", home.clone()).set("PI_AGENT_HOME", home.clone())
+            .set("APPDATA", Path::new(&home).join(".config").to_string_lossy().into_owned())
+            .set("LOCALAPPDATA", Path::new(&home).join(".local").to_string_lossy().into_owned());
+        for key in ["PI_PACKAGE_DIR", "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", "PI_WEB_MANAGEMENT_SDK_ROOT", "PI_WEB_MANAGEMENT_CLI_VERSION", "JITI_ALIAS", "NODE_OPTIONS", "NODE_PATH", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] { env = env.remove_var(key); }
+    }
     match &config.shape {
         SessionSpawnShape::Project { tool_args } => {
             if let Some(entries) = tool_args {

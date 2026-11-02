@@ -82,6 +82,7 @@ custom-protocol = ["tauri/custom-protocol"]
 # Gates the bin out of every normal build (cargo build / desktop packaging);
 # `cargo run --features harness --bin static-ui-harness` opts in explicitly.
 harness = ["tauri/test"]
+static-preview = []
 
 [[bin]]
 name = "static-ui-harness"
