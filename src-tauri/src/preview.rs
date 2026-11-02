@@ -24,6 +24,13 @@ fn create_private_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn preview_navigation_allowed(url: &tauri::Url) -> bool {
+    let app_origin = url.port().is_none() && if cfg!(windows) { url.scheme() == "http" && url.host_str() == Some("tauri.localhost") } else { url.scheme() == "tauri" && url.host_str() == Some("localhost") };
+    app_origin || crate::native_prefs::is_inline_frame_document(url)
+        || (url.scheme() == "pi-resource" && url.host_str() == Some("localhost"))
+        || (url.scheme() == "http" && url.host_str() == Some("pi-resource.localhost"))
+}
+
 pub fn run_static_preview() {
     let app = tauri::Builder::default()
         .on_webview_event(|webview, event| {
@@ -39,6 +46,13 @@ pub fn run_static_preview() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
+        .on_menu_event(|app, event| {
+            if event.id().as_ref().starts_with(shell::popup::POPUP_ID_PREFIX) {
+                if let Some(state) = app.try_state::<shell::popup::PopupMenuSelection>() {
+                    if let Ok(slot) = state.0.lock() { if let Some(sender) = slot.as_ref() { let _ = sender.send(event.id().as_ref().to_string()); } }
+                }
+            }
+        })
         .manage(CloseQuits(Mutex::new(true)))
         .manage(shell::popup::PopupMenuSelection::default())
         .manage(DesktopApiToken(crate::generate_random_hex().expect("preview random token unavailable")))
@@ -66,7 +80,13 @@ pub fn run_static_preview() {
             app.manage(Arc::clone(&host.state));
             app.manage(host);
             tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-                .title("Pi Agent LW Preview").inner_size(1200.0, 800.0).build()?;
+                .title("Pi Agent LW Preview").inner_size(1200.0, 800.0)
+                .initialization_script(r#"(function(){try{document.documentElement.classList.add("native-desktop");}catch(e){}})();"#)
+                .on_navigation(|url| {
+                    if preview_navigation_allowed(url) { true } else { shell::open_external(url); false }
+                })
+                .on_new_window(|url, _| { shell::open_external(&url); tauri::webview::NewWindowResponse::Deny })
+                .build()?;
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -81,4 +101,17 @@ pub fn run_static_preview() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preview_navigation_keeps_external_origins_out_of_the_webview() {
+        let app = if cfg!(windows) { "http://tauri.localhost/index.html" } else { "tauri://localhost/index.html" };
+        assert!(preview_navigation_allowed(&tauri::Url::parse(app).unwrap()));
+        assert!(preview_navigation_allowed(&tauri::Url::parse("about:srcdoc").unwrap()));
+        assert!(!preview_navigation_allowed(&tauri::Url::parse("https://example.invalid/").unwrap()));
+        assert!(!preview_navigation_allowed(&tauri::Url::parse("http://tauri.localhost.evil.invalid/").unwrap()));
+    }
 }

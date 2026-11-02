@@ -2366,6 +2366,31 @@ mod dispatch_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preview_session_child_uses_host_owned_home_and_agent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("preview-home"); let agent = home.join(".pi/agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let file = dir.path().join("session.jsonl"); std::fs::write(&file, "fixture").unwrap();
+        let bridge = dir.path().join("bridge.mjs"); std::fs::write(&bridge, "fixture").unwrap();
+        let marker = dir.path().join("environment"); let executable = dir.path().join("fake-pi");
+        std::fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$HOME\" \"$USERPROFILE\" \"$PI_AGENT_HOME\" \"$PI_CODING_AGENT_DIR\" \"${{PI_WEB_MANAGEMENT_SDK_ROOT-unset}}\" > '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let registry = super::SessionRegistry::with_preview_home(Arc::new(std::sync::RwLock::new(())), Arc::new(|_, _| Ok(())), Some(home.clone()));
+        let config = SessionSpawnConfig { executable: executable.to_string_lossy().into_owned(), agent_dir: Some(agent.clone()), session_dir: Some(dir.path().to_path_buf()), bridge_asset: bridge, artifacts_asset: None, chat_asset: None, chat_asset_sha256: None, shape: SessionSpawnShape::Project { tool_args: None }, initial_model: None, thinking_level: None, extra_args: vec![] };
+        // The fixture exits after reporting its environment; no RPC handshake is claimed.
+        assert!(registry.start("fixture", &file, "fixture", dir.path(), &config).is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+        let contents = std::fs::read_to_string(marker).unwrap();
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines, [home.to_str().unwrap(), home.to_str().unwrap(), home.to_str().unwrap(), agent.to_str().unwrap(), "unset"]);
+        let report = registry.shutdown_until(Instant::now() + Duration::from_secs(5));
+        assert!(report.unknown.is_empty(), "{report:?}");
+    }
+
     #[test]
     fn shutdown_reports_held_writer_and_pending_queue_without_waiting() {
         let registry = SessionRegistry::new();
