@@ -84,7 +84,30 @@ impl ManagementTargetKey {
         let mut bytes = [0; 32]; file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
         Ok(Self(bytes))
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    pub fn load_or_create(agent_dir: &Path) -> Result<Self, String> {
+        let _guard = KEY_LOCK.lock().map_err(|_| "management key lock poisoned")?;
+        let root = crate::darwin_storage::PinnedDirectory::root(agent_dir)?;
+        let base = root.child("pi-web", false, true)?.ok_or("management key directory missing")?;
+        let name = "management-target-key.v1";
+        match base.read_record(name, 32)? {
+            Some(bytes) => {
+                if bytes.len() != 32 { return Err("unsafe or corrupt management target key".into()); }
+                Ok(Self(bytes.try_into().map_err(|_| "unsafe or corrupt management target key")?))
+            }
+            None => {
+                // Missing key beside existing evidence can never be regenerated:
+                // the ledger's digests would stop matching.
+                if base.exists("management-operations")? { return Err("management target key missing with existing ledger".into()); }
+                let mut bytes = [0u8; 32];
+                getrandom::fill(&mut bytes).map_err(|e| format!("cannot generate management key: {e}"))?;
+                base.create_file(name, &bytes)?;
+                base.sync()?;
+                Ok(Self(bytes))
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub fn load_or_create(_agent_dir: &Path) -> Result<Self, String> { Err("safe management target key is unavailable on this platform".into()) }
 
     /// Inspect an existing key without creating or changing anything.
@@ -122,7 +145,17 @@ impl ManagementTargetKey {
         if file.metadata().map_err(|e| e.to_string())?.len() != 32 { return Err("unsafe or corrupt management target key".into()); }
         Ok(true)
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    pub fn inspect(agent_dir: &Path) -> Result<bool, String> {
+        let root = crate::darwin_storage::PinnedDirectory::root(agent_dir)?;
+        let Some(pi_web) = root.child("pi-web", false, false)? else { return Ok(false) };
+        match pi_web.read_record("management-target-key.v1", 32)? {
+            Some(bytes) if bytes.len() == 32 => Ok(true),
+            Some(_) => Err("unsafe or corrupt management target key".into()),
+            None => Ok(false),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub fn inspect(_agent_dir: &Path) -> Result<bool, String> { Err("safe management target key is unavailable on this platform".into()) }
 
     pub fn fingerprint(&self, canonical_key: &str) -> Result<String, String> {

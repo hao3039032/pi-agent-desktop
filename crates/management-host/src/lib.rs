@@ -23,8 +23,10 @@
 pub mod ledger;
 #[cfg(windows)]
 mod windows_storage;
+#[cfg(target_os = "macos")]
+mod darwin_storage;
 pub mod target_key;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod ledger_tests;
 #[cfg(all(test, windows))]
 mod windows_ledger_tests;

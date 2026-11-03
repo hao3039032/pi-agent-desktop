@@ -2384,6 +2384,7 @@ dependencies = [
  "hmac",
  "libc",
  "pi-host",
+ "rustix",
  "serde_json",
  "sha2 0.11.0",
  "task-scheduler",

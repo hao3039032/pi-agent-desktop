@@ -72,9 +72,10 @@ test("macOS preview workflow is artifact-only and requires real SDK/static host"
 test("macOS gate names exact real tests and refuses zero-test green", () => {
   const script = read("scripts/migration/test-macos-preview.sh");
   const names = [...script.matchAll(/^ {2}'([^']+)'(?: \\)?$/gm)].map((match) => match[1]);
-  assert.equal(names.length, 13);
+  assert.equal(names.length, 22);
   assert.equal(new Set(names).size, names.length);
   const sources = new Map([
+    ["ledger_tests::", "crates/management-host/src/ledger_tests.rs"],
     ["host_ownership::tests::", "src-tauri/src/host_ownership.rs"],
     ["preview_bundle::tests::", "src-tauri/src/preview_bundle.rs"],
     ["preview::tests::", "src-tauri/src/preview.rs"],
@@ -94,7 +95,37 @@ test("macOS gate names exact real tests and refuses zero-test green", () => {
   for (const required of ["uname -s", "Darwin", "--list", "-Fxq", "--exact", "1 passed; 0 failed; 0 ignored;", "PI_PREVIEW_TEST_BUNDLE", "TAURI_CONFIG"]) {
     assert.ok(script.includes(required), required);
   }
+  assert.ok(script.includes("crates/management-host/Cargo.toml"));
   assert.ok(read(".github/workflows/macos-static-preview.yml").includes("bash ./scripts/migration/test-macos-preview.sh"));
+});
+
+test("the Darwin ledger reaches its pinned directory without procfs", () => {
+  // Linux uses /proc/self/fd; Darwin has no procfs, so the macOS storage must
+  // be descriptor-relative (openat family) and the fail-closed stub may not
+  // remain as the darwin implementation.
+  const storage = read("crates/management-host/src/darwin_storage.rs");
+  for (const call of ["openat(", "mkdirat(", "renameat(", "unlinkat(", "statat(", "Dir::read_from("]) {
+    assert.ok(storage.includes(call), call);
+  }
+  for (const rule of ["OFlags::NOFOLLOW", "OFlags::DIRECTORY", "OFlags::EXCL", "0o077", "0o022", "nlink()", "sync_all()"]) {
+    assert.ok(storage.includes(rule), rule);
+  }
+  assert.ok(storage.includes("F_FULLFSYNC"), "the durability caveat stays documented");
+  const ledger = read("crates/management-host/src/ledger.rs");
+  for (const marker of ['#[cfg(target_os = "macos")]\n    pub fn open(', '#[cfg(target_os = "macos")]\n    fn read_records(', '#[cfg(target_os = "macos")]\n    pub(crate) fn begin_allowing(', '#[cfg(target_os = "macos")]\n    pub(crate) fn finish(', '#[cfg(target_os = "macos")]\n    pub(crate) fn mark_revoked(']) {
+    assert.ok(ledger.includes(marker), marker);
+  }
+  // The unavailable-on-this-platform stub must exclude darwin, or the macOS
+  // build would silently ship the fail-closed placeholder again.
+  assert.ok(!ledger.includes('not(any(target_os = "linux", windows))'));
+  assert.ok(!read("crates/management-host/src/target_key.rs").includes('not(any(target_os = "linux", windows))'));
+  const key = read("crates/management-host/src/target_key.rs");
+  assert.ok(key.includes('#[cfg(target_os = "macos")]\n    pub fn load_or_create('));
+  assert.ok(key.includes('#[cfg(target_os = "macos")]\n    pub fn inspect('));
+  assert.ok(read("crates/management-host/src/lib.rs").includes('#[cfg(target_os = "macos")]\nmod darwin_storage;'));
+  const manifest = read("crates/management-host/Cargo.toml");
+  assert.ok(manifest.includes('[target.\'cfg(target_os = "macos")\'.dependencies]'));
+  assert.ok(manifest.includes('rustix = { version = "1", features = ["fs"] }'));
 });
 
 test("the staged bundle's runtime roles follow the build platform on both sides", () => {

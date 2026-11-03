@@ -61,6 +61,23 @@ run_exact_tests() {
 # The unix ledger and ownership tests are the platform's storage evidence: the
 # Windows run covers the windows crate's ledger instead, and the Linux-only
 # management-ledger tests are not part of this gate.
+#
+# The Darwin ledger and target key reach their pinned directory with
+# openat/mkdirat/renameat/unlinkat (crates/management-host/src/darwin_storage.rs)
+# instead of Linux's /proc/self/fd. These names pin that storage: key stability,
+# read-only inspection, finish/revoke transitions and the real-child admission
+# path the Preview depends on.
+run_exact_tests 'crates/management-host/Cargo.toml' '' \
+  'ledger_tests::target_key_is_private_stable_and_never_regenerated_beside_a_ledger' \
+  'ledger_tests::target_fingerprint_matches_hmac_sha256_contract' \
+  'ledger_tests::read_only_inspection_never_creates_or_clears_evidence' \
+  'ledger_tests::pending_survives_reopen_and_success_finishes_only_own_record' \
+  'ledger_tests::bad_record_and_unsafe_directory_fail_closed' \
+  'ledger_tests::capacity_is_bounded_without_discarding_pending' \
+  'ledger_tests::confirmed_local_revocation_is_monotonic_and_allows_new_generation' \
+  'ledger_tests::partial_mutation_result_stays_pending' \
+  'ledger_tests::real_child_success_and_exit_after_admission_preserve_evidence'
+
 run_exact_tests 'src-tauri/Cargo.toml' 'static-preview' \
   'host_ownership::tests::ownership_child' \
   'host_ownership::tests::cooperative_hosts_exclude_until_real_holder_exit' \

@@ -3,6 +3,7 @@
 //! recovery authority. Pending records are never expired automatically.
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(not(target_os = "macos"))]
 use std::io::{Read, Write};
 use serde_json::{json, Value};
 
@@ -75,9 +76,15 @@ enum LedgerPhase { Pending, Succeeded, Revoked }
 /// enumerating do not authorize replay, repair or removal.
 pub struct OperationLedger {
     directory: std::fs::File,
+    /// The directory's path. The Linux and Windows readers use it for their
+    /// path-based opens; the Darwin reader only uses the descriptor, so the
+    /// field is unused there (it stays for diagnostics parity).
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     path: PathBuf,
     #[cfg(windows)]
     pinned: crate::windows_storage::PinnedDirectory,
+    #[cfg(target_os = "macos")]
+    pinned: crate::darwin_storage::PinnedDirectory,
 }
 
 #[cfg(target_os = "linux")]
@@ -120,7 +127,16 @@ impl OperationLedger {
         let path = pinned.path.clone();
         Ok(Self { directory, path, pinned })
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    pub fn open(agent_dir: &Path) -> Result<Self, String> {
+        let root = crate::darwin_storage::PinnedDirectory::root(agent_dir)?;
+        let pi_web = root.child("pi-web", false, true)?.ok_or("management key directory missing")?;
+        let pinned = pi_web.child("management-operations", true, true)?.ok_or("management ledger directory missing")?;
+        let directory = pinned.directory.try_clone().map_err(|e| e.to_string())?;
+        let path = pinned.path.clone();
+        Ok(Self { directory, path, pinned })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub fn open(_agent_dir: &Path) -> Result<Self, String> { Err("safe management ledger is unavailable on this platform".into()) }
 
     /// Inspect pending admission fences without creating or changing anything.
@@ -164,7 +180,18 @@ impl OperationLedger {
         let _transaction = ledger.pinned.existing_transaction().map_err(|e| e.to_string())?;
         ledger.read_records()
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    fn inspect_records(agent_dir: &Path) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> {
+        let root = crate::darwin_storage::PinnedDirectory::root(agent_dir)?;
+        let Some(pi_web) = root.child("pi-web", false, false)? else { return Ok(Vec::new()) };
+        let Some(pinned) = pi_web.child("management-operations", true, false)? else { return Ok(Vec::new()) };
+        let directory = pinned.directory.try_clone().map_err(|e| e.to_string())?;
+        let path = pinned.path.clone();
+        let ledger = Self { directory, path, pinned };
+        let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
+        ledger.read_records()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn inspect_records(_agent_dir: &Path) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
 
     pub fn list_pending(&self) -> Result<Vec<PendingOperation>, String> {
@@ -198,7 +225,25 @@ impl OperationLedger {
         Ok(records)
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn read_records(&self) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> {
+        use std::os::unix::fs::MetadataExt;
+        let directory = self.directory.metadata().map_err(|e| e.to_string())?;
+        if directory.uid() != unsafe { libc::geteuid() } || directory.mode() & 0o077 != 0 {
+            return Err("unsafe ledger directory ownership or permissions".into());
+        }
+        let mut records = Vec::new();
+        for name in self.pinned.names()? {
+            if records.len() >= MAX_PENDING { return Err("management ledger capacity reached".into()); }
+            let uuid = name.strip_suffix(".json").and_then(|s| uuid::Uuid::parse_str(s).ok()).ok_or("invalid ledger filename")?;
+            if format!("{uuid}.json") != name { return Err("invalid ledger filename".into()); }
+            let bytes = self.pinned.read_record(&name, MAX_RECORD_BYTES)?.ok_or("management ledger record vanished")?;
+            records.push(parse_record(uuid, &bytes)?);
+        }
+        Ok(records)
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn begin(&self, descriptor: &MutationDescriptor) -> Result<String, String> {
         self.begin_allowing(descriptor, &[])
     }
@@ -237,15 +282,46 @@ impl OperationLedger {
         Ok(id)
     }
 
-    #[cfg(not(any(target_os = "linux", windows)))]
+    /// `allowed` is derived under the owning host admission mutex from live,
+    /// guarded same-instance tasks; it is never an external authorization.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn begin_allowing(&self, descriptor: &MutationDescriptor, allowed: &[String]) -> Result<String, String> {
+        let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
+        let operation = descriptor.operation;
+        let target = descriptor.target;
+        let records = self.read_records()?;
+        // All current management configuration mutations share the global
+        // physical coordination slot; conservatively fence any pending scope.
+        if records.iter().any(|(record, phase)| *phase == LedgerPhase::Pending && !allowed.contains(&record.operation_id)) { return Err("management outcome unresolved; mutation not admitted".into()); }
+        // Revocation evidence is retained; only ordinary successes are eligible
+        // for pruning. Capacity exhaustion rejects rather than deleting evidence.
+        let retained = records.iter().filter(|(_, phase)| *phase != LedgerPhase::Succeeded).count();
+        if retained >= MAX_PENDING { return Err("management ledger capacity reached".into()); }
+        for (record, phase) in records {
+            if phase == LedgerPhase::Succeeded { self.pinned.remove(&format!("{}.json", record.operation_id))?; }
+        }
+        self.pinned.sync()?;
+        let scope_text = match &descriptor.scope { OperationScope::Global => "global", OperationScope::Project { path } if path.starts_with('/') && path.len() <= 4096 => path, _ => return Err("invalid management scope".into()) };
+        let id = uuid::Uuid::new_v4().to_string();
+        let timestamp: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
+        let mut v = json!({"version":1,"operationId":id,"operation":operation,"scope":scope_text,"target":target_name(target),"phase":"pending","createdAtMs":timestamp});
+        if let Some(target) = &descriptor.mcp_target {
+            v["mcpTarget"] = json!({"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()});
+        }
+        self.pinned.create_file(&format!("{id}.json"), v.to_string().as_bytes())?;
+        self.pinned.sync()?;
+        Ok(id)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn read_records(&self) -> Result<Vec<(PendingOperation, LedgerPhase)>, String> { Err("safe management ledger is unavailable on this platform".into()) }
-    #[cfg(all(test, not(any(target_os = "linux", windows))))]
+    #[cfg(all(test, not(any(target_os = "linux", target_os = "macos", windows))))]
     pub(crate) fn begin(&self, _: &MutationDescriptor) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub(crate) fn begin_allowing(&self, _: &MutationDescriptor, _: &[String]) -> Result<String, String> { Err("safe management ledger is unavailable on this platform".into()) }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub(crate) fn finish(&self, _: &str) -> Result<(), String> { Err("safe management ledger is unavailable on this platform".into()) }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub(crate) fn mark_revoked(&self, _: &str, _: &McpCredentialTarget, _: u64) -> Result<(), String> { Err("safe management ledger is unavailable on this platform".into()) }
 
     #[cfg(windows)]
@@ -358,6 +434,41 @@ impl OperationLedger {
         let temp = self.path.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&temp).map_err(|e| e.to_string())?;
         file.write_all(value.to_string().as_bytes()).and_then(|_| file.sync_all()).and_then(|_| std::fs::rename(&temp, self.path.join(format!("{id}.json")))).and_then(|_| self.directory.sync_all()).map_err(|e| e.to_string())
+    }
+
+    /// Only the live owner may finish a proven successful operation. There is
+    /// intentionally no public recovery/clear entry point.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn finish(&self, id: &str) -> Result<(), String> {
+        let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
+        let record = self.read_records()?.into_iter().find(|(r, phase)| r.operation_id == id && *phase == LedgerPhase::Pending).map(|(r, _)| r).ok_or("management ledger operation missing")?;
+        let scope = match &record.scope { OperationScope::Global => "global", OperationScope::Project { path } => path };
+        let completed_at_ms: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
+        let mut value = json!({"version":1,"operationId":record.operation_id,"operation":record.operation,"scope":scope,"target":target_name(record.target),"phase":"succeeded","createdAtMs":record.created_at_ms,"completedAtMs":completed_at_ms});
+        if let Some(target) = &record.mcp_target {
+            value["mcpTarget"] = json!({"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()});
+        }
+        let temporary = format!(".{}.tmp", uuid::Uuid::new_v4());
+        self.pinned.create_file(&temporary, value.to_string().as_bytes())?;
+        self.pinned.publish(&temporary, &format!("{id}.json"))
+    }
+
+    /// Caller must hold the live host reservation and validate its routed ACK.
+    /// This transition retains the original unknown outcome, and is monotonic.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mark_revoked(&self, id: &str, target: &McpCredentialTarget, generation: u64) -> Result<(), String> {
+        let _guard = LEDGER_LOCK.lock().map_err(|_| "ledger lock poisoned")?;
+        let record = self.read_records()?.into_iter().find(|(r, phase)| r.operation_id == id && *phase == LedgerPhase::Pending)
+            .map(|(r, _)| r).ok_or("management ledger operation missing")?;
+        if record.mcp_target.as_ref() != Some(target) || !matches!(record.operation.as_str(), "mcp.signInStart" | "mcp.test") || generation > 9_007_199_254_740_991 {
+            return Err("invalid MCP revocation evidence".into());
+        }
+        let scope = match &record.scope { OperationScope::Global => "global", OperationScope::Project { path } => path };
+        let timestamp: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "timestamp overflow")?;
+        let value = json!({"version":1,"operationId":record.operation_id,"operation":record.operation,"scope":scope,"target":target_name(record.target),"mcpTarget":{"primaryDigest":target.primary_digest(),"legacyDigest":target.legacy_digest()},"phase":"revoked","createdAtMs":record.created_at_ms,"completedAtMs":timestamp,"originalOutcome":"unknown","revokedGeneration":generation});
+        let temporary = format!(".{}.tmp", uuid::Uuid::new_v4());
+        self.pinned.create_file(&temporary, value.to_string().as_bytes())?;
+        self.pinned.publish(&temporary, &format!("{id}.json"))
     }
 }
 
