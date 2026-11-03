@@ -98,8 +98,14 @@ test("Windows resources use exact role spelling and reject Windows path aliases"
     verifyBundle(f.root, f.manifest, { requireManagementSdk: true });
     if (process.platform !== "win32") {
       f.put("frontend/INDEX.html", "collision"); f.refresh();
-      assert.throws(() => verifyBundle(f.root, f.manifest), /case-colliding/);
-      rmSync(join(f.root, "frontend/INDEX.html")); f.refresh();
+      // A case-insensitive volume (the default APFS/HFS+ layout on macOS) folds
+      // the two names into one file, so the collision cannot be expressed
+      // there. The check stays covered on case-sensitive filesystems instead of
+      // being skipped by platform name.
+      if (f.manifest.files.some((file) => file.path === "frontend/INDEX.html")) {
+        assert.throws(() => verifyBundle(f.root, f.manifest), /case-colliding/);
+        rmSync(join(f.root, "frontend/INDEX.html")); f.refresh();
+      }
     }
     for (const [key, value] of [["node", "node/Node.exe"], ["node", "node\\\\node.exe"], ["entry", "C:/resources/entry.mjs"], ["entry", "\\\\\\\\server\\\\share\\\\entry.mjs"], ["dependencyRoot", "managed\\\\node_modules"], ["cli", "pi/PI.exe"]]) {
       const bad = structuredClone(f.manifest); bad.managementRuntime[key] = value;
