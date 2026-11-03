@@ -10423,6 +10423,11 @@ export default pi => pi.registerCommand('fixture-confirm', {{ handler: async (_,
         assert!(not_link["error"]["message"].as_str().unwrap_or_default().contains("Not a linked"));
     }
 
+    // Unix-only: the Windows listing walks a handle and reports reparse-point
+    // entries as non-directories without an `outsideLinkTarget` yet (the
+    // Windows link-grant flow is not wired), so the symlink shape below has no
+    // Windows counterpart to assert.
+    #[cfg(unix)]
     #[test]
     fn files_list_marks_a_directory_symlink_pointing_outside() {
         let state = state();
