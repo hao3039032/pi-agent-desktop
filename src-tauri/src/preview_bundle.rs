@@ -44,6 +44,16 @@ fn valid_path(path: &str) -> bool {
             && !part.contains(['\\', ':', '\0'])
     })
 }
+
+/// A path safe to hand a child process. `canonicalize()` returns the verbatim
+/// `\\?\D:\...` form on Windows, and Node's entry-point resolver is not
+/// verbatim-path aware: it reduces such an argv[1] to the bare drive, so the
+/// preview runtime died with `EISDIR: lstat 'D:'` before its first request.
+/// Simplify every path that crosses the process boundary (argv or environment).
+/// `lib.rs`'s `child_process_compatible_path` does the same for the server.
+fn child_process_path(path: &Path) -> PathBuf {
+    dunce::simplified(path).to_path_buf()
+}
 #[cfg(windows)]
 fn reject_windows_aliases(names: &mut [String]) -> Result<(), String> {
     use std::{cmp::Ordering, os::windows::ffi::OsStrExt};
@@ -82,6 +92,7 @@ fn hash(path: &Path) -> Result<(u64, String), String> {
 pub(crate) fn verify(root: &Path) -> Result<PreviewBundle, String> {
     if !root.is_absolute() || !directory(&fs::symlink_metadata(root).map_err(|_| "preview root unavailable")?) { return Err("invalid preview root".into()); }
     let root = root.canonicalize().map_err(|_| "preview root unavailable")?;
+    let root = child_process_path(&root);
     let manifest = json_file(&root.join("bundle-manifest.json"), MAX_MANIFEST)?;
     if manifest.get("version").and_then(Value::as_u64) != Some(1) || manifest.get("piVersion").and_then(Value::as_str) != Some("1.4.0") { return Err("invalid preview manifest version".into()); }
     let roles = manifest.get("managementRuntime").ok_or("preview runtime missing")?;
@@ -201,7 +212,7 @@ mod tests {
     fn preview_bundle_binds_roles_files_and_mixed_sdk_versions() {
         let (dir, _) = fixture();
         let bundle = verify(dir.path()).unwrap();
-        assert_eq!(bundle.cli, dir.path().canonicalize().unwrap().join("pi/pi.exe"));
+        assert_eq!(bundle.cli, child_process_path(&dir.path().canonicalize().unwrap()).join("pi/pi.exe"));
         fs::write(dir.path().join("pi/pi.exe"), "changed").unwrap();
         assert!(verify(dir.path()).is_err());
     }
@@ -215,6 +226,22 @@ mod tests {
         let original = dir.path().join("original-node");
         fs::rename(&node, &original).unwrap(); symlink(&original, &node).unwrap();
         assert!(verify(dir.path()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preview_bundle_simplifies_windows_runtime_paths() {
+        // Node's entry resolver reduces a verbatim `\\?\D:\...` argv[1] to the
+        // bare drive (the preview child died with EISDIR on `D:`), so no
+        // runtime path may keep the verbatim prefix.
+        assert_eq!(child_process_path(Path::new(r"\\?\D:\a\pi\static-preview")), PathBuf::from(r"D:\a\pi\static-preview"));
+        let (dir, _) = fixture();
+        let bundle = verify(dir.path()).unwrap();
+        let entry = child_process_path(&dir.path().canonicalize().unwrap()).join("server/lib/pi-rpc/assets/management-sdk-entry.mjs");
+        assert_eq!(bundle.runtime.entry, entry);
+        for path in [&bundle.runtime.node, &bundle.runtime.dependency_root, &bundle.runtime.projection_root, &bundle.cli, &bundle.bridge] {
+            assert!(!path.to_string_lossy().starts_with(r"\\?\"), "verbatim path reaches the child: {}", path.display());
+        }
     }
 
     #[cfg(windows)]

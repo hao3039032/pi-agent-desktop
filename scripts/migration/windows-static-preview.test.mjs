@@ -63,7 +63,7 @@ test("Windows preview workflow is artifact-only and requires real SDK/static hos
 test("Windows platform gate names exact real tests and refuses zero-test green", () => {
   const script = read("scripts/migration/test-windows-preview.ps1");
   const names = [...script.matchAll(/^    '([^']+)'/gm)].map((match) => match[1]);
-  assert.equal(names.length, 21);
+  assert.equal(names.length, 22);
   assert.equal(new Set(names).size, names.length);
   const sources = new Map([
     ["windows_ledger_tests::", "crates/management-host/src/windows_ledger_tests.rs"],

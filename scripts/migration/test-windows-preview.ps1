@@ -49,6 +49,7 @@ Invoke-ExactTests 'crates/management-host/Cargo.toml' '' @(
 Invoke-ExactTests 'src-tauri/Cargo.toml' 'static-preview' @(
     'host_ownership::windows_tests::ownership_is_exclusive_and_keeps_lock_file',
     'preview_bundle::tests::preview_bundle_binds_roles_files_and_mixed_sdk_versions',
+    'preview_bundle::tests::preview_bundle_simplifies_windows_runtime_paths',
     'preview_bundle::tests::preview_bundle_rejects_windows_ordinal_path_aliases',
     'preview_bundle::tests::preview_bundle_rejects_role_and_sdk_version_mismatches',
     'preview_bundle::tests::preview_bundle_rejects_escapes_aliases_and_extra_files',
