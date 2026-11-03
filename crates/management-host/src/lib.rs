@@ -48,7 +48,9 @@ pub const IDLE_RECYCLE: Duration = Duration::from_secs(60);
 /// startup (a bad module path, a missing dependency, a rejected config) says
 /// why ONLY on stderr, and a bare "exited unexpectedly (1)" is untriageable —
 /// especially on a CI runner whose fixture directory disappears with the job.
-const STDERR_TAIL_LINES: usize = 12;
+/// The whole node uncaught-exception banner is ~14 lines, so the ring must be
+/// able to hold it: a tail that starts mid-stack hides the message itself.
+const STDERR_TAIL_LINES: usize = 40;
 const STDERR_TAIL_BYTES: usize = 4096;
 /// Older lines are dropped, newest kept: the tail is the part that explains
 /// the death, and the ring must not grow with a chatty child.
@@ -106,6 +108,9 @@ pub struct ManagementInstance {
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// The exact child invocation, as the host built it. A failure that says
+    /// only "exited (1)" cannot be told apart from a mangled argument list.
+    spawn_command: String,
     _notify_subscription: Arc<pi_host::client::UiSubscription>,
 }
 
@@ -420,6 +425,10 @@ impl ManagementInstance {
         if text.is_empty() { String::new() } else { format!("; child stderr: {text}") }
     }
 
+    fn failure_suffix(&self) -> String {
+        format!("; child command: {}{} (pid {})", self.spawn_command, self.stderr_suffix(), self.client.pid())
+    }
+
     fn management_call_wait(&self, op: &str, args: Value, request_id: &str, task: Arc<Mutex<TaskRecord>>) -> Result<Value, String> {
         use std::sync::mpsc;
         let nonce = self.nonce.clone();
@@ -433,9 +442,9 @@ impl ManagementInstance {
             let ack = self
                 .client
                 .command("prompt", json!({ "message": format!("/pi-web:mgmt {request_id} {token}") }), None)
-                .map_err(|error| format!("management prompt failed: {error}{}", self.stderr_suffix()))?;
+                .map_err(|error| format!("management prompt failed: {error}{}", self.failure_suffix()))?;
             if ack.get("disposition").and_then(Value::as_str) != Some("handled") {
-                return Err(format!("the management command was not handled (extension missing?){}", self.stderr_suffix()));
+                return Err(format!("the management command was not handled (extension missing?){}", self.failure_suffix()));
             }
             if task.lock().unwrap().snapshot.cancel_requested { let _ = self.send_cancel(request_id); }
             loop {
@@ -453,7 +462,7 @@ impl ManagementInstance {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if !self.client.has_exited() => continue,
-                Err(_) => return Err(format!("management op {op} outcome unknown: child exited{}", self.stderr_suffix())),
+                Err(_) => return Err(format!("management op {op} outcome unknown: child exited{}", self.failure_suffix())),
               }
             }
         })();
@@ -1556,6 +1565,12 @@ fn spawn_management_with_environment(
     let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
     let capture = Arc::clone(&stderr_tail);
     let on_log: Option<Arc<dyn Fn(String) + Send + Sync>> = Some(Arc::new(move |line: String| record_stderr_tail(&capture, line)));
+    // Recorded before the move: a failure message must state the invocation,
+    // not just the exit code.
+    let spawn_command = match &sdk_runtime {
+        Some(runtime) => format!("{} {}", runtime.node.display(), runtime.entry.display()),
+        None => format!("{} --mode rpc {}", config.executable, args.join(" ")),
+    };
     let client = if let Some(runtime) = &sdk_runtime {
         if runtime.cli_version != "1.4.0" || !runtime.node.is_absolute() || !runtime.entry.is_absolute() || !runtime.dependency_root.is_absolute() || !runtime.projection_root.is_absolute() {
             return Err("invalid management SDK runtime configuration".into());
@@ -1585,6 +1600,7 @@ fn spawn_management_with_environment(
         client,
         pending,
         stderr_tail,
+        spawn_command,
         _notify_subscription: Arc::new(notify_subscription),
         host_closing,
         state: Arc::new(Mutex::new(InstanceState {
