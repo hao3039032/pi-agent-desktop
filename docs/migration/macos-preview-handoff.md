@@ -13,9 +13,19 @@
 - `crates/management-host/src/darwin_storage.rs` + `ledger.rs`/`target_key.rs` 的 `#[cfg(target_os = "macos")]` 实现：Darwin 没有 procfs，Linux 用 `/proc/self/fd/<fd>` 表达「永远相对 pinned 目录」，macOS 改用 `openat`/`mkdirat`/`renameat`/`unlinkat`/`statat`（`rustix`，已经是锁文件里的既有依赖）直接对目录描述符操作；路径只在打开目录时解析一次，之后祖先被 rename 或换成 symlink 都无法把读、建、发布重定向出去。权限/所有权/硬链接校验（`uid`、`mode & 0o077|0o022`、`nlink == 1`）、`O_NOFOLLOW`/`O_EXCL`/`O_NONBLOCK`、临时文件 + `rename` + 目录 `fsync` 与 Linux/Windows 同规则。`ledger_tests` 由 Linux-only 扩到 Linux+macOS。
 - `.github/workflows/windows-static-preview.yml` 的契约步骤同时运行 macOS 契约测试，避免两侧约定漂移。
 
+## 首次全绿结果
+
+[41616545606](https://github.com/hao3039032/pi-agent-desktop/actions/runs/41616545606)（`463cd454`，`macos-15` / `aarch64-apple-darwin`）**整条流程通过**：
+
+- 22 项 `--exact` 门禁各自 `1 passed; 0 failed; 0 ignored`（9 项 ledger/target key + 4 项 ownership + 4 项 bundle + 3 项 preview + 2 项 static host），包含 staged runtime 的 `auth.apiKeyStore` → 真 CLI `ensure_session` → `auth.apiKeyDelete`。
+- 版本 `0.0.5-preview.g463cd4541c62`，dmg + `SHA256SUMS.txt` + `preview.json` 上传为 artifact `macos-static-preview-5-463cd4541c627583af3558f31e6993596bfa4ae1`（112,682,804 字节）。
+- 生成字节统计（非峰值磁盘）：staging 348,626,585 + Cargo/Tauri target 4,532,251,320 + Vite 7,548,010 + 下载 pi 84,513,829 = 4,972,939,744，按既有约定只告警并上报父级。
+
+在这之前的四次运行依次只暴露一个真实阻断，均已修复：未 cfg 限定的 Unix 符号链接测试（整库编译失败）→ case-insensitive APFS 上的大小写冲突断言 → darwin 缺失的 ledger/target key（`safe management target key is unavailable on this platform`）→ `--no-stapling` 旗标名错误 → 汇总行漏写 `echo`（退出 127）。修完后 `preview/macos-static` 的 tip 仍是本次验证过的提交。
+
 ## 边界（未验证的部分）
 
-- 本地（Linux）只证明 Linux 侧不回归：management-host 37 passed（唯一失败项是本机 `pi` 为 1.5.0、测试钉 1.4.0 的既有版本不匹配）、`preview_bundle`(4)、`preview`(3)、`static_host::preview_state_*`(1)、迁移契约 23 passed。macOS 代码只用 `cargo check/test --no-run --target aarch64-apple-darwin` 做了类型检查（本地无 darwin SDK 无法链接），**没有 macOS 执行证据**；22 项门禁与 dmg 构建以实际 Actions 结果为准。
+- 已获得 macOS 执行证据（上节），但仅限上述 22 项门禁与 dmg 打包；本地（Linux）回归为 management-host 37 passed（唯一失败项是本机 `pi` 为 1.5.0、测试钉 1.4.0 的既有版本不匹配）、`preview_bundle`(4)、`preview`(3)、`static_host::preview_state_*`(1)、迁移契约 23 passed；macOS 代码另用 `cargo check/test --no-run --target aarch64-apple-darwin` 做过类型检查（本地无 darwin SDK，不能链接）。
 - Darwin ledger 的耐久性边界：`fsync` 在 macOS 不刷盘缓存（需要 `F_FULLFSYNC`），断电仍可能丢掉最新记录；这与 Windows `WRITE_THROUGH` 发布的 caveat 同类，记录为限制，不声称等同 POSIX 目录 fsync。
 - dmg 为 ad-hoc 签名（`APPLE_SIGNING_IDENTITY="-"`，`--no-stapling`），不是可分发签名或公证产物；未做真实安装、升级、Gatekeeper、原生窗口、iframe IPC 或用户数据隔离验收。
 - Preview 仍拒绝 `terminal.create`、托盘隐藏、调度执行/接管；SDK/CLI 固定 1.4.0，未升级依赖，未改正式 updater／发布路径。
