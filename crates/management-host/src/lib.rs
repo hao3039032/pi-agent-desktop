@@ -31,7 +31,7 @@ mod windows_ledger_tests;
 #[cfg(all(test, unix))]
 mod task_input_shutdown_tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,6 +43,22 @@ use serde_json::{json, Value};
 /// Idle management instances recycle after this long without a lease
 /// (plan §五 管理实例: 空闲 60 秒回收).
 pub const IDLE_RECYCLE: Duration = Duration::from_secs(60);
+
+/// How much child stderr a failed call carries back: a child that dies during
+/// startup (a bad module path, a missing dependency, a rejected config) says
+/// why ONLY on stderr, and a bare "exited unexpectedly (1)" is untriageable —
+/// especially on a CI runner whose fixture directory disappears with the job.
+const STDERR_TAIL_LINES: usize = 12;
+const STDERR_TAIL_BYTES: usize = 4096;
+/// Older lines are dropped, newest kept: the tail is the part that explains
+/// the death, and the ring must not grow with a chatty child.
+fn record_stderr_tail(tail: &Mutex<VecDeque<String>>, line: String) {
+    let Ok(mut tail) = tail.lock() else { return };
+    let line = line.trim_end();
+    if line.is_empty() { return }
+    tail.push_back(line.chars().take(STDERR_TAIL_BYTES).collect());
+    while tail.len() > STDERR_TAIL_LINES { tail.pop_front(); }
+}
 
 /// How to spawn management children.
 #[derive(Clone)]
@@ -89,6 +105,7 @@ pub struct ManagementInstance {
     sdk_runtime: Option<ManagementSdkRuntime>,
     agent_dir_check: Option<Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>>,
     admission: Arc<Mutex<ManagementAdmission>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
     _notify_subscription: Arc<pi_host::client::UiSubscription>,
 }
 
@@ -389,6 +406,20 @@ impl ManagementInstance {
         }
     }
 
+    /// The child's last stderr lines, for a failure message. Empty when the
+    /// child said nothing (a silent exit) — never a placeholder that pretends
+    /// the diagnostics were captured.
+    fn stderr_suffix(&self) -> String {
+        let Ok(tail) = self.stderr_tail.lock() else { return String::new() };
+        let mut text = String::new();
+        for line in tail.iter().rev() {
+            let candidate = if text.is_empty() { line.clone() } else { format!("{line} | {text}") };
+            if candidate.len() > STDERR_TAIL_BYTES { break }
+            text = candidate;
+        }
+        if text.is_empty() { String::new() } else { format!("; child stderr: {text}") }
+    }
+
     fn management_call_wait(&self, op: &str, args: Value, request_id: &str, task: Arc<Mutex<TaskRecord>>) -> Result<Value, String> {
         use std::sync::mpsc;
         let nonce = self.nonce.clone();
@@ -402,9 +433,9 @@ impl ManagementInstance {
             let ack = self
                 .client
                 .command("prompt", json!({ "message": format!("/pi-web:mgmt {request_id} {token}") }), None)
-                .map_err(|error| format!("management prompt failed: {error}"))?;
+                .map_err(|error| format!("management prompt failed: {error}{}", self.stderr_suffix()))?;
             if ack.get("disposition").and_then(Value::as_str) != Some("handled") {
-                return Err("the management command was not handled (extension missing?)".to_string());
+                return Err(format!("the management command was not handled (extension missing?){}", self.stderr_suffix()));
             }
             if task.lock().unwrap().snapshot.cancel_requested { let _ = self.send_cancel(request_id); }
             loop {
@@ -422,7 +453,7 @@ impl ManagementInstance {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) if !self.client.has_exited() => continue,
-                Err(_) => return Err(format!("management op {op} outcome unknown: child exited")),
+                Err(_) => return Err(format!("management op {op} outcome unknown: child exited{}", self.stderr_suffix())),
               }
             }
         })();
@@ -1522,6 +1553,9 @@ fn spawn_management_with_environment(
         env = env.remove_var(key);
     }
     env = env.set("PI_WEB_MGMT_NONCE", nonce.clone());
+    let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+    let capture = Arc::clone(&stderr_tail);
+    let on_log: Option<Arc<dyn Fn(String) + Send + Sync>> = Some(Arc::new(move |line: String| record_stderr_tail(&capture, line)));
     let client = if let Some(runtime) = &sdk_runtime {
         if runtime.cli_version != "1.4.0" || !runtime.node.is_absolute() || !runtime.entry.is_absolute() || !runtime.dependency_root.is_absolute() || !runtime.projection_root.is_absolute() {
             return Err("invalid management SDK runtime configuration".into());
@@ -1532,9 +1566,9 @@ fn spawn_management_with_environment(
         env = env.set("PI_WEB_MANAGEMENT_SDK_ROOT", runtime.dependency_root.to_string_lossy().into_owned())
             .set("PI_WEB_MANAGED_MODULES", runtime.projection_root.to_string_lossy().into_owned())
             .set("PI_WEB_MANAGEMENT_CLI_VERSION", runtime.cli_version.clone());
-        PiRpcClient::spawn_program(&runtime.node.to_string_lossy(), SpawnOptions { args: vec![runtime.entry.to_string_lossy().into_owned()], cwd: None, env, ..SpawnOptions::default() })
+        PiRpcClient::spawn_program(&runtime.node.to_string_lossy(), SpawnOptions { args: vec![runtime.entry.to_string_lossy().into_owned()], cwd: None, env, on_log, ..SpawnOptions::default() })
     } else {
-        PiRpcClient::spawn(&config.executable, SpawnOptions { args, cwd: None, env, ..SpawnOptions::default() })
+        PiRpcClient::spawn(&config.executable, SpawnOptions { args, cwd: None, env, on_log, ..SpawnOptions::default() })
     }.map_err(|error| format!("management instance failed to start: {error}"))?;
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let router_pending = Arc::clone(&pending);
@@ -1550,6 +1584,7 @@ fn spawn_management_with_environment(
         nonce,
         client,
         pending,
+        stderr_tail,
         _notify_subscription: Arc::new(notify_subscription),
         host_closing,
         state: Arc::new(Mutex::new(InstanceState {
