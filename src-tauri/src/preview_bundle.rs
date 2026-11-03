@@ -10,6 +10,18 @@ const MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PACKAGE: u64 = 1024 * 1024;
 
+/// The staged tree's role paths carry the host's executable names: the stager
+/// (`prepare-static-bundle.mjs`) uses `node.exe`/`pi.exe` on Windows and
+/// `node`/`pi` elsewhere, and `bundle-manifest.json` records them that way.
+#[cfg(windows)]
+const NODE_BIN: &str = "node/node.exe";
+#[cfg(not(windows))]
+const NODE_BIN: &str = "node/node";
+#[cfg(windows)]
+const PI_BIN: &str = "pi.exe";
+#[cfg(not(windows))]
+const PI_BIN: &str = "pi";
+
 pub(crate) struct PreviewBundle {
     pub runtime: management_host::ManagementSdkRuntime,
     pub cli: PathBuf,
@@ -96,7 +108,8 @@ pub(crate) fn verify(root: &Path) -> Result<PreviewBundle, String> {
     let manifest = json_file(&root.join("bundle-manifest.json"), MAX_MANIFEST)?;
     if manifest.get("version").and_then(Value::as_u64) != Some(1) || manifest.get("piVersion").and_then(Value::as_str) != Some("1.4.0") { return Err("invalid preview manifest version".into()); }
     let roles = manifest.get("managementRuntime").ok_or("preview runtime missing")?;
-    for (key, value) in [("piVersion", "1.4.0"), ("node", "node/node.exe"), ("entry", "server/lib/pi-rpc/assets/management-sdk-entry.mjs"), ("dependencyRoot", "managed/node_modules"), ("projectionRoot", "managed"), ("cli", "pi/pi.exe")] {
+    let cli_role = format!("pi/{PI_BIN}");
+    for (key, value) in [("piVersion", "1.4.0"), ("node", NODE_BIN), ("entry", "server/lib/pi-rpc/assets/management-sdk-entry.mjs"), ("dependencyRoot", "managed/node_modules"), ("projectionRoot", "managed"), ("cli", cli_role.as_str())] {
         if roles.get(key).and_then(Value::as_str) != Some(value) { return Err("invalid preview runtime role".into()); }
     }
     if roles.get("version").and_then(Value::as_u64) != Some(1) || roles.as_object().map(|v| v.len()) != Some(7) { return Err("invalid preview runtime metadata".into()); }
@@ -139,15 +152,15 @@ pub(crate) fn verify(root: &Path) -> Result<PreviewBundle, String> {
     #[cfg(windows)]
     reject_windows_aliases(&mut windows_names)?;
     if actual.len() != expected.len() { return Err("preview file missing".into()); }
-    for name in ["node/node.exe", "pi/pi.exe", "pi/pi-distribution.json", "managed/pi-web-session-projection.mjs", "server/lib/pi-rpc/assets/management-sdk-entry.mjs", "server/lib/pi-rpc/assets/management-stdio.mjs", "server/lib/pi-rpc/assets/pi-web-management.mjs", "server/lib/pi-rpc/assets/pi-web-bridge.mjs", "server/lib/pi-rpc/assets/pi-web-artifacts.mjs", "server/lib/pi-rpc/assets/pi-web-chat.mjs"] {
+    for name in [NODE_BIN, cli_role.as_str(), "pi/pi-distribution.json", "managed/pi-web-session-projection.mjs", "server/lib/pi-rpc/assets/management-sdk-entry.mjs", "server/lib/pi-rpc/assets/management-stdio.mjs", "server/lib/pi-rpc/assets/pi-web-management.mjs", "server/lib/pi-rpc/assets/pi-web-bridge.mjs", "server/lib/pi-rpc/assets/pi-web-artifacts.mjs", "server/lib/pi-rpc/assets/pi-web-chat.mjs"] {
         if !actual.contains(name) { return Err("required preview file missing".into()); }
     }
     let distribution = json_file(&root.join("pi/pi-distribution.json"), MAX_MANIFEST)?;
-    if distribution.get("complete").and_then(Value::as_bool) != Some(true) || distribution.get("binary").and_then(Value::as_str) != Some("pi.exe") { return Err("invalid preview CLI distribution".into()); }
+    if distribution.get("complete").and_then(Value::as_bool) != Some(true) || distribution.get("binary").and_then(Value::as_str) != Some(PI_BIN) { return Err("invalid preview CLI distribution".into()); }
     let files = distribution.get("files").and_then(Value::as_array).ok_or("preview CLI files missing")?;
     let mut cli_files = BTreeSet::new();
     for file in files { let file = file.as_str().ok_or("invalid preview CLI file")?; if !valid_path(file) || file == "pi-distribution.json" || !cli_files.insert(format!("pi/{file}")) { return Err("invalid preview CLI files".into()); } }
-    if !cli_files.contains("pi/pi.exe") || cli_files != actual.iter().filter(|p| p.starts_with("pi/") && *p != "pi/pi-distribution.json").cloned().collect() { return Err("preview CLI files mismatch".into()); }
+    if !cli_files.contains(&cli_role) || cli_files != actual.iter().filter(|p| p.starts_with("pi/") && *p != "pi/pi-distribution.json").cloned().collect() { return Err("preview CLI files mismatch".into()); }
     let sdk = root.join("managed/node_modules");
     let mut queue = vec![("@earendil-works/pi-coding-agent".to_string(), "1.4.0".to_string())];
     let mut seen = BTreeMap::new();
@@ -168,8 +181,8 @@ pub(crate) fn verify(root: &Path) -> Result<PreviewBundle, String> {
     if !seen.contains_key("@earendil-works/pi-ai") || !seen.contains_key("@earendil-works/pi-mcp") { return Err("preview SDK graph incomplete".into()); }
     let assets = root.join("server/lib/pi-rpc/assets");
     Ok(PreviewBundle {
-        runtime: management_host::ManagementSdkRuntime { node: root.join("node/node.exe"), entry: assets.join("management-sdk-entry.mjs"), dependency_root: sdk, projection_root: root.join("managed"), cli_version: "1.4.0".into() },
-        cli: root.join("pi/pi.exe"), bridge: assets.join("pi-web-bridge.mjs"), artifacts: assets.join("pi-web-artifacts.mjs"), chat: assets.join("pi-web-chat.mjs"),
+        runtime: management_host::ManagementSdkRuntime { node: root.join(NODE_BIN), entry: assets.join("management-sdk-entry.mjs"), dependency_root: sdk, projection_root: root.join("managed"), cli_version: "1.4.0".into() },
+        cli: root.join(&cli_role), bridge: assets.join("pi-web-bridge.mjs"), artifacts: assets.join("pi-web-artifacts.mjs"), chat: assets.join("pi-web-chat.mjs"),
     })
 }
 
@@ -181,28 +194,30 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Value) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        let cli_role = format!("pi/{PI_BIN}");
+        let distribution = format!(r#"{{"complete":true,"binary":"{PI_BIN}","files":["{PI_BIN}"]}}"#);
         let files = [
-            ("node/node.exe", "node"), ("pi/pi.exe", "cli"),
-            ("pi/pi-distribution.json", r#"{"complete":true,"binary":"pi.exe","files":["pi.exe"]}"#),
-            ("managed/pi-web-session-projection.mjs", "projection"),
-            ("server/lib/pi-rpc/assets/management-sdk-entry.mjs", "entry"),
-            ("server/lib/pi-rpc/assets/management-stdio.mjs", "stdio"),
-            ("server/lib/pi-rpc/assets/pi-web-management.mjs", "management"),
-            ("server/lib/pi-rpc/assets/pi-web-bridge.mjs", "bridge"),
-            ("server/lib/pi-rpc/assets/pi-web-artifacts.mjs", "artifacts"),
-            ("server/lib/pi-rpc/assets/pi-web-chat.mjs", "chat"),
-            ("managed/node_modules/@earendil-works/pi-coding-agent/package.json", r#"{"name":"@earendil-works/pi-coding-agent","version":"1.4.0","dependencies":{"@earendil-works/pi-ai":"1.3.0","@earendil-works/pi-mcp":"1.2.0"}}"#),
-            ("managed/node_modules/@earendil-works/pi-ai/package.json", r#"{"name":"@earendil-works/pi-ai","version":"1.3.0"}"#),
-            ("managed/node_modules/@earendil-works/pi-mcp/package.json", r#"{"name":"@earendil-works/pi-mcp","version":"1.2.0"}"#),
+            (NODE_BIN.to_string(), "node".to_string()), (cli_role.clone(), "cli".to_string()),
+            ("pi/pi-distribution.json".to_string(), distribution),
+            ("managed/pi-web-session-projection.mjs".to_string(), "projection".to_string()),
+            ("server/lib/pi-rpc/assets/management-sdk-entry.mjs".to_string(), "entry".to_string()),
+            ("server/lib/pi-rpc/assets/management-stdio.mjs".to_string(), "stdio".to_string()),
+            ("server/lib/pi-rpc/assets/pi-web-management.mjs".to_string(), "management".to_string()),
+            ("server/lib/pi-rpc/assets/pi-web-bridge.mjs".to_string(), "bridge".to_string()),
+            ("server/lib/pi-rpc/assets/pi-web-artifacts.mjs".to_string(), "artifacts".to_string()),
+            ("server/lib/pi-rpc/assets/pi-web-chat.mjs".to_string(), "chat".to_string()),
+            ("managed/node_modules/@earendil-works/pi-coding-agent/package.json".to_string(), r#"{"name":"@earendil-works/pi-coding-agent","version":"1.4.0","dependencies":{"@earendil-works/pi-ai":"1.3.0","@earendil-works/pi-mcp":"1.2.0"}}"#.to_string()),
+            ("managed/node_modules/@earendil-works/pi-ai/package.json".to_string(), r#"{"name":"@earendil-works/pi-ai","version":"1.3.0"}"#.to_string()),
+            ("managed/node_modules/@earendil-works/pi-mcp/package.json".to_string(), r#"{"name":"@earendil-works/pi-mcp","version":"1.2.0"}"#.to_string()),
         ];
         let mut rows = Vec::new();
-        for (name, content) in files {
+        for (name, content) in &files {
             let path = root.join(name); fs::create_dir_all(path.parent().unwrap()).unwrap(); fs::write(&path, content).unwrap();
             let (size, sha256) = hash(&path).unwrap(); rows.push(json!({"path":name,"size":size,"sha256":sha256}));
         }
         let manifest = json!({"version":1,"piVersion":"1.4.0","files":rows,"managementRuntime":{
-            "version":1,"piVersion":"1.4.0","node":"node/node.exe","entry":"server/lib/pi-rpc/assets/management-sdk-entry.mjs",
-            "dependencyRoot":"managed/node_modules","projectionRoot":"managed","cli":"pi/pi.exe"
+            "version":1,"piVersion":"1.4.0","node":NODE_BIN,"entry":"server/lib/pi-rpc/assets/management-sdk-entry.mjs",
+            "dependencyRoot":"managed/node_modules","projectionRoot":"managed","cli":cli_role
         }});
         fs::write(root.join("bundle-manifest.json"), manifest.to_string()).unwrap();
         (dir, manifest)
@@ -212,8 +227,9 @@ mod tests {
     fn preview_bundle_binds_roles_files_and_mixed_sdk_versions() {
         let (dir, _) = fixture();
         let bundle = verify(dir.path()).unwrap();
-        assert_eq!(bundle.cli, child_process_path(&dir.path().canonicalize().unwrap()).join("pi/pi.exe"));
-        fs::write(dir.path().join("pi/pi.exe"), "changed").unwrap();
+        let cli = child_process_path(&dir.path().canonicalize().unwrap()).join(format!("pi/{PI_BIN}"));
+        assert_eq!(bundle.cli, cli);
+        fs::write(&cli, "changed").unwrap();
         assert!(verify(dir.path()).is_err());
     }
 
@@ -222,7 +238,7 @@ mod tests {
     fn preview_bundle_rejects_symlinked_resource() {
         use std::os::unix::fs::symlink;
         let (dir, _) = fixture();
-        let node = dir.path().join("node/node.exe");
+        let node = dir.path().join(NODE_BIN);
         let original = dir.path().join("original-node");
         fs::rename(&node, &original).unwrap(); symlink(&original, &node).unwrap();
         assert!(verify(dir.path()).is_err());

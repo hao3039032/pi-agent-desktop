@@ -265,24 +265,38 @@ mod tests {
         assert!(host.shutdown_until(std::time::Instant::now() + Duration::from_secs(10)).is_ok());
     }
 
-    // Windows CI supplies the verified staged tree, not checkout SDK modules.
+    // Platform CI supplies the verified staged tree, not checkout SDK modules.
     // No prompt or provider request is sent; the only credential is a fake key.
     #[cfg(all(feature = "static-preview", windows))]
     #[test]
     fn preview_staged_windows_runtime_stores_fake_key_and_starts_cli() {
+        staged_preview_runtime_fixture();
+    }
+
+    #[cfg(all(feature = "static-preview", target_os = "macos"))]
+    #[test]
+    fn preview_staged_macos_runtime_stores_fake_key_and_starts_cli() {
+        staged_preview_runtime_fixture();
+    }
+
+    /// The staged-tree identity of both Preview platforms: the same fixture
+    /// proves the verified resource tree, its independent SDK runtime and a
+    /// real CLI child work when nothing from the checkout can be reached.
+    #[cfg(all(feature = "static-preview", any(windows, target_os = "macos")))]
+    fn staged_preview_runtime_fixture() {
         use serde_json::json;
         let root = std::path::PathBuf::from(std::env::var_os("PI_PREVIEW_TEST_BUNDLE").expect("staged preview bundle required"));
         let bundle = crate::preview_bundle::verify(&root).unwrap();
         // Keep evidence even if an assertion fails while a child is still alive.
         let retained = tempfile::tempdir().unwrap().keep();
-        eprintln!("Windows Preview fixture (retained on failure): {}", retained.display());
+        eprintln!("Preview fixture (retained on failure): {}", retained.display());
         let home = retained.join("preview-home");
         let project = retained.join("project");
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(&project).unwrap();
         let host = IsolatedStaticHost::init_preview(&home, bundle).unwrap();
         let call = |op: &str, args: serde_json::Value| {
-            let response = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"preview-windows-fixture","op":op,"args":args}));
+            let response = crate::pi_ipc::dispatch_envelope(&host.state, json!({"v":1,"id":"preview-fixture","op":op,"args":args}));
             assert_eq!(response["ok"], true, "{response}");
             response["data"].clone()
         };

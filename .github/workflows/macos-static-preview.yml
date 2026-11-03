@@ -1,0 +1,158 @@
+name: macOS static migration preview
+
+# Artifact-only Apple Silicon Preview build: same staged resource tree, same
+# independent management SDK and the same native static host as the Windows
+# Preview job, but nothing is released — the dmg lands as a workflow artifact.
+# Manual dispatch plus a dedicated branch, so no product branch is touched.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [preview/macos-static]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-static-preview
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      PI_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Install locked dependencies
+        shell: bash
+        run: |
+          npm ci
+          npm run check:deps
+          npm ci --prefix static-frontend
+      - name: Require the integrated SDK and native preview
+        shell: bash
+        run: |
+          test -f lib/pi-rpc/assets/management-sdk-entry.mjs || { echo 'Integrate the management SDK lane first'; exit 1; }
+          test -f lib/pi-rpc/assets/management-stdio.mjs || { echo 'Integrate the management SDK lane first'; exit 1; }
+          grep -q -F 'sdkRuntime = false' scripts/migration/build-management-modules.mjs || { echo 'Integrate SDK projection support first'; exit 1; }
+          grep -q -E '^static-preview\s*=' src-tauri/Cargo.toml || { echo 'Integrate the real native static-preview feature first'; exit 1; }
+          test -f src-tauri/tauri.preview.macos.conf.json || { echo 'Add the macOS preview bundle targets first'; exit 1; }
+          node -e "const p=require('./scripts/release-component-pins.json').pi.version; const l=require('./package-lock.json').packages['node_modules/@earendil-works/pi-coding-agent'].version; const i=require('./node_modules/@earendil-works/pi-coding-agent/package.json').version; if(p!=='1.4.0'||p!==l||p!==i) throw Error('SDK pin/lock/install mismatch')"
+      - name: Verify migration contract tests
+        shell: bash
+        run: |
+          unset PI_PACKAGE_DIR PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT JITI_ALIAS NODE_OPTIONS NODE_PATH
+          node --test scripts/migration/static-bundle-manifest.test.mjs scripts/migration/windows-static-preview.test.mjs scripts/migration/macos-static-preview.test.mjs scripts/migration/preview-smoke-probe.test.mjs scripts/migration/management-entry-paths.test.mjs
+      - name: Download checksum-verified official pi distribution
+        shell: bash
+        run: |
+          piVersion="$(node -p "require('./scripts/release-component-pins.json').pi.version")"
+          test "$piVersion" = '1.4.0' || { echo "Unexpected Preview CLI pin: $piVersion"; exit 1; }
+          releaseBase="https://github.com/earendil-works/pi/releases/download/v$piVersion"
+          node scripts/pi-cli-release.mjs --target aarch64-apple-darwin --download-dir "$RUNNER_TEMP/pi-download" --github-env "$GITHUB_ENV" --base "$releaseBase"
+      - name: Build real static frontend
+        shell: bash
+        run: |
+          npm run build --prefix static-frontend
+      - name: Stage and verify one preview resource tree
+        shell: bash
+        run: |
+          export HOME="$RUNNER_TEMP/preview-stage-home"
+          mkdir -p "$HOME"
+          unset PI_PACKAGE_DIR PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT JITI_ALIAS NODE_OPTIONS NODE_PATH
+          node_bin="$(command -v node)"
+          npm_dir="$(dirname "$(dirname "$node_bin")")/lib/node_modules/npm"
+          test -f "$npm_dir/bin/npm-cli.js" || { echo "npm runtime not found next to $node_bin"; exit 1; }
+          node scripts/migration/prepare-static-bundle.mjs --out src-tauri/resources/static-preview --pi-dir "$PI_CLI_DISTRIBUTION_DIR" --node "$node_bin" --npm-dir "$npm_dir" --frontend desktop/frontend-static --management-sdk
+          node scripts/migration/verify-static-bundle.mjs src-tauri/resources/static-preview --management-sdk
+          bytes=$(find src-tauri/resources/static-preview -type f -exec stat -f %z {} + | awk '{total += $1} END {print total + 0}')
+          test "$bytes" -le 1073741824 || { echo "Preview resource tree exceeds 1 GiB: $bytes"; exit 1; }
+          # The checkout's own node_modules would let a partial tree resolve the
+          # SDK by accident; hide it for the offline smoke exactly as the gate.
+          mv node_modules node_modules.preview-hidden
+          trap 'mv node_modules.preview-hidden node_modules' EXIT
+          node scripts/migration/smoke-static-preview.mjs src-tauri/resources/static-preview
+          mv node_modules.preview-hidden node_modules
+          trap - EXIT
+      - name: Run exact macOS storage and native host gates
+        shell: bash
+        run: |
+          # No checkout dependency fallback for the Rust -> staged CLI/SDK test.
+          mv node_modules node_modules.preview-hidden
+          trap 'mv node_modules.preview-hidden node_modules' EXIT
+          bash ./scripts/migration/test-macos-preview.sh
+          mv node_modules.preview-hidden node_modules
+          trap - EXIT
+      - name: Compute isolated preview version
+        shell: bash
+        run: |
+          number="$GITHUB_RUN_NUMBER"
+          test "$number" -ge 1 && test "$number" -le 65535 || { echo "Invalid preview version inputs"; exit 1; }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid preview version inputs"; exit 1; }
+          version="0.0.$number-preview.g${GITHUB_SHA:0:12}"
+          printf '{"version":"%s"}\n' "$version" > "$RUNNER_TEMP/preview-version.json"
+          echo "PREVIEW_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build macOS Preview (ad-hoc signed)
+        shell: bash
+        run: |
+          unset PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          APPLE_SIGNING_IDENTITY="-" node node_modules/@tauri-apps/cli/tauri.js build --ci --no-stapling --target aarch64-apple-darwin --features static-preview --config src-tauri/tauri.preview.conf.json --config src-tauri/tauri.preview.macos.conf.json --config "$RUNNER_TEMP/preview-version.json" -- --locked
+      - name: Record preview artifacts
+        shell: bash
+        run: |
+          count=0
+          installer=''
+          while IFS= read -r -d '' file; do count=$((count + 1)); installer="$file"; done < <(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -type f -print0)
+          test "$count" -eq 1 || { echo "Expected exactly one dmg installer, found $count"; exit 1; }
+          bytes() { find "$1" -type f -exec stat -f %z {} + | awk '{total += $1} END {print total + 0}'; }
+          stage_bytes=$(bytes src-tauri/resources/static-preview)
+          target_bytes=$(bytes src-tauri/target)
+          frontend_bytes=$(bytes desktop/frontend-static)
+          download_bytes=$(bytes "$RUNNER_TEMP/pi-download")
+          generated_bytes=$((stage_bytes + target_bytes + frontend_bytes + download_bytes))
+          echo "Generated bytes (staging=$stage_bytes, complete Cargo/Tauri target=$target_bytes, Vite=$frontend_bytes, downloaded pi=$download_bytes): $generated_bytes. This is not total or peak runner disk usage."
+          if [ "$generated_bytes" -gt 1073741824 ]; then echo "::warning::Generated output exceeds the former local 1 GiB staging budget; report this to the parent: $generated_bytes bytes"; fi
+          mkdir -p preview-artifact
+          hash=$(shasum -a 256 "$installer" | awk '{print $1}')
+          printf '%s  %s\n' "$hash" "$(basename "$installer")" > preview-artifact/SHA256SUMS.txt
+          STAGE_BYTES="$stage_bytes" TARGET_BYTES="$target_bytes" FRONTEND_BYTES="$frontend_bytes" DOWNLOAD_BYTES="$download_bytes" GENERATED_BYTES="$generated_bytes" INSTALLER="$(basename "$installer")" SHA256="$hash" node -e '
+            const fs = require("fs");
+            const env = process.env;
+            fs.writeFileSync("preview-artifact/preview.json", JSON.stringify({
+              version: env.PREVIEW_VERSION,
+              commit: env.GITHUB_SHA,
+              target: "aarch64-apple-darwin",
+              piVersion: "1.4.0",
+              installer: env.INSTALLER,
+              sha256: env.SHA256,
+              stageBytes: Number(env.STAGE_BYTES),
+              targetBytes: Number(env.TARGET_BYTES),
+              frontendBytes: Number(env.FRONTEND_BYTES),
+              downloadBytes: Number(env.DOWNLOAD_BYTES),
+              generatedBytes: Number(env.GENERATED_BYTES),
+              exceedsFormerLocalBudget: Number(env.GENERATED_BYTES) > 1073741824,
+            }, null, 2) + "\n");
+          '
+          "Generated bytes: $generated_bytes" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-static-preview-${{ github.run_number }}-${{ github.sha }}
+          path: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            preview-artifact/SHA256SUMS.txt
+            preview-artifact/preview.json
+          if-no-files-found: error
+          retention-days: 14
