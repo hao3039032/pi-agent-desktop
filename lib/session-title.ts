@@ -278,6 +278,65 @@ function titleFromAssistant(message: AssistantMessage): GeneratedSessionTitle {
   };
 }
 
+/**
+ * A title request for a session whose model calls happen outside this process
+ * (the CLI engine keeps them in the pi child): the caller supplies the
+ * transcript it can read from the session file and a stream that speaks the
+ * child's model runtime. The request itself is byte-for-byte the one
+ * `generateSessionTitle()` builds in-process.
+ */
+export interface TranscriptTitleSource {
+  messages: readonly AgentMessage[];
+  model: Model<Api>;
+  streamSimple(
+    model: Model<Api>,
+    context: Context,
+    options: SimpleStreamOptions,
+  ): { result(): Promise<AssistantMessage> };
+}
+
+export async function generateSessionTitleFromTranscript(
+  source: TranscriptTitleSource,
+): Promise<GeneratedSessionTitle> {
+  const transcript = buildTitleTranscript([...source.messages]);
+  if (!transcript.trim()) {
+    throw new Error("The session has no usable text to name");
+  }
+
+  const thinkingLevel = resolveTitleThinkingLevel(source.model);
+  const context: Context = {
+    systemPrompt: TITLE_SYSTEM_PROMPT,
+    messages: [{
+      role: "user",
+      content: [{ type: "text", text: `${transcript}\n\n${TITLE_PROMPT}` }],
+      timestamp: Date.now(),
+    }],
+  };
+  const controller = new AbortController();
+  const options: SimpleStreamOptions = {
+    maxTokens: TITLE_MAX_TOKENS,
+    cacheRetention: "none",
+    sessionId: randomUUID(),
+    signal: controller.signal,
+    ...(thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
+  };
+
+  const timeout = setTimeout(() => controller.abort(), TITLE_TIMEOUT_MS);
+
+  try {
+    // Providers read the prompt from the transcript's leading system message.
+    const stream = source.streamSimple(source.model, normalizeContext(context), options);
+    return titleFromAssistant(await stream.result());
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("Session title generation timed out");
+    }
+    throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export async function generateSessionTitle(source: AgentSession): Promise<GeneratedSessionTitle> {
   const sourceAgent = source.agent;
   // Snapshot whatever the session holds right now. The transcript is plain

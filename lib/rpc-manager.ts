@@ -1,5 +1,6 @@
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { createAgentSessionServices, getAgentDir, SessionManager, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionServices } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, statSync, writeFileSync } from "fs";
@@ -44,7 +45,7 @@ import { readSubagentRun, readSubagentSessionResources, SUBAGENT_CONTROL_TOOL_NA
 import type { SubagentEventBus, SubagentRpcTransport } from "./pi-subagents-rpc";
 import { createBridgeSubagentTransport, createEventBusSubagentTransport } from "./pi-subagents-rpc";
 import { loadResultHasPiSubagentsExtension } from "./subagent-extension";
-import { generateSessionTitle } from "./session-title";
+import { generateSessionTitle, generateSessionTitleFromTranscript, type GeneratedSessionTitle } from "./session-title";
 import { isAutoTitleEnabled } from "./session-title-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { contextFilesSystemPrompt } from "./chat-only";
@@ -239,6 +240,73 @@ function pushRunOutcome(sessionId: string, outcome: AgentRunOutcome): void {
 function pushAttentionNeeded(sessionId: string, prompt: string): void {
   void notifySessionEvent(sessionId, { kind: "attention", detail: prompt }).catch((error) => {
     console.error("[pi-web] failed to send attention push:", error instanceof Error ? error.message : error);
+  });
+}
+
+/** One host-side runtime per cwd+agentDir, for CLI sessions' title requests. */
+const titleRuntimes = new Map<string, Promise<AgentSessionServices>>();
+
+function titleRuntimeFor(cwd: string, agentDir: string): Promise<AgentSessionServices> {
+  const key = `${cwd}\u0000${agentDir}`;
+  let runtime = titleRuntimes.get(key);
+  if (!runtime) {
+    // Only the model catalog and its credentials matter here: loading extensions,
+    // skills, templates or context files just to name a session would be waste.
+    runtime = createAgentSessionServices({
+      cwd,
+      agentDir,
+      resourceLoaderOptions: {
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+      },
+    });
+    titleRuntimes.set(key, runtime);
+    runtime.catch(() => titleRuntimes.delete(key));
+  }
+  return runtime;
+}
+
+/** The transcript a CLI session's title request reads: the entries of its own file. */
+function titleMessagesFromEntries(entries: readonly unknown[]): AgentMessage[] {
+  const messages: AgentMessage[] = [];
+  for (const entry of entries) {
+    const record = entry as { type?: string; message?: unknown; summary?: unknown };
+    if (record.type === "message" && record.message) {
+      messages.push(record.message as AgentMessage);
+    } else if (record.type === "compaction" && typeof record.summary === "string") {
+      messages.push({ role: "compactionSummary", summary: record.summary, content: [] } as unknown as AgentMessage);
+    } else if (record.type === "branch_summary" && typeof record.summary === "string") {
+      messages.push({ role: "branchSummary", summary: record.summary, content: [] } as unknown as AgentMessage);
+    }
+  }
+  return messages;
+}
+
+/**
+ * A title for this session, whichever engine it runs on. The in-process engine
+ * streams it from the session's own Agent; the CLI engine keeps every model call
+ * in the child, so the transcript comes off the session file and the request runs
+ * on a host-side ModelRuntime with the same shape.
+ */
+export async function generateSessionTitleForWrapper(inner: AgentSessionLike): Promise<GeneratedSessionTitle> {
+  const agentMessages = (inner.agent as { state?: { messages?: unknown } } | undefined)?.state?.messages;
+  if (Array.isArray(agentMessages) && agentMessages.length > 0) {
+    return generateSessionTitle(inner as unknown as AgentSession);
+  }
+  const model = inner.model;
+  if (!model) throw new Error("The session has no model to name it with");
+  const services = await titleRuntimeFor(inner.sessionManager.getCwd(), getAgentDir());
+  const resolved = services.modelRuntime.getModel(model.provider, model.id);
+  if (!resolved) {
+    throw new Error(`The model ${model.provider}/${model.id} is not available to generate a title`);
+  }
+  return generateSessionTitleFromTranscript({
+    messages: titleMessagesFromEntries(inner.sessionManager.getEntries() as readonly unknown[]),
+    model: resolved,
+    streamSimple: (target, context, options) => services.modelRuntime.streamSimple(target, context, options),
   });
 }
 
@@ -750,7 +818,7 @@ export class AgentSessionWrapper {
     }
     this.autoTitleSettled = true;
     if (named) return;
-    void generateSessionTitle(this.inner as unknown as AgentSession)
+    void generateSessionTitleForWrapper(this.inner)
       .then(({ title }) => {
         // The user may have renamed it, or closed it, while the request ran.
         if (!this.isAlive() || this.inner.sessionManager.getSessionName()) return;
