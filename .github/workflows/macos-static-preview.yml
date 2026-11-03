@@ -109,7 +109,7 @@ jobs:
         shell: bash
         run: |
           unset PI_AGENT_DESKTOP_UPDATER_PUBLIC_KEY TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
-          APPLE_SIGNING_IDENTITY="-" node node_modules/@tauri-apps/cli/tauri.js build --ci --no-stapling --target aarch64-apple-darwin --features static-preview --config src-tauri/tauri.preview.conf.json --config src-tauri/tauri.preview.macos.conf.json --config "$RUNNER_TEMP/preview-version.json" -- --locked
+          APPLE_SIGNING_IDENTITY="-" node node_modules/@tauri-apps/cli/tauri.js build --ci --skip-stapling --target aarch64-apple-darwin --features static-preview --config src-tauri/tauri.preview.conf.json --config src-tauri/tauri.preview.macos.conf.json --config "$RUNNER_TEMP/preview-version.json" -- --locked
       - name: Record preview artifacts
         shell: bash
         run: |
