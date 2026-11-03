@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { AgentSessionWrapper } from "../rpc-manager";
-import type { SessionEntry } from "../types";
+import type { AgentRunOutcome, SessionEntry } from "../types";
 import { getLatestModelChange, getLatestResponseModel } from "../session-reader";
 import { appendSessionToolSelection, readSessionToolSelection, validateSessionToolSelection } from "../session-tool-selection";
 import { sanitizeProjectCommandEnvironment } from "../project-command-env";
@@ -63,8 +63,10 @@ export interface StartCliSessionOptions {
   sessionDir?: string;
   env?: NodeJS.ProcessEnv;
   onLog?: (line: string) => void;
-  /** Completion notifications (startRpcSession wires notifySessionComplete). */
-  onAgentRunComplete?: (sessionId: string) => void;
+  /** Completion notifications (startRpcSession wires notifySessionEvent). */
+  onAgentRunComplete?: (sessionId: string, outcome: AgentRunOutcome) => void;
+  /** A blocking extension dialog is waiting for the user (phone push). */
+  onAttentionNeeded?: (sessionId: string, prompt: string) => void;
   /**
    * Registration hook for the live path (startRpcSession): when present the
    * factory hands the wrapper over instead of starting it itself —
@@ -489,6 +491,7 @@ export async function startCliRpcSessionFromManager(
         ? { exactSystemPrompt: () => options.chatOnlyExactPrompt! }
         : {}),
       ...(options.onAgentRunComplete ? { onAgentRunComplete: options.onAgentRunComplete } : {}),
+      ...(options.onAttentionNeeded ? { onAttentionNeeded: options.onAttentionNeeded } : {}),
       terminateProcess: async () => {
         client.kill();
         await core.waitForChildExit();

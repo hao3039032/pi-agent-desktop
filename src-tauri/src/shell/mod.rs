@@ -2,6 +2,7 @@ mod macos_menu;
 mod platform_tray;
 pub mod popup;
 mod server;
+mod webview_recovery;
 mod window;
 #[cfg(target_os = "macos")]
 mod window_appkit;
@@ -26,6 +27,7 @@ pub use platform_tray::build_linux_tray;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use platform_tray::build_platform_tray;
 pub use server::{CloseQuits, DesktopApiToken, DesktopServer};
+pub use webview_recovery::{is_rebuilding_main_window, on_main_window_destroyed};
 pub use window::{build_window, launched_at_login, AUTOSTART_ARG};
 
 pub(crate) const WINDOW_LABEL: &str = "main";

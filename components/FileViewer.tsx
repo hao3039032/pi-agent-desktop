@@ -68,7 +68,7 @@ const DISPLAY_MODE_LABELS: Record<DisplayMode, string> = {
 
 const FILE_CODE_STYLE: CSSProperties = {
   fontFamily: "var(--font-mono)",
-  fontSize: 13,
+  fontSize: "var(--fs-body)",
   lineHeight: 1.6,
 };
 
@@ -81,7 +81,7 @@ const FILE_LINE_NUMBER_STYLE: CSSProperties = {
   background: "var(--bg-panel)",
   borderRight: "var(--hairline) solid var(--border)",
   fontFamily: "var(--font-mono)",
-  fontSize: 11,
+  fontSize: "var(--fs-micro)",
   fontStyle: "normal",
   fontVariantNumeric: "tabular-nums",
   lineHeight: "20.8px",
@@ -101,7 +101,7 @@ interface SelectedLineRange {
 
 function MentionIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <circle cx="12" cy="12" r="4" />
       <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" />
     </svg>
@@ -209,6 +209,15 @@ function SourceCodeRenderer({ rows, stylesheet, useInlineStyles, wrapLines }: So
   });
 }
 
+/**
+ * The files API answers a path that is gone with a bare "Not found". A file
+ * can be opened from history (a turn's written-files card, an old link) after
+ * a later command removed it, so say that instead of echoing the server text.
+ */
+function describeFileError(error: string, t: ReturnType<typeof useI18n>["t"]): string {
+  return error === "Not found" ? t("files.notFound") : error;
+}
+
 function getFileApiUrl(
   filePath: string,
   type: "read" | "download" | "meta" | "preview" | "serve" | "watch",
@@ -252,7 +261,7 @@ function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceS
         })();
       }}
     >
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
         <polyline points="7 10 12 15 17 10" />
         <line x1="12" y1="15" x2="12" y2="3" />
@@ -281,7 +290,7 @@ function DesktopPathActions({ filePath }: { filePath: string }) {
           void import("@/lib/desktop-native").then(({ openPathNative }) => openPathNative(filePath));
         }}
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
           <polyline points="15 3 21 3 21 9" />
           <line x1="10" y1="14" x2="21" y2="3" />
@@ -296,7 +305,7 @@ function DesktopPathActions({ filePath }: { filePath: string }) {
           void import("@/lib/desktop-native").then(({ revealItemInDirNative }) => revealItemInDirNative(filePath));
         }}
       >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
           <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
         </svg>
       </button>
@@ -402,7 +411,7 @@ function DiffView({ patch }: { patch: string }) {
   const hasChanges = diff.some((l) => l.type !== "unchanged");
   if (!hasChanges) {
     return (
-      <div style={{ padding: "12px 16px", fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
+      <div style={{ padding: "12px 16px", fontSize: "var(--fs-caption)", color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
         {t("i18n.noChanges")}
       </div>
     );
@@ -456,7 +465,7 @@ function DiffView({ patch }: { patch: string }) {
                 padding: "2px 16px",
                 color: "var(--text-dim)",
                 background: "var(--bg-panel)",
-                fontSize: 11,
+                fontSize: "var(--fs-micro)",
                 borderTop: "var(--hairline) solid var(--border)",
                 borderBottom: "var(--hairline) solid var(--border)",
               }}
@@ -505,7 +514,7 @@ function DiffView({ patch }: { patch: string }) {
                   color: prefixColor,
                   userSelect: "none",
                   flexShrink: 0,
-                  fontWeight: 600,
+                  fontWeight: "var(--fw-semibold)",
                 }}
               >
                 {prefix}
@@ -531,6 +540,7 @@ function DiffView({ patch }: { patch: string }) {
 }
 
 function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
+  const { t } = useI18n();
   const [watching, setWatching] = useState(false);
   const [bust, setBust] = useState(0);
   const [size, setSize] = useState<number | null>(null);
@@ -632,7 +642,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
         className="file-viewer-image-stage"
       >
         {error ? (
-          <div style={{ color: "var(--danger)", fontSize: 13 }}>{error}</div>
+          <div style={{ color: "var(--danger)", fontSize: "var(--fs-body)" }}>{describeFileError(error, t)}</div>
         ) : (
           // eslint-disable-next-line @next/next/no-img-element
           <img
@@ -647,7 +657,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
               maxWidth: "100%",
               maxHeight: "100%",
               objectFit: "contain",
-              boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+              boxShadow: "var(--shadow-popover)",
             }}
           />
         )}
@@ -665,6 +675,7 @@ function formatDuration(seconds: number): string {
 }
 
 function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
+  const { t } = useI18n();
   const [watching, setWatching] = useState(false);
   const [bust, setBust] = useState(0);
   const [size, setSize] = useState<number | null>(null);
@@ -746,8 +757,8 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
       >
         <div style={{ width: "min(680px, 100%)" }}>
           {error && (
-            <div style={{ color: "var(--danger)", fontSize: 13, marginBottom: 12, textAlign: "center" }}>
-              {error}
+            <div style={{ color: "var(--danger)", fontSize: "var(--fs-body)", marginBottom: 12, textAlign: "center" }}>
+              {describeFileError(error, t)}
             </div>
           )}
           <audio
@@ -857,7 +868,7 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
           gap: 12,
           padding: "4px 16px",
           borderBottom: "var(--hairline) solid var(--border)",
-          fontSize: 11,
+          fontSize: "var(--fs-micro)",
           color: "var(--text-dim)",
           background: "var(--bg)",
           flexShrink: 0,
@@ -871,16 +882,16 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
         {size != null && <span>{formatSize(size)}</span>}
         <span
           title={watching ? t("i18n.liveSync") : t("i18n.notWatching")}
-          style={{ display: "flex", alignItems: "center", gap: 4, color: watching ? "#4ade80" : "var(--text-dim)" }}
+          style={{ display: "flex", alignItems: "center", gap: 4, color: watching ? "var(--success)" : "var(--text-dim)" }}
         >
           <span
             style={{
               width: 7,
               height: 7,
               borderRadius: "50%",
-              background: watching ? "#4ade80" : "var(--border)",
+              background: watching ? "var(--success)" : "var(--border)",
               display: "inline-block",
-              boxShadow: watching ? "0 0 4px #4ade80" : "none",
+              boxShadow: watching ? "0 0 4px var(--success)" : "none",
             }}
           />
           {watching ? "live" : "static"}
@@ -900,8 +911,8 @@ function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
       >
         <div style={{ width: "min(960px, 100%)", height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 0 }}>
           {error && (
-            <div style={{ color: "#f87171", fontSize: 13, marginBottom: 12, textAlign: "center" }}>
-              {error}
+            <div style={{ color: "var(--danger)", fontSize: "var(--fs-body)", marginBottom: 12, textAlign: "center" }}>
+              {describeFileError(error, t)}
             </div>
           )}
           <video
@@ -1009,8 +1020,8 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, initialPage, watchEnab
       />
       <div className="file-viewer-document-stage">
         {error ? (
-          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, color: "var(--danger)", fontSize: 13, textAlign: "center" }}>
-            {error}
+          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, color: "var(--danger)", fontSize: "var(--fs-body)", textAlign: "center" }}>
+            {describeFileError(error, t)}
           </div>
         ) : (
           <iframe
@@ -1455,7 +1466,7 @@ function TextFileViewer({
 
   if (loading || (requestedInitialDisplayMode === "diff" && gitDiffLoading && !data)) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 13 }}>
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: "var(--fs-body)" }}>
         {t("i18n.loading")}
       </div>
     );
@@ -1463,8 +1474,8 @@ function TextFileViewer({
 
   if (error && !isDeletedDiff) {
     return (
-      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "#f87171", fontSize: 13 }}>
-        {error}
+      <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--danger)", fontSize: "var(--fs-body)" }}>
+        {describeFileError(error, t)}
       </div>
     );
   }
@@ -1495,7 +1506,7 @@ function TextFileViewer({
           gap: 8,
           padding: "5px 12px",
           borderBottom: "var(--hairline) solid var(--border)",
-          fontSize: 11,
+          fontSize: "var(--fs-micro)",
           color: "var(--text-dim)",
           background: "var(--bg)",
           flexShrink: 0,
@@ -1512,8 +1523,8 @@ function TextFileViewer({
             aria-label={watching ? t("i18n.liveSync") : t("i18n.notWatching")}
             className="file-viewer-live-indicator"
             style={{
-              background: watching ? "#4ade80" : "var(--border)",
-              boxShadow: watching ? "0 0 4px #4ade80" : "none",
+              background: watching ? "var(--success)" : "var(--border)",
+              boxShadow: watching ? "0 0 4px var(--success)" : "none",
             }}
           />
         )}
@@ -1620,9 +1631,9 @@ function TextFileViewer({
             gap: 10,
             padding: "5px 8px",
             border: "var(--hairline) solid var(--border)",
-            borderRadius: 6,
+            borderRadius: "var(--radius-sm)",
             color: "var(--text-dim)",
-            fontSize: 11,
+            fontSize: "var(--fs-micro)",
           }}
         >
           <span>{formatSize(data.nextOffset)} / {formatSize(data.size)}</span>

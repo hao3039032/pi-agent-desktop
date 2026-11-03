@@ -4,7 +4,7 @@
 
 - 当前仓库是 `hao3039032/pi-agent-desktop`，**直接上游是 https://github.com/abcwyc/pi-agent-desktop**（remote `abcwyc`）。`agegr/pi-web`（remote `piweb`）是上游的上游，不是本仓库默认 rebase 目标。
 - 用户说“rebase 上游 vX.Y.Z”时，默认指 **abcwyc 的 release tag**。禁止仅凭本地裸标签 `vX.Y.Z` 判断来源：两个仓库存在同名标签。必须先检查 `git remote -v` 和 `git ls-remote --tags abcwyc 'vX.Y.Z*'`，再用 `git fetch --no-tags abcwyc refs/tags/vX.Y.Z:refs/remotes/abcwyc/vX.Y.Z` 获取，使用 `abcwyc/vX.Y.Z^{commit}` 校验实际提交。
-- 本次直接上游基线：**abcwyc v0.7.8 = `fc00e56d42fff380ede8628fb3a0915793258fa3`**（前一基线 v0.7.7 = `2ef9721a26391ede95255e7787158ab05ebd203b`，v0.7.6 = `67340ed4bf85a37ab20d2c0eccfe62af4cb1afbc`，v0.7.5 = `2909e09a7af13e74635ac5027d55afb4b180b4f1`）。同名标签在两个仓库都存在；本仓库实际 remote 是 `abcwyc`，必须用 `abcwyc/vX.Y.Z^{commit}` 校验，不能用本地裸标签。v0.7.8 使用 merge 整合，保留 LW 与直接上游的提交历史。
+- 本次直接上游基线：**abcwyc v0.8.2 = `620aa1ae1afc947e342c3304c3d8a223d04f33e3`**（前一基线 v0.7.8 = `fc00e56d42fff380ede8628fb3a0915793258fa3`，v0.7.7 = `2ef9721a26391ede95255e7787158ab05ebd203b`，v0.7.6 = `67340ed4bf85a37ab20d2c0eccfe62af4cb1afbc`，v0.7.5 = `2909e09a7af13e74635ac5027d55afb4b180b4f1`）。同名标签在两个仓库都存在；本仓库实际 remote 是 `upstream`（url 指向 abcwyc），必须用 `upstream/vX.Y.Z^{commit}` 校验，不能用本地裸标签。v0.7.8 与 v0.8.2 均使用 merge 整合，保留 LW 与直接上游的提交历史。
 - 压缩提交只整理直接上游基线之后的 **LW 自有提交**；不得压缩、重写或重新归类 abcwyc 的桌面历史。先检查 merge-base、双方独有提交和变更范围；若范围突然变成数百个提交，停止并核对上游。
 - 重写前保留 backup 分支；压缩后比对完整 Git tree，确保代码不变；rebase 后核验目标祖先关系并做行为回归。不得把 abort/回滚称为完成，不得在未授权时 force-push。
 - 以下继承文档中的“fork/pi-web baseline”多指 **abcwyc 相对 pi-web 的维护边界**（例如 `scripts/fork-ownership.json`、CSS hash 基线）；不能据此决定 LW 的 rebase 范围。保留这些检查，但将直接上游整合与祖先项目的漂移统计分开。
@@ -90,6 +90,12 @@ app/api/
   agent/[id]/subagents/route.ts   GET/POST restricted pi-subagents fleet view + control actions
   agent/running/route.ts          GET currently-running session ids
   agent/running/events/route.ts   GET SSE stream of currently-running session ids
+  agent/tasks/route.ts            GET live task snapshots (running step, waiting dialogs, last outcome) for the Tasks page
+  remote-access/route.ts          GET/PUT Tailscale remote-access setting (PUT only from loopback)
+  push/{config,subscribe,unsubscribe,test}/route.ts  Web Push key, device subscriptions, test send
+  relay/route.ts                  GET/PUT encrypted relay status and config (PUT local-only)
+  relay/pairing/**                POST pairing QR ticket, POST [id] approve/deny (local-only)
+  relay/devices/[id]/route.ts     DELETE revoke a paired phone (local-only)
   auth/all-providers/route.ts     GET API-key provider list
   auth/api-key/[provider]/route.ts GET/POST/DELETE provider API key status/storage
   auth/login/[provider]/route.ts  GET OAuth/device-code SSE | POST manual code
@@ -117,12 +123,17 @@ app/api/
   desktop/read-images/route.ts    POST read natively-picked images into attachment payloads
   desktop/save/route.ts           POST copy a file to, or write bytes at, a natively-picked path
   artifacts/settings/route.ts     GET/PUT the "artifacts in the side panel" prompt switch
+  session-title/settings/route.ts GET/PUT the "name sessions automatically" switch
+  artifacts/route.ts              GET ?q= artifacts across all sessions (Artifacts page)
+  artifacts/item/route.ts         GET ?session=&identifier= one artifact with every version
+  artifacts/file/route.ts         GET ?path= one written/edited file's calls | ?session=&toolCallId= a write's content
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
   artifacts.ts         `:::artifact` scanner, markdown encoding, version collection
   artifact-store.ts    client store shared by ChatWindow, message cards and the artifact panel
-  artifact-settings.ts / pi-rpc/assets/pi-web-artifacts.mjs  prompt switch file + `<artifacts>` prompt section asset
+  artifact-index.ts    server index of artifacts in every session file (Artifacts page)
+  artifact-settings.ts / pi-rpc/assets/pi-web-artifacts.mjs  prompt switch file + `<artifacts>` prompt section asset (CLI-engine port of the removed artifact-guide-extension.ts)
   html-preview.ts      inline HTML/SVG/React preview detection, sandbox, srcdoc bootstrap, React document
   preview-runtime.ts   loads public/preview-runtime/ (bundled React, Sucrase, Tailwind) for React previews
   app-prefs.ts         APP_PREF_KEYS + typed localStorage accessors (SSR/private-mode safe)
@@ -158,13 +169,17 @@ components/
   BranchNavigator.tsx in-session branch switcher
   MarkdownBody.tsx    markdown renderer
   HtmlPreviewBlock.tsx / HtmlPreviewErrorBar.tsx  inline previews and their error strip
-  ArtifactCard.tsx / ArtifactPanel.tsx / artifact-tabs.ts  artifact card in messages, right-panel tab
+  ArtifactCard.tsx / ArtifactPanel.tsx / ArtifactView.tsx / artifact-tabs.ts  artifact card in messages, right-panel tab, shared viewer
+  artifacts/          Artifacts page (cross-session list, search, preview) and its sidebar row
   ModelsConfig.tsx    modal for editing models.json (opened from sidebar bottom)
   EnabledModelsSection.tsx  model switches inside ModelsConfig, backed by enabledModels
   SubagentFleetPanel.tsx  native fleet controls opened by the composer's pi-subagents widget tags
   PluginsConfig.tsx   modal for installed package plugins
   SkillsConfig.tsx    modal for loaded/search/installable skills
   scheduled/          Scheduled page (list, detail, editor, run history) and its sidebar row
+  tasks/              Tasks page (waiting / running / recent across projects) and its sidebar row
+  RemoteAccessSection.tsx  Settings › General › Remote access (Tailscale) and "Notify this device"
+  RelaySection.tsx    Settings › General › Remote relay: relay config, pairing QR, approvals, paired phones
   SettingsPanel.tsx   settings dialog; its General tab hosts the app intro, Version & Updates and the desktop-only switches
   AppUpdatesSection.tsx  Version & Updates block at the top of General
   desktop/DesktopAppSection.tsx  window/tray prefs; renders nothing outside Tauri
@@ -201,7 +216,7 @@ Read the doc for the area you touch before changing it. Upstream docs (no prefix
 - [subagents.md](docs/agents/subagents.md): removed with the CLI engine (M4) — the pi-subagents package runs its own children inside the pi child process; `lib/subagents.ts` keeps the legacy marker readers the session routes use.
 - [fork-tools-subagents.md](docs/agents/fork-tools-subagents.md) § restricted API: the pi-subagents fleet monitor — `app/api/agent/[id]/subagents`, `lib/pi-subagents-rpc.ts`, `lib/pi-subagents-view.ts`, the `subagentsEventBus` on the wrapper, `components/SubagentFleetPanel.tsx`.
 - [scheduled-tasks.md](docs/agents/scheduled-tasks.md): scheduled tasks (the Scheduled page): server-side scheduler and its lease, catch-up and overlap rules, read-only default, the run index that hides runs from the project tree, why shared state is on `globalThis`. Files: `lib/scheduled-tasks/**`, `app/api/scheduled-tasks/**`, `instrumentation-node.ts`, `hooks/useScheduledTasks.ts`, `components/scheduled/**`, the Scheduled row in `components/SessionSidebar.tsx`, the page overlay in `components/AppShell.tsx`.
-- [artifacts.md](docs/agents/artifacts.md): inline HTML/SVG/React previews and `:::artifact` blocks: what renders where, the sandbox rules and the desktop `about:srcdoc` allowance, the auto-run rule for scripted pages, the bundled React runtime (inlined, because sandboxed frames cannot reach localhost; `npm run preview-runtime` regenerates it), the fix flow and the prompt switch. Files: `lib/artifacts.ts`, `lib/artifact-store.ts`, `lib/html-preview.ts`, `lib/artifact-settings.ts`, `lib/pi-rpc/assets/pi-web-artifacts.mjs`, `hooks/useArtifactPublisher.ts`, `hooks/useHtmlPreviewFrame.ts`, `lib/preview-runtime.ts`, `scripts/build-preview-runtime.mjs`, `public/preview-runtime/`, `components/Artifact*.tsx`, `components/HtmlPreview*.tsx`, `components/artifact-tabs.ts`, `app/api/artifacts/**`, `is_inline_frame_document` in `src-tauri/src/lib.rs`.
+- [artifacts.md](docs/agents/artifacts.md): inline HTML/SVG/React previews and `:::artifact` blocks, output vs process files on the Artifacts page: what renders where, the sandbox rules and the desktop `about:srcdoc` allowance, the auto-run rule for scripted pages, the bundled React runtime (inlined, because sandboxed frames cannot reach localhost; `npm run preview-runtime` regenerates it), the fix flow and the prompt switch, the cross-session Artifacts page. Files: `lib/artifacts.ts`, `lib/artifact-store.ts`, `lib/artifact-index.ts`, `lib/file-output-role.ts`, `lib/artifact-file-roles.ts`, `lib/artifact-favorites.ts`, `components/artifacts/**`, `lib/html-preview.ts`, `lib/artifact-settings.ts`, `lib/pi-rpc/assets/pi-web-artifacts.mjs`, `hooks/useArtifactPublisher.ts`, `hooks/useHtmlPreviewFrame.ts`, `lib/preview-runtime.ts`, `scripts/build-preview-runtime.mjs`, `public/preview-runtime/`, `components/Artifact*.tsx`, `components/HtmlPreview*.tsx`, `components/artifact-tabs.ts`, `app/api/artifacts/**`, `is_inline_frame_document` in `src-tauri/src/lib.rs`.
 - [client-platform.md](docs/agents/client-platform.md): mobile software keyboard and viewport height, completion sound. Files: `hooks/useViewportHeight.ts`, `hooks/useAudio.ts`, the keyboard-open CSS.
 
 Fork notes:
@@ -304,3 +319,13 @@ changes to shared choices also run `node e2e/option-controls.mjs`.
 --accent --user-bg --tool-bg
 --font-mono
 ```
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

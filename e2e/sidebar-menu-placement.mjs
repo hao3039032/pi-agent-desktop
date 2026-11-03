@@ -85,9 +85,9 @@ try {
     await projectMenu.waitFor();
     await projectMenu.evaluate(el => Promise.all(el.getAnimations({ subtree: true }).map(animation => animation.finished)));
     await assertMenuFitsUpwards(page, ".sidebar-project-context-menu", "#project-more", "project menu");
-    const archiveItem = projectMenu.getByRole("menuitem", { name: locale === "zh-CN" ? "移除项目" : "Remove project" });
+    const archiveItem = projectMenu.getByRole("menuitem", { name: locale === "zh-CN" ? "移到存档" : "Move to archive" });
     await archiveItem.waitFor();
-    assert.ok(await archiveItem.isVisible(), "the remove-project entry must be reachable");
+    assert.ok(await archiveItem.isVisible(), "the archive-project entry must be reachable");
     await page.screenshot({ path: `${out}/project-menu-${theme}-${locale}-${width}.png` });
 
     assert.deepEqual(errors, []);

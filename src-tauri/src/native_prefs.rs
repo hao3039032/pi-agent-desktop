@@ -65,6 +65,9 @@ fn clear_runtime_caches(app: &AppHandle) -> u64 {
     // Windows %LOCALAPPDATA%\<id>.
     if let Ok(cache_dir) = app.path().app_cache_dir() {
         for entry in fs::read_dir(&cache_dir).into_iter().flatten().flatten() {
+            if keeps_in_cache_dir(&entry.file_name()) {
+                continue;
+            }
             freed += remove_counting(&entry.path());
         }
     }
@@ -74,9 +77,10 @@ fn clear_runtime_caches(app: &AppHandle) -> u64 {
         freed += remove_counting(&data_dir.join("WebKitCache"));
     }
     // Windows WebView2: cache folders inside each profile, never the profile
-    // itself (it holds localStorage and cookies).
+    // itself (it holds localStorage and cookies). Tauri puts the profile in
+    // app_local_data_dir, not the roaming app_data_dir.
     #[cfg(target_os = "windows")]
-    if let Ok(data_dir) = app.path().app_data_dir() {
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
         for profile in fs::read_dir(data_dir.join("EBWebView"))
             .into_iter()
             .flatten()
@@ -88,6 +92,19 @@ fn clear_runtime_caches(app: &AppHandle) -> u64 {
         }
     }
     freed
+}
+
+/// On Windows app_cache_dir and app_local_data_dir are the same folder,
+/// %LOCALAPPDATA%\<id>, which also holds the WebView2 profile (localStorage)
+/// and app_log_dir. Only the caches in it may go.
+#[cfg(target_os = "windows")]
+fn keeps_in_cache_dir(name: &std::ffi::OsStr) -> bool {
+    name == "EBWebView" || name == "logs"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn keeps_in_cache_dir(_name: &std::ffi::OsStr) -> bool {
+    false
 }
 
 /// Clear the webview's disk caches on demand (Settings › General).
@@ -184,9 +201,9 @@ fn clear_webview_caches(app: &AppHandle) {
             let _ = fs::remove_dir_all(&webkit_cache);
         }
     }
-    // Windows WebView2: cache partition under the app data dir.
+    // Windows WebView2: cache partition under the app local data dir.
     #[cfg(target_os = "windows")]
-    if let Ok(data_dir) = app.path().app_data_dir() {
+    if let Ok(data_dir) = app.path().app_local_data_dir() {
         let webview2 = data_dir.join("EBWebView");
         if webview2.is_dir() {
             for entry in fs::read_dir(&webview2).into_iter().flatten().flatten() {
@@ -197,24 +214,16 @@ fn clear_webview_caches(app: &AppHandle) {
             }
         }
     }
-    // macOS WKWebView: per-origin caches under ~/Library/WebKit/<identifier>.
+    // macOS WKWebView: the HTTP cache lives in ~/Library/Caches/<identifier>.
+    // Never touch ~/Library/WebKit/<identifier>: its WebsiteData holds the
+    // origin's localStorage (every Settings switch, sidebar state, drafts), so
+    // removing it wiped the user's preferences on every upgrade.
     #[cfg(target_os = "macos")]
-    if let Ok(config_dir) = app.path().app_config_dir() {
-        // app_config_dir on macOS is ~/Library/Application Support/<identifier>;
-        // WKWebView WebsiteKit caches live under ~/Library/WebKit/<bundle-id>.
-        if let Some(home) = dirs_home_dir() {
-            let wk = home.join("Library/WebKit/com.abcwyc.pi-agent");
-            if wk.is_dir() {
-                let _ = fs::remove_dir_all(&wk);
-            }
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        for entry in fs::read_dir(&cache_dir).into_iter().flatten().flatten() {
+            remove_counting(&entry.path());
         }
-        let _ = config_dir; // suppress unused on non-mac
     }
-}
-
-#[cfg(target_os = "macos")]
-fn dirs_home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
 }
 
 /// Detect a version change since the last successful launch and, when one is

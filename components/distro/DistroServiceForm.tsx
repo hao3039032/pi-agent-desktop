@@ -22,7 +22,7 @@ const inputStyle: CSSProperties = {
   border: "1px solid var(--border)",
   borderRadius: 5,
   color: "var(--text)",
-  fontSize: 12,
+  fontSize: "var(--fs-caption)",
   fontFamily: "var(--font-mono)",
   outline: "none",
 };
@@ -119,7 +119,7 @@ export function DistroServiceForm({
           display: "flex",
           alignItems: "center",
           gap: 7,
-          fontSize: 12,
+          fontSize: "var(--fs-caption)",
           color: "var(--text-muted)",
           cursor: "pointer",
           userSelect: "none",
@@ -134,7 +134,7 @@ export function DistroServiceForm({
       </label>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <span
-          style={{ flex: 1, fontSize: 12, color: message?.error ? "var(--color-danger, #e5484d)" : "var(--text-muted)" }}
+          style={{ flex: 1, fontSize: "var(--fs-caption)", color: message?.error ? "var(--danger)" : "var(--text-muted)" }}
           role={message?.error ? "alert" : undefined}
         >
           {message?.text}

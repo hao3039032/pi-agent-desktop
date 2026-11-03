@@ -16,6 +16,7 @@ import { collectTurnResultImages, customGeneratedImage } from "@/lib/turn-result
 import { TurnImageOwner, TurnImageTargetContext } from "./TurnResultImages";
 import { MarkdownBody } from "./MarkdownBody";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
+import { NewSessionWelcome } from "./NewSessionWelcome";
 import { ConversationNavigator, type ConversationTurnLocation } from "./ConversationNavigator";
 import { ExtensionWidgets } from "./ExtensionWidgets";
 import { ExtensionStatusLine, formatExtensionStatusLine } from "./ExtensionStatusLine";
@@ -61,7 +62,9 @@ import {
 import { isTauriDesktop } from "@/lib/desktop-updater";
 import { isImeComposing } from "@/lib/ime";
 import { useChatAccess } from "@/hooks/useChatAccess";
+import { ChatShellPrompt } from "./ChatShellPrompt";
 import { ChatConfirmDialog } from "./ChatConfirmDialog";
+import { lastTurnHitChatShellBlock } from "@/lib/chat-shell-block";
 import { assignMessageKeys, createMessageKeyTracker } from "@/lib/message-keys";
 
 interface Props {
@@ -262,12 +265,12 @@ function ProcessDetailsGroup({ messageCount, toolCallCount, defaultExpanded = fa
           background: "transparent",
           color: "var(--text-muted)",
           cursor: "pointer",
-          fontSize: 12,
+          fontSize: "var(--fs-caption)",
           textAlign: "left",
         }}
         title={expanded ? t("chat.collapseProcess") : t("chat.expandProcess")}
       >
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0, transform: expanded ? "rotate(90deg)" : "none", transition: "transform var(--dur-base) var(--ease-native)" }}>
           <polyline points="4 2.5 7.5 6 4 9.5" />
         </svg>
         <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -352,14 +355,17 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
   const sessionBusy = agentRunning || bashRunning;
   // A chat's folder and whether it may use the computer; the server owns both.
   const chatAccess = useChatAccess(session?.id, chatOnly && Boolean(session) && !isNew, handleChatAccessRebuilt);
-  const [chatUnlockDialog, setChatUnlockDialog] = useState<"unlock" | "lock" | null>(null);
   const handleToggleChatUnlocked = useCallback((nextUnlocked: boolean) => {
     if (sessionBusy) {
       addNotice({ type: "error", message: t("chat.chatUnlockBusy") });
       return;
     }
-    setChatUnlockDialog(nextUnlocked ? "unlock" : "lock");
-  }, [addNotice, sessionBusy, t]);
+    void chatAccess?.setUnlocked(nextUnlocked);
+  }, [addNotice, chatAccess, sessionBusy, t]);
+  // The model asked for a shell this chat does not have: offer the permission right here.
+  const chatNeedsShell = Boolean(
+    chatAccess?.state.available && !chatAccess.state.unlocked && !sessionBusy && lastTurnHitChatShellBlock(messages),
+  );
   // The desktop window stays hidden until the conversation it opens on is
   // loaded (or its load failed and the error is what the user will see).
   useReportDesktopReady(!loading, "chat");
@@ -1380,6 +1386,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     <ChatInput
       ref={chatInputRef}
       onSend={handleSend}
+      onClearDraft={cancelEdit}
       onAttachFiles={onAttachFiles}
       onAbort={handleAbort}
       stopPending={stopPending}
@@ -1458,7 +1465,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           type="button"
           className="file-viewer-icon-button"
           onClick={retryLoad}
-          style={{ width: "auto", height: 32, gap: 5, padding: "0 12px", border: "none", fontSize: 12, fontWeight: 500 }}
+          style={{ width: "auto", height: 32, gap: 5, padding: "0 12px", border: "none", fontSize: "var(--fs-caption)", fontWeight: "var(--fw-medium)" }}
         >
           {t("common.retry")}
         </button>
@@ -1544,10 +1551,10 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
                 <line x1="87.5" y1="66.5" x2="85.4" y2="68.6"/>
               </g>
             </svg>
-            <div style={{ maxWidth: 320, color: "var(--text)", fontSize: 13, fontWeight: 550, lineHeight: 1.35 }}>
+            <div style={{ maxWidth: 320, color: "var(--text)", fontSize: "var(--fs-body)", fontWeight: "var(--fw-medium)", lineHeight: 1.35 }}>
               {t(chatOnly ? "chat.dropImagesHint" : "chat.dropFilesHint")}
             </div>
-            <div style={{ maxWidth: 360, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.4 }}>
+            <div style={{ maxWidth: 360, color: "var(--text-muted)", fontSize: "var(--fs-caption)", lineHeight: 1.4 }}>
               {t(chatOnly ? "chat.dropImagesDetail" : isTauriDesktop() ? "chat.dropFilesDetailDesktop" : "chat.dropFilesDetail")}
             </div>
           </div>
@@ -1885,9 +1892,9 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
             overflowY: "auto",
             padding: quoteInputOpen ? 12 : 3,
             border: "var(--hairline) solid var(--border)",
-            borderRadius: 6,
+            borderRadius: "var(--radius-sm)",
             background: "var(--bg)",
-            boxShadow: "0 2px 10px rgba(0,0,0,0.12)",
+            boxShadow: "var(--shadow-popover)",
           }}
         >
           {quoteInputOpen ? (
@@ -1897,7 +1904,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
               style={{ width: "100%", minWidth: 0, margin: 0, padding: 0, border: "none", display: "flex", flexDirection: "column", gap: 10 }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ flex: 1, minWidth: 0, fontSize: 12, fontWeight: 600 }}>{t("chat.askInNewChat")}</span>
+                <span style={{ flex: 1, minWidth: 0, fontSize: "var(--fs-caption)", fontWeight: "var(--fw-semibold)" }}>{t("chat.askInNewChat")}</span>
                 <button type="button" className="file-viewer-icon-button" title={t("i18n.close")} aria-label={t("i18n.close")} disabled={quoteSubmitting} onClick={closeQuotedSelection} style={{ border: "none" }}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
                 </button>
@@ -1909,7 +1916,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
                 onAbort={closeQuotedSelection}
                 isStreaming={false}
               />
-              {quoteError && <div role="alert" style={{ color: "#dc2626", fontSize: 12, overflowWrap: "anywhere" }}>{quoteError}</div>}
+              {quoteError && <div role="alert" style={{ color: "var(--danger)", fontSize: "var(--fs-caption)", overflowWrap: "anywhere" }}>{quoteError}</div>}
             </fieldset>
           ) : <>
           <button
@@ -1919,9 +1926,9 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
             aria-label={t("chat.askInCurrent")}
             onPointerDown={(event) => event.preventDefault()}
             onClick={askSelectionHere}
-            style={{ width: "auto", height: 35, flex: "0 0 auto", gap: 5, padding: "0 10px", border: "none", fontSize: 12, fontWeight: 500 }}
+            style={{ width: "auto", height: 35, flex: "0 0 auto", gap: 5, padding: "0 10px", border: "none", fontSize: "var(--fs-caption)", fontWeight: "var(--fw-medium)" }}
           >
-            <span aria-hidden="true" style={{ fontSize: 15 }}>@</span>
+            <span aria-hidden="true" style={{ fontSize: "var(--fs-title)" }}>@</span>
             <span>{t("chat.askInCurrent")}</span>
           </button>
           {onAskInNewChat && quotedSelection.sourceEntryId && !bashRunning && (
@@ -1932,9 +1939,9 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
               aria-label={t("chat.askInNewChat")}
               onPointerDown={(event) => event.preventDefault()}
               onClick={() => { setQuoteInputOpen(true); window.getSelection()?.removeAllRanges(); }}
-              style={{ width: "auto", height: 35, flex: "0 0 auto", gap: 5, padding: "0 10px", border: "none", fontSize: 12, fontWeight: 500 }}
+              style={{ width: "auto", height: 35, flex: "0 0 auto", gap: 5, padding: "0 10px", border: "none", fontSize: "var(--fs-caption)", fontWeight: "var(--fw-medium)" }}
             >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M6 3v12M18 9a9 9 0 0 1-9 9" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" />
               </svg>
               <span>{t("chat.askInNewChat")}</span>
@@ -1951,7 +1958,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           the max column width. */}
       <div
         ref={composerOverlayRef}
-        className={isEmptyNew ? "relative shrink-0" : "absolute inset-x-0 z-20"}
+        className={isEmptyNew ? "relative shrink-0" : "chat-composer-overlay absolute inset-x-0 z-20"}
         style={{
           ...(isEmptyNew ? {} : { bottom: "env(safe-area-inset-bottom)" }),
           ...(scrollbarGutter > 0 ? { paddingInline: scrollbarGutter } : {}),
@@ -1991,33 +1998,34 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
             </div>
           </div>
         )}
+        {chatNeedsShell && chatAccess && (
+          <ChatShellPrompt
+            busy={chatAccess.busy}
+            error={chatAccess.error}
+            onAllow={() => {
+              void chatAccess.setUnlocked(true).then((ok) => {
+                if (ok) void handleSend(t("chat.chatShellPromptContinue"));
+              });
+            }}
+          />
+        )}
+        {isEmptyNew && (
+          <NewSessionWelcome
+            cwd={newSessionCwd}
+            isChat={chatOnly}
+          />
+        )}
         {chatInputElement}
         {forceStopTarget && (
           <ChatConfirmDialog
             title={t("chat.forceStopTitle")}
             body={t("chat.forceStopBody")}
             confirmLabel={t("chat.forceStopConfirm")}
-            cancelLabel={t("chat.chatConfirmCancel")}
+            cancelLabel={t("chat.cancel")}
             danger
             busy={forceStopBusy}
             onCancel={dismissForceStop}
             onConfirm={() => { void handleForceStop(); }}
-          />
-        )}
-        {chatUnlockDialog && chatAccess && (
-          <ChatConfirmDialog
-            title={t(chatUnlockDialog === "unlock" ? "chat.chatUnlockTitle" : "chat.chatLockTitle")}
-            body={t(chatUnlockDialog === "unlock" ? "chat.chatUnlockBody" : "chat.chatLockBody")}
-            confirmLabel={t(chatUnlockDialog === "unlock" ? "chat.chatUnlockConfirm" : "chat.chatLockConfirm")}
-            cancelLabel={t("chat.chatConfirmCancel")}
-            busy={chatAccess.busy}
-            error={chatAccess.error}
-            onCancel={() => { chatAccess.clearError(); setChatUnlockDialog(null); }}
-            onConfirm={() => {
-              void chatAccess.setUnlocked(chatUnlockDialog === "unlock").then((ok) => {
-                if (ok) setChatUnlockDialog(null);
-              });
-            }}
           />
         )}
         {(belowEditorWidgets.length > 0 || hasExtensionStatus) && (
@@ -2054,7 +2062,7 @@ function NoticeShelf({ notices, floating = false, onPauseChange }: { notices: No
           : notice.type === "warning"
             ? "var(--warning)"
             : notice.type === "success"
-              ? "#10b981"
+              ? "var(--success)"
               : "var(--accent)";
         return (
           <div
@@ -2083,7 +2091,7 @@ function NoticeShelf({ notices, floating = false, onPauseChange }: { notices: No
               pointerEvents: "auto",
               marginBottom: index === notices.length - 1 ? 0 : 6,
               overflow: "hidden",
-              borderRadius: 10,
+              borderRadius: "var(--radius-lg)",
               border: "var(--hairline) solid color-mix(in srgb, var(--border) 70%, transparent)",
               background: "var(--bg)",
               color: "var(--text-muted)",
@@ -2091,7 +2099,7 @@ function NoticeShelf({ notices, floating = false, onPauseChange }: { notices: No
               maxWidth: "min(100%, 620px)",
               boxShadow: floating
                 ? "0 1px 2px rgba(15,23,42,0.05), 0 10px 28px -14px rgba(15,23,42,0.24)"
-                : "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
+                : "var(--shadow-composer)",
               fontSize: 14,
               lineHeight: 1.5,
               transformOrigin: "top right",
@@ -2153,7 +2161,7 @@ function ExtensionWaitingCount({ count }: { count: number }) {
   const { t } = useI18n();
   if (count <= 0) return null;
   return (
-    <span style={{ fontSize: 11, fontWeight: 650, color: "var(--accent)", whiteSpace: "nowrap", flexShrink: 0 }}>
+    <span style={{ fontSize: "var(--fs-micro)", fontWeight: "var(--fw-semibold)", color: "var(--accent)", whiteSpace: "nowrap", flexShrink: 0 }}>
       {t("chat.extensionMoreWaiting", { count })}
     </span>
   );
@@ -2188,7 +2196,7 @@ function ExtensionDialog({
   }, [request.expiresAt]);
 
   const countdown = remainingSeconds !== null && (
-    <span style={{ fontSize: 11, color: "var(--text-dim)", whiteSpace: "nowrap", flexShrink: 0 }}>
+    <span style={{ fontSize: "var(--fs-micro)", color: "var(--text-dim)", whiteSpace: "nowrap", flexShrink: 0 }}>
       {t("chat.extensionExpiresIn", { seconds: remainingSeconds })}
     </span>
   );
@@ -2213,7 +2221,7 @@ function ExtensionDialog({
         position: "absolute",
         inset: 0,
         bottom: "var(--chat-composer-inset, 0px)",
-        zIndex: 90,
+        zIndex: "var(--z-chrome)",
         display: "flex",
         alignItems: collapsed ? "flex-start" : "center",
         justifyContent: "center",
@@ -2235,28 +2243,28 @@ function ExtensionDialog({
             width: "100%",
             padding: "10px 12px",
             border: "var(--hairline) solid var(--border)",
-            borderRadius: 8,
+            borderRadius: "var(--radius-md)",
             background: "var(--bg)",
-            boxShadow: "0 12px 32px rgba(0,0,0,0.18)",
+            boxShadow: "var(--shadow-popover)",
             color: "var(--text)",
             cursor: "pointer",
             textAlign: "left",
           }}
         >
-          <span style={{ fontSize: 11, fontWeight: 650, color: "var(--accent)", flexShrink: 0 }}>
+          <span style={{ fontSize: "var(--fs-micro)", fontWeight: "var(--fw-semibold)", color: "var(--accent)", flexShrink: 0 }}>
             {t("chat.extensionPending")}
           </span>
-          <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
+          <span style={{ fontSize: "var(--fs-body)", fontWeight: "var(--fw-semibold)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
             {request.title}
           </span>
           {summary && (
-            <span style={{ fontSize: 12, color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "34%", flexShrink: 1 }}>
+            <span style={{ fontSize: "var(--fs-caption)", color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "34%", flexShrink: 1 }}>
               {summary}
             </span>
           )}
           <ExtensionWaitingCount count={waitingCount} />
           {countdown}
-          <span style={{ fontSize: 12, color: "var(--text-muted)", flexShrink: 0 }}>
+          <span style={{ fontSize: "var(--fs-caption)", color: "var(--text-muted)", flexShrink: 0 }}>
             {t("chat.extensionExpand")}
           </span>
         </button>
@@ -2271,9 +2279,9 @@ function ExtensionDialog({
           display: "flex",
           flexDirection: "column",
           border: "var(--hairline) solid var(--border)",
-          borderRadius: 8,
+          borderRadius: "var(--radius-md)",
           background: "var(--bg)",
-          boxShadow: "0 20px 60px rgba(0,0,0,0.28)",
+          boxShadow: "var(--shadow-dialog)",
           overflow: "hidden",
         }}
       >
@@ -2281,8 +2289,8 @@ function ExtensionDialog({
           <div style={{ flex: 1, minWidth: 0 }}>
             {/* Pi's TUI shows the title verbatim, newlines included; select/input have no
                 separate message field, so extensions put multi-line text here. */}
-            <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650, lineHeight: 1.45, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{request.title}</div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 3, color: "var(--text-dim)", fontSize: 11, fontFamily: "var(--font-mono)" }}>
+            <div style={{ color: "var(--text)", fontSize: 14, fontWeight: "var(--fw-semibold)", lineHeight: 1.45, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{request.title}</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 3, color: "var(--text-dim)", fontSize: "var(--fs-micro)", fontFamily: "var(--font-mono)" }}>
               <span>{t("chat.extensionRequest")}</span>
               <ExtensionWaitingCount count={waitingCount} />
               {countdown}
@@ -2299,7 +2307,7 @@ function ExtensionDialog({
               placeItems: "center",
               width: 28,
               height: 28,
-              borderRadius: 6,
+              borderRadius: "var(--radius-sm)",
               border: "var(--hairline) solid var(--border)",
               background: "var(--bg-panel)",
               color: "var(--text-muted)",
@@ -2307,7 +2315,7 @@ function ExtensionDialog({
               flexShrink: 0,
             }}
           >
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
               <polyline points="2 3.5 5 6.5 8 3.5" />
             </svg>
           </button>
@@ -2355,13 +2363,13 @@ function ExtensionDialog({
                   style={{
                     width: "100%",
                     padding: "9px 10px",
-                    borderRadius: 7,
+                    borderRadius: "var(--radius-md)",
                     border: "var(--hairline) solid var(--border)",
                     background: "var(--bg-panel)",
                     color: "var(--text)",
                     cursor: "pointer",
                     textAlign: "left",
-                    fontSize: 13,
+                    fontSize: "var(--fs-body)",
                     overflowWrap: "anywhere",
                     // Match the scroller's padding so keyboard navigation never parks the
                     // option flush against the edge, where whole-pixel scroll snapping and
@@ -2390,15 +2398,15 @@ function ExtensionDialog({
                     gap: 7,
                     padding: "7px 10px",
                     border: "var(--hairline) solid color-mix(in srgb, var(--accent) 42%, transparent)",
-                    borderRadius: 7,
+                    borderRadius: "var(--radius-md)",
                     background: "color-mix(in srgb, var(--accent) 10%, transparent)",
                     color: "var(--accent)",
-                    fontSize: 12,
-                    fontWeight: 650,
+                    fontSize: "var(--fs-caption)",
+                    fontWeight: "var(--fw-semibold)",
                     textDecoration: "none",
                   }}
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M15 3h6v6" />
                     <path d="M10 14 21 3" />
                     <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5" />
@@ -2422,12 +2430,12 @@ function ExtensionDialog({
               style={{
                 width: "100%",
                 padding: "9px 10px",
-                borderRadius: 7,
+                borderRadius: "var(--radius-md)",
                 border: "var(--hairline) solid var(--border)",
                 background: "var(--bg-panel)",
                 color: "var(--text)",
                 outline: "none",
-                fontSize: 13,
+                fontSize: "var(--fs-body)",
               }}
             />
           )}
@@ -2443,13 +2451,13 @@ function ExtensionDialog({
                 width: "100%",
                 minHeight: 220,
                 padding: 10,
-                borderRadius: 7,
+                borderRadius: "var(--radius-md)",
                 border: "var(--hairline) solid var(--border)",
                 background: "var(--bg-panel)",
                 color: "var(--text)",
                 outline: "none",
                 resize: "vertical",
-                fontSize: 13,
+                fontSize: "var(--fs-body)",
                 lineHeight: 1.55,
                 fontFamily: "var(--font-mono)",
               }}
@@ -2463,7 +2471,7 @@ function ExtensionDialog({
             onClick={() => onRespond(request, { cancelled: true })}
             style={{
               padding: "6px 10px",
-              borderRadius: 6,
+              borderRadius: "var(--radius-sm)",
               border: "var(--hairline) solid var(--border)",
               background: "var(--bg)",
               color: "var(--text-muted)",
@@ -2477,7 +2485,7 @@ function ExtensionDialog({
               onClick={submitValue}
               style={{
                 padding: "6px 10px",
-                borderRadius: 6,
+                borderRadius: "var(--radius-sm)",
                 border: "var(--hairline) solid var(--accent)",
                 background: "var(--accent)",
                 color: "var(--accent-contrast)",
@@ -2491,7 +2499,7 @@ function ExtensionDialog({
               onClick={submitValue}
               style={{
                 padding: "6px 10px",
-                borderRadius: 6,
+                borderRadius: "var(--radius-sm)",
                 border: "var(--hairline) solid var(--accent)",
                 background: "var(--accent)",
                 color: "var(--accent-contrast)",
@@ -2559,27 +2567,27 @@ function ExtensionCustomPanel({
             width: "100%",
             padding: "10px 12px",
             border: "var(--hairline) solid var(--border)",
-            borderRadius: 8,
+            borderRadius: "var(--radius-md)",
             background: "var(--bg)",
-            boxShadow: "0 12px 32px rgba(0,0,0,0.18)",
+            boxShadow: "var(--shadow-popover)",
             color: "var(--text)",
             cursor: "pointer",
             textAlign: "left",
           }}
         >
-          <span style={{ fontSize: 11, fontWeight: 650, color: "var(--accent)", flexShrink: 0 }}>
+          <span style={{ fontSize: "var(--fs-micro)", fontWeight: "var(--fw-semibold)", color: "var(--accent)", flexShrink: 0 }}>
             {t("chat.extensionPending")}
           </span>
-          <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
+          <span style={{ fontSize: "var(--fs-body)", fontWeight: "var(--fw-semibold)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>
             {t("chat.extensionPanel")}
           </span>
           {summary && (
-            <span style={{ fontSize: 12, color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "34%", flexShrink: 1 }}>
+            <span style={{ fontSize: "var(--fs-caption)", color: "var(--text-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "34%", flexShrink: 1 }}>
               {summary}
             </span>
           )}
           <ExtensionWaitingCount count={waitingCount} />
-          <span style={{ fontSize: 12, color: "var(--text-muted)", flexShrink: 0 }}>
+          <span style={{ fontSize: "var(--fs-caption)", color: "var(--text-muted)", flexShrink: 0 }}>
             {t("chat.extensionExpand")}
           </span>
         </button>
@@ -2597,9 +2605,9 @@ function ExtensionCustomPanel({
           display: "flex",
           flexDirection: "column",
           border: "var(--hairline) solid var(--border)",
-          borderRadius: 8,
+          borderRadius: "var(--radius-md)",
           background: "var(--bg)",
-          boxShadow: "0 20px 60px rgba(0,0,0,0.28)",
+          boxShadow: "var(--shadow-dialog)",
           overflow: "hidden",
           outline: "none",
         }}
@@ -2653,7 +2661,7 @@ function ExtensionCustomPanel({
           }}
         />
         <div style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 12px", borderBottom: "var(--hairline) solid var(--border)" }}>
-           <div style={{ color: "var(--text)", fontSize: 13, fontWeight: 650 }}>{t("chat.extensionPanel")}</div>
+           <div style={{ color: "var(--text)", fontSize: "var(--fs-body)", fontWeight: "var(--fw-semibold)" }}>{t("chat.extensionPanel")}</div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <ExtensionWaitingCount count={waitingCount} />
             <button
@@ -2667,7 +2675,7 @@ function ExtensionCustomPanel({
                 placeItems: "center",
                 width: 28,
                 height: 28,
-                borderRadius: 6,
+                borderRadius: "var(--radius-sm)",
                 border: "var(--hairline) solid var(--border)",
                 background: "var(--bg-panel)",
                 color: "var(--text-muted)",
@@ -2675,7 +2683,7 @@ function ExtensionCustomPanel({
                 flexShrink: 0,
               }}
             >
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <svg width="12" height="12" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <polyline points="2 3.5 5 6.5 8 3.5" />
               </svg>
             </button>
@@ -2683,12 +2691,12 @@ function ExtensionCustomPanel({
               onClick={() => onInput(request, "\x03")}
               style={{
                 padding: "5px 9px",
-                borderRadius: 6,
+                borderRadius: "var(--radius-sm)",
                 border: "var(--hairline) solid var(--border)",
                 background: "var(--bg-panel)",
                 color: "var(--text-muted)",
                 cursor: "pointer",
-                fontSize: 12,
+                fontSize: "var(--fs-caption)",
               }}
             >
                {t("chat.close")}
@@ -2704,7 +2712,7 @@ function ExtensionCustomPanel({
             background: "var(--bg-panel)",
             color: "var(--text)",
             fontFamily: "var(--font-mono)",
-            fontSize: 13,
+            fontSize: "var(--fs-body)",
             lineHeight: 1.45,
             whiteSpace: "pre",
           }}

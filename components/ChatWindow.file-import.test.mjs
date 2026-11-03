@@ -98,7 +98,7 @@ for (const generations of [0, 1, 2]) {
     const added = [], revoked = [];
     const context = {
       compact: false, MAX_ATTACHED_IMAGES: 10, MAX_ATTACHED_IMAGE_BYTES: 100,
-      attachedImagesRef: { current: [] }, pendingImageCountRef: { current: 0 }, imageReadGenerationRef: { current: 0 },
+      attachedImagesRef: { current: [] }, pendingImageCountRef: { current: 0 }, imageReadGenerationRef: { current: 0 }, attachmentClearVersionRef: { current: 0 },
       compressImageFile: () => pending.promise, URL: { createObjectURL: () => "blob:preview" },
       appendAttachedImages: (images) => added.push(...images), revokeImagePreview: (image) => revoked.push(image),
     };

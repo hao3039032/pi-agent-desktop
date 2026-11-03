@@ -53,7 +53,11 @@ for (const live of [false, true]) {
               isChatUnlocked: () => storedUnlock,
             });
           }
-          const response = await GET(new Request(`http://localhost/api/sessions/${id}/chat-access`), {
+          // A real browser request carries Host; it is what isLocalRequest() reads to
+          // decide the chat may be unlocked on this computer.
+          const response = await GET(new Request(`http://localhost/api/sessions/${id}/chat-access`, {
+            headers: { host: "localhost" },
+          }), {
             params: Promise.resolve({ id }),
           });
           assert.equal(response.status, 200);

@@ -315,7 +315,107 @@ const FORK_FEATURES = [
     file: "components/AppShell.tsx",
     // The page covers the chat without unmounting it. Picking a session or starting a
     // new one must close it, and the cold-start restore must not.
-    markers: ["ScheduledView", "scheduledOpen", "scheduledOpenRef", "handleOpenScheduled", "setScheduledOpen(false)", "useScheduledRunNotifications"],
+    markers: ["ScheduledView", "scheduledOpen", "pageOpenRef", "handleOpenScheduled", "setWorkspaceView(null)", "useScheduledRunNotifications"],
+  },
+  {
+    name: "Tasks entry in the sidebar",
+    file: "components/SessionSidebar.tsx",
+    markers: ["TasksSidebarRow", "onOpenTasks"],
+  },
+  {
+    name: "Tasks page in AppShell",
+    file: "components/AppShell.tsx",
+    // Shares `?view=` with Scheduled and Artifacts; the phone's overview of every session.
+    markers: ["<TasksView", "handleOpenTasks", 'value === "tasks"'],
+  },
+  {
+    name: "Remote access settings and Notify this device",
+    file: "components/SettingsPanel.tsx",
+    markers: ["<RemoteAccessSection />"],
+  },
+  {
+    name: "Remote access gate in the proxy",
+    file: "proxy.ts",
+    // Funnel would put a shell on the public internet; the tailnet name needs a Tailscale user.
+    markers: ["isTailscaleFunnelRequest(request)", "isRemoteAccessRequestAuthorized(request, remoteAccess)"],
+  },
+  {
+    name: "Remote access host and origin rules",
+    file: "lib/request-security.ts",
+    // Serve passes the client's Host through: a relayed request must not count as local,
+    // and the tailnet name must not skip the login check because an env var lists it.
+    markers: ["isRelayedFromAnotherMachine(request)", "hostname === remoteAccess.hostname", "isRemoteAccessOrigin("],
+  },
+  {
+    name: "Phone pushes: failed, waiting, login-bound",
+    file: "lib/web-push.ts",
+    markers: ["notifySessionEvent", "sessionPushPayload", "isLoginAllowed", "sendTest"],
+  },
+  {
+    name: "Tap-driven push enable for iOS",
+    file: "lib/push-client.ts",
+    markers: ["enablePushOnThisDevice", "pushRegistration"],
+  },
+  {
+    name: "Run outcome, attention and task snapshots",
+    file: "lib/rpc-manager.ts",
+    // agent_settled.aborted keeps a Stop during retry from pushing "failed"; recent
+    // outcomes keep the Tasks page right after the idle eviction.
+    markers: ["onAttentionNeeded", "getRpcTaskSnapshots", "recordRecentRunOutcome", "event.aborted === true", "notifySessionEvent("],
+  },
+  {
+    name: "Relay: proxy admits only this process's relay mark",
+    file: "proxy.ts",
+    markers: ["readRelayMark(request)", 'relayMark === "forged"'],
+  },
+  {
+    name: "Relay: connector starts at boot",
+    file: "instrumentation-node.ts",
+    markers: ["restartRelayFromConfig()"],
+  },
+  {
+    name: "Relay: desktop-token routes refuse relayed requests",
+    file: "lib/desktop-api-auth.ts",
+    markers: ["hasRelayMark(request)"],
+  },
+  {
+    name: "Relay: Settings section",
+    file: "components/SettingsPanel.tsx",
+    markers: ["<RelaySection />"],
+  },
+  {
+    name: "Relay: no app service worker inside the phone shell",
+    file: "components/PwaRegistration.tsx",
+    markers: ["window.self !== window.top"],
+  },
+  {
+    name: "Relay: revoked phones get no pushes",
+    file: "lib/web-push.ts",
+    markers: ["isRelayDevicePaired", "subscription.relayDevice"],
+  },
+  {
+    name: "Relay: push subscriptions record the relay device",
+    file: "app/api/push/subscribe/route.ts",
+    markers: ["readRelayMark(req)", "relayDevice"],
+  },
+  {
+    name: "Local-only file manager routes ask isLocalRequest",
+    file: "app/api/open-in-explorer/route.ts",
+    // A loopback Host proves nothing: the relay connector and Tailscale Serve both forward one.
+    markers: ["isLocalRequest(request)"],
+    forbiddenMarkers: ["isLoopbackHost(request"],
+  },
+  {
+    name: "Artifacts entry in the sidebar",
+    file: "components/SessionSidebar.tsx",
+    markers: ["ArtifactsSidebarRow", "onOpenArtifacts"],
+  },
+  {
+    name: "Artifacts page in AppShell",
+    file: "components/AppShell.tsx",
+    // Shares `?view=` with Scheduled; "Show in conversation" reuses the search
+    // jump (handleOpenSession with an entry id) to scroll to the version.
+    markers: ["<ArtifactsView", "handleOpenArtifacts", "parseWorkspaceView", "handleOpenSession(sessionId, entryId)"],
   },
   {
     name: "scheduled runs are tagged in the session list",

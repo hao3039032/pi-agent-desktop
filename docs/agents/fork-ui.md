@@ -37,6 +37,39 @@ and screenshots go to the ignored `test-results/streaming-markdown/` directory.
 
 Fork-owned notes moved out of `AGENTS.md` to keep it short. The upstream doc on the same topic (`docs/agents/*.md` without the `fork-` prefix) may describe the same area in other words; where they disagree, these notes describe this fork. Hard rules that must survive a merge are also listed in `AGENTS.md` under **Hard rules**.
 
+## Image dimension hints in user messages
+
+The SDK appends `[Image: original … displayed at …]` coordinate notes to persisted
+image prompts after resizing. `lib/user-image-display.ts` projects a strict trailing
+note block (including MIME conversion hints) out of `UserMessageView` display/copy
+and new edit drafts, only with attached images (no more distinct hint groups than images).
+Exact repeated suffix groups from older edits count once; distinct excess groups
+and notes inside unfinished Markdown fences remain untouched.
+Edit drafts preserve attachments and do not mutate stored messages or existing model
+input. The scanner and live-runtime first-message previews use the same projection;
+index format 3 invalidates stale derived previews, never user-assigned names.
+Embedded/quoted notes and text-only messages stay visible. Exact manually appended
+SDK-shaped suffixes are indistinguishable without upstream metadata.
+Tests: `node --test lib/user-image-display.test.mjs components/MessageView.test.mjs lib/session-list-scanner.test.mjs`;
+`PLAYWRIGHT_CHANNEL=chrome node e2e/user-image-display.mjs` exercises in-place
+optimistic/delivered/history updates, real ChatInput text/attachment admission,
+cancel, edit drafts and resend without a model call.
+This is a MessageView integration replay, not a full authenticated SSE round trip.
+
+## Composer clearing and history-edit admission
+
+`ChatInput.replaceMessage()` returns whether it actually restored history. A
+nonempty draft, attached files/images or pending image processing refuses the
+replacement; `useAgentSession` sets edit state only on success. Refusal produces
+one coalesced 3-second warning (including during exit animation); unrelated
+notices keep their 5-second default and hover/focus pause behavior.
+
+The explicit clear button calls the existing draft/text/attachment cleanup and
+`onClearDraft` to leave history-edit mode. It does not send, stop the agent, remove
+history or modify the outbox. A clear-generation guard rejects late attachment
+read/conversion results and revokes discarded image preview URLs. Cancel remains
+a separate, non-destructive action that only leaves history-edit mode.
+
 ## Conversation find
 
 `ConversationFind` is mounted by `ChatWindow`. Ctrl+F / Cmd+F searches the current
@@ -111,6 +144,11 @@ The sidebar project tree is a keyboard `tree`: rows move focus with Up/Down/Home
 
 ## Projects pane views
 The Projects header's hover-only `…` menu switches between `grouped` (project rows with nested session families) and `timeline` (all top-level session families sorted by the root session's `modified` time, with each row's project name after the title). The choice persists in `APP_PREF_KEYS.projectViewMode`. Collapse/expand-all remain grouped-view actions; switching modes never rewrites the stored `collapsedProjects` set. The old Recent section is intentionally gone — the timeline replaces it. Desktop uses `showNativeMenu` check items, while the web build renders `ProjectViewMenu` as a DOM popover. In grouped view, "Show more" reveals five additional session rows per click; collapsing and reopening a project clears that page state so it starts from the latest five (`APP_PREF_KEYS.expandedProjects` stores root → extra pages).
+
+## Project archive
+A project row's menu (its `…` or a right-click on the row) offers "Move to archive"; the project leaves the list for the Archive group at the bottom of the Projects pane (`components/ArchivedProjectsSection.tsx`), folded by default (`APP_PREF_KEYS.archiveExpanded`). The archive is the old "Remove project" set (`APP_PREF_KEYS.archivedProjects`, keyed by project root, so all worktrees go together), now held by the `lib/archived-projects.ts` store that both `SessionSidebar` and `AppShell` read. Archived projects unfold to show their sessions, which stay readable and can be continued, but there is no new session in one: the row has no `+`, and every new-session entry point (sidebar "New session", the row `+`, Ctrl+Alt+N, the native app menu) refuses with a notice instead of silently restoring. Restoring is explicit: the archived row's menu ("Restore to projects") or picking the folder again through "Add project" / the composer's folder picker. Archiving the selected project moves the selection to the most recent listed project. Unfolding an archived project never selects it, since selecting a project opens a new-session composer there. A search looks inside the archive and unfolds it.
+
+Single project sessions archive the same way chats do (#200): the session row's menu offers "Archive" / "Unarchive" on top-level sessions, ids are kept in `APP_PREF_KEYS.archivedSessions` (localStorage, so per browser like the project archive), and an archived session leaves its project's list and the chronological view for a "Show archived (n)" fold at the end of that project. The open session stays listed where it was until the user moves away, a search lists archived sessions in place, and sending to an archived session does not restore it.
 
 ## Plugins and skills
 - `/api/plugins` uses pi's `SettingsManager` + `DefaultPackageManager` for global/project package install, remove, update, enable, and disable. Disabling writes empty `extensions/skills/prompts/themes` arrays for that package entry.

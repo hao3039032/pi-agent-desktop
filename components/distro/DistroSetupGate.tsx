@@ -56,8 +56,8 @@ export function DistroSetupGate() {
         }}
       >
         <div>
-          <h2 style={{ margin: 0, fontSize: 16, fontWeight: 600 }}>{s.setupTitle}</h2>
-          <p style={{ margin: "6px 0 0", fontSize: 12, lineHeight: 1.5, color: "var(--text-muted)" }}>{s.setupIntro}</p>
+          <h2 style={{ margin: 0, fontSize: "var(--fs-title)", fontWeight: "var(--fw-semibold)" }}>{s.setupTitle}</h2>
+          <p style={{ margin: "6px 0 0", fontSize: "var(--fs-caption)", lineHeight: 1.5, color: "var(--text-muted)" }}>{s.setupIntro}</p>
         </div>
         <DistroServiceForm
           status={status}

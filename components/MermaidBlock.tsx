@@ -57,6 +57,26 @@ type RenderState =
   | { key: string; status: "error" }
   | { key: string; status: "ready"; svg: string };
 
+/** Renders a diagram to an SVG string (strict security level); rejects on invalid input. */
+export async function renderMermaidSvg(code: string, isDark: boolean): Promise<string> {
+  const { default: mermaid } = await import("mermaid");
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    suppressErrorRendering: true,
+    theme: isDark ? "dark" : "default",
+  });
+
+  const parsed = await mermaid.parse(code, { suppressErrors: true });
+  if (!parsed) throw new Error("Invalid Mermaid diagram");
+
+  const id =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? `mermaid-${crypto.randomUUID()}`
+      : `mermaid-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return (await mermaid.render(id, code)).svg;
+}
+
 export function MermaidBlock({ code, isStreaming, defaultPreview = false, fit = false, headerAction }: MermaidBlockProps) {
   const { isDark } = useTheme();
   const { t } = useI18n();
@@ -99,29 +119,9 @@ export function MermaidBlock({ code, isStreaming, defaultPreview = false, fit = 
     let cancelled = false;
     setRenderState({ key: currentKey, status: "loading" });
 
-    const render = async () => {
-      const { default: mermaid } = await import("mermaid");
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: "strict",
-        suppressErrorRendering: true,
-        theme: isDark ? "dark" : "default",
-      });
-
-      const parsed = await mermaid.parse(code, { suppressErrors: true });
-      if (!parsed) throw new Error("Invalid Mermaid diagram");
-
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? `mermaid-${crypto.randomUUID()}`
-          : `mermaid-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const result = await mermaid.render(id, code);
-      if (!cancelled) {
-        setRenderState({ key: currentKey, status: "ready", svg: result.svg });
-      }
-    };
-
-    render().catch(() => {
+    renderMermaidSvg(code, isDark).then((svg) => {
+      if (!cancelled) setRenderState({ key: currentKey, status: "ready", svg });
+    }).catch(() => {
       if (!cancelled) setRenderState({ key: currentKey, status: "error" });
     });
 
@@ -264,7 +264,7 @@ function MermaidZoomDialog({ svg, onClose }: { svg: string; onClose: () => void 
                 title={t("i18n.zoomOut")}
                 aria-label={t("i18n.zoomOut")}
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
                   <path d="M5 12h14" />
                 </svg>
               </button>
@@ -276,7 +276,7 @@ function MermaidZoomDialog({ svg, onClose }: { svg: string; onClose: () => void 
                 title={t("i18n.zoomIn")}
                 aria-label={t("i18n.zoomIn")}
               >
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
                   <path d="M12 5v14M5 12h14" />
                 </svg>
               </button>
@@ -288,7 +288,7 @@ function MermaidZoomDialog({ svg, onClose }: { svg: string; onClose: () => void 
               title={t("i18n.fitToWidth")}
               aria-label={t("i18n.fitToWidth")}
             >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
               </svg>
             </button>
@@ -299,7 +299,7 @@ function MermaidZoomDialog({ svg, onClose }: { svg: string; onClose: () => void 
               title={t("i18n.close")}
               aria-label={t("i18n.close")}
             >
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
                 <path d="M6 6l12 12M18 6 6 18" />
               </svg>
             </button>

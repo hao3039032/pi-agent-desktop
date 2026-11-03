@@ -114,51 +114,49 @@ jobs:
           tagName: v__VERSION__
           releaseName: pi-agent-desktop v__VERSION__
           releaseBody: |
-            ## Pi Agent Desktop 0.7.8
+            ## Pi Agent Desktop 0.8.2
 
             ### New
 
-            - **Find in conversation.** Press Ctrl/Cmd+F to search the loaded part of a conversation, with match highlighting, a counter, Enter / Shift+Enter to step through matches and Esc to return to the composer. Matches stay put while a reply is streaming.
-            - **Choose the terminal shell.** General settings now lets you pick the shell used by "Open in terminal". Windows prefers PowerShell 7, then Windows PowerShell, then CMD; macOS and Linux keep your login shell. The choice applies to new or restarted terminals.
-            - **Richer replies.** A leading YAML block is shown as a code block instead of disappearing, GitHub alerts (`> [!NOTE]`) render as callouts, long code blocks fold, and code blocks that the reply says were saved to a file get an Open button.
-            - **Conversation titles.** Title generation shows its progress and gives an actionable message when it fails.
+            - **Archive single sessions.** Right-click a project session, or use its "…" menu, and choose "Archive". It moves out of the project's list into a "Show archived (n)" fold under that project; search still finds it, and "Unarchive" brings it back.
+            - **Name sessions automatically.** Settings › General › "Name sessions automatically" (off by default). After the first reply, the session's model writes a title for an unnamed session, at the cost of one extra short request per session.
 
             ### Improved
 
-            - **A calmer look.** Neutral grays, a flat window and sidebar canvas, thinner two-tier borders that stay visible on Retina screens, softer code colors and consistent corner radii. The accent color follows the system. The background presets from 0.7.7 are gone, replaced by this neutral canvas; light, dark and system modes remain.
-            - Terminals use the workbench's light and dark colors and start faster, and closing a terminal on Windows no longer errors.
-            - Project and session menus stay inside the window, and delete confirmations are shared and keyboard friendly.
-            - Line numbers are excluded when you select code.
+            - **Session switching is fast again.** 0.8.1 released loaded sessions once more than 4 were idle, so switching back to one had to load it from scratch. Idle sessions are now released only when they add up to more than 256 MiB.
+            - **Lower GPU use in the sidebar**, most noticeable on Windows: the sidebar no longer blurs its (opaque) background, and the running and unread indicators use lighter animations that stop when reduced motion is on.
+            - **pi 1.5.0.** Adds GPT-6.1 Terra (OpenAI, Azure OpenAI and OpenAI Codex), handles large streamed tool calls with far less CPU and memory, lets tool search find tools from Chinese and other non-English queries, and signs in to more MCP servers that use OAuth.
+            - **A quieter chat.** Assistant messages no longer show their cost and token counts, and the new-session screen no longer shows starter suggestion chips.
 
             ### Fixed
 
-            - A project that is a subfolder of a Git repository no longer shows the parent repository's worktrees in the sidebar.
+            - A scheduled task's time limit now covers the whole run, so a run whose session never starts or whose prompt is never accepted can no longer hold a scheduler slot forever.
+            - Renaming a session while it is open now updates its title right away and keeps it in the session's history.
 
-            Bundled components: pi 1.4.0, pi-web 0.10.0.
+            Bundled components: pi 1.5.0, pi-web 0.10.0.
 
             ---
 
-            ## Pi Agent Desktop 0.7.8
+            ## Pi Agent Desktop 0.8.2
 
             ### 新增
 
-            - **对话内查找。** 按 Ctrl/Cmd+F 搜索已加载的对话内容：高亮匹配、显示计数，Enter / Shift+Enter 在匹配间跳转，Esc 回到输入框。回复流式输出时，当前匹配位置保持不动。
-            - **选择终端 Shell。** “通用”设置可选择“在终端中打开”使用的 Shell。Windows 优先 PowerShell 7，其次 Windows PowerShell，再次 CMD；macOS 和 Linux 沿用登录 Shell。新建或重启的终端会使用该选择。
-            - **更丰富的回复渲染。** 开头的 YAML 块现在以代码块显示而不是消失；支持 GitHub 提示块（`> [!NOTE]`）；长代码块可折叠；回复中说明已保存到文件的代码块会出现“打开”按钮。
-            - **对话标题生成。** 标题生成会显示进度，失败时给出可操作的提示。
+            - **单个会话也能归档。** 右键项目里的会话或点它的“…”菜单，选择“归档”，会话会从项目列表移到该项目下的“显示已归档（n）”折叠区；搜索仍能找到它，选择“取消归档”即可恢复。
+            - **自动命名会话。** “设置 › 通用 › 自动命名会话”（默认关闭）。第一轮回复结束后，用当前会话的模型为未命名的会话生成标题，每个会话多一次简短请求。
 
             ### 改进
 
-            - **更平静的外观。** 中性灰、统一的窗口与侧栏纯色底、更细的两档边线（在 Retina 屏上依然清晰）、更柔和的代码配色和统一圆角；强调色跟随系统。0.7.7 的背景预设已移除，由中性底色取代；浅色、深色与跟随系统模式保留。
-            - 终端使用工作台的明暗配色且启动更快；Windows 上关闭终端不再报错。
-            - 项目和会话菜单不会超出窗口，删除确认改为共用组件并支持键盘操作。
-            - 选择代码时不再选中行号。
+            - **切换会话重新变快。** 0.8.1 在闲置会话超过 4 个时就会释放它们，切回去时需要重新加载。现在只有闲置会话合计超过 256 MiB 时才会释放。
+            - **侧栏 GPU 占用更低**，Windows 上最明显：侧栏不再对（不透明的）背景做模糊，运行中和未读标记改用更轻的动画，开启“减少动态效果”时会停止。
+            - **pi 1.5.0。** 新增 GPT-6.1 Terra（OpenAI、Azure OpenAI 和 OpenAI Codex）；流式输出大型工具调用时 CPU 和内存占用大幅降低；工具搜索支持中文等非英文查询；可以登录更多使用 OAuth 的 MCP 服务器。
+            - **对话界面更清爽。** 助手消息下方不再显示费用和 token 数，新会话页面也不再显示建议提示。
 
             ### 修复
 
-            - 位于 Git 仓库子目录的项目，侧栏不再显示父仓库的 worktree。
+            - 定时任务的时间限制现在覆盖整个运行过程：会话始终没有启动、或提示始终没有被接收的运行，不会再一直占用调度名额。
+            - 会话打开时重命名，标题会立即更新，并正确记录在会话历史中。
 
-            内置组件版本：pi 1.4.0、pi-web 0.10.0。
+            内置组件版本：pi 1.5.0、pi-web 0.10.0。
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true

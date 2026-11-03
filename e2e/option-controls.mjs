@@ -108,6 +108,9 @@ try{
   if(await saveDefault.count())assert.equal(await saveDefault.evaluate(el=>parseFloat(getComputedStyle(el).marginTop)),0,'default star must not get row spacing');
   const low=reasoningRows.filter({has:page.getByRole('option',{name:/^low\b/})});
   const star=low.locator('button.app-default-star');await star.hover();
+  // Read the settled hover state: popover buttons transition their background, so an
+  // immediate read races the first frame and can pass while the star still paints one.
+  await page.waitForTimeout(250);
   const starStyle=await star.evaluate(el=>{const s=getComputedStyle(el);return {border:s.borderTopWidth,bg:s.backgroundColor,shadow:s.boxShadow};});
   assert.equal(starStyle.border,'0px');assert.equal(starStyle.shadow,'none');
   assert.ok(starStyle.bg==='rgba(0, 0, 0, 0)'||parseFloat(starStyle.bg.match(/[\d.]+\)$/)?.[0]??'1')<=0.06,'star hover stays quiet: '+starStyle.bg);

@@ -66,6 +66,7 @@ function Fixture() {
           onBackToActions={() => {}}
           onReveal={() => {}}
           onArchive={() => {}}
+          onRestore={() => {}}
           onSwitchBranch={() => {}}
           onFetch={() => {}}
           onSelectWorktree={() => {}}

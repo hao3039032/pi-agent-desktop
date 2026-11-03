@@ -19,6 +19,8 @@ export interface RunnerSession {
    * never appends this entry beside a live child.
    */
   markScheduledRun(data: ScheduledRunMarkerData): Promise<void>;
+  /** Closes a session the run no longer needs. */
+  destroy?(): void;
 }
 
 export interface RunnerDeps {
@@ -81,15 +83,43 @@ export async function executeRun(
   let unsubscribe: (() => void) | undefined;
   let abortTimer: ReturnType<typeof setTimeout> | undefined;
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let session: RunnerSession | undefined;
+
+  // The limit covers the whole run: starting the session, naming it and handing
+  // over the prompt count too, so a start that never settles still frees its slot.
+  let timedOut = false;
+  const durationMs = deps.durationMs ?? task.maxDurationMin * 60_000;
+  const gaveUp = new Promise<void>((resolve) => {
+    abortTimer = setTimeout(() => {
+      timedOut = true;
+      if (!session) return resolve();
+      void session.send({ type: "abort" }).catch(() => undefined);
+      graceTimer = setTimeout(resolve, deps.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS);
+    }, durationMs);
+  });
+  const timeLimit = (): RunOutcome => ({
+    status: "aborted",
+    error: `Stopped after reaching the ${task.maxDurationMin} minute limit`,
+    errorCode: "time-limit",
+    errorParams: { minutes: task.maxDurationMin },
+    ...(sessionId ? { sessionId } : {}),
+    countsAsFailure: true,
+  });
 
   try {
-    const started = await deps.startSession(task.cwd, {
+    const starting = deps.startSession(task.cwd, {
       toolNames,
       ...(task.model ? { initialModel: task.model } : {}),
       ...(task.thinkingLevel ? { thinkingLevel: task.thinkingLevel } : {}),
       allowInitialModelFallback: true,
     });
-    const { session } = started;
+    const started = await Promise.race([starting, gaveUp.then(() => undefined)]);
+    if (!started) {
+      // The session may still arrive; nothing will use it, so close it before it does anything.
+      starting.then(({ session: late }) => late.destroy?.(), () => undefined);
+      return timeLimit();
+    }
+    session = started.session;
     sessionId = started.sessionId;
 
     // The tag is the session's single-writer entry: the engine's child appends
@@ -115,7 +145,11 @@ export async function executeRun(
       };
     }
     // A missing title only costs a less readable sidebar row.
-    await session.send({ type: "set_session_name", name: runSessionName(task, deps.now()) }).catch(() => undefined);
+    await Promise.race([
+      session.send({ type: "set_session_name", name: runSessionName(task, deps.now()) }).catch(() => undefined),
+      gaveUp,
+    ]);
+    if (timedOut) return timeLimit();
     onSessionReady?.(sessionId);
 
     let resolveDone!: () => void;
@@ -141,29 +175,19 @@ export async function executeRun(
     });
 
     // send() resolves once the prompt is accepted; the run itself ends with prompt_done.
-    await session.send({ type: "prompt", message: task.prompt });
-
-    let timedOut = false;
-    const durationMs = deps.durationMs ?? task.maxDurationMin * 60_000;
-    const gaveUp = new Promise<void>((resolve) => {
-      abortTimer = setTimeout(() => {
-        timedOut = true;
-        void session.send({ type: "abort" }).catch(() => undefined);
-        graceTimer = setTimeout(resolve, deps.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS);
-      }, durationMs);
-    });
-    await Promise.race([promptDone, gaveUp]);
-
+    const admitted = await Promise.race([
+      session.send({ type: "prompt", message: task.prompt }).then(() => true),
+      gaveUp.then(() => false),
+    ]);
     if (timedOut) {
-      return {
-        status: "aborted",
-        error: `Stopped after reaching the ${task.maxDurationMin} minute limit`,
-        errorCode: "time-limit",
-        errorParams: { minutes: task.maxDurationMin },
-        sessionId,
-        countsAsFailure: true,
-      };
+      // The abort went out while the prompt was still being admitted, so it may have missed the run.
+      if (admitted) void session.send({ type: "abort" }).catch(() => undefined);
+      return timeLimit();
     }
+
+    await Promise.race([promptDone, gaveUp]);
+    if (timedOut) return timeLimit();
+
     if (promptError) return { status: "failed", error: promptError, sessionId, countsAsFailure: true };
     const stopReason = lastAssistant?.stopReason;
     if (stopReason === "error") {
