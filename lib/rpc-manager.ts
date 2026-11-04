@@ -91,9 +91,10 @@ export interface AgentEvent {
 }
 
 type EventListener = (event: AgentEvent) => void;
-type AgentRunCompleteListener = (sessionId: string, outcome: AgentRunOutcome) => void;
+/** `sessionName`: the caller's copy of the title; omitted, the push looks it up. */
+type AgentRunCompleteListener = (sessionId: string, outcome: AgentRunOutcome, sessionName?: string | null) => void;
 /** A blocking extension dialog (select / confirm / input / editor / custom) is waiting for the user. */
-type AttentionNeededListener = (sessionId: string, prompt: string) => void;
+type AttentionNeededListener = (sessionId: string, prompt: string, sessionName?: string | null) => void;
 
 // How recent runs ended, kept past the wrapper: the idle timeout destroys a
 // wrapper 10 minutes after its run, and the Tasks page is often read later than
@@ -226,34 +227,42 @@ const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
  * Which push a finished run earns. A run the user stopped needs no message on
  * their phone; a failure and a completion say different things.
  */
-function pushRunOutcome(sessionId: string, outcome: AgentRunOutcome): void {
+function pushRunOutcome(sessionId: string, outcome: AgentRunOutcome, sessionName?: string | null): void {
   if (outcome.status === "aborted") return;
   const push = outcome.status === "failed"
-    ? notifySessionEvent(sessionId, { kind: "failed", detail: outcome.error })
-    : notifySessionEvent(sessionId, { kind: "complete" });
+    ? notifySessionEvent(sessionId, { kind: "failed", detail: outcome.error }, sessionName)
+    : notifySessionEvent(sessionId, { kind: "complete" }, sessionName);
   void push.catch((error) => {
     console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);
   });
 }
 
 /** A blocking extension dialog is waiting: the phone says so even unattended. */
-function pushAttentionNeeded(sessionId: string, prompt: string): void {
-  void notifySessionEvent(sessionId, { kind: "attention", detail: prompt }).catch((error) => {
+function pushAttentionNeeded(sessionId: string, prompt: string, sessionName?: string | null): void {
+  void notifySessionEvent(sessionId, { kind: "attention", detail: prompt }, sessionName).catch((error) => {
     console.error("[pi-web] failed to send attention push:", error instanceof Error ? error.message : error);
   });
 }
 
-/** One host-side runtime per cwd+agentDir, for CLI sessions' title requests. */
+/**
+ * One host-side runtime per agentDir, for CLI sessions' title requests. Keyed
+ * on the agentDir alone: every chat has its own folder as cwd, so a cwd key
+ * would retain one full services graph per named chat for the process's life.
+ * Only the model catalog and its credentials are needed, and resource loading
+ * is off below.
+ */
 const titleRuntimes = new Map<string, Promise<AgentSessionServices>>();
 
-function titleRuntimeFor(cwd: string, agentDir: string): Promise<AgentSessionServices> {
-  const key = `${cwd}\u0000${agentDir}`;
+function titleRuntimeFor(agentDir: string): Promise<AgentSessionServices> {
+  const key = agentDir;
   let runtime = titleRuntimes.get(key);
   if (!runtime) {
     // Only the model catalog and its credentials matter here: loading extensions,
     // skills, templates or context files just to name a session would be waste.
+    // The agent dir stands in for the cwd for the same reason (lib/model-runtime.ts),
+    // so no project's resources leak into a shared runtime.
     runtime = createAgentSessionServices({
-      cwd,
+      cwd: agentDir,
       agentDir,
       resourceLoaderOptions: {
         noExtensions: true,
@@ -270,7 +279,7 @@ function titleRuntimeFor(cwd: string, agentDir: string): Promise<AgentSessionSer
 }
 
 /** The transcript a CLI session's title request reads: the entries of its own file. */
-function titleMessagesFromEntries(entries: readonly unknown[]): AgentMessage[] {
+export function titleMessagesFromEntries(entries: readonly unknown[]): AgentMessage[] {
   const messages: AgentMessage[] = [];
   for (const entry of entries) {
     const record = entry as { type?: string; message?: unknown; summary?: unknown };
@@ -298,7 +307,7 @@ export async function generateSessionTitleForWrapper(inner: AgentSessionLike): P
   }
   const model = inner.model;
   if (!model) throw new Error("The session has no model to name it with");
-  const services = await titleRuntimeFor(inner.sessionManager.getCwd(), getAgentDir());
+  const services = await titleRuntimeFor(getAgentDir());
   const resolved = services.modelRuntime.getModel(model.provider, model.id);
   if (!resolved) {
     throw new Error(`The model ${model.provider}/${model.id} is not available to generate a title`);
@@ -795,9 +804,25 @@ export class AgentSessionWrapper {
     this.autoTitleAfterRun();
     recordRecentRunOutcome(this.sessionId, this.lastFinishedRun);
     try {
-      this.onAgentRunComplete?.(this.sessionId, this.lastRunOutcome);
+      this.onAgentRunComplete?.(this.sessionId, this.lastRunOutcome, this.sessionNameForPush());
     } catch (error) {
       console.error("[pi-web] completion listener failed:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  /**
+   * The title this session already carries, for a push to name it without the
+   * notifier scanning every session file. `null` means "known to have no name" —
+   * the notifier then skips the lookup instead of scanning; undefined is only
+   * for a read that failed, which leaves the lookup as the fallback.
+   */
+  private sessionNameForPush(): string | null | undefined {
+    try {
+      // An empty name is no name: say so, so an untitled session's first push
+      // does not enumerate every session file just to learn it has no title.
+      return this.inner.sessionManager.getSessionName() || null;
+    } catch {
+      return undefined;
     }
   }
 
@@ -822,8 +847,12 @@ export class AgentSessionWrapper {
       .then(({ title }) => {
         // The user may have renamed it, or closed it, while the request ran.
         if (!this.isAlive() || this.inner.sessionManager.getSessionName()) return;
-        this.inner.setSessionName(title);
-        invalidateSessionListCache();
+        // Returned, so a failing write lands in the .catch below (and retries)
+        // instead of escaping as an unhandled rejection. `setSessionName` may
+        // also be synchronous in-process, so promise-wrap it.
+        return Promise.resolve(this.inner.setSessionName(title)).then(() => {
+          invalidateSessionListCache();
+        });
       })
       .catch((error) => {
         this.autoTitleSettled = false;
@@ -869,7 +898,7 @@ export class AgentSessionWrapper {
       : typeof request.message === "string" ? request.message
         : "";
     try {
-      this.onAttentionNeeded?.(this.sessionId, prompt);
+      this.onAttentionNeeded?.(this.sessionId, prompt, this.sessionNameForPush());
     } catch (error) {
       console.error("[pi-web] attention listener failed:", error instanceof Error ? error.message : error);
     }
@@ -2048,6 +2077,9 @@ export class AgentSessionWrapper {
         cancel: () => settle(cancelled()),
       });
       this.emit(fullRequest);
+      // A dialog the child raises is as blocking as an in-process one, and the
+      // user may be away from the screen: same push, same filtering.
+      this.notifyAttentionNeeded(fullRequest as unknown as ExtensionUiRequestBody);
     });
   }
 

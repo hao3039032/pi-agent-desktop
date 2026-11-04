@@ -94,6 +94,78 @@ Merged `fc00e56` (abcwyc v0.7.8)..`620aa1ae` (v0.8.2) as a real merge commit: 11
 - **`lib/pi-rpc/assets/pi-web-chat.mjs` typebox fallback fixed**: the dependency moved from `@sinclair/typebox` to `typebox`, and `({ Type } = await import("@sinclair/typebox"))` on a missing package silently left `Type` undefined. It now tries `typebox` → `@sinclair/typebox` → `@earendil-works/pi-ai`, requires an actual `Type` export, and only then falls back to the plain-object builder.
 - **Inline-style baseline**: upstream's new `scripts/inline-style-tokens.test.mjs` flagged LW's own `components/distro/*` forms. Those three inline sizes/weights and one hex fallback were moved onto the `--fs-*`/`--fw-*`/`--danger` tokens rather than adding them to the baseline.
 - **Two upstream features needed a CLI-engine port, not just a merge**:
-  1. Automatic session titles (`lib/session-title.ts`) and the topbar "Generate title" button both called `generateSessionTitle(inner as AgentSession)`, which reads `inner.agent.state.messages` and `inner.agent.streamFunction` — neither exists on the CLI engine (the model calls live in the child). `lib/session-title.ts` gained `generateSessionTitleFromTranscript({ messages, model, streamSimple })`, and `generateSessionTitleForWrapper(inner)` in `lib/rpc-manager.ts` takes the in-process path only when the session really has an Agent transcript; otherwise it reads the entries off the session file (`titleMessagesFromEntries`, compaction and branch summaries included) and streams the title through a host-side `ModelRuntime` created with `createAgentSessionServices({ resourceLoaderOptions: { noExtensions, noSkills, noPromptTemplates, noThemes, noContextFiles } })`, cached per cwd+agentDir. `app/api/sessions/[id]/auto-name/route.ts` uses the same function. Covered by two new `lib/session-title.test.mjs` cases.
+  1. Automatic session titles (`lib/session-title.ts`) and the topbar "Generate title" button both called `generateSessionTitle(inner as AgentSession)`, which reads `inner.agent.state.messages` and `inner.agent.streamFunction` — neither exists on the CLI engine (the model calls live in the child). `lib/session-title.ts` gained `generateSessionTitleFromTranscript({ messages, model, streamSimple })`, and `generateSessionTitleForWrapper(inner)` in `lib/rpc-manager.ts` takes the in-process path only when the session really has an Agent transcript; otherwise it reads the entries off the session file (`titleMessagesFromEntries`, compaction and branch summaries included) and streams the title through a host-side `ModelRuntime` created with `createAgentSessionServices({ resourceLoaderOptions: { noExtensions, noSkills, noPromptTemplates, noThemes, noContextFiles } })`, cached per agentDir (see the review follow-up below for why not cwd). `app/api/sessions/[id]/auto-name/route.ts` uses the same function. Covered by two new `lib/session-title.test.mjs` cases.
   2. Upstream's `ChatShellPrompt` only appears when the last turn's tool result starts with `CHAT_SHELL_BLOCK_MARKER` (`[chat-no-shell]`). The server-side policy that produces it is `lib/chat-workspace-policy.ts`, but a chat's actual tool guard runs inside the child in `lib/pi-rpc/assets/pi-web-chat.mjs`, so that asset's folder-chat refusal now carries the same prefix (with a comment tying it to the TS constant) and `lib/pi-rpc/chat-policy.unit.test.mjs` pins the two together.
 - **Verification**: `tsc --noEmit`, `npm run lint` (0 errors), `npm test` (3816 tests, 3794 pass, 0 fail, 22 skipped), `npm run drift` (after moving `lib/request-security.ts` low → medium, drift 36), `scripts/upstream-css-baseline.json` re-pinned to `620aa1ae` (both stylesheets hash identically — upstream changed neither), and `npm run desktop:prepare` + `desktop:verify` after the SDK bump. `scripts/fork-ownership.json` also gained upstream's new entries through the merge.
+
+### v0.8.2 review follow-up (three fresh-context reviewers)
+
+Three reviewers (correctness/CLI boundary, tests/validation, security/contracts) inspected
+`a2000c12..HEAD` with no shell of their own, so every finding below was re-verified here and
+the validation commands were run by the parent.
+
+- **P1, security — relay private keys were readable through `/api/files`.** `CREDENTIAL_PATHS`
+  listed `.pi/agent/auth.json` only; the relay store added by this merge lives in
+  `<agentDir>/pi-web` (`relayDir()`) and holds `relay-identity.json` (`noisePrivate` + the
+  ECDSA `signingPrivate` JWK) and `relay.json`'s `adminToken`, so one `GET` returned them
+  whenever `~` (or `~/.pi`) was a session cwd — the case `credential-route.test.mjs` itself
+  builds. `.pi/agent/pi-web` and `.pi/agent/web-push.json` (VAPID private key, same home-relative
+  gap) joined `CREDENTIAL_PATHS`, with read/download/serve/meta/preview cases asserting 403 and
+  no secret in the body. The follow-up review widened this to `.pi/agent/models.json`, which may
+  hold literal provider API keys (the settings API redacts them; a file read would not). The whole
+  `pi-web` directory is refused rather than its three secret files: the rest of that directory
+  (pi-web settings, the artifact index) is not meant to be opened through this API either, and a
+  future key file cannot be forgotten. `/api/files` is the only consumer, so nothing else loses
+  access.
+- **P1, correctness — the attention push never fired on the CLI engine.** `relayExternalUiRequest`
+  is the only path a child dialog takes; it emitted the request but never called
+  `notifyAttentionNeeded`, so upstream's "waiting for you" push only ever worked on the removed
+  in-process path. It now notifies right after the emit (the method's own `BLOCKING_UI_METHODS` /
+  suppression filtering still decides), with a test in `lib/rpc-manager-shutdown.test.mjs` for a
+  relayed `confirm` firing and a relayed `notify` not firing.
+- **P1, tests — the title port had no executable coverage.** `titleMessagesFromEntries` is now
+  exported and `lib/rpc-manager-title-entries.test.mjs` pins the compaction/branch-summary mapping
+  (and that labels and summary-less entries are dropped) that the merge record claimed was covered.
+- **P1, tests — the four relay routes were outside the exhaustive local-only guard.**
+  `lib/relay/mark.test.mjs` now lists `app/api/relay/route.ts`, `relay/pairing/route.ts`,
+  `relay/pairing/[id]/route.ts` and `relay/devices/[id]/route.ts`; all four already gated on
+  `isLocalRequest`, so nothing was weakened. The follow-up review noted the file-wide match would
+  still pass if only a read-only GET kept its gate, so the four mutating handlers (PUT, POST, POST,
+  DELETE) are now pinned per method; `GET /api/relay` only reads and reports the local flag.
+- **P2 — `titleRuntimes` retained one services graph per chat.** The cache key included `cwd`, and
+  a chat's cwd is its own folder, so every named chat leaked a `createAgentSessionServices` graph
+  for the process's life. Now keyed on `agentDir` alone, built with `cwd: agentDir` (the same
+  precedent as `lib/model-runtime.ts`), which is safe because only the model catalog and its
+  credentials are used and resource loading is off.
+- **P2 — `autoTitleAfterRun` dropped a rejecting promise.** `setSessionName(...)` was neither
+  returned nor awaited, so a failed rename escaped the `.catch`, left `autoTitleSettled` true and
+  skipped the retry the docs promise. It is returned (`Promise.resolve(...)`, since an in-process
+  implementation may be synchronous) and the list cache is invalidated only after it resolves.
+- **P2 — pushes scanned every session for a name.** `pushRunOutcome`/`pushAttentionNeeded` passed no
+  session name, so `notifySessionEvent` fell back to `SessionManager.listAll()`. Both listener types
+  take `sessionName?: string | null` now, the wrapper supplies `sessionManager.getSessionName() || null`,
+  and `StartCliSessionOptions` carries the same shape. `null` is the "known untitled, skip the lookup"
+  signal the notifier already had; `undefined` (only a failed read) keeps the lookup. The first pass
+  returned `undefined` for a blank name, so the commonest push — an untitled session's first
+  completion — still paid the full scan.
+- **P2 — documented authorization location was stale.** `docs/agents/fork-chat-workspace.md` now says
+  locality for `unlocked: true` is the route's `isLocalRequest`, while `setRpcChatUnlockLocked` owns
+  folder/exposure/running/persisted. The check was not moved.
+- **Deferred:** `fetchDistroStatus`'s shape guard still has no unit test (a Segment I adaptation, not
+  part of this diff).
+
+The targeted follow-up review (fresh context, same read-only reviewer) returned **Fix verdict:
+ACCEPT**, **Merge verdict: OK with notes**, and its three P2 notes were folded in above: the
+`null`/`undefined` session-name split, the per-method relay guard, and the `models.json` deny entry.
+A final pre-merge re-check of those three confirmed each FIXED and found no new or leftover P0/P1
+("Merge verdict: OK with notes"). Notes deliberately left alone, all P2:
+
+- `sessionNameForPush()`'s `"" → null` branch is pinned at the notifier (`lib/web-push.test.mjs`)
+  but not at the wrapper; only the throwing/`undefined` branch has a wrapper-level test, because
+  the shared `makePromptInner` harness has no `getSessionName`.
+- `CREDENTIAL_PATHS` is home-relative, so an agent dir placed outside `$HOME` through
+  `PI_CODING_AGENT_DIR` is not covered — exactly the pre-existing shape for `auth.json`.
+- The per-method relay regex is an unbounded `[\s\S]*?`, so it means "still calls
+  `isLocalRequest` after this handler header". That fails if the gate is deleted (there is no
+  later occurrence in those files), but bounding it with `(?=export async function|$)` would say
+  "inside this handler" more precisely.

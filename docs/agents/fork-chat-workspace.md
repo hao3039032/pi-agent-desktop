@@ -146,9 +146,13 @@ wins), so it outlives the process and is per chat. `POST /api/sessions/[id]/chat
 the host writes it only after the child process REALLY exited (`waitForChildExit`; a
 disposed wrapper still leaves the child a few seconds of exit grace), never beside a
 live writer, and there is deliberately no bridge op for it: the unlock's authorization
-(local-only, chat folder, not running, file persisted) lives in `setRpcChatUnlock` alone
-and cannot be bypassed by a raw bridge request. A just-destroyed wrapper's still-dying
-child is covered too (`recordChildExitWait`/`waitForRecentChildExit` in `rpc-manager.ts`:
+is split between the route and `setRpcChatUnlock`, so no bridge request can bypass it.
+The route is the locality decision (`POST /api/sessions/[id]/chat-access` refuses
+`unlocked: true` unless `isLocalRequest`; locking again is allowed from anywhere),
+and `setRpcChatUnlockLocked` is everything about the session itself: the chat folder,
+the server not being network-exposed (`isNetworkExposedServer`), not running, and the
+file being persisted. A just-destroyed wrapper's still-dying child is covered too
+(`recordChildExitWait`/`waitForRecentChildExit` in `rpc-manager.ts`:
 host appends and replacement spawns for that session id wait for the tracked real exit).
 The client then re-attaches like after a tool-preset change (`handleChatAccessRebuilt`).
 

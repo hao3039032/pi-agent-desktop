@@ -64,9 +64,9 @@ export interface StartCliSessionOptions {
   env?: NodeJS.ProcessEnv;
   onLog?: (line: string) => void;
   /** Completion notifications (startRpcSession wires notifySessionEvent). */
-  onAgentRunComplete?: (sessionId: string, outcome: AgentRunOutcome) => void;
+  onAgentRunComplete?: (sessionId: string, outcome: AgentRunOutcome, sessionName?: string | null) => void;
   /** A blocking extension dialog is waiting for the user (phone push). */
-  onAttentionNeeded?: (sessionId: string, prompt: string) => void;
+  onAttentionNeeded?: (sessionId: string, prompt: string, sessionName?: string | null) => void;
   /**
    * Registration hook for the live path (startRpcSession): when present the
    * factory hands the wrapper over instead of starting it itself —

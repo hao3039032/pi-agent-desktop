@@ -40,14 +40,29 @@ function get(filePath, type) {
 
 const key = write(".ssh/id_ed25519", "PRIVATE KEY");
 const auth = write(".pi/agent/auth.json", "{\"provider\":{\"key\":\"sk-test\"}}");
+// The relay identity is the desktop's private key pair; relay.json holds the
+// admin token and web-push.json the VAPID private key. One GET must not hand
+// any of them over.
+const relayIdentity = write(
+  ".pi/agent/pi-web/relay-identity.json",
+  JSON.stringify({ noisePrivate: "bm9pc2Uta2V5", signingPrivate: { d: "c2lnbmluZy1rZXk" } }),
+);
+const relayConfig = write(".pi/agent/pi-web/relay.json", JSON.stringify({ adminToken: "relay-admin-token" }));
+// models.json may carry literal provider keys; the settings API redacts them, a
+// file read must not hand them out either.
+const models = write(".pi/agent/models.json", JSON.stringify({ providers: { custom: { apiKey: "literal-provider-key" } } }));
+const pushKeys = write(".pi/agent/web-push.json", JSON.stringify({ vapidKeys: { privateKey: "vapid-private" } }));
 const project = write("work/app/README.md", "hello");
 
 test("credential stores under ~ are refused for every read type", async () => {
-  for (const target of [key, auth]) {
+  for (const target of [key, auth, relayIdentity, relayConfig, pushKeys, models]) {
     for (const type of [undefined, "read", "download", "serve", "meta", "preview"]) {
       const response = await get(target, type);
       assert.equal(response.status, 403, `${type ?? "untyped"} ${target}`);
-      assert.doesNotMatch(await response.text(), /PRIVATE KEY|sk-test/);
+      assert.doesNotMatch(
+        await response.text(),
+        /PRIVATE KEY|sk-test|bm9pc2Uta2V5|c2lnbmluZy1rZXk|relay-admin-token|vapid-private|literal-provider-key/,
+      );
     }
   }
   assert.equal((await get(path.join(home, ".ssh"), "list")).status, 403);
@@ -83,7 +98,17 @@ test("uploads into a credential store are refused", async () => {
 });
 
 test("isCredentialPath covers the listed stores and leaves project secrets alone", () => {
-  for (const relative of [".aws/credentials", ".netrc", ".git-credentials", ".docker/config.json", ".config/gcloud/x"]) {
+  for (const relative of [
+    ".aws/credentials",
+    ".netrc",
+    ".git-credentials",
+    ".docker/config.json",
+    ".config/gcloud/x",
+    ".pi/agent/pi-web/relay-identity.json",
+    ".pi/agent/pi-web/relay-devices.json",
+    ".pi/agent/web-push.json",
+    ".pi/agent/models.json",
+  ]) {
     assert.equal(isCredentialPath(path.join(home, relative), home), true, relative);
   }
   for (const relative of ["work/app/.env", ".sshrc", ".pi/agent/settings.json", ".docker/other.json"]) {

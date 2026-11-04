@@ -9,6 +9,15 @@ import { userHome } from "./user-home.ts";
  * network-exposed server behind a password would otherwise hand over private
  * keys and provider tokens with one GET, without a prompt or a transcript.
  * Project files such as `.env` stay viewable: they belong to the workspace.
+ * The relay and push stores are secret on the same terms as auth.json: the
+ * relay identity holds the Noise and signing private keys (`relayDir()`, which
+ * is `<agentDir>/pi-web`), `relay.json` holds the relay's admin token,
+ * `relay-devices.json` the paired phones' keys, and `web-push.json` holds the
+ * VAPID private key. `models.json` may hold literal provider API keys, which
+ * the settings API redacts but a file read would not. The whole `pi-web`
+ * directory is refused rather than the three secret files inside it: the other
+ * files there (pi-web settings, the artifact index) are not meant to be opened
+ * through this API either, and a future key file cannot be forgotten.
  */
 const CREDENTIAL_PATHS = [
   ".ssh",
@@ -25,6 +34,9 @@ const CREDENTIAL_PATHS = [
   ".pgpass",
   ".npmrc",
   ".pi/agent/auth.json",
+  ".pi/agent/models.json",
+  ".pi/agent/pi-web",
+  ".pi/agent/web-push.json",
 ] as const;
 
 // Default macOS and Windows volumes are case-insensitive: `~/.SSH/id_rsa` opens the key.
