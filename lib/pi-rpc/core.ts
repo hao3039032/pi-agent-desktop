@@ -252,6 +252,26 @@ interface GetCommandsResult {
 }
 
 export class CliAgentSessionCore extends RpcAgentSession {
+  /** Display-only window: older bodies never cross the pipe. The CLI still
+   * supplies every navigation edge and usage record for existing consumers.
+   */
+  async getDisplaySnapshot(options: { tail: number; wholeTurns?: boolean }) {
+    const { decodeFlatSnapshot } = await import("./flat-snapshot");
+    return decodeFlatSnapshot(await this.bridgeRequest("session.display-window", options, 60_000));
+  }
+
+  override async getActiveSnapshot(options: { timeoutMs?: number } = {}) {
+    try {
+      return await super.getActiveSnapshot(options);
+    } catch (error) {
+      // Only native tree serialization's known depth failure has a recovery
+      // path. A dead/busy child or any other failed read remains an error.
+      if (!(error instanceof Error) || !/get_tree.*(?:Maximum call stack|stack overflow)/i.test(error.message)) throw error;
+      const { decodeFlatSnapshot } = await import("./flat-snapshot");
+      return decodeFlatSnapshot(await this.bridgeRequest("session.snapshot-flat", {}, options.timeoutMs ?? 60_000));
+    }
+  }
+
   private readonly coreSessionFile: string;
   private readonly sessionCwd: string;
   private readonly sessionDir: string | undefined;

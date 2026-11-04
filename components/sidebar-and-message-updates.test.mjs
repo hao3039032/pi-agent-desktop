@@ -21,7 +21,7 @@ test("message actions stay reachable for keyboard and touch users", () => {
 test("busy sessions disable in-session edits without hiding the action", () => {
   const chatWindowSource = readFileSync(new URL("./ChatWindow.tsx", import.meta.url), "utf8");
   assert.match(chatWindowSource, /onEditContent=\{handleEditContent\}/);
-  assert.match(chatWindowSource, /editDisabled=\{sessionBusy\}/);
+  assert.match(chatWindowSource, /editDisabled=\{sessionBusy \|\| sessionViewStale\}/);
   assert.match(messageSource, /disabled=\{editBlocked\}/);
   assert.match(messageSource, /t\("i18n\.editFromHereBusyTitle"\)/);
 });

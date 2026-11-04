@@ -242,6 +242,10 @@ export interface AgentSessionLike {
    * reported to the caller, never answered from disk.
    */
   getActiveEntries?(options?: { timeoutMs?: number }): Promise<{ entries: unknown[]; leafId: string | null }>;
+  /** Display-only: retains old metadata, but only recent branch message bodies. */
+  getDisplaySnapshot?(options: { tail: number; wholeTurns?: boolean }): Promise<{
+    entries: unknown[]; tree: unknown[]; leafId: string | null;
+  }>;
   getActiveSnapshot?(options?: { timeoutMs?: number }): Promise<{
     entries: unknown[];
     tree: unknown[];

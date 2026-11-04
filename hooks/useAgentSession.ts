@@ -16,7 +16,8 @@ import { normalizeToolCalls } from "@/lib/normalize";
 import { attachmentAwareTitle } from "@/lib/chat-attachments";
 import { AgentCommandError, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { mergeComposerQueueSnapshot, type ComposerQueueActionResult, type PendingComposerMessage } from "@/lib/composer-queue-types";
-import { fetchWithRetry } from "@/lib/fetch-timeout";
+import { fetchWithDeadline, fetchWithRetry } from "@/lib/fetch-timeout";
+import { SESSION_READ_TIMEOUT_MS, SESSION_READ_SLOW_MS, readSessionResponse, type SessionLoadPhase } from "@/lib/session-load";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
 import { rememberScrollPosition, sessionScrollTops } from "@/lib/scroll-memory";
 import {
@@ -371,6 +372,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [data, setData] = useState<SessionData | null>(null);
   const [loading, setLoading] = useState(!isNew);
   const [error, setError] = useState<string | null>(null);
+  const [sessionLoadPhase, setSessionLoadPhase] = useState<SessionLoadPhase>(isNew ? "ready" : "opening");
+  const [sessionViewStale, setSessionViewStale] = useState(false);
   const [activeLeafId, setActiveLeafId] = useState<string | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [activeToolResults, setActiveToolResults] = useState<Map<string, ToolResultMessage>>(new Map());
@@ -498,8 +501,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const modelSwitchPendingRef = useRef(false);
   const draftKeyAliasesRef = useRef(new Map<string, string>());
   const sessionHookMountedRef = useRef(true);
-  // In-flight session reads, keyed by session id (or force:<id> for fresh reads).
+  // In-flight reads shared by opening and refresh, scoped to session/generation/run.
   const loadFlightsRef = useRef(new Map<string, Promise<unknown>>());
+  const sessionLoadIdRef = useRef(0);
+  const sessionReadAbortRef = useRef<AbortController | null>(null);
   // Latest settled view state, readable from the unmount cleanup without
   // re-subscribing it. Assigned every render like sessionPropIdRef below.
   const dataRef = useRef<SessionData | null>(null);
@@ -632,6 +637,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setData(null);
     setLoading(!isNew);
     setError(null);
+    setSessionLoadPhase(isNew ? "ready" : "opening");
+    setSessionViewStale(false);
     setActiveLeafId(null);
     setMessages([]);
     setActiveToolResults(new Map());
@@ -779,49 +786,55 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, []);
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
+    if (!sessionHookMountedRef.current || sessionIdRef.current !== sid) return null;
     // Single-flight: concurrent reads for the same session (mount + SSE settle +
     // reconcile) share one request unless the caller forces a fresh read.
-    const flightKey = `${options?.force ? "force:" : ""}${sid}:${sessionGenerationRef.current}:${promptRunIdRef.current}`;
+    const flightKey = `${sid}:${sessionGenerationRef.current}:${promptRunIdRef.current}`;
     const inflight = options?.force ? undefined : loadFlightsRef.current.get(flightKey);
     if (inflight) return await inflight;
+    const requestId = ++sessionLoadIdRef.current;
+    sessionReadAbortRef.current?.abort();
+    const controller = new AbortController();
+    sessionReadAbortRef.current = controller;
   const flight = (async (): Promise<unknown> => {
     let messagesLoaded = false;
     const sessionGeneration = sessionGenerationRef.current;
     const requestPromptRunId = promptRunIdRef.current;
     const isCurrent = () => (
-      sessionIdRef.current === sid
+      sessionHookMountedRef.current
+      && !controller.signal.aborted
+      && sessionLoadIdRef.current === requestId
+      && sessionIdRef.current === sid
       && sessionGenerationRef.current === sessionGeneration
     );
+    const slowTimer = setTimeout(() => {
+      if (isCurrent()) setSessionLoadPhase((phase) => phase === "opening" ? "slow" : phase);
+    }, SESSION_READ_SLOW_MS);
     try {
-      if (showLoading) setLoading(true);
+      if (!isCurrent()) return null;
+      if (showLoading && dataRef.current?.sessionId !== sid && messagesRef.current.length === 0) setLoading(true);
+      setError(null);
+      setSessionLoadPhase("opening");
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1", tree: "summary", wholeTurns: "1" });
       if (options?.force) params.set("force", "1");
-      // A hung first attempt must not leave "loading session" on screen
-      // forever: abandon it, retry once with a longer deadline. The server
-      // finishes its cold-start work regardless, so the retry usually lands
-      // warm (see AGENTS.md — the session load must have a deadline).
-      const res = await fetchWithRetry(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
+      // Keep one read alive long enough for the CLI's bounded 60s snapshot.
+      // A slow read is progress, not an error page; retry transient failures once.
+      const { res, payload } = await fetchWithRetry(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
+        timeoutMs: SESSION_READ_TIMEOUT_MS,
+        retryTimeoutMs: SESSION_READ_TIMEOUT_MS,
+        init: { signal: controller.signal },
         shouldRetry: isCurrent,
+        onRetry: () => { if (isCurrent()) setSessionLoadPhase("retrying"); },
+        readResponse: readSessionResponse<SessionData>,
       });
-      if (res.status === 404) {
-        if (showLoading) {
-          setData(null);
-          setActiveLeafId(null);
-          setMessages([]);
-          setEntryIds([]);
-          setHistoryCursor(null);
-          setHasEarlierMessages(false);
-          setError(null);
-        }
-        deleteSessionViewSnapshot(sid);
-        return null;
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData;
       if (!isCurrent()) return null;
+      if (res.status === 404) deleteSessionViewSnapshot(sid);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = payload!;
       // Any history request (including an idle/background refresh) may have
       // captured the transcript before submission. Keep the optimistic message.
       if (promptRunIdRef.current !== requestPromptRunId) {
+        setSessionLoadPhase("ready");
         if (showLoading) setLoading(false);
         return null;
       }
@@ -884,6 +897,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
       setCurrentThinkingOverride(null);
       setError(null);
+      setSessionLoadPhase("ready");
+      setSessionViewStale(false);
+      clearTimeout(slowTimer);
       if (d.treeFormat === "summary" && d.snapshotRevision) {
         setSessionViewSnapshot({
           sessionId: sid,
@@ -910,13 +926,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
 
       messagesLoaded = true;
-      if (showLoading) setLoading(false);
+      setLoading(false);
       if (!includeState) return null;
 
       try {
-        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
-        if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
-        const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
+        const agentState = await fetchWithDeadline(
+          `/api/sessions/${encodeURIComponent(sid)}/state`, 15_000, { signal: controller.signal },
+          async (res) => {
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return await res.json() as { running: boolean; state?: AgentStateResponse };
+          },
+        );
         if (!isCurrent() || promptRunIdRef.current !== requestPromptRunId) return null;
 
         const liveState = agentState.state;
@@ -940,13 +960,25 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
     } catch (e) {
-      if (isCurrent()) setError(String(e));
+      if (!isCurrent()) return null;
+      if (promptRunIdRef.current === requestPromptRunId) {
+        setError(String(e)); // Diagnostic details only, never the primary UI copy.
+        setSessionLoadPhase("failed");
+        setSessionViewStale(true);
+        setLoading(false);
+      } else {
+        // The user started another turn while history was being read. A late
+        // failure belongs to that older snapshot, not to the new live turn.
+        setSessionLoadPhase("ready");
+      }
       return "error";
     } finally {
+      clearTimeout(slowTimer);
       if (showLoading && !messagesLoaded && isCurrent()) setLoading(false);
+      if (sessionReadAbortRef.current === controller) sessionReadAbortRef.current = null;
     }
     })();
-    if (!options?.force) loadFlightsRef.current.set(flightKey, flight);
+    loadFlightsRef.current.set(flightKey, flight);
     flight.finally(() => {
       if (loadFlightsRef.current.get(flightKey) === flight) loadFlightsRef.current.delete(flightKey);
     });
@@ -3045,6 +3077,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           },
           stats: cached.stats as SessionData["stats"],
         });
+        setSessionViewStale(true);
         setActiveLeafId(cached.leafId);
         setMessages(cached.messages);
         setEntryIds(cached.entryIds);
@@ -3089,6 +3122,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     return () => {
       sessionHookMountedRef.current = false;
+      sessionReadAbortRef.current?.abort();
+      loadFlightsRef.current = new Map();
       const abandonedDraftKey = isNew ? newSessionDraftKey : null;
       if (abandonedDraftKey) {
         queueMicrotask(() => {
@@ -3148,7 +3183,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => onSystemInfoLoaderChange?.(null);
   }, [loadSystemInfoFor, onSystemInfoLoaderChange]);
 
-  const branchSwitchLocked = agentRunning || bashRunning || isCompacting || branchSummaryPending;
+  const branchSwitchLocked = loading || sessionViewStale || agentRunning || bashRunning || isCompacting || branchSummaryPending;
   useEffect(() => {
     if (!onBranchDataChange) return;
     onBranchDataChange(data?.tree ?? [], activeLeafId, handleLeafChange, branchSwitchLocked);
@@ -3300,7 +3335,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   return {
     // State
-    data, loading, error, activeLeafId, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
+    data, loading, error, sessionLoadPhase, sessionViewStale, activeLeafId, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
     agentRunning, promptPreparing, modelNames, modelList, modelError, modelScopeWarnings: visibleModelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId, retryLoad, dismissModelScopeWarnings,
     isCompacting, compactError, compactNotice, compactResult, currentModel, displayModel, modelSwitching, sessionStats,

@@ -63,6 +63,7 @@ import { isTauriDesktop } from "@/lib/desktop-updater";
 import { isImeComposing } from "@/lib/ime";
 import { useChatAccess } from "@/hooks/useChatAccess";
 import { ChatShellPrompt } from "./ChatShellPrompt";
+import { SessionLoadNotice } from "./SessionLoadNotice";
 import { ChatConfirmDialog } from "./ChatConfirmDialog";
 import { lastTurnHitChatShellBlock } from "@/lib/chat-shell-block";
 import { assignMessageKeys, createMessageKeyTracker } from "@/lib/message-keys";
@@ -317,7 +318,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
   const [restoreAnchorReady, setRestoreAnchorReady] = useState(false);
 
   const {
-    loading, error, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
+    data, loading, error, sessionLoadPhase, sessionViewStale, messages, activeToolResults, entryIds, historyCursor, hasEarlierMessages, streamState,
     agentRunning, promptPreparing, bashRunning, pendingBash, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId, summarizationRetry, automation, handleSetAutomation,
     isCompacting, compactError, compactNotice, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
@@ -1457,20 +1458,9 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
     />
   );
 
-  if (error) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-red-400">
-        <div>{error}</div>
-        <button
-          type="button"
-          className="file-viewer-icon-button"
-          onClick={retryLoad}
-          style={{ width: "auto", height: 32, gap: 5, padding: "0 12px", border: "none", fontSize: "var(--fs-caption)", fontWeight: "var(--fw-medium)" }}
-        >
-          {t("common.retry")}
-        </button>
-      </div>
-    );
+  // A failed refresh must never unmount an already visible conversation.
+  if (error && !data && messages.length === 0 && !streamState.isStreaming) {
+    return <SessionLoadNotice phase={sessionLoadPhase} error={error} hasContent={false} onRetry={retryLoad} />;
   }
 
   const aboveEditorWidgets = extensionWidgets.filter((widget) => widget.placement !== "belowEditor");
@@ -1578,6 +1568,9 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
         <NoticeShelf notices={notices} floating onPauseChange={setNoticePaused} />
       </div>
 
+      {!loading && !isNew && <SessionLoadNotice
+        phase={sessionLoadPhase} error={error} hasContent stale={sessionViewStale} onRetry={retryLoad}
+      />}
       {/* Composer overlays the scrollport; trailing spacer clears the last lines. */}
       <div ref={chatContentRegionRef} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
         {extensionDialog && (
@@ -1604,7 +1597,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
           <div style={{ minWidth: 0, padding: `0 ${CHAT_COLUMN_PADDING}px` }}>
             <div ref={messageContentRef} onPointerUp={captureQuotedSelection} style={{ width: "100%", minWidth: 0, maxWidth: "var(--chat-content-max-width, 820px)", margin: "0 auto" }}>
             {loading ? (
-              <div className="chat-loading-hint">{t("chat.loadingSession")}</div>
+              <SessionLoadNotice phase={sessionLoadPhase} error={error} hasContent={false} onRetry={retryLoad} />
             ) : (() => {
               let lastUserIdx = -1;
               for (let i = messages.length - 1; i >= 0; i--) {
@@ -1676,7 +1669,7 @@ export function ChatWindow({ session, workspaceKind, searchTarget, onSearchTarge
                     onFork={bashRunning || isNew ? undefined : handleFork}
                     forking={forkingEntryId === entryIds[idx]}
                     onEditContent={handleEditContent}
-                    editDisabled={sessionBusy}
+                    editDisabled={sessionBusy || sessionViewStale}
                     onCancelEdit={cancelEdit}
                     isEditing={editEntryId === entryIds[idx]}
                     showTimestamp={showTimestamp}

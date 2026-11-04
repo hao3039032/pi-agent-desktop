@@ -582,7 +582,9 @@ export class RpcAgentSession {
     const timeoutMs = options.timeoutMs ?? 60_000;
     const [entriesResult, treeResult] = await Promise.all([
       this.getActiveEntries({ timeoutMs }),
-      this.client.command<{ tree?: unknown; leafId?: unknown }>("get_tree", {}, timeoutMs),
+      this.client.command<{ tree?: unknown; leafId?: unknown }>("get_tree", {}, timeoutMs).catch((error) => {
+        throw new Error(`pi RPC 'get_tree' failed: ${error instanceof Error ? error.message : String(error)}`);
+      }),
     ]);
     if (!Array.isArray(treeResult?.tree)) {
       throw new Error("pi RPC 'get_tree' did not return a tree array");

@@ -41,6 +41,10 @@ export async function GET(
     const rpc = getRpcSession(id);
     const searchParams = new URL(req.url).searchParams;
     const force = searchParams.get("force") === "1";
+    const summaryTree = searchParams.get("tree") === "summary";
+    const rawTail = Number(searchParams.get("tail"));
+    const tail = Number.isFinite(rawTail) && rawTail > 0 ? Math.min(rawTail, 1000) : 50;
+    const wholeTurns = searchParams.has("wholeTurns");
 
     // A live wrapper only reflects the appends pi-web itself made. When another
     // pi process (the TUI) writes the same session file, the in-memory index
@@ -73,7 +77,9 @@ export async function GET(
     if (liveRpc?.inner.getActiveSnapshot) {
       let snapshot: { entries: unknown[]; tree: unknown[]; leafId: string | null };
       try {
-        snapshot = await liveRpc.inner.getActiveSnapshot();
+        snapshot = summaryTree && liveRpc.inner.getDisplaySnapshot
+          ? await liveRpc.inner.getDisplaySnapshot({ tail, wholeTurns })
+          : await liveRpc.inner.getActiveSnapshot();
       } catch (error) {
         throw new Error(
           "the live session's active branch could not be read from the CLI process: "
@@ -95,17 +101,12 @@ export async function GET(
       rawTree = sm.getTree() as unknown[];
     }
     const filePath = liveRpc?.sessionFile || sm?.getSessionFile() || resolvedPath || "";
-    const summaryTree = searchParams.get("tree") === "summary";
     const tree = summaryTree
       ? toSummaryTree(projectTreeForResponse(rawTree as never))
       : projectTreeForResponse(rawTree as never);
     perf?.span("tree");
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
-    const rawTail = Number(searchParams.get("tail"));
-    const tail = Number.isFinite(rawTail) && rawTail > 0 ? Math.min(rawTail, 1000) : 50;
-    // Chat-view loads ask for whole turns; the default keeps `tail` an exact cap.
-    const wholeTurns = searchParams.has("wholeTurns");
     const context = buildSessionContext(entries as never, leafId, {
       deferThinking,
       deferToolResultImages,

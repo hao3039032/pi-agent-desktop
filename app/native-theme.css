@@ -10737,3 +10737,52 @@ html.dark .artifacts-thumb[data-tone="data"] { --tone: #4fc1d6; }
 .relay-devices > .settings-option-hint {
   padding: 10px 14px 0;
 }
+
+/* Conversation reads: cached history stays mounted, diagnostics are opt-in. */
+.session-load-notice {
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.session-load-notice.is-opening {
+  margin: auto;
+  padding: 32px 24px;
+  max-width: 560px;
+  text-align: center;
+}
+.session-load-notice.is-inline {
+  flex: 0 0 auto;
+  max-height: 30vh;
+  overflow: auto;
+  padding: 10px 20px;
+  border-bottom: var(--hairline) solid var(--border);
+  background: var(--bg-panel);
+}
+.session-load-title { color: var(--text); font-weight: var(--fw-medium); }
+.session-load-notice p { margin: 4px 0 0; }
+.session-load-retry {
+  margin-top: 8px;
+  padding: 6px 12px;
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  background: var(--bg-panel);
+  cursor: pointer;
+}
+.session-load-retry:hover { background: var(--bg-hover); }
+.session-load-retry:focus-visible, .session-load-diagnostics summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.session-load-diagnostics { margin-top: 8px; text-align: start; }
+.session-load-diagnostics summary { cursor: pointer; }
+.session-load-diagnostics pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  max-height: 120px;
+  overflow: auto;
+}

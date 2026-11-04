@@ -1,5 +1,53 @@
 # Sessions, events and the chat client — fork notes
 
+## Opening and refreshing conversations
+
+The history reader in `useAgentSession` uses `fetchWithRetry` with a session-specific
+65s deadline per attempt (one retry), including JSON body consumption. This exceeds
+the live CLI snapshot's 60s budget; small settings/list requests keep their original
+6s/10s deadlines. `SessionLoadNotice` shows opening, slow-after-8s, retrying, and
+recoverable failure states in all three locales. Raw HTTP/RPC diagnostics are opt-in
+`<details>`, never the headline or a replacement for a visible conversation.
+
+Page-memory cached history is shown immediately and explicitly marked as synchronizing.
+Failed background reads keep both history and the composer mounted. Retry clears the
+failure immediately and never hides cached content. A session-generation + monotonic
+read id guards all completions, timers and errors; switching/unmounting aborts transport
+and prevents retries. Forced initial reads share their flight with passive refreshes;
+a newer forced read cancels the old one. No fallback substitutes a disk-tail branch
+for a failing live CLI snapshot. Cached branches are labelled stale and the branch
+navigator/history-edit action stay locked until validated. The state-only read has its
+own bounded deadline and does not remove already loaded history if it fails.
+
+`lib/pi-rpc/line-buffer.ts` frames stdout incrementally: scan each new chunk for LF,
+retain fragments, join once per complete record. The old accumulated-string scan was
+quadratic in response size and could starve localhost health probes when tool outputs
+or inline images made `get_entries` / `get_tree` large. This is a pre-existing hot path,
+not proof of an SDK 1.5.0 regression. UTF-8 decoding still belongs to the pipe stream;
+CRLF is accepted and Unicode U+2028/U+2029 remain message data.
+
+For summary-tree display reads the bridge now returns recent bodies only, selected
+inside the child (`pi-web-session-window.mjs`); the rest are lightweight metadata
+needed by existing cumulative statistics, model settings, and navigation consumers.
+This is NOT an O(page-size) metadata read yet: the child still walks the tree and the
+host still aggregates metadata. Old message/image/tool/system payloads no longer cross
+the pipe. Generic full-snapshot reads recover a native `get_tree` serialization stack
+overflow through `session.snapshot-flat` (same live child, flat topology encoding),
+never by substituting a disk-tail branch. The 4000-entry real-CLI smoke covers first
+page, stats, non-tail navigation and generic snapshot recovery. Local comparisons of
+SDK 1.4.0/1.5.0 reproduced native get_tree overflow at 2500/4000 entries in both;
+there is no evidence yet of a new 1.5.0-specific serialization regression.
+
+Validation: `hooks/useAgentSession.loading.test.mjs`, `lib/session-load.test.mjs`,
+`components/SessionLoadNotice.test.mjs`, `lib/pi-rpc/line-buffer.test.mjs`, plus the
+real-CLI active-leaf smoke. `node e2e/session-load.mjs` renders the actual notice and
+styles at desktop/narrow sizes in both themes, without loading user sessions or
+calling a model. `node --experimental-strip-types scripts/benchmark-rpc-framing.mjs
+4 16 64` compares synthetic chunk framing + JSON parsing (not end-to-end UI time).
+A local run measured old/new 118/3ms, 1610/8ms, 27732/33ms; timings vary by host.
+Do not claim this fixes every disconnect: the health probe still detects an
+unreachable service, and actual user-case diagnosis requires logs/timing.
+
 ## Generated session titles
 
 Generate title makes a separate bounded request with the current conversation's

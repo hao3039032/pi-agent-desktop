@@ -15,25 +15,31 @@
 /** Generous enough for a cold packaged server; short enough to not feel stuck. */
 export const DEFAULT_FETCH_TIMEOUT_MS = 6_000;
 
-export async function fetchWithDeadline(
+export async function fetchWithDeadline<T = Response>(
   url: string,
   timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
   init: RequestInit = {},
-): Promise<Response> {
+  readResponse?: (response: Response) => Promise<T>,
+): Promise<T> {
   const controller = new AbortController();
+  const abort = () => controller.abort(init.signal?.reason);
+  init.signal?.addEventListener("abort", abort, { once: true });
+  if (init.signal?.aborted) abort();
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     controller.abort();
   }, timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    // With a reader the deadline covers the body as well as response headers.
+    return readResponse ? await readResponse(response) : response as T;
   } catch (error) {
-    // A bare AbortError reads as if the app cancelled the request on purpose.
     if (timedOut) throw new Error(`Request timed out after ${timeoutMs}ms`);
     throw error;
   } finally {
     clearTimeout(timer);
+    init.signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -50,25 +56,30 @@ export const DEFAULT_FETCH_RETRY_TIMEOUT_MS = 10_000;
  * has become pointless — the user switching away mid-request, say — so a
  * stale load cannot cost another full timeout.
  */
-export async function fetchWithRetry(
+export async function fetchWithRetry<T = Response>(
   url: string,
   options: {
     timeoutMs?: number;
     retryTimeoutMs?: number;
     init?: RequestInit;
     shouldRetry?: () => boolean;
+    onRetry?: () => void;
+    readResponse?: (response: Response) => Promise<T>;
   } = {},
-): Promise<Response> {
+): Promise<T> {
   const {
     timeoutMs = DEFAULT_FETCH_TIMEOUT_MS,
     retryTimeoutMs = DEFAULT_FETCH_RETRY_TIMEOUT_MS,
     init = {},
     shouldRetry,
+    onRetry,
+    readResponse,
   } = options;
   try {
-    return await fetchWithDeadline(url, timeoutMs, init);
+    return await fetchWithDeadline<T>(url, timeoutMs, init, readResponse);
   } catch (error) {
-    if (shouldRetry && !shouldRetry()) throw error;
-    return fetchWithDeadline(url, retryTimeoutMs, init);
+    if (init.signal?.aborted || (shouldRetry && !shouldRetry())) throw error;
+    onRetry?.();
+    return fetchWithDeadline<T>(url, retryTimeoutMs, init, readResponse);
   }
 }

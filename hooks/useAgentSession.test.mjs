@@ -206,7 +206,7 @@ test("forking stays available during a run while in-session branch switches wait
   // in-session edit still waits because pi refuses navigate_tree mid-run.
   assert.match(chatWindowSource, /onFork=\{bashRunning \|\| isNew \? undefined : handleFork\}/);
   assert.match(chatWindowSource, /onEditContent=\{handleEditContent\}/);
-  assert.match(chatWindowSource, /editDisabled=\{sessionBusy\}/);
+  assert.match(chatWindowSource, /editDisabled=\{sessionBusy \|\| sessionViewStale\}/);
   assert.match(messageViewSource, /disabled=\{editBlocked\}/);
   assert.match(messageViewSource, /t\("i18n\.editFromHereBusyTitle"\)/);
   assert.match(chatWindowSource, /onAskInNewChat && quotedSelection\.sourceEntryId && !bashRunning &&/);
@@ -214,7 +214,7 @@ test("forking stays available during a run while in-session branch switches wait
 
   // A branch summary being generated holds the leaf too, like compaction.
   assert.match(leafChangeSource, /if \(bashRunningRef\.current \|\| agentRunningRef\.current \|\| isCompacting \|\| branchSummaryHolds\(branchSummarySessionIdRef\.current, sessionIdRef\.current\)\) return;/);
-  assert.match(source, /const branchSwitchLocked = agentRunning \|\| bashRunning \|\| isCompacting \|\| branchSummaryPending;/);
+  assert.match(source, /const branchSwitchLocked = loading \|\| sessionViewStale \|\| agentRunning \|\| bashRunning \|\| isCompacting \|\| branchSummaryPending;/);
   assert.match(source, /onBranchDataChange\(data\?\.tree \?\? \[\], activeLeafId, handleLeafChange, branchSwitchLocked\)/);
   assert.match(appShellSource, /setBranchSwitchLocked\(locked\)/);
   // The fork's top bar mounts one BranchNavigator (upstream has a second in

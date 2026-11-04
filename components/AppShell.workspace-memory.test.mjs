@@ -104,6 +104,8 @@ test("New restores the draft after session navigation and workspace auto-restore
         bashRecoveryIdRef: { current: 0 },
         cancelEventStreamGrace() {},
         closeEvents() {},
+        sessionReadAbortRef: { current: null },
+        loadFlightsRef: { current: new Map() },
         closeSettingsMenu() {},
         settingsSection: null,
         getLastSettingsSection: () => "general",

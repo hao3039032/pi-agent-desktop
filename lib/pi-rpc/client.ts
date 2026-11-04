@@ -35,6 +35,7 @@
 
 import { type ChildProcessByStdio, spawn, type SpawnOptions } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
+import { RpcLineBuffer } from "./line-buffer";
 
 export interface PiRpcCommandResponse<T = unknown> {
   id?: string;
@@ -122,7 +123,7 @@ export class PiRpcClient {
   /** Set while replaying, so a handler that registers another cannot reorder. */
   private uiFlushing = false;
   private exitListeners = new Set<(code: number | null) => void>();
-  private stdoutBuffer = "";
+  private readonly stdoutBuffer = new RpcLineBuffer();
   private stderrBuffer = "";
   private droppingStderrLine = false;
   private exiting = false;
@@ -379,13 +380,8 @@ export class PiRpcClient {
   }
 
   private onStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    // Hand framing on LF only; \r before it is tolerated, U+2028/2029 are data.
-    for (;;) {
-      const index = this.stdoutBuffer.indexOf("\n");
-      if (index < 0) break;
-      const line = this.stdoutBuffer.slice(0, index).replace(/\r$/, "");
-      this.stdoutBuffer = this.stdoutBuffer.slice(index + 1);
+    // Scan each incoming chunk once; assemble a large response only at its LF.
+    for (const line of this.stdoutBuffer.push(chunk)) {
       if (!line.trim()) continue;
       let record: PiRpcRecord;
       try {
@@ -544,6 +540,7 @@ export class PiRpcClient {
   }
 
   private failAll(error: Error): void {
+    this.stdoutBuffer.clear();
     if (!this.fatal) this.fatal = error;
     for (const [id, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);
