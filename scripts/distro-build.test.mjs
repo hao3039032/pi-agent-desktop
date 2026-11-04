@@ -42,7 +42,7 @@ test("distro resources extend the upstream list per platform", () => {
   assert.deepEqual(distroResources("windows", ["resources/server", "resources/node"]),
     ["resources/server", "resources/node", "resources/pi-seed", "resources/pi", "resources/git"]);
   assert.deepEqual(distroResources("macos", ["resources/server"]),
-    ["resources/server", "resources/pi-seed", "resources/pi", "resources/node"]);
+    ["resources/server", "resources/pi-seed", "resources/pi", "resources/node", "resources/ripgrep"]);
   assert.deepEqual(distroResources("linux", ["resources/server", "resources/node"]),
     ["resources/server", "resources/node", "resources/pi-seed", "resources/pi"]);
 });

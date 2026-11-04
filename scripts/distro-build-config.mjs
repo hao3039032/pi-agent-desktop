@@ -51,8 +51,9 @@ export function distroVersion(upstreamVersion, revision) {
 export function distroResources(platform, upstreamResources) {
   const extra = ["resources/pi-seed", "resources/pi"];
   // macOS bundles node inside "Pi Agent Server.app"; the distro adds the npm
-  // CLI next to it under resources/node (see prepare-desktop.mjs).
-  if (platform === "macos") extra.push("resources/node");
+  // CLI next to it under resources/node (see prepare-desktop.mjs), plus the
+  // target-architecture ripgrep binary used by Plan mode's srt probe.
+  if (platform === "macos") extra.push("resources/node", "resources/ripgrep");
   if (platform === "windows") extra.push("resources/git");
   return [...new Set([...upstreamResources, ...extra])];
 }

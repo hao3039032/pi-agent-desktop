@@ -79,6 +79,10 @@ export function hasSystemGitBash(): boolean {
 /**
  * Make the bundled tools reachable for pi and everything it spawns:
  *
+ * - srt/ripgrep: Plan mode's Anthropic Sandbox Runtime and its macOS
+ *   ripgrep prerequisite are bundled with the app. Their directories are
+ *   prepended so a desktop app launched outside a login shell cannot lose
+ *   either binary to a missing/incomplete Homebrew or npm PATH.
  * - npm: pi installs/updates packages by spawning `npm` from PATH. The Rust
  *   shell only puts the bundled `node` on PATH, so without a system Node.js
  *   every plugin install failed with `spawn npm ENOENT`. Appended, so a
@@ -88,8 +92,24 @@ export function hasSystemGitBash(): boolean {
  *   system Git for Windows exists, otherwise `System32\bash.exe` (WSL) would
  *   be found first.
  */
-export function configureDistroPath(resourcesDir: string): void {
+export function configureDistroPath(resourcesDir: string, platform = process.platform): void {
   const entries = pathEntries();
+
+  // The Plan extension resolves srt through PATH and the desktop server does
+  // not necessarily inherit the user's interactive-shell PATH. Keep the
+  // bundled runtime ahead of a user's global srt: the extension and its
+  // adjacent @anthropic-ai/sandbox-runtime library must come from the same
+  // installation, otherwise the launcher can reject a mismatched shim.
+  const srtBin = join(resourcesDir, "pi-seed", "npm", "node_modules", ".bin");
+  const bundledSrt = platform === "win32" ? join(srtBin, "srt.cmd") : join(srtBin, "srt");
+  if (existsSync(bundledSrt) && !entries.includes(srtBin)) entries.unshift(srtBin);
+
+  // macOS Plan mode also needs `rg`; unlike srt it is not part of the npm
+  // package, so the release stages the target-architecture binary separately.
+  const ripgrepDir = join(resourcesDir, "ripgrep");
+  if (platform === "darwin" && existsSync(join(ripgrepDir, "rg")) && !entries.includes(ripgrepDir)) {
+    entries.unshift(ripgrepDir);
+  }
 
   // npm/npm.cmd shims written by scripts/distro-seed.mjs, wrapping the npm
   // CLI bundled at resources/node/node_modules/npm.
@@ -99,7 +119,7 @@ export function configureDistroPath(resourcesDir: string): void {
     entries.push(npmShims);
   }
 
-  if (process.platform === "win32") {
+  if (platform === "win32") {
     const gitBin = join(resourcesDir, "git", "bin");
     if (existsSync(join(gitBin, "bash.exe")) && !hasSystemGitBash() && !entries.includes(gitBin)) {
       entries.unshift(gitBin);
