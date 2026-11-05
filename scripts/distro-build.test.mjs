@@ -10,7 +10,21 @@ import {
   updateMirrorList,
 } from "./distro-build-config.mjs";
 import { compareVersions } from "./release-components.mjs";
-import { seedRelativePath } from "./distro-seed.mjs";
+import { seedPackageGroups, seedRelativePath } from "./distro-seed.mjs";
+
+test("runtime dependencies are installed without joining the Pi package manifest", () => {
+  const groups = seedPackageGroups({
+    packages: ["npm:pi-subagents"],
+    runtimePackages: ["npm:@anthropic-ai/sandbox-runtime"],
+  });
+  assert.deepEqual(groups.packages, ["npm:pi-subagents"]);
+  assert.deepEqual(groups.runtimePackages, ["npm:@anthropic-ai/sandbox-runtime"]);
+  assert.deepEqual(groups.all, [...groups.packages, ...groups.runtimePackages]);
+  assert.deepEqual(seedPackageGroups({ packages: [] }).runtimePackages, []);
+  assert.throws(() => seedPackageGroups({
+    packages: ["npm:@scope/pkg@1"], runtimePackages: ["npm:@scope/pkg@2"],
+  }), /duplicate install paths/);
+});
 
 test("distro versions sort between upstream releases", () => {
   assert.equal(distroVersion("0.4.8", 1), "0.4.801");

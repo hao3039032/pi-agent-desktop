@@ -217,14 +217,15 @@ jobs:
         env:
           PI_DESKTOP_REQUIRE_PI: "1"
 
-      - name: Verify packaged server
-        # The verify script is exercised on mac/linux; its Windows path
-        # handling is not yet proven (follow-up candidate).
-        if: runner.os != 'Windows'
-        run: npm run desktop:verify
-
       - name: Pre-install distro pi packages
         run: npm run distro:seed
+
+      - name: Verify packaged server
+        # Verify AFTER seeding: otherwise the pi child never loads the shipped
+        # extension set (v0.8.204 passed while registering a runtime as an extension).
+        # The Windows path handling is not yet proven (follow-up candidate).
+        if: runner.os != 'Windows'
+        run: npm run desktop:verify
 
       - name: Stage PortableGit (Git Bash)
         if: runner.os == 'Windows'

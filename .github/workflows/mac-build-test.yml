@@ -119,11 +119,12 @@ jobs:
         env:
           PI_DESKTOP_REQUIRE_PI: "1"
 
-      - name: Verify packaged server
-        run: npm run desktop:verify
-
       - name: Pre-install distro pi packages
         run: npm run distro:seed
+
+      - name: Verify packaged server
+        # Include the shipped packages in the session-start smoke test.
+        run: npm run desktop:verify
 
       # Not tauri-action: no release, no draft, no latest.json — the bundles
       # land in target/release/bundle and are uploaded as artifacts below.

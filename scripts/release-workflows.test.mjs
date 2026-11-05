@@ -236,6 +236,15 @@ test("distro macOS runner choices keep architecture targets and release gates in
   assert.match(workflow, /publish:\n\s+needs: build/);
 });
 
+test("distro session smoke tests run after the bundled packages are installed", async () => {
+  for (const name of ["distro-release.yml", "mac-build-test.yml"]) {
+    const workflow = await readFile(join(root, ".github", "workflows", name), "utf8");
+    const seed = workflow.indexOf("run: npm run distro:seed");
+    const verify = workflow.indexOf("run: npm run desktop:verify");
+    assert.ok(seed !== -1 && verify > seed, `${name}: verify must include the shipped package set`);
+  }
+});
+
 test("the distro release stages the pi CLI by target triple through the shared script", async () => {
   const workflow = await readFile(
     join(root, ".github", "workflows", "distro-release.yml"),

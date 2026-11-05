@@ -35,6 +35,18 @@ export function seedRelativePath(source) {
   throw new Error(`Unsupported distro package source (use npm: or git:): ${source}`);
 }
 
+/** Install both groups, but only Pi resource packages may reach user settings. */
+export function seedPackageGroups(config) {
+  const packages = config.packages;
+  const runtimePackages = config.runtimePackages ?? [];
+  const all = [...packages, ...runtimePackages];
+  const paths = all.map(seedRelativePath);
+  if (new Set(paths).size !== paths.length) {
+    throw new Error("Distro package groups must not contain duplicate install paths");
+  }
+  return { packages, runtimePackages, all };
+}
+
 function run(command, args, env) {
   const result = spawnSync(command, args, { stdio: "inherit", env, cwd: rootDir });
   if (result.status !== 0) {
@@ -74,7 +86,9 @@ function main() {
 
   const staging = mkdtempSync(join(tmpdir(), "pi-seed-"));
   try {
-    writeFileSync(join(staging, "settings.json"), JSON.stringify({ packages: distro.packages }, null, 2));
+    const groups = seedPackageGroups(distro);
+    // This throwaway config is for installation only; no session loads it.
+    writeFileSync(join(staging, "settings.json"), JSON.stringify({ packages: groups.all }, null, 2));
     const env = { ...process.env, PI_CODING_AGENT_DIR: staging };
     delete env.PI_OFFLINE;
     run(process.execPath, [cli, "update", "--extensions"], env);
@@ -82,7 +96,7 @@ function main() {
     rmSync(seedDir, { recursive: true, force: true });
     mkdirSync(seedDir, { recursive: true });
 
-    const packages = distro.packages.map((source) => {
+    const installedPackages = groups.all.map((source) => {
       const path = seedRelativePath(source);
       const installed = join(staging, ...path.split("/"));
       const pkgJson = join(installed, "package.json");
@@ -94,7 +108,7 @@ function main() {
       const from = join(staging, top);
       if (existsSync(from)) cpSync(from, join(seedDir, top), { recursive: true, verbatimSymlinks: true });
     }
-    for (const pkg of packages) {
+    for (const pkg of installedPackages) {
       if (!pkg.path.startsWith("git/")) continue;
       const dir = join(seedDir, ...pkg.path.split("/"));
       // History is not needed for a read-only bundled copy.
@@ -125,13 +139,15 @@ function main() {
 
     writeNpmShims(join(seedDir, "bin"));
 
+    const packages = installedPackages.filter((pkg) => groups.packages.includes(pkg.source));
+    const runtimePackages = installedPackages.filter((pkg) => groups.runtimePackages.includes(pkg.source));
     const seedVersion = createHash("sha256")
-      .update(JSON.stringify({ distro, packages }))
+      .update(JSON.stringify({ distro, packages, runtimePackages }))
       .digest("hex")
       .slice(0, 16);
     writeFileSync(
       join(seedDir, "manifest.json"),
-      `${JSON.stringify({ distro: distro.id, revision: distro.revision, seedVersion, packages }, null, 2)}\n`,
+      `${JSON.stringify({ distro: distro.id, revision: distro.revision, seedVersion, packages, runtimePackages }, null, 2)}\n`,
     );
 
     // NSIS cannot package paths over MAX_PATH. Budget for a long per-user
@@ -146,8 +162,8 @@ function main() {
       const stats = statSync(file);
       if (stats.isFile()) { files++; bytes += stats.size; }
     }
-    console.log(`pi-seed: ${packages.length} packages, ${files} files, ${(bytes / 1048576).toFixed(1)} MiB (seed ${seedVersion})`);
-    for (const pkg of packages) console.log(`  ${pkg.source} ${pkg.version} -> ${pkg.path}`);
+    console.log(`pi-seed: ${packages.length} Pi packages + ${runtimePackages.length} runtime dependencies, ${files} files, ${(bytes / 1048576).toFixed(1)} MiB (seed ${seedVersion})`);
+    for (const pkg of installedPackages) console.log(`  ${pkg.source} ${pkg.version} -> ${pkg.path}`);
     if (overlong.length > 0) {
       throw new Error(`pi-seed paths too long for Windows installs:\n${overlong.slice(0, 20).join("\n")}`);
     }

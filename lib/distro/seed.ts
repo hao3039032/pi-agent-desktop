@@ -16,6 +16,8 @@ export interface SeedManifest {
   /** Changes whenever the bundled package set or any of their versions changes. */
   seedVersion: string;
   packages: Array<{ source: string; path: string; version?: string }>;
+  /** Installed next to extensions, but never registered in settings.packages. */
+  runtimePackages?: Array<{ source: string; path: string; version?: string }>;
 }
 
 interface DistroState extends ManagedState {
@@ -118,13 +120,15 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
   const versionChanged = previous?.seedVersion !== manifest.seedVersion;
 
   const settingsManager = SettingsManager.create(agentDir, agentDir);
-  const seed = manifest.packages.map((pkg) => ({
+  const bundledPackage = (pkg: SeedManifest["packages"][number]) => ({
     source: pkg.source,
     relativePath: pkg.path,
     path: join(resourcesDir, "pi-seed", ...pkg.path.split("/")),
-  }));
+  });
+  const seed = manifest.packages.map(bundledPackage);
+  const runtimePackages = (manifest.runtimePackages ?? []).map(bundledPackage);
   const current = (settingsManager.getGlobalSettings().packages ?? []) as PackageEntry[];
-  const reconciled = reconcilePackages({ entries: current, seed, previous });
+  const reconciled = reconcilePackages({ entries: current, seed, runtimePackages, previous });
   if (reconciled.changed) settingsManager.setPackages(reconciled.entries as never);
 
   if (firstRun) {

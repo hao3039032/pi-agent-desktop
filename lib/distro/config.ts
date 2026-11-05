@@ -24,7 +24,10 @@ export interface DistroConfig {
     defaultModel: string;
     models: DistroModel[];
   };
+  /** Pi resource packages registered in the user's settings. */
   packages: string[];
+  /** Bundled dependencies only: installed, but never registered as Pi packages. */
+  runtimePackages?: string[];
   settingsDefaults: {
     defaultThinkingLevel?: string;
     /** Seeded once, only when the user's settings.json carries no `defaultTools`

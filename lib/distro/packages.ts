@@ -53,6 +53,8 @@ function isSeedCopy(source: string, relativeSeedPath: string): boolean {
 export interface ReconcileInput {
   entries: PackageEntry[];
   seed: Array<SeedPackage & { relativePath: string }>;
+  /** Install-only dependencies; old bundled registrations must be removed. */
+  runtimePackages?: Array<SeedPackage & { relativePath: string }>;
   previous: ManagedState | null;
 }
 
@@ -79,8 +81,18 @@ export interface ReconcileResult {
  * so re-bundling the package later re-adds it instead of remembering a removal
  * the user never made.
  */
-export function reconcilePackages({ entries, seed, previous }: ReconcileInput): ReconcileResult {
-  let result = [...entries];
+export function reconcilePackages({ entries, seed, runtimePackages = [], previous }: ReconcileInput): ReconcileResult {
+  // v0.8.203/204 registered sandbox-runtime as a Pi package. It is only a
+  // bundled dependency, so Pi tried to load it as an extension and exited 1.
+  // Remove only bundle-owned entries (also after a move or lost state file),
+  // never the user's npm sources or independent local copies.
+  let result = entries.filter((entry) => !runtimePackages.some((pkg) => {
+    const source = entrySource(entry);
+    const previousPath = previous?.packages[pkg.source];
+    return normalizePath(source) === normalizePath(pkg.path)
+      || (previousPath !== undefined && normalizePath(source) === normalizePath(previousPath))
+      || isSeedCopy(source, pkg.relativePath);
+  }));
   const managed: ManagedState = { packages: {} };
 
   for (const pkg of seed) {
