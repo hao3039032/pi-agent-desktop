@@ -137,7 +137,6 @@ lib/
   html-preview.ts      inline HTML/SVG/React preview detection, sandbox, srcdoc bootstrap, React document
   preview-runtime.ts   loads public/preview-runtime/ (bundled React, Sucrase, Tailwind) for React previews
   app-prefs.ts         APP_PREF_KEYS + typed localStorage accessors (SSR/private-mode safe)
-  desktop-connection.ts useDesktopConnection() — local server health probe for the reconnect banner
   desktop-native.ts    native dialogs, open/reveal path, external links, save/import, window lifecycle
   desktop-notify.ts    native completion notifications (skipped while the window is focused)
   cwd-project-roots.ts cwd → project root identities the server reported (parked draft rows)

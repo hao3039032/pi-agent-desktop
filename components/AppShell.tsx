@@ -41,7 +41,6 @@ import { useMenuNavigation } from "@/hooks/useMenuNavigation";
 import { APP_PREF_KEYS, getPrefBool, getPrefJson, setPref } from "@/lib/app-prefs";
 import { useViewportHeight } from "@/hooks/useViewportHeight";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
-import { useDesktopConnection } from "@/lib/desktop-connection";
 import { isTauriDesktop, setCloseQuitsNative } from "@/lib/desktop-native";
 import { canUseNativeMenu, menuPointBelow, showNativeMenu } from "@/lib/desktop-menu";
 import { useNativeContextMenu } from "@/hooks/useNativeContextMenu";
@@ -804,8 +803,6 @@ export function AppShell() {
       void setCloseQuitsNative(getPrefBool(APP_PREF_KEYS.closeQuits, false));
     }
   }, [desktopMode]);
-
-  const { state: connectionState, retry: retryConnection } = useDesktopConnection(desktopMode);
 
   const handleFileLineMention = useCallback((relativePath: string, startLine: number, endLine: number) => {
     chatInputRef.current?.insertText(buildFileLineMentionText(relativePath, startLine, endLine));
@@ -2209,43 +2206,6 @@ export function AppShell() {
         background: "var(--bg)",
       } as React.CSSProperties}
     >
-      {connectionState === "offline" && (
-        <div
-          role="alert"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: 10,
-            flexShrink: 0,
-            padding: "7px 12px",
-            background: "color-mix(in srgb, var(--danger) 14%, var(--bg-panel))",
-            borderBottom: "var(--hairline) solid color-mix(in srgb, var(--danger) 35%, var(--border))",
-            color: "var(--text)",
-            fontSize: "var(--fs-caption)",
-            zIndex: 300,
-          }}
-        >
-          <span>{translate("connection.offline")}</span>
-          <button
-            type="button"
-            onClick={retryConnection}
-            style={{
-              height: 24,
-              padding: "0 10px",
-              border: "var(--hairline) solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              background: "var(--bg)",
-              color: "var(--accent)",
-              cursor: "pointer",
-              fontSize: "var(--fs-micro)",
-              fontWeight: "var(--fw-semibold)",
-            }}
-          >
-            {translate("connection.retry")}
-          </button>
-        </div>
-      )}
       <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
       {/* Mobile overlay backdrop */}
       <div
