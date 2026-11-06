@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { getWebPassword, verifyBrowserPassword, webPasswordSigningKey, type WebPassword } from "./browser-password.ts";
 
 export const PI_WEB_AUTH_USERNAME = "pi";
 export const PI_WEB_SESSION_COOKIE = "pi_web_session";
@@ -13,21 +14,22 @@ function secretsEqual(actual: string, expected: string): boolean {
 }
 
 export function isWebPasswordEnabled(
-  password: string | undefined = process.env.PI_WEB_PASSWORD,
-): password is string {
-  return typeof password === "string" && password.length > 0;
+  password: WebPassword | undefined = getWebPassword(),
+): password is WebPassword {
+  return typeof password === "string" ? password.length > 0 : Boolean(password);
 }
 
 export function isValidWebPassword(
   suppliedPassword: string,
-  password = process.env.PI_WEB_PASSWORD,
+  password: WebPassword | undefined = getWebPassword(),
 ): boolean {
-  return isWebPasswordEnabled(password) && secretsEqual(suppliedPassword, password);
+  if (!isWebPasswordEnabled(password)) return false;
+  return typeof password === "string" ? secretsEqual(suppliedPassword, password) : verifyBrowserPassword(suppliedPassword, password);
 }
 
 export function isValidBasicAuthorization(
   authorization: string | null,
-  password = process.env.PI_WEB_PASSWORD,
+  password: WebPassword | undefined = getWebPassword(),
 ): boolean {
   if (!isWebPasswordEnabled(password) || !authorization) return false;
 
@@ -53,12 +55,12 @@ export function isValidBasicAuthorization(
   return usernameMatches && passwordMatches;
 }
 
-function sessionSignature(payload: string, password: string): string {
-  return createHmac("sha256", password).update(`pi-web-session:${payload}`, "utf8").digest("hex");
+function sessionSignature(payload: string, password: WebPassword): string {
+  return createHmac("sha256", webPasswordSigningKey(password)).update(`pi-web-session:${payload}`, "utf8").digest("hex");
 }
 
 export function createWebSessionToken(
-  password: string,
+  password: WebPassword,
   now = Date.now(),
   nonce = randomBytes(16).toString("hex"),
 ): string {
@@ -68,7 +70,7 @@ export function createWebSessionToken(
 
 export function isValidWebSessionToken(
   token: string | undefined,
-  password = process.env.PI_WEB_PASSWORD,
+  password: WebPassword | undefined = getWebPassword(),
   now = Date.now(),
 ): boolean {
   if (!token || !isWebPasswordEnabled(password)) return false;

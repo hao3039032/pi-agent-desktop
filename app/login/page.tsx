@@ -1,7 +1,8 @@
 "use client";
 
 import Image from "next/image";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
+import { authenticateDesktopNative, isTauriDesktop } from "@/lib/desktop-native";
 import { I18nProvider, useI18n } from "@/hooks/useI18n";
 import { safeLoginDestination } from "@/lib/login-destination";
 
@@ -15,6 +16,29 @@ function LoginForm() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [desktop, setDesktop] = useState<boolean | null>(null);
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.resolve().then(async () => {
+      if (cancelled) return;
+      const native = isTauriDesktop();
+      setDesktop(native);
+      if (!native) return;
+      setError("");
+      setBusy(true);
+      try {
+        await authenticateDesktopNative();
+        if (!cancelled) window.location.replace(safeDestination());
+      } catch {
+        if (!cancelled) setError(t("browserPassword.desktopError"));
+      } finally {
+        if (!cancelled) setBusy(false);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [retry, t]);
 
   const failureMessage = async (response: Response): Promise<string> => {
     if (response.status === 401) return t("auth.invalidPassword");
@@ -52,10 +76,13 @@ function LoginForm() {
           <Image src="/icons/apple-touch-icon.png" width={52} height={52} alt="" priority />
           <div>
             <h1>Pi Web</h1>
-            <p>{t("auth.prompt")}</p>
+            <p>{t(desktop === false ? "auth.prompt" : "browserPassword.desktopConnecting")}</p>
           </div>
         </header>
-        <form className="web-login-form" onSubmit={submit}>
+        {desktop !== false ? <div className="web-login-form">
+          <p className="web-login-error" role="alert">{error}</p>
+          {error && <button type="button" disabled={busy} onClick={() => setRetry((value) => value + 1)}>{t("browserPassword.retry")}</button>}
+        </div> : <form className="web-login-form" onSubmit={submit}>
           <div className="web-login-composer">
             <label className="web-login-label" htmlFor="web-login-password">{t("auth.password")}</label>
             <input
@@ -78,7 +105,7 @@ function LoginForm() {
             </button>
           </div>
           <p className="web-login-error" role="alert" aria-live="polite">{error}</p>
-        </form>
+        </form>}
       </div>
     </main>
   );

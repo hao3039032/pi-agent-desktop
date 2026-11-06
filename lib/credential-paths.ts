@@ -1,6 +1,7 @@
 import { realpathSync } from "fs";
 import path from "path";
 import { userHome } from "./user-home.ts";
+import { browserPasswordPath } from "./browser-password.ts";
 
 /**
  * Credential stores under the home directory that /api/files never reads,
@@ -59,6 +60,10 @@ export function isCredentialPath(target: string, home: string = userHome()): boo
   } catch {
     // A missing path is checked lexically only.
   }
+  // The browser verifier is a credential even with a custom PI_CODING_AGENT_DIR.
+  const passwordPaths = [comparable(browserPasswordPath())];
+  try { passwordPaths.push(comparable(realpathSync.native(browserPasswordPath()))); } catch { /* Missing file: lexical check still applies. */ }
+  if (candidates.some((candidate) => passwordPaths.some((secret) => isUnder(candidate, secret)))) return true;
   const homes = [comparable(home)];
   try {
     homes.push(comparable(realpathSync.native(home)));

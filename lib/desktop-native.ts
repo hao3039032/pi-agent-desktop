@@ -12,6 +12,27 @@ export async function confirmLanAccessNative(message: string, title: string): Pr
   return confirm(message, { title, kind: "warning" });
 }
 
+export interface BrowserPasswordStatus { enabled: boolean; managed: boolean; corrupt: boolean }
+
+export async function authenticateDesktopNative(): Promise<void> {
+  const response = await fetch("/api/desktop/auth", { method: "POST", headers: await desktopApiHeaders() });
+  if (!response.ok) throw new Error("Desktop authentication failed");
+}
+
+export async function browserPasswordNative(method: "GET" | "PUT" | "DELETE" = "GET", password?: string): Promise<BrowserPasswordStatus> {
+  // Authenticate before a change so enabling browser protection never locks the
+  // running desktop UI out. The setting route additionally requires the token.
+  if (method !== "GET") await authenticateDesktopNative();
+  const response = await fetch("/api/desktop/browser-password", {
+    method,
+    headers: await desktopApiHeaders({ "Content-Type": "application/json" }),
+    ...(method === "PUT" ? { body: JSON.stringify({ password }) } : {}),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error("Could not read or change browser password");
+  return response.json();
+}
+
 export async function getLanAccessNative(): Promise<boolean> {
   if (!isTauriDesktop()) throw new Error("Desktop only");
   const { invoke } = await import("@tauri-apps/api/core");

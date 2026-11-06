@@ -1,4 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { getWebPassword, type WebPassword } from "@/lib/browser-password";
+import { isDesktopBootstrapRequest, isDesktopWebSession } from "@/lib/desktop-web-auth";
 import {
   getAuthRetryAfterMs,
   recordAuthFailure,
@@ -10,6 +12,7 @@ import {
 } from "@/lib/request-security";
 import {
   isRemoteAccessHost,
+  isLocalRequest,
   isTailscaleFunnelRequest,
   isRemoteAccessRequestAuthorized,
   readRemoteAccessConfig,
@@ -41,8 +44,10 @@ export function proxy(request: NextRequest) {
 
   // Tailscale Funnel puts this port on the public internet. Without a web password
   // that is a shell for anyone, so refuse it however the Host header reads.
-  if (isTailscaleFunnelRequest(request) && !isWebPasswordEnabled(process.env.PI_WEB_PASSWORD)) {
-    return new NextResponse("Pi refuses Tailscale Funnel (public) traffic. Use tailscale serve, which keeps it inside your tailnet.", {
+  if (isTailscaleFunnelRequest(request)) {
+    let enabled = false;
+    try { enabled = isWebPasswordEnabled(); } catch { /* Unreadable credentials fail closed. */ }
+    if (!enabled) return new NextResponse("Pi refuses Tailscale Funnel (public) traffic. Use tailscale serve, which keeps it inside your tailnet.", {
       status: 403,
       headers: { "Cache-Control": "no-store" },
     });
@@ -77,7 +82,31 @@ export function proxy(request: NextRequest) {
     return NextResponse.json({ error: "Untrusted API request" }, { status: 403 });
   }
 
-  const password = process.env.PI_WEB_PASSWORD;
+  // The Rust shell checks this non-secret instance id before creating its
+  // WebView (and keeps probing it). It conveys no authentication privilege.
+  if (request.nextUrl.pathname === "/api/desktop/identity"
+    && (request.method === "GET" || request.method === "HEAD")
+    && isLocalRequest(request)) return NextResponse.next();
+
+  // Only native-token authenticated bootstrap/settings calls bypass the browser
+  // password. Host, Origin and relay checks above still apply.
+  const desktopEndpoint = request.nextUrl.pathname === "/api/desktop/auth"
+    || request.nextUrl.pathname === "/api/desktop/browser-password";
+  if (desktopEndpoint && isDesktopBootstrapRequest(request)) return NextResponse.next();
+  if (isDesktopWebSession(request)) {
+    return request.nextUrl.pathname === "/login"
+      ? NextResponse.redirect(new URL("/", request.url)) : NextResponse.next();
+  }
+
+  let password: WebPassword | undefined;
+  try { password = getWebPassword(); }
+  catch {
+    // The minimal login page can bootstrap the native window for local recovery.
+    // No browser business API is opened if credentials cannot be read.
+    if (request.nextUrl.pathname === "/login") return NextResponse.next();
+    if (!isApiRequest) return NextResponse.redirect(new URL("/login", request.url));
+    return NextResponse.json({ error: "Browser authentication configuration is unavailable" }, { status: 503 });
+  }
   if (!isWebPasswordEnabled(password)) {
     if (request.nextUrl.pathname === "/login") {
       return NextResponse.redirect(new URL("/", request.url));

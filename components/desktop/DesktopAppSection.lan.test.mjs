@@ -42,6 +42,7 @@ function harness({ initial = false, confirm = async () => true, save = async () 
     "@/hooks/useI18n": { useI18n: () => ({ t: (key) => key }) },
     "@/components/SettingsUi": { ConfigSwitch, ConfigButton: () => null },
     "./useDesktopChrome": { useDesktopChrome: () => ({ isDesktop: true }) },
+    "./BrowserPasswordSection": { BrowserPasswordSection: () => null },
   };
   const compiledModule = { exports: {} };
   vm.runInNewContext(compiled, { exports: compiledModule.exports, module: compiledModule, require: (name) => mocks[name] ?? require(name) });

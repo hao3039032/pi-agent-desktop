@@ -18,6 +18,7 @@ import { useI18n } from "@/hooks/useI18n";
 import { ConfigButton, ConfigSwitch } from "@/components/SettingsUi";
 
 import { useDesktopChrome } from "./useDesktopChrome";
+import { BrowserPasswordSection } from "./BrowserPasswordSection";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -182,6 +183,7 @@ export function DesktopAppSection() {
           </ConfigButton>
         </div>
       </div>
+      <BrowserPasswordSection />
       <div className="settings-action-group">
         <ConfigButton onClick={() => void openLogDirNative()}>
           {t("appSettings.openLogs")}
