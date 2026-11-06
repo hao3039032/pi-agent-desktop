@@ -39,6 +39,43 @@ try {
   console.error("[Pi Agent] compile cache unavailable:", cacheError);
 }
 
+// Only loopback peers may supply proxy identity. In LAN mode a client can send
+// both Host: 127.0.0.1 and a forged X-Forwarded-For; Next preserves that header,
+// so local-only settings must see the socket address instead. Keep this wrapper
+// installed for the server's lifetime, independently of startup diagnostics.
+{
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const http = require("node:http");
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { BlockList, isIP } = require("node:net");
+  const loopback = new BlockList();
+  loopback.addSubnet("127.0.0.0", 8, "ipv4");
+  loopback.addAddress("::1", "ipv6");
+  const originalEmit = http.Server.prototype.emit;
+  http.Server.prototype.emit = function emitWithPeerIdentity(event, ...args) {
+    if (event === "request") {
+      const [request] = args;
+      const address = request.socket?.remoteAddress;
+      const family = typeof address === "string" ? isIP(address) : 0;
+      // BlockList also recognizes IPv4-mapped IPv6 addresses in the IPv4 subnet.
+      if (!family || !loopback.check(address, family === 6 ? "ipv6" : "ipv4")) {
+        const peer = family ? address : "unknown";
+        request.headers["x-forwarded-for"] = peer;
+        request.headersDistinct["x-forwarded-for"] = [peer];
+        // Keep the raw representation consistent for Request adapters that read
+        // rawHeaders rather than Node's normalized headers. Remove all copies.
+        for (let index = request.rawHeaders.length - 2; index >= 0; index -= 2) {
+          if (request.rawHeaders[index].toLowerCase() === "x-forwarded-for") {
+            request.rawHeaders.splice(index, 2);
+          }
+        }
+        request.rawHeaders.push("X-Forwarded-For", peer);
+      }
+    }
+    return originalEmit.call(this, event, ...args);
+  };
+}
+
 // Startup diagnostics (#157). On some Windows logins the shell's identity
 // probe goes unanswered for over a minute after Next prints "Ready", and the
 // log showed nothing in between. These lines say which it was: the probe never

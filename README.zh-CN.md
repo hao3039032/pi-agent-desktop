@@ -136,7 +136,7 @@ npm run dev
 PI_WEB_PASSWORD='换成足够长的口令' npm run dev:lan
 ```
 
-设置 `PI_WEB_PASSWORD` 后，浏览器首次访问需要输入密码，连续失败会被限流。连接仍是明文 HTTP，请放在 HTTPS 或可信 VPN 之后；如需用 IP 以外的域名访问，用 `PI_WEB_ALLOWED_HOSTS`（逗号分隔）放行。未设密码时，启动器拒绝监听非回环地址；在可信网络上可以设 `PI_WEB_ALLOW_UNAUTHENTICATED=1` 强制启动，启动时会打印警告。桌面 App 不受影响：它只绑定回环地址，并用每进程 token 认证 WebView。
+设置 `PI_WEB_PASSWORD` 后，浏览器首次访问需要输入密码，连续失败会被限流。连接仍是明文 HTTP，请放在 HTTPS 或可信 VPN 之后；如需用 IP 以外的域名访问，用 `PI_WEB_ALLOWED_HOSTS`（逗号分隔）放行。未设密码时，启动器拒绝监听非回环地址；在可信网络上可以设 `PI_WEB_ALLOW_UNAUTHENTICATED=1` 强制启动，启动时会打印警告。桌面 App 默认只绑定回环地址，原生文件操作需要每进程 token。可在「设置 › 常规 › 桌面端 › 允许网络访问」中确认风险后，选择监听所有 IPv4 网络接口。该桌面选项不要求密码，HTTP 也不加密：任何能连接端口的人都可操作 Pi、运行命令和访问文件，甚至可能来自局域网之外。请仅在可信网络使用，并检查防火墙。开启或关闭后均须完全退出并重启应用（关闭窗口可能只是隐藏应用）。若单独配置了 `PI_WEB_PASSWORD`，其密码保护仍然有效。
 
 ### 启动桌面开发模式
 

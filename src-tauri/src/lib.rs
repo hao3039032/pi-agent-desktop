@@ -24,7 +24,8 @@ mod update_install;
 
 use logging::{desktop_log, install_panic_hook, mark_process_start, since_process_start_ms};
 use native_prefs::{
-    clear_app_cache, reconcile_webview_cache_for_version, set_ui_theme, write_last_version,
+    clear_app_cache, get_lan_access, reconcile_webview_cache_for_version, set_lan_access,
+    set_ui_theme, write_last_version,
 };
 #[cfg(feature = "custom-protocol")]
 use native_prefs::{read_last_server_port, write_last_server_port};
@@ -475,7 +476,8 @@ fn server_process_path(node_path: &Path) -> Option<std::ffi::OsString> {
 }
 
 #[cfg(feature = "custom-protocol")]
-fn choose_port(app: &AppHandle) -> io::Result<u16> {
+fn choose_port(app: &AppHandle, lan_access: bool) -> io::Result<u16> {
+    let bind_ip = if lan_access { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
     let mut candidates = Vec::with_capacity(36);
     if let Some(last) = read_last_server_port(app) {
         candidates.push(last);
@@ -486,7 +488,7 @@ fn choose_port(app: &AppHandle) -> io::Result<u16> {
     }
 
     for port in candidates {
-        if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        if let Ok(listener) = TcpListener::bind((bind_ip, port)) {
             let chosen = listener.local_addr()?.port();
             drop(listener);
             write_last_server_port(app, chosen);
@@ -494,7 +496,7 @@ fn choose_port(app: &AppHandle) -> io::Result<u16> {
         }
     }
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let listener = TcpListener::bind((bind_ip, 0))?;
     let chosen = listener.local_addr()?.port();
     drop(listener);
     write_last_server_port(app, chosen);
@@ -810,7 +812,9 @@ fn start_packaged_server(
             .open(&log_path)?;
         let stderr = stdout.try_clone()?;
 
-        let port = choose_port(app)?;
+        let lan_access = native_prefs::read_lan_access(app);
+        let hostname = if lan_access { "0.0.0.0" } else { "127.0.0.1" };
+        let port = choose_port(app, lan_access)?;
         let mut command = Command::new(&node_path);
         if let Ok(cache_dir) = app.path().app_cache_dir() {
             command.env(COMPILE_CACHE_DIR_ENV, cache_dir.join("node-compile-cache"));
@@ -818,7 +822,8 @@ fn start_packaged_server(
         command
             .arg(&server_script)
             .current_dir(&server_dir)
-            .env("HOSTNAME", "127.0.0.1")
+            .env("HOSTNAME", hostname)
+            .env("PI_WEB_HOSTNAME", hostname)
             .env("PORT", port.to_string())
             .env("NODE_ENV", "production")
             .env("NEXT_TELEMETRY_DISABLED", "1")
@@ -1404,6 +1409,8 @@ pub fn run() {
             app_ready,
             window_painted,
             set_ui_theme,
+            get_lan_access,
+            set_lan_access,
             clear_app_cache,
             update_install::install_available_update
         ])

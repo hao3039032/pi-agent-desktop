@@ -123,6 +123,24 @@ fn ui_prefs_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("ui-prefs.json"))
 }
 
+/// A native-only setting: remote browsers cannot invoke these commands.
+pub fn read_lan_access(app: &AppHandle) -> bool {
+    read_ui_prefs(app).get("lanAccess").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+#[tauri::command]
+pub fn get_lan_access(app: AppHandle) -> bool {
+    read_lan_access(&app)
+}
+
+#[tauri::command]
+pub fn set_lan_access(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut prefs = read_ui_prefs(&app);
+    if !prefs.is_object() { prefs = serde_json::json!({}); }
+    prefs["lanAccess"] = serde_json::json!(enabled);
+    write_ui_prefs(&app, &prefs)
+}
+
 fn normalize_theme(theme: &str) -> Option<&'static str> {
     match theme {
         "light" => Some("light"),

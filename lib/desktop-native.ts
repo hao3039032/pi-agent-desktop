@@ -5,6 +5,25 @@ import {
   MAX_DESKTOP_SAVE_BYTES,
 } from "@/lib/desktop-api";
 
+export async function confirmLanAccessNative(message: string, title: string): Promise<boolean> {
+  if (!isTauriDesktop()) throw new Error("Desktop only");
+  // WKWebView does not provide window.confirm without a JS dialog delegate.
+  const { confirm } = await import("@tauri-apps/plugin-dialog");
+  return confirm(message, { title, kind: "warning" });
+}
+
+export async function getLanAccessNative(): Promise<boolean> {
+  if (!isTauriDesktop()) throw new Error("Desktop only");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<boolean>("get_lan_access");
+}
+
+export async function setLanAccessNative(enabled: boolean): Promise<void> {
+  if (!isTauriDesktop()) throw new Error("Desktop only");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_lan_access", { enabled });
+}
+
 export type DesktopDialogFilter = {
   name: string;
   extensions: string[];

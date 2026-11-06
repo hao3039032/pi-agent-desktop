@@ -5,6 +5,9 @@ import { useEffect, useState } from "react";
 import { APP_PREF_KEYS, getPrefBool, setPrefBool } from "@/lib/app-prefs";
 import {
   clearAppCacheNative,
+  confirmLanAccessNative,
+  getLanAccessNative,
+  setLanAccessNative,
   isAutostartEnabledNative,
   openLogDirNative,
   quitAppNative,
@@ -43,6 +46,10 @@ export function DesktopAppSection() {
   // null = not read yet (switch disabled so a click cannot race the read).
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [autostartError, setAutostartError] = useState(false);
+  const [lanAccess, setLanAccess] = useState<boolean | null>(null);
+  const [lanError, setLanError] = useState(false);
+  const [lanChanged, setLanChanged] = useState(false);
+  const [lanBusy, setLanBusy] = useState(false);
 
   const [cacheState, setCacheState] = useState<
     { status: "idle" | "busy" | "error" } | { status: "done"; freed: number }
@@ -51,6 +58,9 @@ export function DesktopAppSection() {
   useEffect(() => {
     if (!isDesktop) return;
     let cancelled = false;
+    getLanAccessNative()
+      .then((enabled) => { if (!cancelled) setLanAccess(enabled); })
+      .catch(() => { if (!cancelled) setLanError(true); });
     isAutostartEnabledNative()
       .then((enabled) => { if (!cancelled) setAutostart(enabled); })
       .catch(() => { if (!cancelled) setAutostartError(true); });
@@ -70,6 +80,21 @@ export function DesktopAppSection() {
     }
   };
 
+  const toggleLanAccess = async (next: boolean) => {
+    setLanError(false);
+    setLanBusy(true);
+    try {
+      if (next && !await confirmLanAccessNative(t("appSettings.lanConfirm"), t("appSettings.lanAccess"))) return;
+      await setLanAccessNative(next);
+      setLanAccess(next);
+      setLanChanged(true);
+    } catch {
+      setLanError(true);
+    } finally {
+      setLanBusy(false);
+    }
+  };
+
   const clearCache = async () => {
     setCacheState({ status: "busy" });
     try {
@@ -84,6 +109,20 @@ export function DesktopAppSection() {
       <h3 className="settings-general-heading">{t("appSettings.desktopSection")}</h3>
       <p className="settings-general-description">{t("appSettings.desktopHint")}</p>
       <div className="settings-option-list">
+        <div className="settings-option">
+          <span className="settings-option-text">
+            <span className="settings-option-title">{t("appSettings.lanAccess")}</span>
+            <span className="settings-option-hint" role="status">
+              {lanError ? t("appSettings.lanError") : lanChanged ? t("appSettings.lanRestart") : t("appSettings.lanHint", { port: typeof window === "undefined" ? "" : window.location.port })}
+            </span>
+          </span>
+          <ConfigSwitch
+            checked={lanAccess === true}
+            disabled={lanAccess === null || lanBusy}
+            label={t("appSettings.lanAccess")}
+            onChange={(next) => void toggleLanAccess(next)}
+          />
+        </div>
         <div className="settings-option">
           <span className="settings-option-text">
             <span className="settings-option-title">{t("appSettings.closeQuits")}</span>

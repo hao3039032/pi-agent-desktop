@@ -59,6 +59,11 @@ description = "Allows the UI to persist light/dark theme for the next cold start
 commands.allow = ["set_ui_theme"]
 
 [[permission]]
+identifier = "allow-lan-access-settings"
+description = "Allows the desktop window to configure LAN listening for the next launch."
+commands.allow = ["get_lan_access", "set_lan_access"]
+
+[[permission]]
 identifier = "allow-get-desktop-api-token"
 description = "Allows the trusted desktop WebView to authorize native-dialog filesystem requests."
 commands.allow = ["get_desktop_api_token"]
