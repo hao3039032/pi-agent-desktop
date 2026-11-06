@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 8,
+  "revision": 9,
   "updateMirrors": ["gh-proxy.com", "ghproxy.cn"],
   "app": {
     "productName": "Pi Agent LW",
@@ -118,27 +118,6 @@
         }
       },
       {
-        "id": "gemini-3.8-flash",
-        "name": "Gemini 3.8 Flash",
-        "api": "google-generative-ai",
-        "baseUrl": "https://ai-new-api.91prize.com/v1beta",
-        "reasoning": true,
-        "input": [
-          "text",
-          "image"
-        ],
-        "contextWindow": 1048576,
-        "maxTokens": 65536,
-        "thinkingLevelMap": {
-          "xhigh": "high",
-          "max": "high",
-          "high": "high",
-          "medium": "medium",
-          "low": "low",
-          "minimal": "minimal"
-        }
-      },
-      {
         "id": "gemini-3.5-flash-lite",
         "name": "Gemini 3.5 Flash Lite",
         "api": "google-generative-ai",
@@ -238,9 +217,9 @@
     "apiKeyKey": "geminiApiKey",
     "defaults": {
       "allowBrowserCookies": true,
-      "provider": "gemini",
-      "searchModel": "gemini-3.8-flash",
-      "summaryModel": "gemini-3.5-flash-lite",
+      "provider": "exa",
+      "summaryModel": "lw/deepseek-v4.1-flash",
+      "queryRewriteModel": "lw/deepseek-v4.1-flash",
       "youtube": {
         "enabled": true,
         "preferredModel": "gemini-3.5-flash-lite"
@@ -259,7 +238,7 @@
   },
   "agentFiles": {
     "extensions/pi-auto-review/config.json": {
-      "model": "lw/gemini-3.5-flash-lite",
+      "model": "lw/deepseek-v4.1-flash",
       "reasoning": "low",
       "timeoutMs": 90000,
       "maxTokens": 1024,
@@ -385,6 +364,6 @@
     ]
   },
   "agentTextFiles": {
-    "WATCHDOG.yml": "# pi-omp-advisor 全局配置(用户级,所有项目生效)\n# main: false —— 常规 pi 会话默认不启动 advisor(按需用 /advisor on 临时开启)\nmain: false\nsubagents: false\n\nadvisors:\n  - name: advisor\n    model: lw/gemini-3.8-flash\n    tools: [read, grep, glob]\n    contextTokens: 48000\n"
+    "WATCHDOG.yml": "# pi-omp-advisor 全局配置(用户级,所有项目生效)\n# main: false —— 常规 pi 会话默认不启动 advisor(按需用 /advisor on 临时开启)\nmain: false\nsubagents: false\n\nadvisors:\n  - name: advisor\n    model: lw/deepseek-v4.1-flash\n    tools: [read, grep, glob]\n    contextTokens: 48000\n"
   }
 }

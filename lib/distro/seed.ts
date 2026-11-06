@@ -9,6 +9,7 @@ import { defaultToolEntries, getGlobalSettingsPath, updateGlobalSettings } from 
 import { runMcpAdapterMigration } from "./mcp-migration";
 import { applyLazyToolActivation } from "./lazy-tool-activation";
 import { applyPlanToolsMigration } from "./plan-tools-migration";
+import { runReleaseMigrations } from "./release-migrations";
 
 export interface SeedManifest {
   distro: string;
@@ -26,6 +27,8 @@ interface DistroState extends ManagedState {
   defaultsApplied?: boolean;
   /** One-time migrations that already ran (name → true). */
   migrations?: Record<string, boolean>;
+  /** One completion receipt per distribution release, independent of seed hashes. */
+  releaseMigrations?: Record<string, boolean>;
   /** The shellPath this app pinned to the bundled Git Bash (shell-path.ts). */
   managedShellPath?: string;
 }
@@ -251,11 +254,15 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
   ensureImageGenConfig(agentDir);
 
   for (const [name, contents] of Object.entries(DISTRO.agentTextFiles ?? {})) {
+    // The advisor accepts both spellings; do not shadow an existing YAML config.
+    if (name === "WATCHDOG.yml" && fileExists(join(agentDir, "WATCHDOG.yaml"))) continue;
     const path = join(agentDir, name);
     if (!fileExists(path) && typeof contents === "string") writeFileSync(path, contents, { mode: 0o644 });
   }
 
   if (versionChanged) refreshProviderModels();
+
+  const releaseMigrations = runReleaseMigrations(agentDir, previous?.releaseMigrations);
 
   writeJsonObject(distroStatePath(agentDir), {
     distro: DISTRO.id,
@@ -263,6 +270,7 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
     defaultsApplied: true,
     packages: reconciled.managed.packages,
     migrations,
+    releaseMigrations,
     // Preserved for ensureBundledBashShellPath, which merges into the same
     // file after this write; dropping it here would orphan the pin marker.
     ...(previous?.managedShellPath ? { managedShellPath: previous.managedShellPath } : {}),
