@@ -12,7 +12,7 @@ export interface ReleaseMigration {
  */
 export const RELEASE_MIGRATIONS: readonly ReleaseMigration[] = [
   {
-    version: "0.8.209",
+    version: "0.8.210",
     run(agentDir) {
       const report = applyDeepSeekMigration(agentDir);
       if (report.written.length) console.log(`[distro] DeepSeek roles: updated ${report.written.join(", ")}`);

@@ -49,7 +49,7 @@ export function migrateAdvisorText(source: string): string | null {
 }
 
 /** Global user config only. No project traversal and no credential routing changes.
- * seedAgentDir records releaseMigrations["0.8.209"] after success. Invalid files
+ * seedAgentDir records releaseMigrations["0.8.210"] after success. Invalid files
  * are reported and left intact; read/write errors throw so the next start retries.
  */
 export function applyDeepSeekMigration(agentDir: string): DeepSeekMigrationReport {
@@ -82,12 +82,9 @@ export function applyDeepSeekMigration(agentDir: string): DeepSeekMigrationRepor
     if (typeof config.model === "string" && OLD_TEXT_MODELS.has(config.model)) config.model = DEEPSEEK_MODEL;
   });
   updateJson("web-search.json", (config) => {
-    // Search is a separate provider API, not a chat model. Exa supports a
-    // keyless search path; keep Gemini credentials for audio/video only.
-    if (config.provider === "gemini" && config.searchModel === REMOVED_MODEL_ID && config.searchProvider === undefined) {
-      config.provider = "exa";
-      delete config.searchModel;
-    }
+    // Grounded search uses its own Gemini API, independently of the chat
+    // catalog. Preserve provider/searchModel (including Gemini 3.8 Flash),
+    // media preferences and credentials; migrate only summary/rewrite roles.
     for (const key of ["summaryModel", "queryRewriteModel"]) {
       if (config[key] === undefined || (typeof config[key] === "string" && OLD_TEXT_MODELS.has(config[key]))) {
         config[key] = DEEPSEEK_MODEL;

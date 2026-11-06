@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 9,
+  "revision": 10,
   "updateMirrors": ["gh-proxy.com", "ghproxy.cn"],
   "app": {
     "productName": "Pi Agent LW",
@@ -217,7 +217,8 @@
     "apiKeyKey": "geminiApiKey",
     "defaults": {
       "allowBrowserCookies": true,
-      "provider": "exa",
+      "provider": "gemini",
+      "searchModel": "gemini-3.8-flash",
       "summaryModel": "lw/deepseek-v4.1-flash",
       "queryRewriteModel": "lw/deepseek-v4.1-flash",
       "youtube": {
