@@ -1412,7 +1412,8 @@ pub fn run() {
             get_lan_access,
             set_lan_access,
             clear_app_cache,
-            update_install::install_available_update
+            update_install::install_available_update,
+            update_install::list_update_sources
         ])
         .setup(move |app| {
             desktop_log(

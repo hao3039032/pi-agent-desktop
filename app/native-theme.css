@@ -889,6 +889,30 @@
   color: var(--text-dim);
 }
 
+/* Download route picker: the card's third row, the same option shape as the
+   terminal default picker (label + select grid, stacking on narrow screens). */
+.settings-update-route {
+  flex-basis: 100%;
+  display: grid;
+  grid-template-columns: minmax(96px, 1fr) minmax(160px, 260px);
+  align-items: center;
+  column-gap: 16px;
+  padding-top: 10px;
+  border-top: var(--hairline) solid var(--separator);
+}
+
+.settings-update-route .app-select-trigger {
+  width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 640px) {
+  .settings-update-route {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+}
+
 .settings-updates-release-link {
   margin-left: 6px;
   color: inherit;

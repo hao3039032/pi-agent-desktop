@@ -1,12 +1,13 @@
 /**
  * Desktop auto-update driver.
  *
- * The webview never supplies a download URL, mirror list, signature or target:
- * it asks the shell to install whatever update it finds, and the shell
- * (`src-tauri/src/update_install.rs`) checks, downloads — direct first, then
- * through the mirrors compiled in from `distro/distro.json` — verifies the
- * minisign signature and installs. That keeps the trust boundary in Rust and
- * keeps this file to progress reporting and error translation.
+ * The webview never supplies a download URL, mirror list, signature or target.
+ * It may name one of the download routes the shell compiled in (`auto`,
+ * `direct`, or a mirror from `distro/distro.json`): the shell re-validates the
+ * id against its own whitelist, rejects anything else, and then checks,
+ * downloads over that route, verifies the minisign signature and installs.
+ * That keeps the trust boundary in Rust and keeps this file to progress
+ * reporting, route listing and error translation.
  */
 
 export type DesktopUpgradePhase = "checking" | "downloading" | "installing";
@@ -26,17 +27,30 @@ export interface DesktopUpgradeResult {
   sourceHost?: string;
 }
 
+/** One download route the shell compiled in, for the Settings picker. */
+export interface DesktopUpdateSource {
+  /** `auto`, `direct` or `mirror:<host>` — opaque to the page beyond echoing it back. */
+  id: string;
+  kind: "auto" | "direct" | "mirror";
+  /** The mirror origin, present for `mirror` entries. */
+  host?: string;
+}
+
+export const DEFAULT_UPDATE_SOURCE_ID = "auto";
+
 /**
  * `transport` is a network verdict and may succeed later — every configured
  * source failed. `manifest` means the update metadata itself could not be read
- * (an HTML error page, a truncated answer). The rest are verdicts about the
- * update itself: `signature` a verification failure (never retried, never
- * installed), `unavailable` a build or platform that cannot update, `install` a
- * local installation failure, `busy` a second concurrent attempt.
+ * (an HTML error page, a truncated answer). `source` means the route id the
+ * page named is not one this build compiled in. The rest are verdicts about
+ * the update itself: `signature` a verification failure (never retried, never
+ * installed), `unavailable` a build or platform that cannot update, `install`
+ * a local installation failure, `busy` a second concurrent attempt.
  */
 export type DesktopUpgradeFailureKind =
   | "transport"
   | "manifest"
+  | "source"
   | "signature"
   | "unavailable"
   | "install"
@@ -89,6 +103,7 @@ interface NativeFailure {
 const FAILURE_KINDS = new Set<DesktopUpgradeFailureKind>([
   "transport",
   "manifest",
+  "source",
   "signature",
   "unavailable",
   "install",
@@ -121,8 +136,52 @@ export function toDesktopUpgradeError(error: unknown): DesktopUpgradeError {
   return new DesktopUpgradeError("other", error instanceof Error ? error.message : String(error));
 }
 
+/** Keep only well-formed route entries; the shell re-validates every id. */
+export function toDesktopUpdateSources(raw: unknown): DesktopUpdateSource[] {
+  if (!Array.isArray(raw)) return [];
+  const kinds = new Set(["auto", "direct", "mirror"] as const);
+  const sources: DesktopUpdateSource[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const candidate = entry as { id?: unknown; kind?: unknown; host?: unknown };
+    if (typeof candidate.id !== "string" || !candidate.id) continue;
+    if (typeof candidate.kind !== "string" || !kinds.has(candidate.kind as "auto" | "direct" | "mirror")) continue;
+    // A mirror without its host cannot be labelled or matched later, so it is
+    // not a choice at all rather than a broken one.
+    if (candidate.kind === "mirror" && typeof candidate.host !== "string") continue;
+    sources.push({
+      id: candidate.id,
+      kind: candidate.kind as DesktopUpdateSource["kind"],
+      ...(candidate.kind === "mirror" && typeof candidate.host === "string" ? { host: candidate.host } : {}),
+    });
+  }
+  return sources;
+}
+
+/** The saved id when this build still knows it, otherwise the automatic route. */
+export function resolveDesktopUpdateSourceId(
+  saved: string | null | undefined,
+  sources: readonly DesktopUpdateSource[],
+): string {
+  return saved && sources.some((source) => source.id === saved)
+    ? saved
+    : DEFAULT_UPDATE_SOURCE_ID;
+}
+
+/**
+ * The download routes this build's shell compiled in, for the Settings picker.
+ * Empty in a browser (nothing to route there) or when this build cannot
+ * install updates; a native failure rejects so the UI can offer a retry.
+ */
+export async function listDesktopUpdateSources(): Promise<DesktopUpdateSource[]> {
+  if (!isTauriDesktop()) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return toDesktopUpdateSources(await invoke<unknown>("list_update_sources"));
+}
+
 export async function installLatestDesktopRelease(
   onProgress: (progress: DesktopUpgradeProgress) => void,
+  options: { sourceId?: string } = {},
 ): Promise<DesktopUpgradeResult> {
   if (!isTauriDesktop()) {
     throw new DesktopUpgradeError(
@@ -153,7 +212,11 @@ export async function installLatestDesktopRelease(
   });
 
   try {
-    const outcome = await invoke<NativeOutcome>("install_available_update");
+    // The payload is exactly one route id from the shell's own list; the
+    // shell re-validates it and never accepts a URL, host, signature or target.
+    const outcome = await invoke<NativeOutcome>("install_available_update", {
+      source: options.sourceId ?? DEFAULT_UPDATE_SOURCE_ID,
+    });
     if (!outcome.installed) return { installed: false };
 
     onProgress({

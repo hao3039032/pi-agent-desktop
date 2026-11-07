@@ -82,3 +82,8 @@ commands.allow = ["clear_app_cache"]
 identifier = "allow-install-available-update"
 description = "Allows the UI to install the signed update the shell finds: it checks, downloads (direct, then the mirrors compiled in from distro.json), verifies the minisign signature and installs. No download URL, mirror, signature or target is accepted from the page."
 commands.allow = ["install_available_update"]
+
+[[permission]]
+identifier = "allow-list-update-sources"
+description = "Allows the UI to read the download routes this build compiled in (automatic, GitHub direct, and the mirrors from distro.json). Read-only: the shell re-validates any route id the page later sends."
+commands.allow = ["list_update_sources"]

@@ -10,6 +10,7 @@
     "core:default",
     "updater:default",
     "process:allow-restart",
-    "allow-install-available-update"
+    "allow-install-available-update",
+    "allow-list-update-sources"
   ]
 }

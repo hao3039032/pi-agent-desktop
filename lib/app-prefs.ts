@@ -35,6 +35,9 @@ export const APP_PREF_KEYS = {
   /** Project session ids hidden from their project until "Show archived" (#200). */
   archivedSessions: "pi-web:archived-sessions",
   updateSnooze: "pi-web:update-snooze",
+  /** The update download route id the shell compiled in ("auto", "direct",
+   *  or "mirror:<host>"); absent means automatic. */
+  updateDownloadSource: "pi-web:update-download-source",
   closeQuits: "pi-desktop-close-quits",
   notifyOnComplete: "pi-desktop-notify-on-complete",
   chatDrafts: "pi-chat-drafts-v1",

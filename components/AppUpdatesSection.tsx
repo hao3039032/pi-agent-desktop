@@ -8,9 +8,20 @@ import {
   APP_VERSION,
   APP_VERSION_DISPLAY,
 } from "@/lib/branding";
+import { APP_PREF_KEYS, getPref, setPref } from "@/lib/app-prefs";
 import { handleExternalLinkClick } from "@/lib/desktop-native";
-import { DesktopUpgradeError, installLatestDesktopRelease, type DesktopUpgradeProgress } from "@/lib/desktop-updater";
+import {
+  DEFAULT_UPDATE_SOURCE_ID,
+  DesktopUpgradeError,
+  installLatestDesktopRelease,
+  isTauriDesktop,
+  listDesktopUpdateSources,
+  resolveDesktopUpdateSourceId,
+  type DesktopUpdateSource,
+  type DesktopUpgradeProgress,
+} from "@/lib/desktop-updater";
 import { useI18n } from "@/hooks/useI18n";
+import { AppSelect } from "./AppSelect";
 import { ConfigButton } from "./SettingsUi";
 
 interface Props {
@@ -33,6 +44,14 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
   const [upgradeProgress, setUpgradeProgress] = useState<DesktopUpgradeProgress | null>(null);
   const [upgradeError, setUpgradeError] = useState<{ text: string; kind: DesktopUpgradeError["kind"] } | null>(null);
   const upgradeInFlight = useRef(false);
+  // null = still asking the shell; [] = nothing to route (browser, or a build
+  // without an updater key) and the picker stays hidden.
+  const [updateSources, setUpdateSources] = useState<DesktopUpdateSource[] | null>(null);
+  const [sourcesError, setSourcesError] = useState(false);
+  const [sourcesAttempt, setSourcesAttempt] = useState(0);
+  const [routeId, setRouteId] = useState<string>(
+    () => getPref(APP_PREF_KEYS.updateDownloadSource) || DEFAULT_UPDATE_SOURCE_ID,
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -55,6 +74,30 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    if (!isTauriDesktop()) {
+      setUpdateSources([]);
+      return;
+    }
+    let cancelled = false;
+    setSourcesError(false);
+    listDesktopUpdateSources()
+      .then((sources) => {
+        if (!cancelled) setUpdateSources(sources);
+      })
+      .catch(() => {
+        // The picker cannot be offered, but the update check above is
+        // unaffected; installing still uses the automatic route.
+        if (!cancelled) {
+          setUpdateSources([]);
+          setSourcesError(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sourcesAttempt]);
+
   const busy = Boolean(upgradeProgress);
   useEffect(() => {
     onBusyChange?.(busy);
@@ -71,7 +114,25 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
     () => components.some((component) => component.updateAvailable),
     [components],
   );
-  const canUpgrade = !loading && updateAvailable && !upgradeProgress;
+  const canUpgrade = !loading && updateAvailable && !upgradeProgress
+    && (!isTauriDesktop() || updateSources !== null);
+  // The routes this build compiled in; a saved id that is no longer listed
+  // (a mirror removed from a newer build) resolves back to automatic, and the
+  // notice below says so instead of silently rerouting.
+  const routeOptions = useMemo(
+    () => (updateSources ?? []).map((source) => ({
+      value: source.id,
+      label: source.kind === "auto"
+        ? t("appSettings.downloadRouteAuto")
+        : source.kind === "direct"
+          ? t("appSettings.downloadRouteDirect")
+          : source.host ?? source.id,
+    })),
+    [updateSources, t],
+  );
+  const effectiveRouteId = resolveDesktopUpdateSourceId(routeId, updateSources ?? []);
+  const staleRoute = routeId !== effectiveRouteId;
+  const showRoutePicker = (updateSources?.length ?? 0) > 0;
   // A mirror serving the installer is worth naming: it explains both the
   // switched source and why the progress bar restarted at that switch.
   const downloadSource = upgradeProgress?.phase === "downloading"
@@ -126,7 +187,11 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
     upgradeInFlight.current = true;
     setUpgradeError(null);
     try {
-      const result = await installLatestDesktopRelease(setUpgradeProgress);
+      // Only the resolved route id crosses the bridge — never a URL, host,
+      // signature or target; the shell re-validates it against its own list.
+      const result = await installLatestDesktopRelease(setUpgradeProgress, {
+        sourceId: effectiveRouteId,
+      });
       if (!result.installed) {
         setUpgradeProgress(null);
         setUpgradeError({ text: t("appSettings.noSignedBundle", { name: APP_DISTRIBUTION_NAME }), kind: "other" });
@@ -152,6 +217,11 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
     } finally {
       upgradeInFlight.current = false;
     }
+  };
+
+  const handleRouteChange = (next: string) => {
+    setRouteId(next);
+    setPref(APP_PREF_KEYS.updateDownloadSource, next);
   };
 
   return (
@@ -196,7 +266,45 @@ export function AppUpdatesSection({ onBusyChange }: Props) {
             </ConfigButton>
           )}
         </div>
+        {showRoutePicker && (
+          <div className="settings-update-route">
+            <span className="settings-option-title" id="settings-update-route-label">
+              {t("appSettings.downloadRoute")}
+            </span>
+            <AppSelect
+              aria-label={t("appSettings.downloadRoute")}
+              aria-describedby="settings-update-route-hint"
+              aria-busy={updateSources === null}
+              value={effectiveRouteId}
+              onValueChange={handleRouteChange}
+              disabled={Boolean(upgradeProgress)}
+              options={routeOptions}
+            />
+          </div>
+        )}
       </div>
+      {showRoutePicker && (
+        <p className="settings-general-description settings-updates-note" id="settings-update-route-hint">
+          {t("appSettings.downloadRouteHint")}
+        </p>
+      )}
+      {staleRoute && showRoutePicker && (
+        <p role="status" className="settings-general-description settings-updates-note">
+          {t("appSettings.downloadRouteStale")}
+        </p>
+      )}
+      {sourcesError && (
+        <p role="alert" className="settings-general-error">
+          {t("appSettings.downloadRouteLoadFailed")}
+          <ConfigButton
+            variant="secondary"
+            size="small"
+            onClick={() => setSourcesAttempt((attempt) => attempt + 1)}
+          >
+            {t("common.retry")}
+          </ConfigButton>
+        </p>
+      )}
       {updateAvailable && (
         <p className="settings-general-description settings-updates-note">
           {t("appSettings.updateNote", { name: APP_DISTRIBUTION_NAME })}

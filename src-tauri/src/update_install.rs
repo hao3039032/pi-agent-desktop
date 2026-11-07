@@ -1,9 +1,12 @@
 //! Guarded auto-update installer.
 //!
-//! The webview only asks for "install the update you find". It never supplies a
-//! download URL, mirror list, signature, target or installer path: the endpoint
-//! list comes from this build's Tauri configuration, and the repository, tag
-//! and asset name are checked against values compiled into the shell.
+//! The webview only asks for "install the update you find" and may name one
+//! of the route ids this shell compiled in (`auto`, `direct`, or a configured
+//! mirror). It never supplies a download URL, mirror host of its own choosing,
+//! signature, target or installer path: the endpoint list comes from this
+//! build's Tauri configuration, the repository, tag and asset name are checked
+//! against values compiled into the shell, and an unknown route id is
+//! rejected — never silently replaced by another route.
 //!
 //! What a mirror can and cannot do: an update *manifest* is fetched over HTTPS
 //! but is **not** signed, so a mirror that answers the metadata request can
@@ -63,6 +66,51 @@ const MAX_ENDPOINTS: usize = 1 + MAX_MIRRORS;
 
 static INSTALLING: AtomicBool = AtomicBool::new(false);
 
+/// The download route the user picked in Settings. The id the webview sends is
+/// `auto`, `direct` or `mirror:<host>`; the host half must already be in this
+/// build's mirror list, so a route id can never smuggle in an arbitrary origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateRoute {
+    /// Direct github.com first, then the configured mirrors — the previous
+    /// behaviour and the default.
+    Auto,
+    /// Only the canonical github.com endpoints.
+    Direct,
+    /// Only this mirror host, for both the manifest and the installer bytes.
+    Mirror(String),
+}
+
+pub const AUTO_ROUTE_ID: &str = "auto";
+pub const DIRECT_ROUTE_ID: &str = "direct";
+
+fn mirror_route_id(host: &str) -> String {
+    format!("mirror:{host}")
+}
+
+/// Resolve a webview-submitted route id against the compiled-in mirror list.
+///
+/// `None` means the default (auto), so an older page keeps working. Anything
+/// else that is not `auto`, `direct` or a whitelisted mirror host is rejected:
+/// a stale or hostile id must fail loudly, never fall back to a route nobody
+/// chose.
+fn parse_update_route(id: Option<&str>, mirrors: &[String]) -> Result<UpdateRoute, String> {
+    match id {
+        None | Some(AUTO_ROUTE_ID) => Ok(UpdateRoute::Auto),
+        Some(DIRECT_ROUTE_ID) => Ok(UpdateRoute::Direct),
+        Some(raw) => {
+            let Some(host) = raw.strip_prefix("mirror:") else {
+                return Err(format!("unknown update source: {raw}"));
+            };
+            let host = host.to_ascii_lowercase();
+            if mirrors.iter().any(|known| known.eq_ignore_ascii_case(&host)) {
+                Ok(UpdateRoute::Mirror(host))
+            } else {
+                Err(format!("update source is not configured in this build: {raw}"))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Progress<'a> {
@@ -91,7 +139,8 @@ pub struct InstallOutcome {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallFailure {
-    /// `transport`, `manifest`, `signature`, `unavailable`, `install` or `busy`.
+    /// `transport`, `manifest`, `signature`, `source`, `unavailable`,
+    /// `install` or `busy`.
     kind: &'static str,
     message: String,
     attempted_hosts: Vec<String>,
@@ -207,6 +256,58 @@ fn configured_mirrors() -> Vec<String> {
     parse_mirrors(MIRRORS)
 }
 
+/// One entry of the route list the webview may offer. The ids are the only
+/// strings the page may later send back, and the shell re-validates them.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSourceInfo {
+    /// `auto`, `direct` or `mirror:<host>`.
+    id: String,
+    /// `auto`, `direct` or `mirror`.
+    kind: &'static str,
+    /// The mirror origin, present for `mirror` entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+}
+
+/// The choices this build can honour: always `auto` and `direct`, then one
+/// entry per configured mirror. Hosts come from the compiled-in whitelist, so
+/// the page can never offer a route this shell would refuse.
+fn update_source_choices(mirrors: &[String]) -> Vec<UpdateSourceInfo> {
+    let mut sources = vec![
+        UpdateSourceInfo {
+            id: AUTO_ROUTE_ID.into(),
+            kind: "auto",
+            host: None,
+        },
+        UpdateSourceInfo {
+            id: DIRECT_ROUTE_ID.into(),
+            kind: "direct",
+            host: None,
+        },
+    ];
+    for host in mirrors {
+        sources.push(UpdateSourceInfo {
+            id: mirror_route_id(host),
+            kind: "mirror",
+            host: Some(host.clone()),
+        });
+    }
+    sources
+}
+
+/// The download routes this build may use, for the Settings picker.
+///
+/// Empty when this build cannot install updates at all (no updater key):
+/// there is nothing to route then, and the page hides the picker.
+#[tauri::command]
+pub fn list_update_sources() -> Vec<UpdateSourceInfo> {
+    if UPDATER_PUBLIC_KEY.map(str::trim).is_none_or(str::is_empty) {
+        return Vec::new();
+    }
+    update_source_choices(&configured_mirrors())
+}
+
 /// Why `asset` cannot be the installer for `version`, or `None` when it can.
 ///
 /// A manifest is not signed, so this is the only thing standing between a
@@ -248,24 +349,37 @@ fn canonical_asset_error(asset: &Url, version: &str) -> Option<&'static str> {
     None
 }
 
+/// The mirror's view of any canonical github.com URL:
+/// `https://<mirror>/https://github.com/<owner>/<repo>/…`.
+///
+/// The caller has already established the target is canonical for this build;
+/// this only refuses shapes that could not have passed that check, so the
+/// mirror is never asked for an arbitrary URL.
+fn mirror_github_url(target: &Url, host: &str) -> Option<Url> {
+    if target.scheme() != "https" || target.host_str() != Some("github.com") {
+        return None;
+    }
+    if target.port().is_some_and(|port| port != 443)
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.query().is_some()
+        || target.fragment().is_some()
+    {
+        return None;
+    }
+    if !is_valid_mirror_host(host) {
+        return None;
+    }
+    Url::parse(&format!("https://{host}/{target}")).ok()
+}
+
 /// The mirror's view of a validated canonical asset:
 /// `https://<mirror>/https://github.com/<owner>/<repo>/releases/download/...`.
 ///
 /// The caller has already checked the asset against the announced version with
-/// [`canonical_asset_error`]; this only refuses shapes that could not have
-/// passed that check, so the mirror is never asked for an arbitrary URL.
+/// [`canonical_asset_error`]; the extra path checks keep the mirror URL a
+/// release download, then [`mirror_github_url`] applies the shared shape rules.
 fn mirror_asset_url(asset: &Url, host: &str) -> Option<Url> {
-    if asset.scheme() != "https" || asset.host_str() != Some("github.com") {
-        return None;
-    }
-    if asset.port().is_some_and(|port| port != 443)
-        || !asset.username().is_empty()
-        || asset.password().is_some()
-        || asset.query().is_some()
-        || asset.fragment().is_some()
-    {
-        return None;
-    }
     let path = asset.path();
     if !path.contains("/releases/download/") {
         return None;
@@ -275,9 +389,17 @@ fn mirror_asset_url(asset: &Url, host: &str) -> Option<Url> {
             return None;
         }
     }
-    is_valid_mirror_host(host)
-        .then(|| Url::parse(&format!("https://{host}/{asset}")).ok())
-        .flatten()
+    mirror_github_url(asset, host)
+}
+
+/// `host` or `host:port`, matching how the mirror was configured and how
+/// progress events name the serving source.
+fn url_authority(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
 }
 
 /// Whether another host could plausibly succeed where this one failed.
@@ -412,11 +534,76 @@ fn configured_endpoints<R: Runtime>(app: &AppHandle<R>) -> Vec<(Url, String)> {
     endpoints
 }
 
-/// Download the announced asset, falling back to the configured mirrors when
-/// the transport to `github.com` fails.
+/// The direct github.com manifest endpoint from the build's own Tauri
+/// configuration, which every route derives its candidates from.
+fn canonical_endpoint(configured: &[(Url, String)]) -> Option<(Url, String)> {
+    configured
+        .iter()
+        .find(|(url, _)| url.scheme() == "https" && url.host_str() == Some("github.com"))
+        .cloned()
+}
+
+/// The manifest endpoints a route may use.
+///
+/// `Auto` keeps the previous list (canonical first, then the configured
+/// mirrors, capped). The manual routes use exactly one source each — the point
+/// of the picker is that a chosen mirror is not preceded by a slow direct
+/// attempt — and a mirror never occupies the position where its "no update"
+/// answer could be read as authoritative ([`try_checks`] only accepts that
+/// answer from github.com itself).
+fn plan_manifest_endpoints(
+    route: &UpdateRoute,
+    configured: &[(Url, String)],
+) -> Vec<(Url, String)> {
+    match route {
+        UpdateRoute::Auto => {
+            let mut endpoints = configured.to_vec();
+            endpoints.truncate(MAX_ENDPOINTS);
+            endpoints
+        }
+        UpdateRoute::Direct => canonical_endpoint(configured).into_iter().collect(),
+        UpdateRoute::Mirror(host) => canonical_endpoint(configured)
+            .and_then(|(url, _)| mirror_github_url(&url, host))
+            .map(|url| {
+                let authority = url_authority(&url);
+                vec![(url, authority)]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The download sources a route may use for an already-validated asset URL.
+fn plan_download_sources(
+    route: &UpdateRoute,
+    canonical: &Url,
+    mirrors: &[String],
+) -> Vec<(Url, String)> {
+    match route {
+        UpdateRoute::Auto => {
+            let mut sources = vec![(canonical.clone(), "github.com".to_string())];
+            for host in mirrors {
+                if let Some(url) = mirror_asset_url(canonical, host) {
+                    sources.push((url, host.clone()));
+                }
+            }
+            sources
+        }
+        UpdateRoute::Direct => vec![(canonical.clone(), "github.com".to_string())],
+        UpdateRoute::Mirror(host) => mirror_asset_url(canonical, host)
+            .map(|url| {
+                let authority = url_authority(&url);
+                vec![(url, authority)]
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Download the announced asset over the route's sources, falling back to the
+/// configured mirrors only in `Auto` (the sources list already encodes that).
 async fn download_with_fallback<R: Runtime>(
     app: &AppHandle<R>,
     update: &Update,
+    route: &UpdateRoute,
 ) -> Result<(Vec<u8>, String), (UpdaterError, Vec<String>)> {
     let version = update.version.clone();
     if let Some(reason) = canonical_asset_error(&update.download_url, &version) {
@@ -432,12 +619,7 @@ async fn download_with_fallback<R: Runtime>(
     }
 
     let canonical = update.download_url.clone();
-    let mut sources: Vec<(Url, String)> = vec![(canonical.clone(), "github.com".to_string())];
-    for host in configured_mirrors() {
-        if let Some(url) = mirror_asset_url(&canonical, &host) {
-            sources.push((url, host));
-        }
-    }
+    let sources = plan_download_sources(route, &canonical, &configured_mirrors());
 
     let bytes = try_sources(sources, |url, host| {
         let app = app.clone();
@@ -557,12 +739,15 @@ fn failure_kind(error: &UpdaterError) -> &'static str {
     }
 }
 
-/// Check, download (with mirror fallback) and install the signed update.
+/// Check, download (over the route's sources) and install the signed update.
 ///
-/// Returns `installed: false` when the app is already up to date.
+/// Returns `installed: false` when the app is already up to date. `source` is
+/// the webview's route id: `None` means the automatic route, and an id this
+/// build does not know is rejected before anything is fetched.
 #[tauri::command]
 pub async fn install_available_update<R: Runtime>(
     app: AppHandle<R>,
+    source: Option<String>,
 ) -> Result<InstallOutcome, InstallFailure> {
     if UPDATER_PUBLIC_KEY.map(str::trim).is_none_or(str::is_empty) {
         return Err(InstallFailure::new(
@@ -570,6 +755,13 @@ pub async fn install_available_update<R: Runtime>(
             "This build has no updater key, so it cannot install updates.",
         ));
     }
+
+    // Resolve the route against this build's own whitelist before anything
+    // else: an id nobody configured is a caller error, never a silent switch
+    // to another route.
+    let route =
+        parse_update_route(source.as_deref(), &configured_mirrors())
+            .map_err(|message| InstallFailure::new("source", message))?;
 
     // One install at a time: the renderer also guards its button, but the
     // authoritative bound belongs here, where the installer actually runs.
@@ -580,13 +772,16 @@ pub async fn install_available_update<R: Runtime>(
         ));
     }
 
-    let result = run_install(&app).await;
+    let result = run_install(&app, &route).await;
     INSTALLING.store(false, Ordering::SeqCst);
     result
 }
 
-async fn run_install<R: Runtime>(app: &AppHandle<R>) -> Result<InstallOutcome, InstallFailure> {
-    let endpoints = configured_endpoints(app);
+async fn run_install<R: Runtime>(
+    app: &AppHandle<R>,
+    route: &UpdateRoute,
+) -> Result<InstallOutcome, InstallFailure> {
+    let endpoints = plan_manifest_endpoints(route, &configured_endpoints(app));
     if endpoints.is_empty() {
         return Err(InstallFailure::new(
             "unavailable",
@@ -645,7 +840,7 @@ async fn run_install<R: Runtime>(app: &AppHandle<R>) -> Result<InstallOutcome, I
     };
 
     let (bytes, source_host) =
-        download_with_fallback(app, &update)
+        download_with_fallback(app, &update, route)
             .await
             .map_err(|(error, attempted)| {
                 InstallFailure::new(failure_kind(&error), error.to_string()).with_hosts(attempted)
@@ -1032,6 +1227,173 @@ mod tests {
                 assert_eq!(attempted, vec!["github.com", "m1.example"]);
             }
             _ => panic!("expected every manifest candidate to fail"),
+        }
+    }
+
+    fn route_mirrors() -> Vec<String> {
+        vec!["gh-proxy.com".to_string(), "ghproxy.cn".to_string()]
+    }
+
+    fn configured_endpoints_fixture() -> Vec<(Url, String)> {
+        vec![
+            (
+                url("https://github.com/o/r/releases/latest/download/latest.json"),
+                "github.com".to_string(),
+            ),
+            (
+                url("https://gh-proxy.com/https://github.com/o/r/releases/latest/download/latest.json"),
+                "gh-proxy.com".to_string(),
+            ),
+            (
+                url("https://ghproxy.cn/https://github.com/o/r/releases/latest/download/latest.json"),
+                "ghproxy.cn".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn route_ids_resolve_against_the_compiled_whitelist_only() {
+        let mirrors = route_mirrors();
+        assert_eq!(
+            parse_update_route(None, &mirrors),
+            Ok(UpdateRoute::Auto),
+            "a page that sends nothing keeps the automatic route"
+        );
+        assert_eq!(parse_update_route(Some("auto"), &mirrors), Ok(UpdateRoute::Auto));
+        assert_eq!(parse_update_route(Some("direct"), &mirrors), Ok(UpdateRoute::Direct));
+        assert_eq!(
+            parse_update_route(Some("mirror:GH-PROXY.COM"), &mirrors),
+            Ok(UpdateRoute::Mirror("gh-proxy.com".to_string()))
+        );
+
+        for id in [
+            "",
+            "https://evil.example/x",
+            "mirror:evil.example",
+            "mirror:gh-proxy.com/https://github.com",
+            "mirror:",
+            "github.com",
+        ] {
+            assert!(
+                parse_update_route(Some(id), &mirrors).is_err(),
+                "{id} must be rejected, not silently rerouted"
+            );
+        }
+        // A mirror removed from a newer build invalidates the saved id.
+        assert!(parse_update_route(Some("mirror:old.example"), &[]).is_err());
+    }
+
+    #[test]
+    fn a_manual_mirror_route_uses_only_that_mirror_for_the_manifest() {
+        let route = UpdateRoute::Mirror("ghproxy.cn".to_string());
+        let planned = plan_manifest_endpoints(&route, &configured_endpoints_fixture());
+        assert_eq!(planned.len(), 1, "no direct attempt may precede the chosen mirror");
+        assert_eq!(planned[0].1, "ghproxy.cn");
+        assert_eq!(
+            planned[0].0.as_str(),
+            "https://ghproxy.cn/https://github.com/o/r/releases/latest/download/latest.json"
+        );
+        // A mirror endpoint is never the canonical one, so `try_checks` cannot
+        // read its "no update" answer as authoritative.
+        assert_ne!(planned[0].0.host_str(), Some("github.com"));
+    }
+
+    #[test]
+    fn a_direct_route_uses_only_the_canonical_manifest_endpoint() {
+        let planned = plan_manifest_endpoints(&UpdateRoute::Direct, &configured_endpoints_fixture());
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].1, "github.com");
+        assert_eq!(
+            planned[0].0.as_str(),
+            "https://github.com/o/r/releases/latest/download/latest.json"
+        );
+    }
+
+    #[test]
+    fn manual_routes_refuse_a_missing_canonical_manifest() {
+        let configured = vec![(
+            url("https://ghproxy.cn/https://github.com/o/r/releases/latest/download/latest.json"),
+            "ghproxy.cn".to_string(),
+        )];
+        assert!(plan_manifest_endpoints(&UpdateRoute::Direct, &configured).is_empty());
+        assert!(plan_manifest_endpoints(&UpdateRoute::Mirror("ghproxy.cn".into()), &configured).is_empty());
+    }
+
+    #[test]
+    fn the_automatic_route_keeps_the_previous_endpoint_list() {
+        let configured = configured_endpoints_fixture();
+        let planned = plan_manifest_endpoints(&UpdateRoute::Auto, &configured);
+        assert_eq!(planned, configured);
+    }
+
+    #[test]
+    fn a_manual_route_downloads_from_exactly_one_source() {
+        let asset = url(
+            "https://github.com/hao3039032/pi-agent-desktop/releases/download/v0.7.801/Pi.Agent_0.7.801_aarch64.dmg",
+        );
+        let mirrors = route_mirrors();
+
+        let mirror = plan_download_sources(
+            &UpdateRoute::Mirror("gh-proxy.com".to_string()),
+            &asset,
+            &mirrors,
+        );
+        assert_eq!(mirror.len(), 1);
+        assert_eq!(mirror[0].1, "gh-proxy.com");
+        assert_eq!(
+            mirror[0].0.as_str(),
+            format!("https://gh-proxy.com/{asset}")
+        );
+
+        let direct = plan_download_sources(&UpdateRoute::Direct, &asset, &mirrors);
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].1, "github.com");
+        assert_eq!(direct[0].0, asset);
+    }
+
+    #[test]
+    fn the_automatic_route_downloads_direct_first_then_every_mirror() {
+        let asset = url(
+            "https://github.com/hao3039032/pi-agent-desktop/releases/download/v0.7.801/Pi.Agent_0.7.801_aarch64.dmg",
+        );
+        let sources = plan_download_sources(&UpdateRoute::Auto, &asset, &route_mirrors());
+        let hosts: Vec<&str> = sources.iter().map(|(_, host)| host.as_str()).collect();
+        assert_eq!(hosts, vec!["github.com", "gh-proxy.com", "ghproxy.cn"]);
+    }
+
+    #[test]
+    fn a_mirror_host_with_a_port_keeps_its_port_in_the_reported_source() {
+        let asset = url("https://github.com/o/r/releases/download/v1/a.dmg");
+        let sources = plan_download_sources(
+            &UpdateRoute::Mirror("mirror.example.org:8443".to_string()),
+            &asset,
+            &["mirror.example.org:8443".to_string()],
+        );
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].1, "mirror.example.org:8443");
+    }
+
+    #[test]
+    fn update_source_choices_come_from_the_whitelist_and_start_with_auto() {
+        let none = update_source_choices(&[]);
+        assert_eq!(
+            none.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["auto", "direct"],
+            "a build without mirrors still offers auto and direct"
+        );
+
+        let with_mirrors = update_source_choices(&route_mirrors());
+        assert_eq!(
+            with_mirrors.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["auto", "direct", "mirror:gh-proxy.com", "mirror:ghproxy.cn"]
+        );
+        assert_eq!(with_mirrors[2].kind, "mirror");
+        assert_eq!(with_mirrors[2].host.as_deref(), Some("gh-proxy.com"));
+        assert_eq!(with_mirrors[0].host, None);
+
+        // Every offered id parses back to the route it names.
+        for choice in &with_mirrors {
+            assert!(parse_update_route(Some(&choice.id), &route_mirrors()).is_ok());
         }
     }
 }

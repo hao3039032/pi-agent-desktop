@@ -170,6 +170,26 @@ try{
    await page.keyboard.press('Escape');
   }
   await surface.locator('.settings-dialog-close').click();await surface.waitFor({state:'hidden'});
+  // The update download-route picker (real component, stubbed shell): a saved
+  // route the shell no longer lists falls back to automatic with a notice, the
+  // choices are the shell's own, and a pick persists to the preference store.
+  await page.evaluate(()=>localStorage.setItem('pi-web:update-download-source','mirror:gone.example'));
+  await page.getByRole('button',{name:'Update route',exact:true}).click();
+  const route=page.getByRole('combobox',{name:'下载线路',exact:true});await route.waitFor();
+  await page.getByText('已保存的下载线路不在当前版本内，已改用自动。').waitFor();
+  assert.match(await route.textContent(),/自动/);
+  assert.equal(await page.evaluate(()=>window.__invoked.includes('list_update_sources')),true);
+  await page.getByText('安装更新时，更新清单和安装包均使用此线路；手动指定后不会自动切换。上方版本信息仍按自动线路检查。').waitFor();
+  await route.click();const routeList=page.getByRole('listbox');await routeList.waitFor();
+  assert.equal(await routeList.getByRole('option').count(),4);
+  await assertRowGaps(routeList.locator('.app-select-option'),'update route');
+  await assertChoiceGeometry(routeList,routeList.locator('.app-select-option'),'update route');
+  await routeList.getByRole('option',{name:'ghproxy.cn',exact:true}).click();await routeList.waitFor({state:'hidden'});
+  assert.match(await route.textContent(),/ghproxy\.cn/);
+  assert.equal(await page.evaluate(()=>localStorage.getItem('pi-web:update-download-source')),'mirror:ghproxy.cn');
+  await page.getByText('已保存的下载线路不在当前版本内，已改用自动。').waitFor({state:'hidden'});
+  if(width===1280)await page.locator('.settings-update-card').screenshot({path:`test-results/ui-send/update-route-${theme}.png`});
+  await page.evaluate(()=>window.__invoked=undefined);
   assert.deepEqual(errors,[]);results.push({theme,width,options:5,mcpOptions:labels.length,geometry,colors,ratios,toolGaps,states});await page.close();
  }
  await writeFile('test-results/ui-send/consistency-controls.json',JSON.stringify(results,null,2));
