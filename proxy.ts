@@ -157,12 +157,12 @@ export function proxy(request: NextRequest) {
       }
       return NextResponse.redirect(loginUrl);
     }
+    // No WWW-Authenticate challenge: a Basic realm makes browsers raise the
+    // native credential dialog on top of the /login redirect flow. Clients that
+    // proactively send Authorization: Basic are still validated above.
     return new NextResponse("Authentication required", {
       status: 401,
-      headers: {
-        "Cache-Control": "no-store",
-        "WWW-Authenticate": 'Basic realm="Pi Web", charset="UTF-8"',
-      },
+      headers: { "Cache-Control": "no-store" },
     });
   }
 
