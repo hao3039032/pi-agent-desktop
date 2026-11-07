@@ -5,20 +5,19 @@ import { useEffect, useState } from "react";
 import { APP_PREF_KEYS, getPrefBool, setPrefBool } from "@/lib/app-prefs";
 import {
   clearAppCacheNative,
-  confirmLanAccessNative,
-  getLanAccessNative,
-  setLanAccessNative,
   isAutostartEnabledNative,
   openLogDirNative,
   quitAppNative,
   setAutostartNative,
   setCloseQuitsNative,
+  type BrowserPasswordStatus,
 } from "@/lib/desktop-native";
 import { useI18n } from "@/hooks/useI18n";
 import { ConfigButton, ConfigSwitch } from "@/components/SettingsUi";
 
 import { useDesktopChrome } from "./useDesktopChrome";
 import { BrowserPasswordSection } from "./BrowserPasswordSection";
+import { LanAccessSection } from "./LanAccessSection";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -47,21 +46,19 @@ export function DesktopAppSection() {
   // null = not read yet (switch disabled so a click cannot race the read).
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [autostartError, setAutostartError] = useState(false);
-  const [lanAccess, setLanAccess] = useState<boolean | null>(null);
-  const [lanError, setLanError] = useState(false);
-  const [lanChanged, setLanChanged] = useState(false);
-  const [lanBusy, setLanBusy] = useState(false);
 
   const [cacheState, setCacheState] = useState<
     { status: "idle" | "busy" | "error" } | { status: "done"; freed: number }
   >({ status: "idle" });
 
+  // Shared between the password section and the network switch: saving a
+  // password must make "Allow network access" usable immediately, and
+  // removing one must pause it without a remount. null = not read yet.
+  const [passwordStatus, setPasswordStatus] = useState<BrowserPasswordStatus | null>(null);
+
   useEffect(() => {
     if (!isDesktop) return;
     let cancelled = false;
-    getLanAccessNative()
-      .then((enabled) => { if (!cancelled) setLanAccess(enabled); })
-      .catch(() => { if (!cancelled) setLanError(true); });
     isAutostartEnabledNative()
       .then((enabled) => { if (!cancelled) setAutostart(enabled); })
       .catch(() => { if (!cancelled) setAutostartError(true); });
@@ -81,21 +78,6 @@ export function DesktopAppSection() {
     }
   };
 
-  const toggleLanAccess = async (next: boolean) => {
-    setLanError(false);
-    setLanBusy(true);
-    try {
-      if (next && !await confirmLanAccessNative(t("appSettings.lanConfirm"), t("appSettings.lanAccess"))) return;
-      await setLanAccessNative(next);
-      setLanAccess(next);
-      setLanChanged(true);
-    } catch {
-      setLanError(true);
-    } finally {
-      setLanBusy(false);
-    }
-  };
-
   const clearCache = async () => {
     setCacheState({ status: "busy" });
     try {
@@ -109,21 +91,11 @@ export function DesktopAppSection() {
     <section className="settings-general-section">
       <h3 className="settings-general-heading">{t("appSettings.desktopSection")}</h3>
       <p className="settings-general-description">{t("appSettings.desktopHint")}</p>
+      {/* Password first: the network switch below refuses to enable until a
+          browser password is saved (or PI_WEB_PASSWORD manages it). */}
+      <BrowserPasswordSection onStatusChange={setPasswordStatus} />
+      <LanAccessSection passwordStatus={passwordStatus} onPasswordStatusChange={setPasswordStatus} />
       <div className="settings-option-list">
-        <div className="settings-option">
-          <span className="settings-option-text">
-            <span className="settings-option-title">{t("appSettings.lanAccess")}</span>
-            <span className="settings-option-hint" role="status">
-              {lanError ? t("appSettings.lanError") : lanChanged ? t("appSettings.lanRestart") : t("appSettings.lanHint", { port: typeof window === "undefined" ? "" : window.location.port })}
-            </span>
-          </span>
-          <ConfigSwitch
-            checked={lanAccess === true}
-            disabled={lanAccess === null || lanBusy}
-            label={t("appSettings.lanAccess")}
-            onChange={(next) => void toggleLanAccess(next)}
-          />
-        </div>
         <div className="settings-option">
           <span className="settings-option-text">
             <span className="settings-option-title">{t("appSettings.closeQuits")}</span>
@@ -183,7 +155,6 @@ export function DesktopAppSection() {
           </ConfigButton>
         </div>
       </div>
-      <BrowserPasswordSection />
       <div className="settings-action-group">
         <ConfigButton onClick={() => void openLogDirNative()}>
           {t("appSettings.openLogs")}

@@ -2759,6 +2759,29 @@ html.dark .sidebar-view-switcher-thumb {
   display: flex;
   flex-direction: column;
 }
+
+/* In the dialog shell the picker renders its list in normal flow (variant
+   "modal"), so the shell — not an absolutely-positioned dropdown — owns the
+   height. The shell is already the menu surface; cancel the nested .app-menu
+   surface but keep its inset and row tokens. */
+.project-picker-modal-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.project-picker-modal-shell .app-menu {
+  border: none !important;
+  flex: 1 1 auto;
+  min-height: 0;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+.project-picker-modal-shell .app-menu > :not(.project-picker-list) {
+  flex-shrink: 0;
+}
 .sidebar-session-list {
   padding: 0 0 6px !important;
 }
@@ -10588,6 +10611,83 @@ html.dark .artifacts-thumb[data-tone="data"] { --tone: #4fc1d6; }
   font-family: var(--font-mono);
   font-size: var(--fs-caption);
   white-space: nowrap;
+}
+
+/* Settings › General › Allow network access (components/desktop/LanAccessSection.tsx) */
+.lan-address-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Same inset as the .settings-option rows around it. */
+  padding: 0 14px 10px;
+}
+
+.lan-address-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lan-address-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.lan-address-url {
+  grid-column: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  white-space: normal;
+  text-decoration: none;
+}
+
+/* The URL itself is the link; the accent appears on intent, not at rest. */
+.lan-address-url:hover,
+.lan-address-url:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.lan-address-url:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.lan-address-copy {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+
+.lan-address-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
+}
+
+/* Keep the adapter on its own line rather than truncating the access URL. */
+.lan-address-adapter {
+  grid-column: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: var(--fs-caption);
 }
 
 /* Tasks page (components/tasks/TasksView.tsx): reuses the Scheduled page's

@@ -6,6 +6,12 @@ import { createWebSessionToken, isValidWebSessionToken } from "./web-auth.ts";
 
 export const DESKTOP_SESSION_COOKIE = "pi_desktop_session";
 
+/** Whether this HTTP server was started by the desktop shell, which sets the token env. */
+export function isDesktopServerProcess(): boolean {
+  const token = process.env.PI_DESKTOP_API_TOKEN?.trim();
+  return Boolean(token && token.length >= 32);
+}
+
 function desktopSessionKey(): string | undefined {
   const token = process.env.PI_DESKTOP_API_TOKEN?.trim();
   if (!token || token.length < 32) return undefined;

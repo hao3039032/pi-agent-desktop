@@ -13,8 +13,12 @@ interface ProjectPickerProps {
   selectedProject: string | null;
   homeDir: string;
   onSelectCwd: (cwd: string) => void;
-  /** "block" fills its container (sidebar empty state); "inline" is a compact toolbar trigger. */
-  variant?: "block" | "inline";
+  /** "block" fills its container (sidebar empty state); "inline" is a compact
+   *  toolbar trigger; "modal" is the always-open list body of a dialog shell —
+   *  no trigger button, the panel flows in normal layout so the shell gets its
+   *  height (an absolutely-positioned dropdown clips inside `overflow:hidden`).
+   *  See `.project-picker-modal-shell` in native-theme.css. */
+  variant?: "block" | "inline" | "modal";
   disabled?: boolean;
 }
 
@@ -178,8 +182,26 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
   const visibleProjects = selectVisibleProjects(recentProjects, selectedProject, projectFilter);
 
   const isInline = variant === "inline";
+  const isModal = variant === "modal";
+  // Inside a dialog shell the list is the point of the dialog, so the panel is
+  // always mounted and flows in normal layout (the shell supplies the surface,
+  // height and scrolling); the web directory browser takes its place while open.
+  const panelOpen = isModal ? !customPathOpen : dropdownOpen;
 
-  const panelStyle = isInline && dropdownRect
+  const panelStyle = isModal
+    ? {
+        position: "static" as const,
+        width: "100%",
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column" as const,
+        background: "transparent",
+        border: "none",
+        borderRadius: 0,
+        boxShadow: "none",
+        overflow: "hidden",
+      }
+    : isInline && dropdownRect
     ? {
         position: "fixed" as const,
         bottom: window.innerHeight - dropdownRect.top + 6,
@@ -208,7 +230,13 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
       };
 
   return (
-    <div ref={dropdownRef} style={{ position: "relative", width: isInline ? undefined : "100%" }}>
+    <div ref={dropdownRef} className={isModal ? "project-picker-modal-body" : undefined} style={{ position: "relative", width: isInline ? undefined : "100%" }}
+      onKeyDown={(event) => {
+        // DirectoryPicker is portalled but React events still bubble here.
+        // Its Escape cancels only the directory browser, not the project dialog.
+        if (isModal && customPathOpen && event.key === "Escape") event.stopPropagation();
+      }}>
+      {!isModal && (
       <button
         type="button"
         className={isInline ? "native-toolbar-button" : "sidebar-header-row"}
@@ -277,8 +305,9 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
           </>
         )}
       </button>
+      )}
 
-      <AnimatedDropdown className="native-popover app-menu" open={dropdownOpen} style={panelStyle}>
+      <AnimatedDropdown className="native-popover app-menu" open={panelOpen} style={panelStyle}>
         {showProjectFilter && (
           <div style={{ padding: "6px 8px", borderBottom: "var(--hairline) solid var(--border)" }}>
             <input
@@ -286,9 +315,15 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
               onChange={(e) => setProjectFilter(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Escape" && !isImeComposing(e)) {
-                  e.stopPropagation();
-                  if (projectFilter) setProjectFilter("");
-                  else closeDropdown();
+                  if (projectFilter) {
+                    e.stopPropagation();
+                    setProjectFilter("");
+                  } else if (!isModal) {
+                    e.stopPropagation();
+                    closeDropdown();
+                  }
+                  // In a dialog shell with an empty filter, the Escape bubbles to
+                  // the overlay, which closes the dialog.
                 }
               }}
               placeholder="Filter projects…"
@@ -308,7 +343,13 @@ export function ProjectPicker({ recentProjects, selectedCwd, selectedProject, ho
             />
           </div>
         )}
-        <div style={{ maxHeight: "min(50vh, 380px)", overflowY: "auto" }}>
+        <div className="project-picker-list" style={{
+          maxHeight: "min(50vh, 380px)",
+          overflowY: "auto",
+          // In a dialog shell the list is the flexible part: it shrinks and
+          // scrolls so the shortcut rows below stay reachable on short screens.
+          ...(isModal ? { flex: "1 1 auto", minHeight: 0 } : null),
+        }}>
           {visibleProjects.map((project, index) => (
             <button
               key={project}

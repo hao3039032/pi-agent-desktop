@@ -5,14 +5,40 @@ import {
   MAX_DESKTOP_SAVE_BYTES,
 } from "@/lib/desktop-api";
 
-export async function confirmLanAccessNative(message: string, title: string): Promise<boolean> {
-  if (!isTauriDesktop()) throw new Error("Desktop only");
-  // WKWebView does not provide window.confirm without a JS dialog delegate.
-  const { confirm } = await import("@tauri-apps/plugin-dialog");
-  return confirm(message, { title, kind: "warning" });
+export interface BrowserPasswordStatus { enabled: boolean; managed: boolean; corrupt: boolean }
+
+/** Whether this status permits exposing the server to the network: a password saved and readable, or `PI_WEB_PASSWORD`. */
+export function isBrowserPasswordUsable(status: BrowserPasswordStatus | null | undefined): boolean {
+  return Boolean(status && (status.managed || (status.enabled && !status.corrupt)));
 }
 
-export interface BrowserPasswordStatus { enabled: boolean; managed: boolean; corrupt: boolean }
+/** One adapter address another device could try to reach this computer on. */
+export interface LanAddress {
+  /** An IPv4 address, e.g. `192.168.1.20`. */
+  address: string;
+  /** The adapter that holds the address, e.g. `en0`, `vEthernet (Hyper-V)`. */
+  interface: string;
+}
+
+/** The running server's network exposure, as the desktop settings show it. */
+export interface LanAddressStatus {
+  /** The port this server is bound to; null when unknown. */
+  port: number | null;
+  /** Whether the running server accepts connections from beyond loopback. */
+  lanListening: boolean;
+  /** This machine's non-internal IPv4 addresses. */
+  addresses: LanAddress[];
+}
+
+/** Read which addresses the running server listens on (route is local + token only). */
+export async function lanAddressesNative(): Promise<LanAddressStatus> {
+  const response = await fetch("/api/desktop/lan-addresses", {
+    headers: await desktopApiHeaders(),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error("Could not read network addresses");
+  return response.json();
+}
 
 export async function authenticateDesktopNative(): Promise<void> {
   const response = await fetch("/api/desktop/auth", { method: "POST", headers: await desktopApiHeaders() });

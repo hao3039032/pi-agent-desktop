@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getWebPassword, type WebPassword } from "@/lib/browser-password";
-import { isDesktopBootstrapRequest, isDesktopWebSession } from "@/lib/desktop-web-auth";
+import { isDesktopBootstrapRequest, isDesktopWebSession, isDesktopServerProcess } from "@/lib/desktop-web-auth";
 import {
   getAuthRetryAfterMs,
   recordAuthFailure,
@@ -9,6 +9,7 @@ import {
 import {
   isApiRequestAllowed,
   isApiRequestHostAllowed,
+  isListeningBeyondLoopback,
 } from "@/lib/request-security";
 import {
   isRemoteAccessHost,
@@ -108,6 +109,19 @@ export function proxy(request: NextRequest) {
     return NextResponse.json({ error: "Browser authentication configuration is unavailable" }, { status: 503 });
   }
   if (!isWebPasswordEnabled(password)) {
+    // The desktop's "Allow network access" preference binds beyond loopback at
+    // startup. Without a usable password that hands the whole app to anyone on
+    // the network, so remote requests are refused — pages and API alike — until
+    // a browser password is saved (settings require it before enabling; this
+    // also covers a password removed while the preference is already on).
+    // Local requests keep every path, including saving the password from the
+    // native window; relay-marked traffic authenticated earlier is untouched.
+    if (isDesktopServerProcess() && isListeningBeyondLoopback() && !isLocalRequest(request)) {
+      return new NextResponse("Save a browser password before allowing network access.", {
+        status: 403,
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
     if (request.nextUrl.pathname === "/login") {
       return NextResponse.redirect(new URL("/", request.url));
     }

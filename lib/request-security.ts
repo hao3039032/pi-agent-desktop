@@ -56,7 +56,7 @@ function isLoopbackIp(hostname: string): boolean {
 }
 
 /** Started to listen beyond loopback (`dev:lan`, `pi-web --hostname 0.0.0.0`): other machines connect directly. */
-function isListeningBeyondLoopback(): boolean {
+export function isListeningBeyondLoopback(): boolean {
   const configured = process.env.PI_WEB_HOSTNAME?.trim().toLowerCase();
   if (!configured) return false;
   const bare = configured.replace(/^\[|\]$/g, "");

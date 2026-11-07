@@ -7,6 +7,7 @@ import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { skillExpansionToCommand } from "@/lib/slash-display";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { useI18n } from "@/hooks/useI18n";
+import { focusModalPanel, listenForPanelEscape } from "@/lib/stacked-dialog";
 import { formatCompactRelativeTime, formatRelativeTime } from "@/lib/i18n/format";
 import { createPortal } from "react-dom";
 import { ProjectPicker, selectProjectDirectoryNative } from "./ProjectPicker";
@@ -69,6 +70,47 @@ import {
 } from "@/lib/archived-projects";
 import { useMenuPlacement } from "@/hooks/useMenuPlacement";
 import type { MenuAnchor } from "@/lib/menu-placement";
+
+/**
+ * The project-picker dialog shell for both entries (continue-chat-in-project
+ * and the sidebar's + button). The picker renders its list directly in this
+ * shell (its `modal` variant): in normal flow, so the shell gets its height —
+ * an absolutely-positioned dropdown clipped inside `overflow:hidden` is the
+ * bug this replaces. Escape closes it alone (bubble phase, so the picker's
+ * filter input can clear itself first), focus moves into it and back, and a
+ * backdrop click closes it.
+ */
+function ProjectPickerOverlay({ label, onClose, children }: {
+  label?: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const shellRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useLayoutEffect(() => focusModalPanel(document, shellRef.current), []);
+  useEffect(() => listenForPanelEscape(document, () => onCloseRef.current()), []);
+  return (
+    <div className="project-picker-modal-overlay" role="dialog" aria-modal="true" aria-label={label} onClick={() => onCloseRef.current()}>
+      <div ref={shellRef} className="project-picker-modal-shell" tabIndex={-1} onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          // A portalled directory browser owns its own keyboard handling.
+          if (event.key !== "Tab" || !event.currentTarget.contains(event.target as Node)) return;
+          const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), a[href]"))
+            .filter((element) => element.getClientRects().length > 0);
+          const first = controls[0], last = controls.at(-1);
+          if (!first) { event.preventDefault(); event.currentTarget.focus(); }
+          else if (event.shiftKey && (document.activeElement === first || document.activeElement === event.currentTarget)) {
+            event.preventDefault(); last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault(); first.focus();
+          }
+        }}>
+        {children}
+      </div>
+    </div>
+  );
+}
 
 function sessionListUrl(summary: boolean, force: boolean): string {
   if (summary) return "/api/sessions?summary=1";
@@ -2369,35 +2411,31 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         />
       )}
       {continueChat && (
-        <div className="project-picker-modal-overlay" role="dialog" aria-modal="true" aria-label={t("sidebar.continueInProject")} onClick={() => setContinueChat(null)}>
-          <div className="project-picker-modal-shell" onClick={(e) => e.stopPropagation()}>
-            <ProjectPicker
-              recentProjects={recentProjects}
-              selectedCwd={null}
-              selectedProject={null}
-              homeDir={homeDir}
-              onSelectCwd={(cwd) => void continueChatInProject(continueChat, cwd)}
-              variant="block"
-            />
-          </div>
-        </div>
+        <ProjectPickerOverlay label={t("sidebar.continueInProject")} onClose={() => setContinueChat(null)}>
+          <ProjectPicker
+            recentProjects={recentProjects}
+            selectedCwd={null}
+            selectedProject={null}
+            homeDir={homeDir}
+            onSelectCwd={(cwd) => void continueChatInProject(continueChat, cwd)}
+            variant="modal"
+          />
+        </ProjectPickerOverlay>
       )}
       {projectPickerOpen && (
-        <div className="project-picker-modal-overlay" role="dialog" aria-modal="true" onClick={() => setProjectPickerOpen(false)}>
-          <div className="project-picker-modal-shell" onClick={(e) => e.stopPropagation()}>
-            <ProjectPicker
-              recentProjects={recentProjects}
-              selectedCwd={selectedCwdProp && !isChatCwd(selectedCwdProp) ? selectedCwdProp : null}
-              selectedProject={selectedProjectRoot}
-              homeDir={homeDir}
-              onSelectCwd={(cwd) => {
-                activateProject(cwd);
-                setProjectPickerOpen(false);
-              }}
-              variant="block"
-            />
-          </div>
-        </div>
+        <ProjectPickerOverlay label={t("sidebar.addProject")} onClose={() => setProjectPickerOpen(false)}>
+          <ProjectPicker
+            recentProjects={recentProjects}
+            selectedCwd={selectedCwdProp && !isChatCwd(selectedCwdProp) ? selectedCwdProp : null}
+            selectedProject={selectedProjectRoot}
+            homeDir={homeDir}
+            onSelectCwd={(cwd) => {
+              activateProject(cwd);
+              setProjectPickerOpen(false);
+            }}
+            variant="modal"
+          />
+        </ProjectPickerOverlay>
       )}
     </div>
   );

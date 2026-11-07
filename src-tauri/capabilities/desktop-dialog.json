@@ -8,7 +8,6 @@
   },
   "permissions": [
     "dialog:allow-open",
-    "dialog:allow-confirm",
     "dialog:allow-save",
     "clipboard-manager:allow-write-text",
     "clipboard-manager:allow-read-text",

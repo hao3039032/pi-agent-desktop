@@ -19,11 +19,27 @@ test("setting is exposed only to the desktop window and warns before enabling", 
   assert.deepEqual(capability.windows, ["main"]);
   assert.deepEqual(capability.remote.urls, ["http://127.0.0.1:*/*"]);
   assert.ok(capability.permissions.includes("allow-lan-access-settings"));
-  const component = read("components/desktop/DesktopAppSection.tsx");
-  assert.ok(capability.permissions.includes("dialog:allow-confirm"));
-  assert.match(component, /if \(next && !await confirmLanAccessNative\(/);
+  const component = read("components/desktop/LanAccessSection.tsx");
+  // The risk confirmation is the shared in-app dialog, never window.confirm
+  // (WKWebView does not implement it) nor an OS-native alert.
+  assert.match(component, /ChatConfirmDialog/);
+  assert.match(component, /appSettings\.lanConfirm/);
   assert.doesNotMatch(component, /window\.confirm/);
+  assert.doesNotMatch(component, /confirmLanAccessNative/);
   const bridge = read("lib/desktop-native.ts");
-  assert.match(bridge, /confirmLanAccessNative[\s\S]*?if \(!isTauriDesktop\(\)\) throw[\s\S]*?import\("@tauri-apps\/plugin-dialog"\)[\s\S]*?return confirm\(message, \{ title, kind: "warning" \}\)/);
-  assert.match(component, /if \(!isDesktop\) return null/);
+  assert.doesNotMatch(bridge, /confirmLanAccessNative/);
+  const host = read("components/desktop/DesktopAppSection.tsx");
+  assert.match(host, /if \(!isDesktop\) return null/);
+});
+
+test("LAN addresses come from a local-only desktop route, not a guessed port", () => {
+  const route = read("app/api/desktop/lan-addresses/route.ts");
+  // Same boundary as the other /api/desktop routes: loopback + per-process token.
+  assert.match(route, /isDesktopBootstrapRequest\(request\)/);
+  assert.match(route, /desktopLanAddressStatus\(request\.headers\.get\("host"\)\)/);
+  const lib = read("lib/lan-addresses.ts");
+  assert.match(lib, /isListeningBeyondLoopback\(\)/);
+  assert.match(lib, /collectLanAddresses/);
+  const client = read("lib/desktop-native.ts");
+  assert.match(client, /lanAddressesNative[\s\S]*?\/api\/desktop\/lan-addresses[\s\S]*?desktopApiHeaders\(\)/);
 });
