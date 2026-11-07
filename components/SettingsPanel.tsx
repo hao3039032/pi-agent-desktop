@@ -2,7 +2,7 @@
 
 import { AppSelect } from "./AppSelect";
 
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { useDiffViewMode } from "@/hooks/useDiffViewMode";
 import { PRODUCT_NAME } from "@/lib/branding";
@@ -16,6 +16,7 @@ import {
   useChatAppearance,
 } from "@/hooks/useChatAppearance";
 import { useEnterSendMode, setEnterSendMode } from "@/hooks/useEnterSendMode";
+import { useQueueWhileRunning, setQueueWhileRunning } from "@/hooks/useQueueWhileRunning";
 import { sendAgentCommand } from "@/lib/agent-client";
 import type { ProjectTrustStatus, ToolSettingsResponse } from "@/lib/api-types";
 import {
@@ -101,6 +102,8 @@ function GeneralSettings({
   const { mode: diffViewMode, setMode: setDiffViewMode } = useDiffViewMode();
   const { width: chatContentWidth, setWidth: setChatContentWidth, fontSize, setFontSize } = useChatAppearance();
   const enterSendMode = useEnterSendMode();
+  const queueWhileRunning = useQueueWhileRunning();
+  const queueHintId = useId();
   const [shellSettings, setShellSettings] = useState<ToolSettingsResponse | null>(null);
   const [shellSaving, setShellSaving] = useState(false);
   const [shellError, setShellError] = useState<string | null>(null);
@@ -296,6 +299,18 @@ function GeneralSettings({
                     <span className="settings-send-mode-label">{t("settings.enterSendModeCtrlEnter")}</span>
                   </label>
                 </div>
+              </div>
+              <div className="settings-chat-option settings-chat-switch-option artifacts-setting-row">
+                <span className="artifacts-setting-text">
+                  <span>{t("settings.queueWhileRunning")}</span>
+                  <span id={queueHintId} className="artifacts-setting-hint">{t("settings.queueWhileRunningHint")}</span>
+                </span>
+                <ConfigSwitch
+                  checked={queueWhileRunning}
+                  label={t("settings.queueWhileRunning")}
+                  describedBy={queueHintId}
+                  onChange={setQueueWhileRunning}
+                />
               </div>
               <div className="settings-chat-option settings-chat-choice-option">
                 <span title={t("appSettings.diffViewModeHint")}>{t("appSettings.diffViewMode")}</span>

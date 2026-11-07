@@ -66,7 +66,11 @@ try {
     current = makeSession();
     const page = await browser.newPage({ viewport: { width, height: 760 }, hasTouch: width === 320, isMobile: width === 320, reducedMotion: 'reduce' });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
-    await page.addInitScript(() => localStorage.setItem('pi-locale', 'zh-CN'));
+    await page.addInitScript(() => {
+      localStorage.setItem('pi-locale', 'zh-CN');
+      // The queue is opt-in since the steer default; the whole fixture flow exercises it.
+      if (!sessionStorage.getItem('no-queue')) localStorage.setItem('pi-web:queue-while-running', 'true');
+    });
     await page.route('**/*', route => route.request().url().startsWith(base) ? route.continue() : route.abort());
     await page.goto(base); await page.evaluate(theme => document.documentElement.classList.toggle('dark', theme === 'dark'), theme);
     const editor = page.locator('textarea'), main = page.locator('.composer-send-button');
@@ -142,9 +146,42 @@ try {
       assert.equal(await editor.inputValue(), '', 'stale edit must not restore already-sent text');
       await page.unroute(base + '/command');
     }
+    // Default (switch off): sending while the run is live steers it directly.
+    await page.evaluate(() => { sessionStorage.setItem('no-queue', '1'); localStorage.removeItem('pi-web:queue-while-running'); });
+    await page.reload(); await page.evaluate(theme => document.documentElement.classList.toggle('dark', theme === 'dark'), theme);
+    // The race loop's last queued item was admitted as a run; end it first.
+    await page.evaluate(() => window.__fixture.finish());
+    await page.waitForFunction(() => document.querySelector('.composer-send-button')?.dataset.action === 'send');
+    await editor.fill('排队关闭后的第一条'); await main.click();
+    await page.waitForFunction(() => document.querySelector('.composer-send-button').dataset.action === 'stop');
+    await editor.fill('直接引导当前任务');
+    assert.equal(await main.getAttribute('data-action'), 'steer');
+    await main.click();
+    assert.equal(await editor.inputValue(), '');
+    assert.equal(await rows.count(), 0);
+    assert.equal((await page.locator('.composer-outbox').count()), 0);
+    assert.equal(current.sent.at(-1).behavior, 'steer');
+    assert.equal(current.sent.at(-1).message, '直接引导当前任务');
+    // Change the live store without remounting: both send triggers use the new
+    // mode, and switching back does not consume an already queued message.
+    await page.evaluate(() => window.__fixture.setQueueWhileRunning(true));
+    await editor.fill('切换后排队');
+    await page.waitForFunction(() => document.querySelector('.composer-send-button').dataset.action === 'queue');
+    await main.click();
+    await rows.filter({ hasText: '切换后排队' }).waitFor();
+    await page.evaluate(() => window.__fixture.setQueueWhileRunning(false));
+    await editor.fill('键盘直接引导');
+    await page.waitForFunction(() => document.querySelector('.composer-send-button').dataset.action === 'steer');
+    const countBefore = current.sent.length;
+    await editor.press('Control+Enter');
+    await page.waitForFunction(() => document.querySelector('textarea').value === '');
+    assert.equal(current.sent.length, countBefore + 1, 'keyboard sends exactly once');
+    assert.equal(current.sent.at(-1).behavior, 'steer');
+    assert.equal(current.sent.at(-1).message, '键盘直接引导');
+    assert.equal(await rows.filter({ hasText: '切换后排队' }).count(), 1, 'changing mode preserves the existing outbox');
     assert.deepEqual(errors, []);
     await page.close(); current.inner.finish(); current.wrapper.destroy();
-    console.log(`${theme} ${width}: one action, queue/edit/delete/steer, reload, stop, automatic delivery, concentric geometry passed`);
+    console.log(`${theme} ${width}: one action, queue/edit/delete/steer, reload, stop, automatic delivery, steer default, concentric geometry passed`);
   }
 } finally {
   if (browser) await browser.close();

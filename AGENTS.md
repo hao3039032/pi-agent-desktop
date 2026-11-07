@@ -238,6 +238,7 @@ Each one undid a real regression; the linked note has the reasoning.
 - Never assign `agent.state.systemPrompt` (a getter since pi 0.86). Exact prompts go only through `lib/exact-system-prompt.ts`; do not add a second path. ([fork-tools-subagents](docs/agents/fork-tools-subagents.md))
 - `useAgentSession`: keep the monotonic request ids, `fetchWithRetry` for the session load, `seedStreamingSnapshot()`, the render-phase scroll save, and the `sessionHookMountedRef` re-assert before `maintainEventsConnected()`. ([fork-sessions](docs/agents/fork-sessions.md))
 - The composer sends exactly one `onSend` per submit; a second raw send restores the text into the box. ([fork-sessions](docs/agents/fork-sessions.md))
+- A send while the agent runs steers the current run by default; the editable outbox is opt-in via Settings › General › Chat (`hooks/useQueueWhileRunning.ts`). One route (`ChatInput.resolveStreamingSendMode`), never a second `onSend`. ([fork-ui](docs/agents/fork-ui.md))
 - Do not re-add the legacy `auto_compaction_*` event cases or a manual DeepSeek xhigh clamp. ([fork-sessions](docs/agents/fork-sessions.md))
 - `enabledModels`: never compare patterns as strings, never assume `provider/*` covers a provider, never rebuild the list from `getAvailable()`; every toggle is a minimal edit and only `resync` repairs entries. ([fork-models](docs/agents/fork-models.md))
 - Provider catalogs refresh over the network only when the user presses "Refresh catalog". ([fork-models](docs/agents/fork-models.md))

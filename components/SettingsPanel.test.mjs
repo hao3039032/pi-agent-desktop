@@ -180,10 +180,11 @@ test("groups chat display controls together without row backgrounds", () => {
   assert.match(chatSection, /className="settings-chat-options"/);
   // The fork's diffViewMode choice rides in the same group after the merged
   // send-mode radio (thinking, width, font, quote, completion sound, send
-  // mode, diff view). The sound switch moved here from the composer row.
-  assert.equal((chatSection.match(/className="settings-chat-option(?: |")/g) ?? []).length, 7);
-  assert.equal((chatSection.match(/<ConfigSwitch/g) ?? []).length, 3);
-  for (const key of ["thinkingExpandedDefault", "chatContentWidth", "chatContentFontSize", "quoteSelection", "completionSound", "enterSendMode", "enterSendModeEnter", "enterSendModeCtrlEnter"]) {
+  // mode, queue-while-running, diff view). The sound switch moved here from
+  // the composer row.
+  assert.equal((chatSection.match(/className="settings-chat-option(?: |")/g) ?? []).length, 8);
+  assert.equal((chatSection.match(/<ConfigSwitch/g) ?? []).length, 4);
+  for (const key of ["thinkingExpandedDefault", "chatContentWidth", "chatContentFontSize", "quoteSelection", "completionSound", "enterSendMode", "enterSendModeEnter", "enterSendModeCtrlEnter", "queueWhileRunning", "queueWhileRunningHint"]) {
     assert.match(chatSection, new RegExp(`t\\("settings\\.${key}"\\)`));
   }
   assert.doesNotMatch(panelSource, /ThinkingIcon|settings-thinking-/);

@@ -122,7 +122,7 @@ with an 8px gap. Menu and Delete-key entry points share this confirmation, inclu
 the optional chat-folder checkbox; Shift+click retains its existing bypass. Keep the
 dialog open while deleting, with local errors and retry, and restore row focus on cancel.
 
-Session rows render the "…" action menu when `(hovered || touchMode)` — `touchMode` is a post-mount `matchMedia("(hover: none)")` check, so hover styling is untouched on desktop and rename/delete stay reachable on touch. The composer's single circular action shows Stop while a run is active and the draft is empty; typing switches it to queued Send, including on narrow screens. Escape remains available to stop while drafting. Rename/delete failures use the global shell notice shelf (`appNotify.error` with `sidebar.renameFailed` / `sidebar.deleteFailed`) instead of being swallowed.
+Session rows render the "…" action menu when `(hovered || touchMode)` — `touchMode` is a post-mount `matchMedia("(hover: none)")` check, so hover styling is untouched on desktop and rename/delete stay reachable on touch. The composer's single circular action shows Stop while a run is active and the draft is empty; typing switches it to the streaming send action (steer by default, queued Send with the queue switch on), including on narrow screens. Escape remains available to stop while drafting. Rename/delete failures use the global shell notice shelf (`appNotify.error` with `sidebar.renameFailed` / `sidebar.deleteFailed`) instead of being swallowed.
 Message-row copy/edit/fork actions use CSS hover/focus-within reveal instead of JS hover state, and are always visible under `(hover: none)`. They must remain pointer-enabled when focused so keyboard tabbing does not land on invisible controls.
 While a session runs, in-session "Edit from here" stays visible but disabled with the Esc hint; fork stays available because it copies to an independent file.
 
@@ -186,10 +186,10 @@ The topbar renders exactly ONE toolbar group (`app-topbar-actions`: history/bran
 
 ## 输入框单按钮与待发送队列
 
-- 输入框只保留一个圆形主操作：空闲时发送；运行中且草稿为空时停止（方块）；运行中有文字或附件时，点击或发送快捷键都加入“完成后发送”队列。不要重新引入 Steer / Follow-up 双按钮或底栏重复的 Stop。
-- `ComposerOutbox` 把待发送消息贴在输入框上沿；每条消息支持立即发送、取回编辑、删除。窄窗口操作使用图标和完整无障碍标签，触屏点击范围至少 44px；不使用彩色描边区分队列模式。
-- 立即发送通过 SDK prompt admission 的 `steer` 在下一个可接收指令的时机引导当前任务，不承诺强制中断正在进行的工具调用。编辑通过 `restoreSubmission` 合并到原会话草稿，保留已有输入与图片。
-- 验证：`node e2e/composer-outbox.mjs`，覆盖深浅色、1280/390/320 宽度、换行同心圆角、排队/编辑/删除/引导、页面刷新及停止后的队列状态。
+- 输入框只保留一个圆形主操作：空闲时发送；运行中且草稿为空时停止（方块）；运行中有文字或附件时，点击或发送快捷键默认直接 `steer`（在下一个可接收指令的时机引导当前任务）。设置 → 通用 → Chat 的“运行中发送先排队”开关（默认关闭，`hooks/useQueueWhileRunning.ts` + `APP_PREF_KEYS.queueWhileRunning`）可恢复旧行为：运行中发送进入“完成后发送”队列。不要重新引入 Steer / Follow-up 双按钮或底栏重复的 Stop。两种模式下按钮的 `data-action`、placeholder、title 与 aria 都随模式切换（steer / queue），且发送路由只有一条：`resolveStreamingSendMode` 决定 `sendQueued("steer" | "followup")`，绝不通过第二次 `onSend` 实现 steer。
+- `ComposerOutbox` 把待发送消息贴在输入框上沿；每条消息支持立即发送、取回编辑、删除。窄窗口操作使用图标和完整无障碍标签，触屏点击范围至少 44px；不使用彩色描边区分队列模式。开关切换不影响已有队列条目，它们仍可编辑、删除或立即发送；服务端 outbox 调度与 SDK `steeringMode` 均不变。
+- 立即发送通过 SDK prompt admission 的 `steer` 在下一个可接收指令的时机引导当前任务，不承诺强制中断正在进行的工具调用；直接 steer（默认）同样走这条 admission。编辑通过 `restoreSubmission` 合并到原会话草稿，保留已有输入与图片。
+- 验证：`node e2e/composer-outbox.mjs`（夹具启用开关跑队列流程，末尾在默认 steer 模式下验证直接引导），覆盖深浅色、1280/390/320 宽度、换行同心圆角、排队/编辑/删除/引导、页面刷新、停止后的队列状态与 steer 默认；单测见 `components/ChatInput.test.mjs`（`resolveStreamingSendMode`、键盘两种模式、默认 steer 文案）与 `hooks/useQueueWhileRunning.test.mjs`（默认不迁移、开/关持久化）。
 
 
 ## 外观与背景

@@ -63,6 +63,10 @@ Settings › General › "Name sessions automatically" (`autoTitle` in Pi Web's 
 ## Editable composer outbox
 
 `lib/composer-queue.ts` owns individually identified pending composer messages, including images.
+Since the steer default, the composer only routes a running send into this outbox when Settings ›
+General › Chat's queue-while-running switch is on (`hooks/useQueueWhileRunning.ts`); by default the
+same submit goes through `sendStreamingPrompt("steer")` directly. Nothing below changes with the
+switch: `ChatInput.resolveStreamingSendMode` picks the one route, never a second `onSend`.
 `queue_composer` accepts into this outbox, `take_composer_message` claims one for edit/delete,
 and `send_composer_message` claims one and submits it through the existing prompt admission
 with `streamingBehavior: "steer"`. Already claimed IDs return a successful no-op with the latest

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ChatInput } from '../components/ChatInput';
 import { I18nProvider } from '../hooks/useI18n';
+import { setQueueWhileRunning } from '../hooks/useQueueWhileRunning';
 
 function Fixture() {
   const input = useRef(null);
@@ -24,13 +25,13 @@ function Fixture() {
     void refresh();
     return () => events.close();
   }, []);
-  window.__fixture = { command, refresh, finish: () => fetch('/finish', { method: 'POST' }).then(refresh) };
+  window.__fixture = { command, refresh, setQueueWhileRunning, finish: () => fetch('/finish', { method: 'POST' }).then(refresh) };
   return <I18nProvider><main style={{ maxWidth: 860, margin: 'auto', paddingTop: 120 }}>
     <div style={{ height: 160, padding: '0 32px', color: 'var(--text-dim)', fontSize: 14 }}>正在处理当前任务…</div>
     <ChatInput ref={input} draftKey="outbox-fixture" isStreaming={streaming} onAbort={() => void command({ type: 'abort' })}
       onSend={(message, images) => void command({ type: 'prompt', message, images })}
       onFollowUp={(message, images) => void command({ type: 'queue_composer', message, images: images?.map(image => ({ type: 'image', data: image.data, mimeType: image.mimeType })) })}
-      onSteer={(message) => { throw Error('Ordinary send must never steer: ' + message); }}
+      onSteer={(message, images) => void command({ type: 'prompt', message, streamingBehavior: 'steer', images: images?.map(image => ({ type: 'image', data: image.data, mimeType: image.mimeType })) })}
       queuedMessages={{ steering: [], followUp: [], pending }}
       onQueuedMessageAction={async (id, action) => {
         const { item } = await command({ type: action === 'send' ? 'send_composer_message' : 'take_composer_message', id });

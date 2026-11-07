@@ -11,7 +11,7 @@ const jiti = createJiti(import.meta.url, {
 });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, compressImageFile, cycleListIndex, filterModelOptions, getTopbarBoundary, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, modelSupportsImageInput, replaceLinksWithMarkdown, shouldCompressImageFile, offersBuiltinSlashCommandWhileStreaming, submitsSlashCommandOnEnter} = await jiti.import("./ChatInput.tsx");
+const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, compressImageFile, cycleListIndex, filterModelOptions, getTopbarBoundary, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, modelSupportsImageInput, replaceLinksWithMarkdown, shouldCompressImageFile, offersBuiltinSlashCommandWhileStreaming, resolveStreamingSendMode, submitsSlashCommandOnEnter} = await jiti.import("./ChatInput.tsx");
 
 const { isBareMcpCommand } = await jiti.import("@/lib/mcp-command.ts");
 const { composeMessageWithAttachedFiles } = await jiti.import("@/lib/chat-attachments.ts");
@@ -119,8 +119,10 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
     compilerOptions: { target: ts.ScriptTarget.ES2020 },
   }).outputText);
   const cases = [
-    ["Enter queues a follow-up", {}, {}, "followup"],
-    ["Alt+Enter follows up", { altKey: true }, {}, "followup"],
+    ["Enter steers the running task by default", {}, {}, "steer"],
+    ["Alt+Enter steers the running task by default", { altKey: true }, {}, "steer"],
+    ["queue switch on: Enter queues a follow-up", {}, { streamingSendMode: "followup" }, "followup"],
+    ["queue switch on: Alt+Enter follows up", { altKey: true }, { streamingSendMode: "followup" }, "followup"],
     ["idle Alt+Enter sends", { altKey: true }, { isStreaming: false }, "send"],
     ["Shift+Enter inserts a newline", { shiftKey: true }, {}, "native"],
     ["Alt+Shift+Enter keeps native behavior", { altKey: true, shiftKey: true }, {}, "native"],
@@ -130,11 +132,13 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
     ["composition grace blocks sending", { altKey: true }, { lastCompositionEndAtRef: { current: 950 } }, "prevented"],
     ["mobile Alt+Enter keeps native behavior", { altKey: true }, { isMobile: true }, "native"],
     ["mobile composition grace cannot send", { altKey: true }, { isMobile: true, lastCompositionEndAtRef: { current: 950 } }, "native"],
-    ["mobile Ctrl+Alt+Enter follows up", { altKey: true, ctrlKey: true }, { isMobile: true }, "followup"],
-    ["mobile Cmd+Alt+Enter follows up", { altKey: true, metaKey: true }, { isMobile: true }, "followup"],
+    ["mobile Ctrl+Alt+Enter steers by default", { altKey: true, ctrlKey: true }, { isMobile: true }, "steer"],
+    ["mobile Cmd+Alt+Enter steers by default", { altKey: true, metaKey: true }, { isMobile: true }, "steer"],
+    ["queue switch on: mobile Ctrl+Alt+Enter follows up", { altKey: true, ctrlKey: true }, { isMobile: true, streamingSendMode: "followup" }, "followup"],
+    ["queue switch on: mobile Cmd+Alt+Enter follows up", { altKey: true, metaKey: true }, { isMobile: true, streamingSendMode: "followup" }, "followup"],
     ["mobile modified Enter respects composition grace", { altKey: true, ctrlKey: true }, { isMobile: true, lastCompositionEndAtRef: { current: 950 } }, "prevented"],
-    ["Enter falls back to follow-up", {}, { onSteer: undefined }, "followup"],
-    ["Alt+Enter falls back to steer", { altKey: true }, { onFollowUp: undefined }, "steer"],
+    ["the mode's handler decides: steer missing falls back to follow-up", {}, { streamingSendMode: "followup" }, "followup"],
+    ["the mode's handler decides: queue action still steers when chosen", { altKey: true }, { streamingSendMode: "steer" }, "steer"],
     ["slash completion takes priority", { altKey: true }, { slashMenuOpen: true, slashQuery: "help" }, "slash"],
     ["available built-in commands take priority", { altKey: true }, { slashMenuOpen: true, slashQuery: "copy", value: "/copy", displayedSlashCommands: [{ name: "copy", source: "builtin", availableWhileStreaming: true }] }, "send"],
     ["pi's built-in /mcp submits at once, also while streaming", {}, { slashMenuOpen: true, slashQuery: "mcp", value: "/mcp", displayedSlashCommands: [{ name: "mcp", source: "extension", sourceInfo: { path: "builtin:mcp" } }] }, "send"],
@@ -143,7 +147,8 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
     ["history selection takes priority", { altKey: true }, { historyMenuOpen: true }, "history"],
     ["Ctrl+Enter mode: Enter inserts a newline", {}, { enterSendMode: "ctrlEnter", isStreaming: false }, "native"],
     ["Ctrl+Enter mode: Ctrl+Enter sends", { ctrlKey: true }, { enterSendMode: "ctrlEnter", isStreaming: false }, "send"],
-    ["Ctrl+Enter mode: Cmd+Enter queues a follow-up", { metaKey: true }, { enterSendMode: "ctrlEnter" }, "followup"],
+    ["Ctrl+Enter mode: Cmd+Enter steers by default", { metaKey: true }, { enterSendMode: "ctrlEnter" }, "steer"],
+    ["queue switch on: Ctrl+Enter mode Cmd+Enter queues a follow-up", { metaKey: true }, { enterSendMode: "ctrlEnter", streamingSendMode: "followup" }, "followup"],
     ["Ctrl+Enter mode: composition grace blocks the newline", {}, { enterSendMode: "ctrlEnter", lastCompositionEndAtRef: { current: 950 } }, "prevented"],
     ["Ctrl+Enter mode: Enter picks a file", {}, { enterSendMode: "ctrlEnter", atMenuOpen: true, atQuery: {} }, "file"],
     ["Ctrl+Enter mode: Enter picks from history", {}, { enterSendMode: "ctrlEnter", historyMenuOpen: true }, "history"],
@@ -156,7 +161,7 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
     const handler = script.runInNewContext({
       Date: { now: () => 1000 },
       COMPOSITION_END_ENTER_GRACE_MS: 100,
-      isMobile: false, isStreaming: true, enterSendMode: "enter",
+      isMobile: false, isStreaming: true, enterSendMode: "enter", streamingSendMode: "steer",
       isComposingRef: { current: false }, lastCompositionEndAtRef: { current: 0 },
       historyMenuOpen: false, inputHistory: ["previous"], historyActiveIndex: 0,
       slashMenuOpen: false, slashQuery: null, displayedSlashCommands: [{}], slashActiveIndex: 0,
@@ -178,6 +183,27 @@ test("follow-up shortcuts preserve newline, IME, mobile and completion behavior"
     });
     assert.equal(action, expected, name);
   }
+});
+
+test("streaming sends steer by default and queue only when the switch is on", () => {
+  const steer = () => {}, followUp = () => {};
+  // Default (switch off, no stored pref): the composer's send steers the run.
+  assert.equal(resolveStreamingSendMode({ queueWhileRunning: false, onSteer: steer, onFollowUp: followUp }), "steer");
+  assert.equal(resolveStreamingSendMode({ queueWhileRunning: true, onSteer: steer, onFollowUp: followUp }), "followup");
+  // A mode without its handler would clear the draft and drop the message.
+  assert.equal(resolveStreamingSendMode({ queueWhileRunning: true, onSteer: steer, onFollowUp: undefined }), "steer");
+  assert.equal(resolveStreamingSendMode({ queueWhileRunning: false, onSteer: undefined, onFollowUp: followUp }), "followup");
+});
+
+test("streaming draft shows the steer action and placeholder by default", () => {
+  setDraft("steer-mode-render", { value: "keep going", images: [] });
+  const html = renderWithI18n(React.createElement(ChatInput, {
+    onSend() {}, onAbort() {}, onSteer() {}, onFollowUp() {}, isStreaming: true, draftKey: "steer-mode-render",
+  }));
+  assert.match(html, /data-action="steer"/);
+  assert.match(html, /aria-label="Steer the running task"/);
+  assert.match(html, /Add a message to steer the running task…/);
+  assert.doesNotMatch(html, /data-action="queue"|Send after completion/);
 });
 
 test("file mention arrows wrap around the match list", () => {

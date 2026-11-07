@@ -34,6 +34,7 @@ import { ImagePreview } from "./ImagePreview";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useMenuNavigation } from "@/hooks/useMenuNavigation";
 import { useEnterSendMode } from "@/hooks/useEnterSendMode";
+import { useQueueWhileRunning } from "@/hooks/useQueueWhileRunning";
 import { useI18n } from "@/hooks/useI18n";
 import type { ReactNode } from "react";
 import type { ContextUsage, SessionStatsInfo } from "@/lib/pi-types";
@@ -385,6 +386,22 @@ function getBuiltinSlashCommand(message: string): BuiltinSlashCommand | undefine
 
 export function canRunBuiltinSlashCommandWhileStreaming(message: string): boolean {
   return getBuiltinSlashCommand(message)?.availableWhileStreaming === true;
+}
+
+/**
+ * Which streaming send `sendQueued` uses while the agent runs. The default
+ * steers the current run at the next receptive moment; Settings › General ›
+ * Chat's “运行中发送先排队” switch (off by default) switches the composer to
+ * the editable outbox instead. A mode without its callback would clear the
+ * draft and drop the message, so the available handler always wins.
+ */
+export function resolveStreamingSendMode({ queueWhileRunning, onSteer, onFollowUp }: {
+  queueWhileRunning: boolean;
+  onSteer?: (message: string, images?: AttachedImage[]) => void;
+  onFollowUp?: (message: string, images?: AttachedImage[]) => void;
+}): "steer" | "followup" {
+  if (queueWhileRunning) return onFollowUp ? "followup" : "steer";
+  return onSteer ? "steer" : "followup";
 }
 
 /**
@@ -867,6 +884,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const isCompact = composerTier === "compact" || isNarrow;
 
   const enterSendMode = useEnterSendMode();
+  const queueWhileRunning = useQueueWhileRunning();
+  const streamingSendMode = resolveStreamingSendMode({ queueWhileRunning, onSteer, onFollowUp });
   const [value, setValue] = useState(() => (draftKey ? getDraft(draftKey)?.value ?? "" : ""));
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [automationDropdownOpen, setAutomationDropdownOpen] = useState(false);
@@ -1916,13 +1935,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       if (sendShortcut) {
         e.preventDefault();
         if (isStreaming && (onSteer || onFollowUp)) {
-          sendQueued(onFollowUp ? "followup" : "steer");
+          sendQueued(streamingSendMode);
         } else {
           handleSend();
         }
       }
     },
-    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, hashMenuOpen, hashQuery, hashMatches, hashActiveIndex, applyHashCompletion, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value, setHashActiveIndex, setHashMenuOpen]
+    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, streamingSendMode, handleSend, getNextSlashIndex, hashMenuOpen, hashQuery, hashMatches, hashActiveIndex, applyHashCompletion, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value, setHashActiveIndex, setHashMenuOpen]
   );
 
   const handleInput = useCallback(() => {
@@ -2840,7 +2859,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             onPaste={handlePaste}
             placeholder={
               isStreaming && (onSteer || onFollowUp)
-                ? t("chat.queuePlaceholder")
+                ? t(streamingSendMode === "followup" ? "chat.queuePlaceholder" : "chat.steerRunPlaceholder")
                 : isStreaming ? t("chat.agentPlaceholder")
                 : isNarrow
                 ? (t("chat.messagePlaceholderShort") || "Message…")
@@ -2890,12 +2909,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <button
             type="button"
             className={compact ? "native-primary-button" : "native-primary-button composer-send-button"}
-            data-action={showStop ? "stop" : isStreaming ? "queue" : "send"}
-            onClick={showStop ? onAbort : isStreaming ? () => void sendQueued(onFollowUp ? "followup" : "steer") : handleSend}
+            data-action={showStop ? "stop" : isStreaming ? (streamingSendMode === "followup" ? "queue" : "steer") : "send"}
+            onClick={showStop ? onAbort : isStreaming ? () => void sendQueued(streamingSendMode) : handleSend}
             disabled={!showStop && (!canSend || (isStreaming && !onFollowUp && !onSteer)) || showStop && stopPending}
             aria-busy={showStop && stopPending || undefined}
-            title={t(showStop ? stopPending ? "chat.stopping" : "chat.stopAgent" : isStreaming ? "chat.queueMessage" : "chat.send")}
-            aria-label={t(showStop ? stopPending ? "chat.stopping" : "chat.stopAgent" : isStreaming ? "chat.queueMessage" : "chat.send")}
+            title={t(showStop ? stopPending ? "chat.stopping" : "chat.stopAgent" : isStreaming ? (streamingSendMode === "followup" ? "chat.queueMessage" : "chat.steerMessage") : "chat.send")}
+            aria-label={t(showStop ? stopPending ? "chat.stopping" : "chat.stopAgent" : isStreaming ? (streamingSendMode === "followup" ? "chat.queueMessage" : "chat.steerMessage") : "chat.send")}
             style={{ flexShrink: 0, alignSelf: "flex-end", ...(compact ? { display: "flex", alignItems: "center", gap: 6 } : null) }}
           >
             {showStop ? (

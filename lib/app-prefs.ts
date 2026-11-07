@@ -41,6 +41,10 @@ export const APP_PREF_KEYS = {
   /** cwd -> project root, as last reported by the server (see lib/cwd-project-roots.ts). */
   cwdProjectRoots: "pi-web:cwd-project-roots",
   diffViewMode: "pi-diff-view-mode",
+  /** "true" while sends during a running agent queue in the composer outbox
+   *  ("send after completion") instead of steering the current run. Absent or
+   *  "false" is the steer default; existing users are never migrated. */
+  queueWhileRunning: "pi-web:queue-while-running",
   /** Last open session / cwd / file tabs for desktop cold-start restore. */
   workspace: "pi-workspace-v1",
 } as const;

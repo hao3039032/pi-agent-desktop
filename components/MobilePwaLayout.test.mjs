@@ -89,7 +89,7 @@ test("collapses secondary composer chrome while the mobile keyboard is open", ()
   // The main composer's send is icon-only (phone and desktop) but keeps an
   // accessible name; only the compact quote composer shows the label. A Stop
   // already sent says "stopping" while it waits (a11y: the click took).
-  assert.match(chatInputSource, /aria-label=\{t\(showStop \? stopPending \? "chat\.stopping" : "chat\.stopAgent" : isStreaming \? "chat\.queueMessage" : "chat\.send"\)\}/);
+  assert.match(chatInputSource, /aria-label=\{t\(showStop \? stopPending \? "chat\.stopping" : "chat\.stopAgent" : isStreaming \? \(streamingSendMode === "followup" \? "chat\.queueMessage" : "chat\.steerMessage"\) : "chat\.send"\)\}/);
   assert.match(chatInputSource, /\{showStop && stopPending \? <span role="status" className=\{compact \? undefined : "sr-only"\}>\{t\("chat\.stopping"\)\}<\/span> : compact && t\(showStop \? "chat\.stop" : "chat\.send"\)\}/);
 });
 
