@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { DISTRO, imageGenBaseUrl, mergeDistroModels, rebaseDistroModelUrls } from "./config";
+import { resolveExaFallbackPair } from "./exa-fallback";
 import { LAZY_TOOL_ACTIVATION } from "./lazy-tool-activation";
 import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
 import { isRecord, readJsonObject, writeJsonObject } from "./json-file";
@@ -118,12 +119,23 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
   // no user choice to respect, so it is treated as a first creation.
   const webSearchHasContent = webSearch !== null && Object.keys(webSearch).length > 0;
   if (webSearch) {
+    // The optional Exa fallback connection follows the same save: derived
+    // from this address + /exa and reusing the platform key. {} keeps a
+    // custom or half-custom pair exactly as the file holds it (spread last).
+    const exaFallback = resolveExaFallbackPair(
+      webSearch,
+      typeof existing.baseUrl === "string" ? existing.baseUrl : "",
+      storedKey,
+      baseUrl,
+      apiKey,
+    );
     writeJsonObject(webSearchFile, {
       ...(webSearchHasContent ? {} : { toolActivation: LAZY_TOOL_ACTIVATION }),
       ...DISTRO.webSearch.defaults,
       ...webSearch,
       [DISTRO.webSearch.baseUrlKey]: baseUrl,
       [DISTRO.webSearch.apiKeyKey]: apiKey,
+      ...exaFallback,
     });
   } else {
     console.warn("[distro] web-search.json is not valid JSON; left untouched");

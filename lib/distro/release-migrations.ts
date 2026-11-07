@@ -1,5 +1,6 @@
 import { compare, valid } from "semver";
 import { applyDeepSeekMigration } from "./deepseek-migration";
+import { applyExaFallbackMigration } from "./exa-fallback";
 
 export interface ReleaseMigration {
   /** Immutable release version: append a new entry, never repurpose a shipped one. */
@@ -17,6 +18,16 @@ export const RELEASE_MIGRATIONS: readonly ReleaseMigration[] = [
       const report = applyDeepSeekMigration(agentDir);
       if (report.written.length) console.log(`[distro] DeepSeek roles: updated ${report.written.join(", ")}`);
       if (report.kept.length) throw new Error(`Unmigrated configuration: ${report.kept.join("; ")}`);
+    },
+  },
+  {
+    version: "0.8.215",
+    run(agentDir) {
+      const report = applyExaFallbackMigration(agentDir);
+      // A kept pair is the user's own connection, not a failure: the receipt
+      // is still recorded so this never re-runs against their choice.
+      if (report.written.length) console.log(`[distro] Exa fallback: pre-filled ${report.written.join(", ")}`);
+      if (report.kept.length) console.log(`[distro] Exa fallback: ${report.kept.join("; ")}`);
     },
   },
 ];

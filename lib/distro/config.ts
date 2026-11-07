@@ -38,6 +38,16 @@ export interface DistroConfig {
   webSearch: {
     baseUrlKey: string;
     apiKeyKey: string;
+    /** Optional Exa fallback connection for pi-web-access (`provider: "exa"`,
+     * an on-demand user choice — the default provider stays `gemini`). The
+     * gateway proxies Exa's native endpoints at `<service baseUrl> + suffix`
+     * and authenticates with the platform key, never an upstream Exa key.
+     * Deliberately not part of `defaults`: those re-merge on every save. */
+    exaFallback?: {
+      baseUrlKey: string;
+      apiKeyKey: string;
+      baseUrlSuffix: string;
+    };
     defaults: Record<string, unknown>;
   };
   /** pi-model-images 0.2+ ships the imagegen CLI as a skill; its config file

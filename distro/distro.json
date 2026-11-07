@@ -215,6 +215,11 @@
   "webSearch": {
     "baseUrlKey": "geminiBaseUrl",
     "apiKeyKey": "geminiApiKey",
+    "exaFallback": {
+      "baseUrlKey": "exaBaseUrl",
+      "apiKeyKey": "exaApiKey",
+      "baseUrlSuffix": "/exa"
+    },
     "defaults": {
       "allowBrowserCookies": true,
       "provider": "gemini",
