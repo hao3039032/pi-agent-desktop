@@ -4,10 +4,10 @@
  *
  * Runs on each release runner (packages can contain platform-specific
  * binaries), after `npm ci`. pi itself does the installing — the bundled SDK's
- * CLI runs `update --extensions` against a throwaway agent dir — so the result
- * is exactly what `pi install` would produce on the user's machine. At runtime
- * lib/distro/seed.ts points the user's settings.json at these copies, so the
- * user needs neither npm nor git.
+ * CLI runs `pi install` for every listed source against a throwaway agent
+ * dir — so the result is exactly what `pi install` would produce on the
+ * user's machine. At runtime lib/distro/seed.ts points the user's
+ * settings.json at these copies, so the user needs neither npm nor git.
  *
  *   node scripts/distro-seed.mjs
  */
@@ -45,6 +45,30 @@ export function seedPackageGroups(config) {
     throw new Error("Distro package groups must not contain duplicate install paths");
   }
   return { packages, runtimePackages, all };
+}
+
+/**
+ * The pi CLI invocations that install every distro package into a throwaway
+ * agent dir — one `pi install` per source, never one `update --extensions`
+ * pass: pi's updater (1.5.0) never installs a version-pinned npm spec it
+ * considers current, so a fresh staging with a bare `update` silently ships
+ * without the distro's pinned package (npm:@codella/pi-prompt-plan@x.y.z).
+ * Kept pure for scripts/distro-build.test.mjs.
+ */
+export function seedInstallArgs(groups, cliPath) {
+  return groups.all.map((source) => [cliPath, "install", source]);
+}
+
+/**
+ * The environment for those installs: `PI_CODING_AGENT_DIR` points pi's
+ * personal settings at the throwaway staging dir (without `--local` the CLI
+ * never touches a project `.pi/settings.json`, so running it from the repo
+ * root is safe), and an offline host must not silently skip the installs.
+ */
+export function seedInstallEnv(stagingDir, base = process.env) {
+  const env = { ...base, PI_CODING_AGENT_DIR: stagingDir };
+  delete env.PI_OFFLINE;
+  return env;
 }
 
 function run(command, args, env) {
@@ -89,9 +113,9 @@ function main() {
     const groups = seedPackageGroups(distro);
     // This throwaway config is for installation only; no session loads it.
     writeFileSync(join(staging, "settings.json"), JSON.stringify({ packages: groups.all }, null, 2));
-    const env = { ...process.env, PI_CODING_AGENT_DIR: staging };
-    delete env.PI_OFFLINE;
-    run(process.execPath, [cli, "update", "--extensions"], env);
+    for (const args of seedInstallArgs(groups, cli)) {
+      run(process.execPath, args, seedInstallEnv(staging));
+    }
 
     rmSync(seedDir, { recursive: true, force: true });
     mkdirSync(seedDir, { recursive: true });

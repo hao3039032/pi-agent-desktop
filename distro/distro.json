@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 15,
+  "revision": 16,
   "updateMirrors": ["gh-proxy.com", "ghproxy.cn"],
   "app": {
     "productName": "Pi Agent LW",
@@ -199,12 +199,9 @@
     "npm:pi-web-access",
     "git:github.com/hao3039032/pi-model-images",
     "npm:pi-omp-advisor",
-    "git:github.com/hao3039032/pi-plan-vanguard",
+    "npm:@codella/pi-prompt-plan@0.2.2",
     "npm:@gotgenes/pi-permission-system",
     "npm:@erichll/pi-auto-review"
-  ],
-  "runtimePackages": [
-    "npm:@anthropic-ai/sandbox-runtime"
   ],
   "settingsDefaults": {
     "defaultThinkingLevel": "high",
@@ -344,30 +341,7 @@
       "toolActivation": "dynamic",
       "timeoutMs": 3600000,
       "checkpointBeforeDeadlineMs": 300000
-    },
-    "pi-plan-vanguard.json": {
-      "defaultPlanTools": [
-        "read",
-        "bash",
-        "grep",
-        "find",
-        "ls",
-        "web_enable",
-        "web_search",
-        "source_check",
-        "fetch_content",
-        "get_search_content",
-        "subagents_enable",
-        "subagent",
-        "subagent_supervisor"
-      ]
     }
-  },
-  "legacyAgentFiles": {
-    "pi-plan-vanguard.json": [
-      "pi-plan-mode.json",
-      "plan-mode.json"
-    ]
   },
   "agentTextFiles": {
     "WATCHDOG.yml": "# pi-omp-advisor 全局配置(用户级,所有项目生效)\n# main: false —— 常规 pi 会话默认不启动 advisor(按需用 /advisor on 临时开启)\nmain: false\nsubagents: false\n\nadvisors:\n  - name: advisor\n    model: lw/deepseek-v4.1-flash\n    tools: [read, grep, glob]\n    contextTokens: 48000\n"

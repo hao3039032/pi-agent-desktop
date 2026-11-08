@@ -2,9 +2,9 @@
 /**
  * Stage the target macOS ripgrep binary for the distro build.
  *
- * Plan mode uses ripgrep as an srt prerequisite. A GUI-launched desktop app
- * cannot rely on Homebrew's PATH, so the binary is shipped beside the other
- * distro resources and its directory is prepended by lib/distro/runtime-env.ts.
+ * pi's grep tool shells out to `rg`. A GUI-launched desktop app cannot rely
+ * on Homebrew's PATH, so the binary is shipped beside the other distro
+ * resources and its directory is prepended by lib/distro/runtime-env.ts.
  *
  *   node scripts/distro-ripgrep.mjs --target aarch64-apple-darwin
  */

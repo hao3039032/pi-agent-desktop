@@ -173,7 +173,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Stage ripgrep for Plan mode on macOS
+      - name: Stage ripgrep for search support on macOS
         if: runner.os == 'macOS'
         run: |
           node scripts/distro-ripgrep.mjs --target "${{ matrix.target }}"

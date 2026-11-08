@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
   distroResources,
   distroVersion,
@@ -10,7 +12,9 @@ import {
   updateMirrorList,
 } from "./distro-build-config.mjs";
 import { compareVersions } from "./release-components.mjs";
-import { seedPackageGroups, seedRelativePath } from "./distro-seed.mjs";
+import { seedInstallArgs, seedInstallEnv, seedPackageGroups, seedRelativePath } from "./distro-seed.mjs";
+
+const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
 test("runtime dependencies are installed without joining the Pi package manifest", () => {
   const groups = seedPackageGroups({
@@ -24,6 +28,35 @@ test("runtime dependencies are installed without joining the Pi package manifest
   assert.throws(() => seedPackageGroups({
     packages: ["npm:@scope/pkg@1"], runtimePackages: ["npm:@scope/pkg@2"],
   }), /duplicate install paths/);
+});
+
+// Drift guard for the pinned plan template: pi's updater (1.5.0) never
+// installs a version-pinned npm spec it considers current — on a fresh
+// staging, a bare `update --extensions` pass silently ships without it
+// (verified against pi 1.5.0: the unpinned spec installs, the pinned one is
+// skipped, `pi install <pinned spec>` installs). The seed must therefore run
+// one `pi install` per listed source, the pinned package included.
+test("every distro source is installed per package, so the pinned plan template is not skipped", async () => {
+  const distro = JSON.parse(await readFile(join(rootDir, "distro", "distro.json"), "utf8"));
+  const pinned = distro.packages.find((source) => /^npm:@codella\/pi-prompt-plan@\d/.test(source));
+  assert.ok(pinned, "the plan template must stay version-pinned in distro.json");
+  const groups = seedPackageGroups(distro);
+  const runs = seedInstallArgs(groups, "/node");
+  assert.deepEqual(runs, groups.all.map((source) => ["/node", "install", source]));
+  assert.ok(runs.some((args) => args.join(" ") === `/node install ${pinned}`), "the pinned spec gets its own install");
+  assert.ok(!runs.some((args) => args.includes("update")), "no update pass that would skip the pinned spec");
+  assert.ok(!runs.some((args) => args.includes("--local")), "installs stay personal-scope (agent dir), never project settings");
+});
+
+// The installs run from the repo root (cwd of scripts/distro-seed.mjs), so
+// their isolation must come from the environment: PI_CODING_AGENT_DIR points
+// pi's personal settings at the throwaway staging dir, and an offline host
+// must not silently skip the installs.
+test("the install environment is pinned to the throwaway agent dir", () => {
+  const env = seedInstallEnv("/tmp/pi-seed-staging", { PI_OFFLINE: "1", PATH: "/usr/bin" });
+  assert.equal(env.PI_CODING_AGENT_DIR, "/tmp/pi-seed-staging");
+  assert.equal(env.PI_OFFLINE, undefined);
+  assert.equal(env.PATH, "/usr/bin");
 });
 
 test("distro versions sort between upstream releases", () => {

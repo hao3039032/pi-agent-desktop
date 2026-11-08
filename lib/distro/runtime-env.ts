@@ -79,10 +79,11 @@ export function hasSystemGitBash(): boolean {
 /**
  * Make the bundled tools reachable for pi and everything it spawns:
  *
- * - srt/ripgrep: Plan mode's Anthropic Sandbox Runtime and its macOS
- *   ripgrep prerequisite are bundled with the app. Their directories are
- *   prepended so a desktop app launched outside a login shell cannot lose
- *   either binary to a missing/incomplete Homebrew or npm PATH.
+ * - ripgrep (macOS): pi's `grep` tool shells out to `rg`. A GUI-launched
+ *   desktop app does not inherit the user's interactive-shell PATH, so a
+ *   missing or incomplete Homebrew install would break search on a clean
+ *   machine (or an offline one); the target-architecture binary is bundled
+ *   with the app and its directory is prepended.
  * - npm: pi installs/updates packages by spawning `npm` from PATH. The Rust
  *   shell only puts the bundled `node` on PATH, so without a system Node.js
  *   every plugin install failed with `spawn npm ENOENT`. Appended, so a
@@ -95,17 +96,9 @@ export function hasSystemGitBash(): boolean {
 export function configureDistroPath(resourcesDir: string, platform = process.platform): void {
   const entries = pathEntries();
 
-  // The Plan extension resolves srt through PATH and the desktop server does
-  // not necessarily inherit the user's interactive-shell PATH. Keep the
-  // bundled runtime ahead of a user's global srt: the extension and its
-  // adjacent @anthropic-ai/sandbox-runtime library must come from the same
-  // installation, otherwise the launcher can reject a mismatched shim.
-  const srtBin = join(resourcesDir, "pi-seed", "npm", "node_modules", ".bin");
-  const bundledSrt = platform === "win32" ? join(srtBin, "srt.cmd") : join(srtBin, "srt");
-  if (existsSync(bundledSrt) && !entries.includes(srtBin)) entries.unshift(srtBin);
-
-  // macOS Plan mode also needs `rg`; unlike srt it is not part of the npm
-  // package, so the release stages the target-architecture binary separately.
+  // macOS search: `rg` serves pi's grep tool; it is not part of any bundled
+  // npm package, so the release stages the target-architecture binary
+  // separately (scripts/distro-ripgrep.mjs).
   const ripgrepDir = join(resourcesDir, "ripgrep");
   if (platform === "darwin" && existsSync(join(ripgrepDir, "rg")) && !entries.includes(ripgrepDir)) {
     entries.unshift(ripgrepDir);

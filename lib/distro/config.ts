@@ -62,7 +62,9 @@ export interface DistroConfig {
   /** Raw text files written into the agent dir on first run (e.g. WATCHDOG.yml). */
   agentTextFiles?: Record<string, string>;
   /** File → legacy file names whose presence must suppress seeding (the
-   * owning extension reads and migrates them itself, e.g. pi-plan-vanguard). */
+   * owning extension reads and migrates them itself; unused since the
+   * plan extension left the bundle, kept for the next package that needs
+   * the same guard). */
   legacyAgentFiles?: Record<string, string[]>;
 }
 

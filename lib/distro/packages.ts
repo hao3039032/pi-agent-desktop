@@ -18,6 +18,59 @@ export interface ManagedState {
   packages: Record<string, string>;
 }
 
+/** A distro package the bundle no longer ships, with the pi-seed-relative
+ * install path every earlier revision placed it at (`seedRelativePath` in
+ * scripts/distro-seed.mjs). */
+export interface RetiredSeedPackage {
+  /** The distro source the bundle used to ship. */
+  source: string;
+  /** Path relative to `pi-seed/` where old bundles installed it. */
+  relativePath: string;
+}
+
+/**
+ * Packages the bundle retired in distro revision 16. Machines that upgraded
+ * may still carry registrations pointing at a bundled copy; those entries are
+ * pruned by path identity alone in `reconcilePackages`, so a lost or corrupt
+ * state file and a moved install directory are covered too. Nothing is ever
+ * deleted from disk, and an install the user made themselves — an npm:/git:
+ * source, a versioned spec, or their own local path — is never touched.
+ *
+ * - `pi-plan-vanguard`: the extension-based Plan mode (its `/plan` command,
+ *   tool policy and settings UI), replaced by the `npm:@codella/pi-prompt-plan`
+ *   prompt template. A user's own copy keeps working; while it is installed
+ *   its extension command shadows the template, so the template is not seeded
+ *   either (`PROMPT_TEMPLATE_SHADOWS`).
+ * - `@anthropic-ai/sandbox-runtime`: the sandbox runtime that extension
+ *   launched. Only ever a bundled dependency, never a Pi package — removing
+ *   leftover registrations is the same fix v0.8.205 applied to v0.8.203/204.
+ */
+export const RETIRED_SEED_PACKAGES: ReadonlyArray<RetiredSeedPackage> = [
+  {
+    source: "git:github.com/hao3039032/pi-plan-vanguard",
+    relativePath: "git/github.com/hao3039032/pi-plan-vanguard",
+  },
+  {
+    source: "npm:@anthropic-ai/sandbox-runtime",
+    relativePath: "npm/node_modules/@anthropic-ai/sandbox-runtime",
+  },
+];
+
+/**
+ * Prompt-template packages (keyed by `packageKey`) whose command a still
+ * installed extension package would shadow: pi dispatches extension commands
+ * before it expands prompt templates, so seeding the template next to the old
+ * extension would leave a `/command` that never reaches the template. The
+ * template is appended only once the shadowing package is gone; the shadow is
+ * matched on package identity (any source form of the same repository), never
+ * on tool or command names. An independent local checkout of the old
+ * extension cannot be recognized without executing untrusted code — that
+ * limitation is documented in docs/distro.md and left to the user.
+ */
+export const PROMPT_TEMPLATE_SHADOWS: Readonly<Record<string, string>> = {
+  "npm:@codella/pi-prompt-plan": "git:github.com/hao3039032/pi-plan-vanguard",
+};
+
 export function entrySource(entry: PackageEntry): string {
   return typeof entry === "string" ? entry : entry.source;
 }
@@ -50,6 +103,23 @@ function isSeedCopy(source: string, relativeSeedPath: string): boolean {
   return normalizePath(source).endsWith(`/pi-seed/${normalizePath(relativeSeedPath)}`);
 }
 
+/**
+ * True when an entry is a registration this seeder itself wrote for `pkg`:
+ * the current bundle path, a path our state recorded for it (also across a
+ * moved install), or any install's copy at the exact pi-seed-relative path.
+ * String and object entries, duplicates and Windows separators included.
+ */
+function isBundleRegistration(
+  entry: PackageEntry,
+  pkg: { path?: string; relativePath: string },
+  previousPath: string | undefined,
+): boolean {
+  const source = entrySource(entry);
+  if (pkg.path !== undefined && normalizePath(source) === normalizePath(pkg.path)) return true;
+  if (previousPath !== undefined && normalizePath(source) === normalizePath(previousPath)) return true;
+  return isSeedCopy(source, pkg.relativePath);
+}
+
 export interface ReconcileInput {
   entries: PackageEntry[];
   seed: Array<SeedPackage & { relativePath: string }>;
@@ -62,6 +132,10 @@ export interface ReconcileResult {
   entries: PackageEntry[];
   managed: ManagedState;
   changed: boolean;
+  /** Seed packages not appended because an installed package's command would
+   * shadow their prompt template (`PROMPT_TEMPLATE_SHADOWS`). The caller
+   * reports these; seeding resumes once the shadowing package is gone. */
+  shadowed: Array<{ source: string; shadow: string }>;
 }
 /**
  * For each seed package:
@@ -82,18 +156,18 @@ export interface ReconcileResult {
  * the user never made.
  */
 export function reconcilePackages({ entries, seed, runtimePackages = [], previous }: ReconcileInput): ReconcileResult {
-  // v0.8.203/204 registered sandbox-runtime as a Pi package. It is only a
-  // bundled dependency, so Pi tried to load it as an extension and exited 1.
-  // Remove only bundle-owned entries (also after a move or lost state file),
-  // never the user's npm sources or independent local copies.
-  let result = entries.filter((entry) => !runtimePackages.some((pkg) => {
-    const source = entrySource(entry);
-    const previousPath = previous?.packages[pkg.source];
-    return normalizePath(source) === normalizePath(pkg.path)
-      || (previousPath !== undefined && normalizePath(source) === normalizePath(previousPath))
-      || isSeedCopy(source, pkg.relativePath);
-  }));
+  // v0.8.203/204 registered sandbox-runtime as a Pi package; Pi tried to load
+  // the bundled dependency as an extension and exited 1. Revision 16 retired
+  // the package from the bundle along with pi-plan-vanguard, so both cleanups
+  // now run here as one pass over the packages the seeder owns: only
+  // bundle-owned registrations are removed (also after a move or with the
+  // state file lost), never the user's npm sources or independent copies.
+  const unmanaged = [...runtimePackages, ...RETIRED_SEED_PACKAGES];
+  let result = entries.filter((entry) => !unmanaged.some((pkg) =>
+    isBundleRegistration(entry, pkg, previous?.packages[pkg.source]),
+  ));
   const managed: ManagedState = { packages: {} };
+  const shadowed: Array<{ source: string; shadow: string }> = [];
 
   for (const pkg of seed) {
     const key = packageKey(pkg.source);
@@ -120,6 +194,14 @@ export function reconcilePackages({ entries, seed, runtimePackages = [], previou
     if (firstIndex === -1) {
       if (previousPath !== undefined) continue; // removed by the user — respect it
       if (result.some(present)) continue;       // installed by the user — respect it
+      // A prompt template whose command the old extension still shadows waits
+      // for the user to remove it (pi runs extension commands first); nothing
+      // is appended twice and nothing of the user's is removed for them.
+      const shadowKey = key !== null ? PROMPT_TEMPLATE_SHADOWS[key] : undefined;
+      if (shadowKey !== undefined && result.some((entry) => packageKey(entrySource(entry)) === shadowKey)) {
+        shadowed.push({ source: pkg.source, shadow: shadowKey });
+        continue;
+      }
       result.push(pkg.path);
       managed.packages[pkg.source] = pkg.path;
       continue;
@@ -147,5 +229,5 @@ export function reconcilePackages({ entries, seed, runtimePackages = [], previou
   }
 
   const changed = JSON.stringify(result) !== JSON.stringify(entries);
-  return { entries: result, managed, changed };
+  return { entries: result, managed, changed, shadowed };
 }
