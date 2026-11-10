@@ -384,6 +384,9 @@ function watchedStore(store: McpOAuthStateStore, flow: Flow, guard: McpSignInWri
       note(state);
       await store.save(state);
     },
+    // Since pi 1.5.1 the sign-in itself refreshes under the store's lock; the
+    // writes it guards go through the save above, so the guard still applies.
+    withRefreshLock: (fn) => store.withRefreshLock(fn),
   };
 }
 
