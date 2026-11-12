@@ -10,6 +10,8 @@ function harness(existing) {
   const calls = { starts: 0, reads: 0 };
   const POST = script.runInNewContext({
     NextResponse: { json: (body, init) => Response.json(body, init) },
+    missingCwdFromBody: () => null,
+    cwdMissingBody: () => ({}),
     getRpcSession: () => existing,
     resolveSessionPath: async () => { calls.reads++; return '/fake/session'; },
     startRpcSession: async () => { calls.starts++; throw new Error('must not start'); },

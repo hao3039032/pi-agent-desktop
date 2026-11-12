@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { AnsiText } from "@/components/AnsiText";
 import type { ExtensionWidgetItem } from "@/lib/types";
@@ -54,7 +54,13 @@ export function getNextExpandedWidgetKey(
   return currentKey === requestedKey ? null : requestedKey;
 }
 
-export function ExtensionWidgets({ widgets, sessionId }: { widgets: ExtensionWidgetItem[]; sessionId?: string }) {
+/**
+ * `children` (the status line) joins the triggers in one row, so the whole row
+ * scrolls sideways together; the expanded panel stays above it, out of the scroll.
+ */
+export function ExtensionWidgets(
+  { widgets, sessionId, children }: { widgets: ExtensionWidgetItem[]; sessionId?: string; children?: ReactNode },
+) {
   const { t } = useI18n();
   const idPrefix = useId();
   const previousContentsRef = useRef<Map<string, string[]> | null>(null);
@@ -163,9 +169,10 @@ export function ExtensionWidgets({ widgets, sessionId }: { widgets: ExtensionWid
           })()}
         </div>
       )}
-      <div className="extension-widget-triggers" aria-label={t("chat.extensionWidgets")}>
-        {widgets.map((widget, index) => {
-          const expandable = widget.lines.length > 0 || Boolean(sessionId && isSubagentFleetWidget(widget.key));
+      <div className="extension-status-row">
+        <div className="extension-widget-triggers" aria-label={t("chat.extensionWidgets")}>
+          {widgets.map((widget, index) => {
+            const expandable = widget.lines.length > 0 || Boolean(sessionId && isSubagentFleetWidget(widget.key));
           const expanded = expandable && widget.key === expandedWidget?.key;
           const updating = updatingWidgetKeys.has(widget.key);
           const lineCountLabel = t(
@@ -227,6 +234,8 @@ export function ExtensionWidgets({ widgets, sessionId }: { widgets: ExtensionWid
             </div>
           );
         })}
+        </div>
+        {children}
       </div>
     </div>
   );

@@ -24,11 +24,11 @@
   },
   "driftedUpstreamFiles": {
     "components/MarkdownBody.tsx": {
-      "risk": "medium",
-      "drift": 173,
-      "structuralDrift": 171,
+      "risk": "high",
+      "drift": 290,
+      "structuralDrift": 282,
       "disposition": "accepted",
-      "reason": "Uses the fork's headless streaming adapter and coalesced preprocessing while preserving Pi's plugins and widget mapping. Incoming markdown changes must retain the static/safety fallbacks, immediate completion and stream replacement behavior."
+      "reason": "Upstream v0.8.4 carried the pi-web v0.12+ markdown overhaul (audio/video, LaTeX copy, code wrap, CJK-friendly wrapping); structural drift past the high threshold against the pi-web baseline."
     },
     "components/SessionSidebar.tsx": {
       "risk": "high",
@@ -45,10 +45,10 @@
       "disposition": "accepted"
     },
     "components/FileExplorer.tsx": {
-      "risk": "medium",
-      "drift": 82,
-      "reason": "Fork interaction changes in an upstream-owned tree: touch/keyboard-reachable row actions, visible action feedback, upload affordances, and the two-step confirmation for linked directories that enclose the project/home. Incoming tree changes require review.",
-      "structuralDrift": 49,
+      "risk": "high",
+      "drift": 670,
+      "reason": "Upstream v0.8.4 (pi-web v0.12-v0.15 catch-up) rebuilt the changes tree, drop-upload and hidden-entry handling; structural drift past the high threshold against the pi-web baseline.",
+      "structuralDrift": 511,
       "disposition": "accepted"
     },
     "components/TabBar.tsx": {
@@ -273,6 +273,20 @@
       "structuralDrift": 6,
       "disposition": "accepted",
       "reason": "Asks isLocalRequest() instead of trusting a loopback Host: requests replayed by the relay connector (and Tailscale Host spoofs) carry a loopback Host too."
+    },
+    "lib/model-discovery.ts": {
+      "risk": "medium",
+      "drift": 106,
+      "structuralDrift": 106,
+      "disposition": "accepted",
+      "reason": "Upstream's pi-web v0.12+ model-discovery pipeline restructured by the v0.8.4 merge; drift is upstream-owned divergence from the pi-web baseline, not fork edits."
+    },
+    "app/api/models-config/discover/route.ts": {
+      "risk": "medium",
+      "drift": 46,
+      "structuralDrift": 46,
+      "disposition": "accepted",
+      "reason": "Pagination and catalog-resolution changes carried by the upstream v0.8.4 merge; upstream-owned divergence from the pi-web baseline."
     }
   },
   "forkOwnedPaths": [

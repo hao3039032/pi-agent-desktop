@@ -4,7 +4,7 @@ import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useMe
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { SkillsResponse } from "@/lib/api-types";
 import type { ModelScopeWarning } from "@/lib/model-scope-warnings";
-import type { UnavailableWorkspace } from "@/lib/workspace-availability";
+import type { UnavailableWorkspaceNotice } from "@/lib/workspace-availability";
 import type { TextContent, UserMessage } from "@/lib/types";
 import {
   clearDraft,
@@ -28,6 +28,7 @@ import {
 import { resolveSessionReferences } from "@/lib/session-reference";
 import type { RoutedModelInfo } from "@/lib/types";
 import { getMarkdownListContinuation } from "@/lib/markdown-list-continuation";
+import { quoteSeparator } from "@/lib/quoted-selection";
 import { isBareMcpCommand, isBuiltinMcpCommand } from "@/lib/mcp-command";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import { ImagePreview } from "./ImagePreview";
@@ -76,6 +77,8 @@ interface Props {
   onAbort: () => void;
   stopPending?: boolean;
   onSteer?: (message: string, images?: AttachedImage[]) => void;
+  /** C1: while a run streams, send the draft to a new side chat instead (no images, as `/side`). */
+  onSideChat?: (message: string) => void;
   onFollowUp?: (message: string, images?: AttachedImage[]) => void;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
   isStreaming: boolean;
@@ -86,10 +89,10 @@ interface Props {
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
-  modelList?: { id: string; name: string; provider: string; input?: string[] }[];
+  modelList?: { id: string; name: string; provider: string; providerName?: string; input?: string[] }[];
   modelError?: string | null;
   /** The cwd can no longer host a run (deleted, replaced by a file, unreadable): sending is blocked and the draft stays. */
-  workspaceUnavailable?: UnavailableWorkspace | null;
+  workspaceUnavailable?: UnavailableWorkspaceNotice | null;
   /** Probe the cwd again, e.g. after the folder was restored. */
   onRecheckWorkspace?: () => void;
   /** Diagnostics from resolving `enabledModels`, e.g. a pattern that matched nothing. */
@@ -178,6 +181,8 @@ interface Props {
 
 export interface ChatInputHandle {
   insertText: (text: string) => void;
+  /** C3: a quote at the caret, starting a paragraph of its own. */
+  insertQuote: (text: string) => void;
   insertIfEmpty: (text: string) => void;
   replaceMessage: (message: UserMessage) => boolean;
   prependText: (text: string) => void;
@@ -281,6 +286,7 @@ type ComposerTier = "normal" | "compact" | "narrow";
 
 interface ModelOption {
   provider: string;
+  providerName?: string;
   modelId: string;
   name: string;
 }
@@ -376,6 +382,10 @@ const BUILTIN_SLASH_COMMANDS: BuiltinSlashCommand[] = [
   { name: "session", description: "chat.commandSession", source: "builtin", availableWhileStreaming: true },
   { name: "copy", description: "chat.commandCopy", source: "builtin", availableWhileStreaming: true },
   { name: "clone", description: "chat.commandClone", source: "builtin" },
+  // C1: a side chat forks the session while it runs (ADR 0007): a side question
+  // during a long parent run is the main use, so it is offered mid-stream. The
+  // fork is file-level and never touches the running agent.
+  { name: "side", description: "chat.commandSide", source: "builtin", availableWhileStreaming: true },
 ];
 
 function getBuiltinSlashCommand(message: string): BuiltinSlashCommand | undefined {
@@ -708,9 +718,10 @@ function ModelNoticeBanner({ tone, title, body, action, onClose, dismissLabel }:
 }
 
 /** Shown instead of the model error that a missing cwd would otherwise cause (#1061). */
-export function WorkspaceUnavailableBanner({ workspace, onRecheck }: { workspace?: UnavailableWorkspace | null; onRecheck?: () => void }) {
+export function WorkspaceUnavailableBanner({ workspace, onRecheck }: { workspace?: UnavailableWorkspaceNotice | null; onRecheck?: () => void }) {
   const { t } = useI18n();
   if (!workspace) return null;
+  const checking = workspace.recheck === "checking";
   const body = workspace.availability === "missing"
     ? t("chat.workspaceMissing", { cwd: workspace.cwd })
     : workspace.availability === "not-directory"
@@ -723,9 +734,12 @@ export function WorkspaceUnavailableBanner({ workspace, onRecheck }: { workspace
         title={t("chat.workspaceUnavailable")}
         body={body}
         action={onRecheck ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
           <button
             type="button"
             onClick={onRecheck}
+            disabled={checking}
+            aria-busy={checking}
             style={{
               flexShrink: 0,
               padding: "2px 8px",
@@ -733,14 +747,19 @@ export function WorkspaceUnavailableBanner({ workspace, onRecheck }: { workspace
               borderRadius: "var(--radius-sm)",
               background: "transparent",
               color: "inherit",
-              cursor: "pointer",
+              cursor: checking ? "default" : "pointer",
+              opacity: checking ? 0.6 : 1,
               fontSize: "var(--fs-micro)",
               lineHeight: 1.4,
               whiteSpace: "nowrap",
             }}
           >
-            {t("chat.workspaceRecheck")}
+            {checking ? t("chat.workspaceRechecking") : t("chat.workspaceRecheck")}
           </button>
+          {workspace.recheck === "unchanged" && (
+            <span role="status">{t("chat.workspaceRecheckUnchanged")}</span>
+          )}
+          </div>
         ) : undefined}
       />
     </div>
@@ -756,7 +775,7 @@ export function ModelErrorBanner({ error }: { error?: string | null }) {
 /** True when the selected model is known to accept image input (#584). Unknown modality info never blocks the user. */
 export function modelSupportsImageInput(
   model: { provider: string; modelId: string } | null | undefined,
-  modelList: { id: string; name: string; provider: string; input?: string[] }[] | undefined
+  modelList: { id: string; name: string; provider: string; providerName?: string; input?: string[] }[] | undefined
 ): boolean {
   if (!model) return true;
   const entry = modelList?.find((m) => m.provider === model.provider && m.id === model.modelId);
@@ -822,7 +841,7 @@ export function ModelScopeWarningBanner({
 }
 
 export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
-  onClearDraft, onSend, onAttachFiles, onAbort, stopPending = false, onSteer, onFollowUp, isStreaming, promptPreparing = false, model, isAutoModelSelection, modelNames, modelList, modelError, workspaceUnavailable, onRecheckWorkspace, modelScopeWarnings, onDismissModelScopeWarnings, onOpenModelsConfig, onModelChange, modelSwitching,
+  onClearDraft, onSend, onAttachFiles, onAbort, stopPending = false, onSteer, onSideChat, onFollowUp, isStreaming, promptPreparing = false, model, isAutoModelSelection, modelNames, modelList, modelError, workspaceUnavailable, onRecheckWorkspace, modelScopeWarnings, onDismissModelScopeWarnings, onOpenModelsConfig, onModelChange, modelSwitching,
   defaultModel, onSetDefaultModel,
   onCompact, onAbortCompaction, isCompacting, compactError, compactNotice, compactResult, summarizationRetry, toolPreset, onToolPresetChange,
   thinkingLevel, isAutoThinkingSelection = false, onThinkingLevelChange, availableThinkingLevels, thinkingLevelMap,
@@ -1199,6 +1218,30 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       requestAnimationFrame(() => {
         if (!ta) return;
         const pos = start + sep.length + text.length;
+        ta.setSelectionRange(pos, pos);
+        ta.focus();
+        ta.style.height = "auto";
+        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      });
+    },
+    insertQuote(text: string) {
+      const ta = textareaRef.current;
+      if (!ta) {
+        setValue((v) => v + quoteSeparator(v) + text);
+        return;
+      }
+      const start = ta.selectionStart ?? ta.value.length;
+      const end = ta.selectionEnd ?? ta.value.length;
+      const before = ta.value.slice(0, start);
+      const inserted = quoteSeparator(before) + text;
+      const newVal = before + inserted + ta.value.slice(end);
+      valueRef.current = newVal;
+      setValue(newVal);
+      setAtQuery(null);
+      setHashQuery(null);
+      requestAnimationFrame(() => {
+        if (!ta) return;
+        const pos = start + inserted.length;
         ta.setSelectionRange(pos, pos);
         ta.focus();
         ta.style.height = "auto";
@@ -1693,6 +1736,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, []);
 
+  const sendToSideChat = useCallback(() => {
+    const msg = value.trim();
+    if (!msg || attachedImages.length || !onSideChat) return;
+    clearInput();
+    onSideChat(msg);
+  }, [value, attachedImages, onSideChat, clearInput]);
+
   const sendQueued = useCallback(async (mode: "steer" | "followup") => {
     if (!isCurrentComposer() || promptPreparing) return;
     const files = attachedFilesRef.current;
@@ -2057,7 +2107,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const fallbackProvider = model?.provider;
   const modelOptions: ModelOption[] = useMemo(() => {
     if (modelList && modelList.length > 0) {
-      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name })).sort(compareModelOptions);
+      return modelList.map((m) => ({ provider: m.provider, providerName: m.providerName, modelId: m.id, name: m.name })).sort(compareModelOptions);
     }
     return Object.entries(modelNames ?? {}).map(([modelId, name]) => ({
       provider: fallbackProvider ?? "unknown",
@@ -2906,6 +2956,20 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               </svg>
             </button>
           )}
+          {isStreaming && onSideChat && (
+            <button
+              type="button"
+              className="composer-clear-button composer-side-chat-button"
+              onClick={sendToSideChat}
+              disabled={!value.trim() || attachedImages.length > 0}
+              title={t("chat.sideChatHint")}
+              aria-label={t("chat.sideChat")}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M21 12a8 8 0 0 1-8 8H5.5a2 2 0 0 1-1.4-3.4A8 8 0 1 1 21 12z" /><path d="M13 8.5v7M9.5 12h7" />
+              </svg>
+            </button>
+          )}
           <button
             type="button"
             className={compact ? "native-primary-button" : "native-primary-button composer-send-button"}
@@ -2963,13 +3027,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 onSelectProject={onSelectProject}
               />
             )}
-            {/* Model selector — visible always, disabled during streaming */}
+            {/* Model selector — visible always, busy while a switch is pending; a switch during a run applies from its next request (C2) */}
             {(modelOptions.length > 0 || model || modelError) && onModelChange && (
               <ModelSelector
                 options={modelOptions}
                 value={model}
                 onChange={onModelChange}
-                disabled={isStreaming}
                 busy={modelSwitching}
                 isAutoSelection={isAutoModelSelection}
                 defaultValue={defaultModel}

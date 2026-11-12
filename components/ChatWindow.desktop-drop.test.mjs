@@ -97,11 +97,10 @@ test("mixed desktop drops degrade per item instead of aborting", () => {
 
 test("browser drops reject directories explicitly instead of uploading them", () => {
   assert.match(chatWindowSource, /"chat\.dropDirectoryBrowserUnsupported"/);
-  assert.match(useDragDropSource, /collectDirectoryNames\(e\)/);
-  assert.match(
-    useDragDropSource,
-    /Array\.from\(e\.dataTransfer\.files\)\.filter\(\(file\) => !directories\.includes\(file\.name\)\)/,
-  );
+  // droppedItems() names folders (webkitGetAsEntry, synchronous) and the hook
+  // reports them beside the files; the chat refuses them with the notice.
+  assert.match(useDragDropSource, /droppedItems\(e\.dataTransfer\)/);
+  assert.match(useDragDropSource, /item\.kind === "folder" \? \[item\.name\] : \[\]/);
 });
 
 test("the native drop listener converts drag pixels per platform and cleans up", () => {

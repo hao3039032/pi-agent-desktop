@@ -26,10 +26,16 @@ export const APP_PREF_KEYS = {
   expandedProjects: "pi-web:expanded-projects",
   /** "1" while the sidebar Chats section is folded. */
   collapsedChats: "pi-web:collapsed-chats",
+  /** Projects header fold; independent of individual project/archive folds. */
+  collapsedProjectsSection: "pi-web:collapsed-projects-section",
   /** Additional five-chat pages shown past the Chats preview cap. */
   chatSessionPages: "pi-web:chat-session-pages",
   /** Chat session ids pinned to the top of the Chats section. */
   pinnedChats: "pi-web:pinned-chats",
+  pinnedSessions: "pi-web:pinned-sessions",
+  pinnedProjects: "pi-web:pinned-projects",
+  /** "tree" shows the Git changes as folders (F2); anything else is the flat list. */
+  changesViewMode: "pi-web:sidebar-changes-view-mode",
   /** Chat session ids hidden from the Chats section until "Show archived". */
   archivedChats: "pi-web:archived-chats",
   /** Project session ids hidden from their project until "Show archived" (#200). */

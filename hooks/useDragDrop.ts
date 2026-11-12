@@ -1,37 +1,36 @@
 "use client";
 
 import { useState, useCallback, useRef } from "react";
+import type { DroppedItem } from "@/lib/file-upload-client";
 
 function hasDraggedFiles(event: React.DragEvent): boolean {
   return Array.from(event.dataTransfer.types).includes("Files");
 }
 
-interface FileSystemEntryLike {
-  isDirectory?: boolean;
-  name?: string;
+/** A drop's files, with dropped folders named instead (they cannot be read as one file). */
+export function droppedItems(dataTransfer: DataTransfer): DroppedItem[] {
+  const items: DroppedItem[] = [];
+  for (const item of Array.from(dataTransfer.items)) {
+    if (item.kind !== "file") continue;
+    const entry = item.webkitGetAsEntry?.();
+    if (entry?.isDirectory) {
+      items.push({ kind: "folder", name: entry.name });
+      continue;
+    }
+    const file = item.getAsFile();
+    if (file) items.push({ kind: "file", file });
+  }
+  if (items.length > 0) return items;
+  return Array.from(dataTransfer.files).map((file) => ({ kind: "file", file }));
 }
 
 /**
- * Directory names among the dragged items. `webkitGetAsEntry` is the only
- * reliable way to tell a dropped folder from a file, and it must be called
- * synchronously — the items list is invalidated once the handler yields.
- * Browsers otherwise hand folders over as unreadable size-0 File objects that
- * fail as bogus "network" upload errors.
+ * The hook reports plain files plus the names of dropped folders: a browser
+ * cannot read a folder's contents, so callers either refuse them (the chat's
+ * "not supported in the browser" notice) or handle them another way. The
+ * desktop shell never drops through this hook (its native drag/drop owns it).
  */
-function collectDirectoryNames(event: React.DragEvent): string[] {
-  const items = event.dataTransfer?.items;
-  if (!items) return [];
-  const names: string[] = [];
-  for (const item of Array.from(items)) {
-    const getEntry = (item as { webkitGetAsEntry?: () => FileSystemEntryLike | null }).webkitGetAsEntry;
-    if (typeof getEntry !== "function") continue;
-    const entry = getEntry.call(item);
-    if (entry?.isDirectory && entry.name) names.push(entry.name);
-  }
-  return names;
-}
-
-export function useDragDrop(onDrop: (files: File[], directories: string[]) => void) {
+export function useDragDrop(onDrop: (files: File[], folders: string[]) => void) {
   const [isDragOver, setIsDragOver] = useState(false);
   const counterRef = useRef(0);
 
@@ -45,6 +44,7 @@ export function useDragDrop(onDrop: (files: File[], directories: string[]) => vo
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (!hasDraggedFiles(e)) return;
     e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
   }, []);
 
   const handleDragLeave = useCallback(() => {
@@ -59,9 +59,10 @@ export function useDragDrop(onDrop: (files: File[], directories: string[]) => vo
     e.preventDefault();
     counterRef.current = 0;
     setIsDragOver(false);
-    const directories = collectDirectoryNames(e);
-    const files = Array.from(e.dataTransfer.files).filter((file) => !directories.includes(file.name));
-    if (files.length > 0 || directories.length > 0) onDrop(files, directories);
+    const items = droppedItems(e.dataTransfer);
+    const files = items.flatMap((item) => (item.kind === "file" ? [item.file] : []));
+    const folders = items.flatMap((item) => (item.kind === "folder" ? [item.name] : []));
+    if (files.length > 0 || folders.length > 0) onDrop(files, folders);
   }, [onDrop]);
 
   return { isDragOver, handleDragEnter, handleDragOver, handleDragLeave, handleDrop };

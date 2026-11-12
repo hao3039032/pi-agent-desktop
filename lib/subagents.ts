@@ -168,3 +168,16 @@ export function readSubagentRun(entries: readonly SessionEntry[], sessionId: str
     ...(result && typeof result.worktreeCleanupError === "string" ? { worktreeCleanupError: result.worktreeCleanupError } : {}),
   };
 }
+
+/** Every tool the SDK builds in (its `allToolNames`, which the package does not export). (Upstream const; the read-only MCP policy filters selections by it.) */
+export const SDK_BUILTIN_TOOLS: readonly string[] = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
+
+/**
+ * A persisted `running` / `queued` status with no live child was left by a process that
+ * stopped mid-run. Every listing must settle it, or a restart leaves a spinner forever.
+ * (From upstream pi-web; the builtin controller is gone, but legacy subagent-child
+ * session files still carry their persisted status and read as interrupted here.)
+ */
+export function settleOrphanedSubagentStatus(status: SubagentStatus): SubagentStatus {
+  return status === "running" || status === "queued" ? "interrupted" : status;
+}

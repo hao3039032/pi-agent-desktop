@@ -114,49 +114,47 @@ jobs:
           tagName: v__VERSION__
           releaseName: pi-agent-desktop v__VERSION__
           releaseBody: |
-            ## Pi Agent Desktop 0.8.2
+            ## Pi Agent Desktop 0.8.4
 
             ### New
 
-            - **Archive single sessions.** Right-click a project session, or use its "…" menu, and choose "Archive". It moves out of the project's list into a "Show archived (n)" fold under that project; search still finds it, and "Unarchive" brings it back.
-            - **Name sessions automatically.** Settings › General › "Name sessions automatically" (off by default). After the first reply, the session's model writes a title for an unnamed session, at the cost of one extra short request per session.
+            - **Regrouped General settings.** Settings › General fills the dialog again, in two columns: "Version & Updates", "Language" and "Display & input" on the left; the desktop options and "Chats outside projects" on the right; the proxy, terminal, relay and remote access options under "Network & advanced". Long hints are shorter, and the two sections that were both called "Chat" now have distinct names.
+            - **Release summary.** "Version & Updates" names the latest release's headline items in one short line under "What's new".
 
             ### Improved
 
-            - **Session switching is fast again.** 0.8.1 released loaded sessions once more than 4 were idle, so switching back to one had to load it from scratch. Idle sessions are now released only when they add up to more than 256 MiB.
-            - **Lower GPU use in the sidebar**, most noticeable on Windows: the sidebar no longer blurs its (opaque) background, and the running and unread indicators use lighter animations that stop when reduced motion is on.
-            - **pi 1.5.0.** Adds GPT-6.1 Terra (OpenAI, Azure OpenAI and OpenAI Codex), handles large streamed tool calls with far less CPU and memory, lets tool search find tools from Chinese and other non-English queries, and signs in to more MCP servers that use OAuth.
-            - **A quieter chat.** Assistant messages no longer show their cost and token counts, and the new-session screen no longer shows starter suggestion chips.
+            - Settings sliders now match the rest of the dialog, and "Chat content width" goes down to 640px.
+            - **pi 1.5.2.** Importing a session whose folder no longer exists no longer leaves duplicate copies, and Anthropic OAuth requests report a current Claude Code version.
 
             ### Fixed
 
-            - A scheduled task's time limit now covers the whole run, so a run whose session never starts or whose prompt is never accepted can no longer hold a scheduler slot forever.
-            - Renaming a session while it is open now updates its title right away and keeps it in the session's history.
+            - In the sidebar, a session's last-activity time (such as "19小时") no longer overlaps its title.
+            - On macOS the sidebar no longer looks washed out when the window and the page disagree about light or dark mode, for example after the system theme changes while the app follows it.
+            - "Add provider" in Settings › Models was taller than the Settings dialog and cut off its search box; it now fits and scrolls inside.
 
-            Bundled components: pi 1.5.0, pi-web 0.10.0.
+            Bundled components: pi 1.5.2, pi-web 0.15.0.
 
             ---
 
-            ## Pi Agent Desktop 0.8.2
+            ## Pi Agent Desktop 0.8.4
 
             ### 新增
 
-            - **单个会话也能归档。** 右键项目里的会话或点它的“…”菜单，选择“归档”，会话会从项目列表移到该项目下的“显示已归档（n）”折叠区；搜索仍能找到它，选择“取消归档”即可恢复。
-            - **自动命名会话。** “设置 › 通用 › 自动命名会话”（默认关闭）。第一轮回复结束后，用当前会话的模型为未命名的会话生成标题，每个会话多一次简短请求。
+            - **常规设置重排。** “设置 › 常规”重新铺满整个弹窗，分为两栏：左栏是“版本与更新”“语言”“聊天显示与输入”，右栏是桌面端选项和“对话（非项目）”；网络代理、终端、远程中继和远程访问归入“网络与高级”。冗长的说明文字已精简，原来两个都叫“对话”的分区也改成了不同的名称。
+            - **更新内容摘要。** “版本与更新”里新增“更新内容”一行，用一句话列出最新版本的主要变化。
 
             ### 改进
 
-            - **切换会话重新变快。** 0.8.1 在闲置会话超过 4 个时就会释放它们，切回去时需要重新加载。现在只有闲置会话合计超过 256 MiB 时才会释放。
-            - **侧栏 GPU 占用更低**，Windows 上最明显：侧栏不再对（不透明的）背景做模糊，运行中和未读标记改用更轻的动画，开启“减少动态效果”时会停止。
-            - **pi 1.5.0。** 新增 GPT-6.1 Terra（OpenAI、Azure OpenAI 和 OpenAI Codex）；流式输出大型工具调用时 CPU 和内存占用大幅降低；工具搜索支持中文等非英文查询；可以登录更多使用 OAuth 的 MCP 服务器。
-            - **对话界面更清爽。** 助手消息下方不再显示费用和 token 数，新会话页面也不再显示建议提示。
+            - 设置中的滑块改为与弹窗其他控件一致的样式，“聊天内容宽度”最小可调到 640px。
+            - **pi 1.5.2。** 导入原文件夹已不存在的会话时不再留下重复副本；Anthropic OAuth 请求会上报当前的 Claude Code 版本。
 
             ### 修复
 
-            - 定时任务的时间限制现在覆盖整个运行过程：会话始终没有启动、或提示始终没有被接收的运行，不会再一直占用调度名额。
-            - 会话打开时重命名，标题会立即更新，并正确记录在会话历史中。
+            - 侧栏中会话的最近活动时间（如“19小时”）不再压住会话标题。
+            - macOS 上，窗口与页面的深浅色不一致时（例如应用跟随系统、系统切换了深浅色），侧栏不再发白。
+            - “设置 › 模型”中的“添加 Provider”弹窗比设置对话框还高，顶部的搜索框被截掉；现在会完整显示在对话框内，并在内部滚动。
 
-            内置组件版本：pi 1.5.0、pi-web 0.10.0。
+            内置组件版本：pi 1.5.2、pi-web 0.15.0。
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true

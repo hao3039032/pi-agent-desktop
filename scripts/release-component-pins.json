@@ -1,7 +1,7 @@
 {
   "pi": {
-    "version": "1.5.1",
-    "reason": "Upgrade the bundled SDK to pi 1.5.1; checked against its changelog (grep context lines come from ripgrep so GrepOperations.readFile is deprecated-but-accepted; OpenAI-compatible sessions omit empty tools arrays; mermaid moved from grok-mermaid to lovely-mermaid)."
+    "version": "1.5.2",
+    "reason": "Upgrade the bundled SDK to pi 1.5.2; checked against its changelog (missing-cwd Continue/Fork prompt is TUI-only, pi-web keeps its own switchSession; Anthropic OAuth reports a current Claude Code version)."
   },
   "pi-web": {
     "version": "0.10.0",

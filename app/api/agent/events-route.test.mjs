@@ -6,7 +6,8 @@ const agentEventsSource = await readFile(new URL("./[id]/events/route.ts", impor
 const agentEventStreamSource = await readFile(new URL("../../../lib/agent-event-stream.ts", import.meta.url), "utf8");
 
 test("agent SSE starts sessions asynchronously and disables response buffering", () => {
-  assert.match(agentEventsSource, /createAgentEventStream\(req, id, sessionPromise\)/);
+  // Upstream's #1283 holder/client tags follow as a fourth argument.
+  assert.match(agentEventsSource, /createAgentEventStream\(req, id, sessionPromise[,)]/);
   assert.match(agentEventsSource, /sessionPromise = startRpcSession\([\s\S]*?\.then\(\(result\) => result\.session\)/);
   assert.doesNotMatch(agentEventsSource, /await startRpcSession\(/);
   assert.match(agentEventsSource, /if \(req\.signal\.aborted\) return new Response\(null, \{ status: 204 \}\)/);

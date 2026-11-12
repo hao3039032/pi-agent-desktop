@@ -464,4 +464,4 @@ Session starts, tool-policy restarts and chat-unlock writes share the per-sessio
   storage and supplies compaction with a fixture extension (no provider request).
 
 ## Exported session HTML
-- `/api/sessions/[id]/export` delegates to pi's export helper, then patches recursive tree helpers in the generated HTML to iterative versions so very deep linear sessions do not overflow the browser call stack.
+- `/api/sessions/[id]/export` delegates to pi's export helper and returns its HTML unmodified. Since pi 1.5.0 the template walks the session tree iteratively, so very deep linear sessions no longer overflow the browser call stack; do not bring back string patches on the generated HTML, they turn every export into a 500 when the template changes. `app/api/sessions/[id]/export/route.test.mjs` pins this.
