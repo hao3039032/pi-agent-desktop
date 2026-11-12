@@ -81,6 +81,10 @@ export interface StartCliSessionOptions {
   chatOnlyExactPrompt?: string;
   /** Whether the wrapper should adopt the chat-only policy (no tools UI). */
   chatOnly?: boolean;
+  /** A side chat: closed tool allow-list, first-prompt naming, no completion push. */
+  sideChat?: boolean;
+  /** A side chat is quiet like a subagent run, including its completion push. */
+  suppressCompletionNotifications?: boolean;
   /**
    * A non-project chat: loads the chat policy extension
    * (assets/pi-web-chat.mjs) with this scope. `filesEnabled` mirrors the
@@ -168,6 +172,18 @@ const CODING_TOOL_SET = new Set(CODING_TOOL_NAMES);
  */
 export function buildToolArgs(selection: readonly string[], defaultTools?: readonly string[]): string[] {
   return ["--tools", buildToolEntries(selection, defaultTools).join(",")];
+}
+
+/**
+ * A side chat's closed tool allow-list. Plain names REPLACE pi's entire
+ * selection (including extension/custom tools), unlike the relative +/-
+ * syntax used for normal projects. MCP is separately disabled at spawn, so
+ * neither direct nor codemode calls can reach it; no codemode/tool_search or
+ * subagent control tools are listed. An empty list means no tools, not pi's
+ * default loadout; the caller keeps chat-only side chats on --no-tools.
+ */
+export function buildSideChatToolArgs(selection: readonly string[], defaultTools?: readonly string[]): string[] {
+  return ["--tools", resolveSpawnToolNames(selection, defaultTools).join(",")];
 }
 
 /** The selection after the shell mapping — what the child actually runs. */
@@ -353,7 +369,14 @@ export async function startCliRpcSessionFromManager(
       ? undefined
       : resolveSpawnToolNames(selection, settings.getDefaultTools());
   if (selection !== undefined && options.chatOnlyExactPrompt === undefined && !options.chatWorkspace) {
-    args.push(...buildToolArgs(selection, settings.getDefaultTools()));
+    args.push(...(options.sideChat
+      ? buildSideChatToolArgs(selection, settings.getDefaultTools())
+      : buildToolArgs(selection, settings.getDefaultTools())));
+  }
+  if (options.sideChat) {
+    // --tools alone never removes MCP (direct or codemode-reachable), and the
+    // registry-level closed list keeps extension/custom/subagent tools out.
+    args.push("--no-mcp");
   }
   if (options.chatWorkspace && !options.chatWorkspace.unlocked) {
     // The file tools (a folder chat) or read alone (legacy) replace the
@@ -482,8 +505,12 @@ export async function startCliRpcSessionFromManager(
       noLiveToolSwitch: !liveTools
         || options.chatOnly === true
         || options.chatOnlyExactPrompt !== undefined
-        || options.chatWorkspace !== undefined,
+        || options.chatWorkspace !== undefined
+        || options.sideChat === true,
       ...(options.chatOnly ? { chatOnly: true } : {}),
+      ...(options.sideChat
+        ? { sideChat: true, suppressCompletionNotifications: options.suppressCompletionNotifications === true }
+        : {}),
       ...(options.chatWorkspace
         ? { chatWorkspace: true, chatFolder: options.chatWorkspace.folder, chatUnlocked: options.chatWorkspace.unlocked }
         : {}),

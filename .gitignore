@@ -60,6 +60,8 @@ next-env.d.ts
 /src-tauri/resources/server/
 /src-tauri/resources/node/
 /src-tauri/target/
+# Rust workspace build output anywhere below crates/ (keep the sources tracked)
+crates/**/target/
 
 # pi agent local state
 /.pi/

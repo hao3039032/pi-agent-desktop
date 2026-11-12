@@ -57,7 +57,7 @@ function flatten(nodes) {
   return nodes.flatMap((node) => node?.kind ? [node] : flatten(node?.children?.flat(Infinity).filter(Boolean) ?? []));
 }
 
-for (const customType of ["subagent-notify", "pi-web:subagent-notification", "extension_debug"]) {
+for (const customType of ["subagent-notify", "subagent-notification", "pi-web:subagent-notification", "extension_debug"]) {
   test(`stream stays after completed history (${customType})`, () => {
     const messages = [user, text("OLD-final"), notice(customType), tool("read"), result("read"), tool("codemode"), result("codemode")];
     const nodes = flatten(render(messages));
@@ -78,7 +78,7 @@ test("multiple package wakes form separate turns; stable history keys survive de
   assert.deepEqual(first.filter((n) => n.kind === "history").map((n) => n.key), second.filter((n) => n.kind === "history").map((n) => n.key));
   assert.equal(second.at(-1).kind, "live");
 });
-for (const customType of ["subagent-notify", "pi-web:subagent-notification"]) {
+for (const customType of ["subagent-notify", "subagent-notification", "pi-web:subagent-notification"]) {
   test(`whole-turn pagination stops at ${customType}, including display:false`, () => {
     const entries = [
       { type: "message", message: user },

@@ -1357,6 +1357,7 @@ export class AgentSessionWrapper {
 
   /** Apply a coding tool selection; `carry` defaults to the tools active now. */
   async setActiveToolSelection(toolNames: string[], carry?: readonly string[]): Promise<void> {
+    if (this.sideChat) return; // the CLI spawn allow-list owns a side chat's fixed tools
     if (this.noLiveToolSwitch) {
       // The child restored the target branch's loadout itself; the pin
       // re-applies at the next respawn (setRpcSessionTools).
@@ -1403,7 +1404,7 @@ export class AgentSessionWrapper {
    * in-process engine keeps its two steps (pin, then apply).
    */
   async applyToolSelectionWithPin(toolNames: string[]): Promise<void> {
-    if (this.noLiveToolSwitch) return;
+    if (this.sideChat || this.noLiveToolSwitch) return;
     await this.inner.refreshTools?.();
     const carry = this.inner.getActiveToolNames();
     const names = resolveActiveToolNames(this.inner, toolNames, carry);
@@ -1428,6 +1429,11 @@ export class AgentSessionWrapper {
   ): Promise<{ cancelled: boolean; aborted?: boolean }> {
     const activeBefore = this.inner.getActiveToolNames();
     const result = await this.inner.navigateTree(targetId, options);
+    // A side chat's CLI tool set is a closed spawn-time allow-list: it never
+    // re-applies the parent's transcript loadout or a pin (which could carry
+    // extension/MCP/subagent tools). setRpcSessionTools also refuses by
+    // metadata, so its selection stays fixed across navigation.
+    if (this.sideChat) return { cancelled: result.cancelled, ...(result.aborted ? { aborted: true } : {}) };
     if (result.cancelled || this.chatOnly || this.chatUnlocked) {
       return { cancelled: result.cancelled, ...(result.aborted ? { aborted: true } : {}) };
     }
@@ -1457,11 +1463,14 @@ export class AgentSessionWrapper {
   }
 
   /** The first prompt names a side chat that still has the name it started with. */
-  private nameSideChat(message: unknown): void {
+  private async nameSideChat(message: unknown): Promise<void> {
     if (this.inner.sessionManager.getSessionName() !== SIDE_SESSION_NAME || typeof message !== "string") return;
     const name = sideChatNameFrom(message);
     if (!name) return;
-    this.inner.setSessionName(name);
+    // The CLI confirms the rename asynchronously (session.ts). Only drop the
+    // catalogue cache after it has actually landed on disk; a rejected rename
+    // reaches the prompt caller instead of leaving a fire-and-forget rejection.
+    await this.inner.setSessionName(name);
     invalidateSessionListCache();
   }
 
@@ -1709,7 +1718,7 @@ export class AgentSessionWrapper {
           if (this.inner.isBashRunning) {
             throw new Error("Cannot send a prompt while a shell command is running");
           }
-          if (this.sideChat) this.nameSideChat(command.message);
+          if (this.sideChat) await this.nameSideChat(command.message);
           if (this.extensionUiAbortController.signal.aborted) {
             this.extensionUiAbortController = new AbortController();
           }
@@ -2212,6 +2221,7 @@ export class AgentSessionWrapper {
         if (this.chatWorkspace || this.chatUnlocked) {
           throw new Error("Chats have no tools. Open a project to change the tool preset.");
         }
+        if (this.sideChat) throw new Error("Side chat tools are fixed when it is forked");
         const toolNames = command.toolNames as string[];
         await this.setActiveToolSelection(toolNames);
         return null;
@@ -4283,6 +4293,7 @@ async function startRpcSessionLocked(
         ...(chatOnlyExactPrompt !== undefined ? { chatOnlyExactPrompt, chatOnly: true } : {}),
         ...(initialModel ? { initialModel } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
+        ...(isSideChat ? { sideChat: true, suppressCompletionNotifications: true } : {}),
         onAgentRunComplete: pushRunOutcome,
         onAttentionNeeded: pushAttentionNeeded,
         registerWrapper: (wrapper, realSessionId) => {
