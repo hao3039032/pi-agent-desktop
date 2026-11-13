@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 1,
+  "revision": 2,
   "updateMirrors": [
     "gh-proxy.com",
     "ghproxy.cn"
@@ -17,6 +17,10 @@
     "id": "lw",
     "name": "LW",
     "api": "anthropic-messages",
+    "compat": {
+      "sendSessionAffinityHeaders": true,
+      "sessionAffinityFormat": "openrouter"
+    },
     "defaultModel": "glm-5.3",
     "models": [
       {

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, imageGenBaseUrl, mergeDistroModels, rebaseDistroModelUrls } from "./config";
+import { DISTRO, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
 import { resolveExaFallbackPair } from "./exa-fallback";
 import { LAZY_TOOL_ACTIVATION } from "./lazy-tool-activation";
 import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
@@ -82,6 +82,11 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
   const storedKey = typeof existing.apiKey === "string" ? existing.apiKey : "";
   const apiKey = incomingKey || storedKey;
   if (!apiKey) throw new DistroConfigError("apiKey is required");
+  // Session-affinity compat defaults are filled in where absent (a value the
+  // user already chose wins), so a provider created by this form carries the
+  // stable x-session-id from its first request even though release migration
+  // 0.8.402 already recorded its receipt on a not-yet-configured install.
+  const compat = mergeDistroProviderCompat(existing.compat);
 
   writeModelsConfig({
     ...config,
@@ -93,6 +98,7 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
         baseUrl,
         api: DISTRO.provider.api,
         apiKey,
+        ...(compat ? { compat } : {}),
         models: mergeDistroModels(
           existing.models,
           rebaseDistroModelUrls(DISTRO.provider.models, baseUrl),

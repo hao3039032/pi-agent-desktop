@@ -4,6 +4,7 @@
  * `distro/distro.json`; see docs/distro.md.
  */
 import distroJson from "../../distro/distro.json";
+import { isRecord } from "./json-file";
 
 export interface DistroModel {
   id: string;
@@ -21,6 +22,12 @@ export interface DistroConfig {
     id: string;
     name: string;
     api: string;
+    /** Provider-level compat defaults for the distro gateway (session-affinity
+     * headers today). Filled in only where absent by mergeDistroProviderCompat:
+     * a value the user already chose (a deliberate `false`, a different
+     * format) is never overwritten. No `$comment` keys here — everything in
+     * this object flows into the user's models.json provider compat. */
+    compat?: Record<string, unknown>;
     defaultModel: string;
     models: DistroModel[];
   };
@@ -69,6 +76,23 @@ export interface DistroConfig {
 }
 
 export const DISTRO: DistroConfig = distroJson as unknown as DistroConfig;
+
+/** Merge the distro provider's compat defaults into a provider entry's
+ * existing compat, filling in only keys that are absent — an explicit value
+ * the user set (a deliberate `false`, a different format) always wins, per
+ * the session-affinity handover rule "never silently drop an explicit
+ * setting". Returns the original object reference when nothing is missing,
+ * `undefined` when neither side has anything, so callers can keep the
+ * provider entry's shape untouched. */
+export function mergeDistroProviderCompat(existing: unknown): Record<string, unknown> | undefined {
+  const base = isRecord(existing) ? existing : undefined;
+  const defaults = DISTRO.provider.compat;
+  if (!defaults) return base;
+  if (!base) return { ...defaults };
+  const missing = Object.entries(defaults).filter(([key]) => !(key in base));
+  if (missing.length === 0) return base;
+  return { ...base, ...Object.fromEntries(missing) };
+}
 
 /** Update distro models by id, while retaining every other existing model. */
 export function mergeDistroModels(existingModels: unknown, distroModels: DistroModel[]): DistroModel[] {

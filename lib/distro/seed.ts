@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, imageGenBaseUrl, mergeDistroModels, rebaseDistroModelUrls } from "./config";
+import { DISTRO, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -51,7 +51,9 @@ function readState(agentDir: string): DistroState | null {
 /**
  * Keep the distro provider's model list in step with the bundled distro.json
  * after an app update. Only the model catalog is managed; the user's baseUrl
- * and apiKey are never touched here.
+ * and apiKey are never touched here. The provider compat defaults (session
+ * affinity) are re-filled where absent, with the same only-if-missing merge
+ * as the service form and release migration 0.8.402.
  */
 function refreshProviderModels(): void {
   try {
@@ -64,6 +66,7 @@ function refreshProviderModels(): void {
       existing.models,
       rebaseDistroModelUrls(DISTRO.provider.models, storedBaseUrl),
     );
+    const compat = mergeDistroProviderCompat(existing.compat);
     writeModelsConfig({
       ...config,
       providers: {
@@ -72,6 +75,7 @@ function refreshProviderModels(): void {
           ...existing,
           name: DISTRO.provider.name,
           api: DISTRO.provider.api,
+          ...(compat ? { compat } : {}),
           models,
         },
       },

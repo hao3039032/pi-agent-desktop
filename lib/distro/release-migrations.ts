@@ -1,6 +1,7 @@
 import { compare, valid } from "semver";
 import { applyDeepSeekMigration } from "./deepseek-migration";
 import { applyExaFallbackMigration } from "./exa-fallback";
+import { applySessionAffinityMigration } from "./session-affinity-migration";
 
 export interface ReleaseMigration {
   /** Immutable release version: append a new entry, never repurpose a shipped one. */
@@ -28,6 +29,16 @@ export const RELEASE_MIGRATIONS: readonly ReleaseMigration[] = [
       // is still recorded so this never re-runs against their choice.
       if (report.written.length) console.log(`[distro] Exa fallback: pre-filled ${report.written.join(", ")}`);
       if (report.kept.length) console.log(`[distro] Exa fallback: ${report.kept.join("; ")}`);
+    },
+  },
+  {
+    version: "0.8.402",
+    run(agentDir) {
+      const report = applySessionAffinityMigration(agentDir);
+      // A kept key is the user's explicit setting, not a failure: the receipt
+      // is still recorded so this never re-runs against their choice.
+      if (report.written.length) console.log(`[distro] session affinity: filled ${report.written.join(", ")}`);
+      if (report.kept.length) console.log(`[distro] session affinity: ${report.kept.join("; ")}`);
     },
   },
 ];

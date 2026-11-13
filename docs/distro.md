@@ -21,7 +21,7 @@
 
 | 路径 | 作用 |
 |---|---|
-| `distro/distro.json` | 唯一配置入口：provider（LW）的模型表、Pi 扩展列表（`packages`）、仅随包安装的运行依赖（`runtimePackages`，当前为空，机制保留）、默认值、web-search 默认值、随包 JSON（`agentFiles`）、`WATCHDOG.yml` 等文本文件（`agentTextFiles`）、`app`（改名、更新指向）、`revision`（发行修订号） |
+| `distro/distro.json` | 唯一配置入口：provider（LW）的模型表与会话亲和 compat（`provider.compat`，网关按稳定 `x-session-id` 识别同一会话）、Pi 扩展列表（`packages`）、仅随包安装的运行依赖（`runtimePackages`，当前为空，机制保留）、默认值、web-search 默认值、随包 JSON（`agentFiles`）、`WATCHDOG.yml` 等文本文件（`agentTextFiles`）、`app`（改名、更新指向）、`revision`（发行修订号） |
 | `scripts/distro-seed.mjs` | 构建时把扩展包装进 `src-tauri/resources/pi-seed/`，并写 `manifest.json`（含 `seedVersion`）和 `bin/npm` shim。git 包去掉 peer 依赖和 `.map`/`.d.ts` 以减小体积 |
 | `scripts/distro-ripgrep.mjs` | macOS 按 Rust target triple 下载固定版本的官方 ripgrep 归档，核验固定 SHA-256 与 Mach-O 架构，将 `rg` 及许可证放入 `resources/ripgrep/`；支持 Apple Silicon 和 Intel 交叉构建 |
 | `scripts/distro-portable-git.mjs` | Windows 构建时下载 PortableGit（版本和 sha256 写死在脚本里），解压、裁剪文档/翻译后放进 `resources/git/`。`post-install.bat` 保留，由运行时执行 |
@@ -64,7 +64,8 @@
   - 权限裁判旧 Gemini 模型、搜索摘要和查询改写的旧 Gemini 值改为 DeepSeek（缺少摘要/改写键时补上）；显式 `current` 或其他自定义模型不动。搜索 provider、searchModel、音视频配置及凭据不动；旧默认的 `provider: "gemini"` + `searchModel: "gemini-3.8-flash"` 保持不变。不创建或迁移 legacy `~/.pi/web-search.json`，不扫描项目配置。
   - 从已有 `models.json` 的 LW provider 删除 `gemini-3.8-flash`，保留 Lite、自定义模型、其他 provider 和凭据；全局默认恰为 `lw/gemini-3.8-flash` 时同步改成 DeepSeek，避免悬空默认值；不改 `enabledModels`。损坏文件和读写错误均保留失败标记为空，修复后可重试。无法区分用户刻意选中的旧默认值与一直沿用默认值，这些精确匹配项都会迁移。
   - **v0.8.215**：给**已存在**的 `<agentDir>/web-search.json` 补齐缺失的 Exa 备用连接（`exaBaseUrl` = LW 服务地址 + `/exa`、`exaApiKey` = 平台 Key），仅在 `models.json` 有 LW 凭据且归属可判定时写入（`lib/distro/exa-fallback.ts`，与服务表单同一条派生/归属规则）。不创建 `web-search.json`（避免遮蔽 legacy `~/.pi/web-search.json`，与 toolActivation 种子同一条判别词）；已显式自定义或只配了单边的 Exa 配置成对保留，不用平台 Key 混搭发往自定义 host；未配置 LW 凭据直接跳过；坏 JSON/IO 失败不标记完成，下次启动重试。补齐的只是连接，`provider`/`workflow` 及媒体、摘要等偏好一律不动，切换到 `provider: "exa"` 始终是用户的按需选择。
-- **升级**：`seedVersion` 变化时会用 distro.json 里的模型表刷新 LW provider 的模型列表（不动用户的 baseUrl/apiKey；模型条目里指向默认服务地址的绝对 baseUrl 会改写成用户配置的地址，如 `…/v1beta`），并重写包路径。
+  - **v0.8.402**：给已配置的 LW provider 补上会话亲和 compat（`sendSessionAffinityHeaders: true` + `sessionAffinityFormat: "openrouter"`，`lib/distro/session-affinity-migration.ts`）：网关（LiteLLM）按 OpenRouter 风格的 `x-session-id` 识别同一会话，才能把整段对话路由到同一上游、命中 prompt cache；pi 1.5.2 在 anthropic-messages / openai-completions / openai-responses 路径都会发送（`openrouter` 只是 header 格式名，不是改发 OpenRouter；`cacheRetention: "none"` 时不经此配置发送）。只补缺失键：用户显式写下的值（如 `false`、别的格式）保留并在日志报告，模型级 compat 覆盖一律不动；服务未配置（`models.json` 无 LW provider）时也记完成收据，由服务表单创建 provider 时补上（`lib/distro/service-config.ts`）与 seedVersion 刷新（`lib/distro/seed.ts`）走同一条 `mergeDistroProviderCompat` 只补缺失合并；坏 JSON/IO 失败不标记完成，下次启动重试。
+- **升级**：`seedVersion` 变化时会用 distro.json 里的模型表刷新 LW provider 的模型列表（不动用户的 baseUrl/apiKey；模型条目里指向默认服务地址的绝对 baseUrl 会改写成用户配置的地址，如 `…/v1beta`），并以同一条 `mergeDistroProviderCompat` 只补缺失地合入 `provider.compat` 会话亲和默认值（已有显式值不动），并重写包路径。
 - **一次性迁移（pi-mcp-adapter → 官方 MCP）**：`lib/distro/mcp-migration.ts`，每个 agent 目录至多跑一次（记录在 `desktop-distro.json` 的 `migrations.mcpAdapter`）：
   1. 删除 `packages` 里手写形式的 pi-mcp-adapter 条目（`npm:pi-mcp-adapter` / 带版本号；包内路径形式由种子剪除逻辑处理）；
   2. 移除 `extensions` 里的 `-builtin:mcp`（adapter 首次启动写入的内置 MCP 关闭标记），恢复官方 MCP；
