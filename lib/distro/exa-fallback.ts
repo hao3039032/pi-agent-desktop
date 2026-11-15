@@ -1,12 +1,11 @@
 /**
- * Optional Exa fallback connection for pi-web-access (`provider: "exa"`).
- * The platform gateway proxies Exa's native POST /search and POST /contents
- * at `<service baseUrl>/exa` and authenticates with the user's platform key —
- * not an upstream Exa key. The pair only pre-fills a connection: the default
- * `provider` stays "gemini" and `workflow` stays "none"; switching the search
- * provider to "exa" is the user's on-demand choice. Whether the platform key
- * may call Exa at all is enforced (and billed) server-side; the client never
- * sends a test request.
+ * Exa connection for pi-web-access (`provider: "exa"`). The platform gateway
+ * proxies Exa's native POST /search and POST /contents at
+ * `<service baseUrl>/exa` and authenticates with the user's platform key —
+ * not an upstream Exa key. Whether the platform key may call Exa at all is
+ * enforced (and billed) server-side; the client never sends a test request.
+ * This module manages only the connection; the service defaults and release
+ * 0.8.503 migration own the provider selection.
  *
  * The pair is owned as a unit and shared by both writers (the service form
  * in service-config.ts and the release migration below). It is (re-)written
@@ -19,7 +18,7 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { DISTRO } from "./config";
+import { DISTRO, distroServiceBaseUrl } from "./config";
 import { isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { readModelsConfig } from "../models-config-store";
 
@@ -85,7 +84,9 @@ export function applyExaFallbackMigration(agentDir: string): ExaFallbackReport {
 
   const models = readModelsConfig(join(agentDir, "models.json"));
   const provider = isRecord(models.providers) ? models.providers[DISTRO.provider.id] : undefined;
-  const baseUrl = isRecord(provider) && typeof provider.baseUrl === "string" ? provider.baseUrl : "";
+  const baseUrl = isRecord(provider) && typeof provider.baseUrl === "string"
+    ? distroServiceBaseUrl(provider.baseUrl)
+    : "";
   const apiKey = isRecord(provider) && typeof provider.apiKey === "string" ? provider.apiKey : "";
   if (!baseUrl || !apiKey) return report; // service not configured: nothing to derive from
 

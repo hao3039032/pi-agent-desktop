@@ -6,9 +6,9 @@
  * `compat.sessionAffinityFormat: "openrouter"` in models.json), which lets it
  * route a whole conversation consistently and reach the upstream prompt
  * cache. pi 1.5.2 sends it on the anthropic-messages, openai-completions and
- * openai-responses paths; the distro provider speaks anthropic-messages with
- * per-model openai-completions overrides, so one provider-level pair covers
- * both. The declarative source is `distro/distro.json` → `provider.compat`
+ * openai-responses paths; the distro provider now defaults to
+ * openai-completions with per-model protocol overrides, so one provider-level
+ * pair covers them. The declarative source is `distro/distro.json` → `provider.compat`
  * (see docs/distro.md and the handover doc this follows, "Pi 会话 Header
  * 配置交接": `openrouter` is only the header format name — nothing is
  * re-routed to OpenRouter).

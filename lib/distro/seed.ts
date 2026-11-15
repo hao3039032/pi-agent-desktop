@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
+import { DISTRO, distroProviderBaseUrl, distroServiceBaseUrl, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
 import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
@@ -50,8 +50,9 @@ function readState(agentDir: string): DistroState | null {
 
 /**
  * Keep the distro provider's model list in step with the bundled distro.json
- * after an app update. Only the model catalog is managed; the user's baseUrl
- * and apiKey are never touched here. The provider compat defaults (session
+ * after an app update. Only the model catalog and protocol are managed; the
+ * user's service address and apiKey are preserved (the provider's OpenAI
+ * baseUrl carries `/v1`). The provider compat defaults (session
  * affinity) are re-filled where absent, with the same only-if-missing merge
  * as the service form and release migration 0.8.402.
  */
@@ -62,9 +63,10 @@ function refreshProviderModels(): void {
     const existing = providers[DISTRO.provider.id];
     if (!isRecord(existing)) return;
     const storedBaseUrl = typeof existing.baseUrl === "string" ? existing.baseUrl : DISTRO.defaultBaseUrl;
+    const serviceBaseUrl = distroServiceBaseUrl(storedBaseUrl);
     const models = mergeDistroModels(
       existing.models,
-      rebaseDistroModelUrls(DISTRO.provider.models, storedBaseUrl),
+      rebaseDistroModelUrls(DISTRO.provider.models, serviceBaseUrl),
     );
     const compat = mergeDistroProviderCompat(existing.compat);
     writeModelsConfig({
@@ -74,6 +76,7 @@ function refreshProviderModels(): void {
         [DISTRO.provider.id]: {
           ...existing,
           name: DISTRO.provider.name,
+          baseUrl: distroProviderBaseUrl(serviceBaseUrl),
           api: DISTRO.provider.api,
           ...(compat ? { compat } : {}),
           models,

@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 1,
+  "revision": 3,
   "updateMirrors": [
     "gh-proxy.com",
     "ghproxy.cn"
@@ -16,7 +16,7 @@
   "provider": {
     "id": "lw",
     "name": "LW",
-    "api": "anthropic-messages",
+    "api": "openai-completions",
     "compat": {
       "sendSessionAffinityHeaders": true,
       "sessionAffinityFormat": "openrouter"
@@ -33,10 +33,22 @@
         "contextWindow": 1000000,
         "maxTokens": 128000,
         "thinkingLevelMap": {
-          "xhigh": null,
-          "max": "max",
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": null,
           "high": "high",
-          "low": "low"
+          "xhigh": null,
+          "max": "max"
+        },
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsReasoningEffort": true,
+          "maxTokensField": "max_tokens",
+          "thinkingFormat": "zai",
+          "supportsStrictMode": true,
+          "zaiToolStream": true
         }
       },
       {
@@ -50,14 +62,29 @@
         "contextWindow": 1048576,
         "maxTokens": 128000,
         "thinkingLevelMap": {
-          "max": "max",
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": null,
           "high": "high",
-          "low": "low"
+          "xhigh": null,
+          "max": "max"
+        },
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsReasoningEffort": true,
+          "maxTokensField": "max_tokens",
+          "thinkingFormat": "zai",
+          "supportsStrictMode": true,
+          "zaiToolStream": true
         }
       },
       {
         "id": "claude-opus-5-5",
         "name": "Claude Opus 5.5",
+        "api": "anthropic-messages",
+        "baseUrl": "https://ai-new-api.91prize.com",
         "reasoning": true,
         "input": [
           "text",
@@ -69,6 +96,8 @@
       {
         "id": "gpt-6-astra",
         "name": "GPT-6 Astra",
+        "api": "openai-responses",
+        "baseUrl": "https://ai-new-api.91prize.com/v1",
         "reasoning": true,
         "input": [
           "text",
@@ -81,6 +110,7 @@
         "id": "gpt-6.1-terra",
         "name": "GPT-6.1 Terra",
         "api": "openai-responses",
+        "baseUrl": "https://ai-new-api.91prize.com/v1",
         "reasoning": true,
         "input": [
           "text",
@@ -122,6 +152,34 @@
               "jpegQuality": 80
             }
           }
+        }
+      },
+      {
+        "id": "gemini-4-argon",
+        "name": "Gemini 4 Argon",
+        "api": "google-generative-ai",
+        "baseUrl": "https://ai-new-api.91prize.com/v1beta",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
+        ],
+        "cost": {
+          "input": 2,
+          "output": 10,
+          "cacheRead": 0.1,
+          "cacheWrite": 0
+        },
+        "contextWindow": 1048576,
+        "maxTokens": 32768,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": "medium",
+          "high": "high",
+          "xhigh": null,
+          "max": null
         }
       },
       {
@@ -226,7 +284,7 @@
     },
     "defaults": {
       "allowBrowserCookies": true,
-      "provider": "gemini",
+      "provider": "exa",
       "searchModel": "gemini-3.8-flash",
       "summaryModel": "lw/deepseek-v4.1-flash",
       "queryRewriteModel": "lw/deepseek-v4.1-flash",

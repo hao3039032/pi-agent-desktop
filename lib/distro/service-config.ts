@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { DISTRO, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
+import { DISTRO, distroProviderBaseUrl, distroServiceBaseUrl, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
 import { resolveExaFallbackPair } from "./exa-fallback";
 import { LAZY_TOOL_ACTIVATION } from "./lazy-tool-activation";
 import { readNpmMirrorEnabled, setNpmMirrorEnabled } from "./npm-mirror";
@@ -37,12 +37,13 @@ export function readDistroServiceStatus(): DistroServiceStatus {
     // An unreadable models.json reads as "not configured"; saving refuses to overwrite it.
   }
   const baseUrl = typeof provider.baseUrl === "string" ? provider.baseUrl : "";
+  const serviceBaseUrl = baseUrl ? distroServiceBaseUrl(baseUrl) : "";
   const hasApiKey = typeof provider.apiKey === "string" && provider.apiKey.trim() !== "";
   return {
     providerId: DISTRO.provider.id,
     providerName: DISTRO.provider.name,
-    configured: baseUrl !== "" && hasApiKey,
-    baseUrl: baseUrl || DISTRO.defaultBaseUrl,
+    configured: serviceBaseUrl !== "" && hasApiKey,
+    baseUrl: serviceBaseUrl || DISTRO.defaultBaseUrl,
     hasApiKey,
     npmMirror: readNpmMirrorEnabled(),
   };
@@ -72,7 +73,10 @@ export function normalizeBaseUrl(value: unknown): string {
  * does not require re-entering the key.
  */
 export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKey?: unknown; useNpmMirror?: unknown }): Promise<DistroServiceStatus> {
-  const baseUrl = normalizeBaseUrl(input.baseUrl);
+  // The dialog and non-chat integrations use the service root; models.json
+  // alone gets the OpenAI `/v1` suffix below. Accept either spelling without
+  // leaking the chat suffix into web-search or Exa.
+  const baseUrl = distroServiceBaseUrl(normalizeBaseUrl(input.baseUrl));
   const incomingKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
   if (/\s/.test(incomingKey)) throw new DistroConfigError("apiKey must not contain whitespace");
 
@@ -95,7 +99,7 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
       [DISTRO.provider.id]: {
         ...existing,
         name: DISTRO.provider.name,
-        baseUrl,
+        baseUrl: distroProviderBaseUrl(baseUrl),
         api: DISTRO.provider.api,
         apiKey,
         ...(compat ? { compat } : {}),
@@ -125,12 +129,12 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
   // no user choice to respect, so it is treated as a first creation.
   const webSearchHasContent = webSearch !== null && Object.keys(webSearch).length > 0;
   if (webSearch) {
-    // The optional Exa fallback connection follows the same save: derived
+    // The default Exa connection follows the same save: derived
     // from this address + /exa and reusing the platform key. {} keeps a
     // custom or half-custom pair exactly as the file holds it (spread last).
     const exaFallback = resolveExaFallbackPair(
       webSearch,
-      typeof existing.baseUrl === "string" ? existing.baseUrl : "",
+      typeof existing.baseUrl === "string" ? distroServiceBaseUrl(existing.baseUrl) : "",
       storedKey,
       baseUrl,
       apiKey,
@@ -148,7 +152,7 @@ export async function applyDistroServiceConfig(input: { baseUrl?: unknown; apiKe
   }
 
   // Same service, OpenAI form: the imagegen CLI posts to
-  // `{baseUrl}/images/generations` and must not share the anthropic base.
+  // `{baseUrl}/images/generations`; its `/v1` suffix is idempotent too.
   const imageGen = imageGenPath(agentDir);
   if (imageGen) {
     const imageGenConfig = readJsonObject(imageGen);

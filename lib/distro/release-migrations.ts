@@ -2,6 +2,8 @@ import { compare, valid } from "semver";
 import { applyDeepSeekMigration } from "./deepseek-migration";
 import { applyExaFallbackMigration } from "./exa-fallback";
 import { applySessionAffinityMigration } from "./session-affinity-migration";
+import { applyOpenAICompletionsMigration } from "./openai-completions-migration";
+import { applyExaDefaultMigration } from "./exa-default-migration";
 
 export interface ReleaseMigration {
   /** Immutable release version: append a new entry, never repurpose a shipped one. */
@@ -39,6 +41,21 @@ export const RELEASE_MIGRATIONS: readonly ReleaseMigration[] = [
       // is still recorded so this never re-runs against their choice.
       if (report.written.length) console.log(`[distro] session affinity: filled ${report.written.join(", ")}`);
       if (report.kept.length) console.log(`[distro] session affinity: ${report.kept.join("; ")}`);
+    },
+  },
+  {
+    version: "0.8.502",
+    run(agentDir) {
+      const report = applyOpenAICompletionsMigration(agentDir);
+      if (report.written.length) console.log(`[distro] OpenAI default protocol: updated ${report.written.join(", ")}`);
+    },
+  },
+  {
+    version: "0.8.503",
+    run(agentDir) {
+      const report = applyExaDefaultMigration(agentDir);
+      if (report.written.length) console.log(`[distro] Exa default search: updated ${report.written.join(", ")}`);
+      if (report.kept.length) console.log(`[distro] Exa default search: ${report.kept.join("; ")}`);
     },
   },
 ];

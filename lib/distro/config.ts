@@ -45,8 +45,7 @@ export interface DistroConfig {
   webSearch: {
     baseUrlKey: string;
     apiKeyKey: string;
-    /** Optional Exa fallback connection for pi-web-access (`provider: "exa"`,
-     * an on-demand user choice — the default provider stays `gemini`). The
+    /** Exa connection for pi-web-access (the default search provider). The
      * gateway proxies Exa's native endpoints at `<service baseUrl> + suffix`
      * and authenticates with the platform key, never an upstream Exa key.
      * Deliberately not part of `defaults`: those re-merge on every save. */
@@ -133,6 +132,22 @@ export function rebaseDistroModelUrls(
       ? { ...model, baseUrl: baseUrl.replace(/\/+$/, "") + model.baseUrl.slice(defaultBase.length) }
       : model,
   );
+}
+
+/** OpenAI chat provider base derived from the user-facing service address.
+ * models.json needs `/v1`; web search, Exa and the service form keep using the
+ * unsuffixed address. Accepting an already-suffixed value makes upgrades and
+ * repeated provider refreshes idempotent. */
+export function distroProviderBaseUrl(serviceBaseUrl: string): string {
+  const base = serviceBaseUrl.trim().replace(/\/+$/, "");
+  if (!base) return "";
+  return base.endsWith("/v1") ? base : base + "/v1";
+}
+
+/** Recover the user-facing service address from a models.json provider base. */
+export function distroServiceBaseUrl(providerBaseUrl: string): string {
+  const base = providerBaseUrl.trim().replace(/\/+$/, "");
+  return base.endsWith("/v1") ? base.slice(0, -3) : base;
 }
 
 /**
