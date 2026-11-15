@@ -56,6 +56,15 @@ test("the distro's own stagings stay out of the traced server and fail the scan 
       stagings.map((name) => `build-output server/src-tauri/resources/${name}/leftover`).sort(),
     );
     assert.deepEqual(result.allowed.map((entry) => entry.path), ["pi-seed/npm/node_modules/jose/dist/webapi/key/import.js"]);
+    // The distro release scans the seed on its own root; the same file must
+    // be allowlisted there, and jose anywhere else must stay a finding.
+    const seedOnly = await scanPayload(join(root, "pi-seed"));
+    assert.deepEqual(seedOnly.findings, []);
+    const elsewhere = join(root, "server", "node_modules", "jose", "dist", "webapi", "key");
+    await mkdir(elsewhere, { recursive: true });
+    await writeFile(join(elsewhere, "import.js"), "'-----BEGIN PRIVATE KEY-----'");
+    const withServerJose = await scanPayload(root);
+    assert.ok(withServerJose.findings.some((finding) => finding.path === "server/node_modules/jose/dist/webapi/key/import.js"));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -224,4 +233,18 @@ test("the shell pins the repository this build releases from", async () => {
   assert.equal(pinned?.[1], distro.app.repository);
   const branding = await readFile(new URL("../lib/branding.ts", import.meta.url), "utf8");
   assert.match(branding, new RegExp(`APP_REPOSITORY = "${distro.app.repository}"`));
+});
+
+// The seed is staged after desktop:prepare's last scan, so the distro release
+// scans it in its own step; PortableGit is the one staging left unscanned
+// (sha256-pinned third-party archive that cannot pass the scanner).
+test("the distro release scans the seed, and only root-level PortableGit is left out of the last gate", async () => {
+  const workflow = await readFile(join(rootDir, ".github", "workflows", "distro-release.yml"), "utf8");
+  const seed = workflow.indexOf("run: npm run distro:seed");
+  const scan = workflow.indexOf("run: node scripts/check-packaged-payload.mjs --root src-tauri/resources/pi-seed");
+  const build = workflow.indexOf("tauri-apps/tauri-action");
+  assert.ok(seed !== -1 && scan > seed && build > scan, "the seed scan must run after distro:seed and before the build");
+
+  const prepare = await readFile(join(rootDir, "scripts", "prepare-desktop.mjs"), "utf8");
+  assert.match(prepare, /dir === stagedResourcesDir \? entries\.filter\(\(entry\) => entry\.name !== "git"\) : entries/);
 });

@@ -80,7 +80,10 @@ export const PAYLOAD_ALLOWED = [
     // LW distro: resources/pi-seed carries pre-installed pi packages; a
     // leftover seed is scanned when `desktop:prepare` runs again locally.
     rule: "private-key",
-    path: /(^|\/)pi-seed\/(.*\/)?node_modules\/jose\/dist\/[^/]+\/key\/import\.js$/,
+    // Anchored at the scan root: matches the seed scanned as part of
+    // `src-tauri/resources` or on its own (`--root src-tauri/resources/pi-seed`),
+    // never the traced server's jose.
+    path: /^(pi-seed\/)?npm\/node_modules\/jose\/dist\/[^/]+\/key\/import\.js$/,
     reason: "jose's PKCS#8 importer compares its input against the `-----BEGIN PRIVATE KEY-----` marker (a parser's string literal, no key body)",
   },
 ];

@@ -220,6 +220,13 @@ jobs:
       - name: Pre-install distro pi packages
         run: npm run distro:seed
 
+      - name: Scan the seeded pi packages
+        # desktop:prepare ran its payload scan before the seed existed, so the
+        # seed is scanned here. PortableGit (staged below, Windows only) is
+        # deliberately not scanned: it is a sha256-pinned third-party archive
+        # whose ssh/gnutls binaries can never pass (docs/agents/fork-desktop.md).
+        run: node scripts/check-packaged-payload.mjs --root src-tauri/resources/pi-seed
+
       - name: Verify packaged server
         # Verify AFTER seeding: otherwise the pi child never loads the shipped
         # extension set (v0.8.204 passed while registering a runtime as an extension).

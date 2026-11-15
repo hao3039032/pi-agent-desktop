@@ -618,6 +618,22 @@ if (piDistributionDir) {
 
 // Last gate before `tauri build` runs: nothing in the staged payload may carry
 // this checkout's own configuration or credentials.
-await assertPayloadClean(join(rootDir, "src-tauri", "resources"), { label: "src-tauri/resources" });
+//
+// LW distro: a leftover `resources/git` (PortableGit, staged by `distro:git`
+// after this script) is left out of this scan. It is a third-party archive
+// verified against a pinned sha256 before it is unpacked, never this
+// checkout's content, and it cannot pass: its ssh/gnutls binaries carry PEM
+// markers and self-test key bodies. Only the root-level directory is skipped;
+// a `git` directory anywhere deeper is scanned like everything else.
+const stagedResourcesDir = join(rootDir, "src-tauri", "resources");
+await assertPayloadClean(stagedResourcesDir, {
+  label: "src-tauri/resources (without the pinned PortableGit staging)",
+  options: {
+    readdir: async (dir, readdirOptions) => {
+      const entries = await readdir(dir, readdirOptions);
+      return dir === stagedResourcesDir ? entries.filter((entry) => entry.name !== "git") : entries;
+    },
+  },
+});
 console.log(`Desktop server staged at ${serverResourcesDir}`);
 console.log(`Node runtime staged at ${nodeBinary} (${triple})`);
