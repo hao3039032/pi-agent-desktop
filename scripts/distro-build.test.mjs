@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { scanPayload } from "./packaged-payload.mjs";
 import {
   distroResources,
   distroVersion,
@@ -15,6 +17,49 @@ import { compareVersions } from "./release-components.mjs";
 import { seedInstallArgs, seedInstallEnv, seedPackageGroups, seedRelativePath } from "./distro-seed.mjs";
 
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
+
+// LW layer over upstream's payload scan (DEFECT-000089). The distro stages
+// pi / pi-seed / git / ripgrep under src-tauri/resources, some of them before
+// the trace (ripgrep on macOS) and all of them on a second local run, so they
+// must stay in the trace excludes and in the scanner's `build-output` rule.
+// Both lists are upstream's files: a merge that rewrites either one drops the
+// distro entries without a conflict worth noticing, hence this pin.
+test("the distro's own stagings stay out of the traced server and fail the scan if they get in", async () => {
+  const stagings = ["pi", "pi-seed", "git", "ripgrep"];
+  const nextConfig = await readFile(join(rootDir, "next.config.ts"), "utf8");
+  for (const name of stagings) {
+    assert.ok(
+      nextConfig.includes(`"src-tauri/resources/${name}/**"`),
+      `next.config.ts outputFileTracingExcludes lost src-tauri/resources/${name}/**`,
+    );
+  }
+
+  const root = await mkdtemp(join(tmpdir(), "distro-payload-"));
+  try {
+    const files = {
+      ...Object.fromEntries(stagings.map((name) => [`server/src-tauri/resources/${name}/leftover`, "x"])),
+      // The seed's jose ships a PEM marker as a parser literal: allowlisted
+      // where it is staged, never a finding there.
+      "pi-seed/npm/node_modules/jose/dist/webapi/key/import.js": "if (pem.indexOf('-----BEGIN PRIVATE KEY-----') !== 0) throw new TypeError()",
+      // The stagings themselves, at the payload root, are the payload.
+      "pi/pi": "binary",
+      "ripgrep/rg": "binary",
+    };
+    for (const [path, content] of Object.entries(files)) {
+      const full = join(root, ...path.split("/"));
+      await mkdir(dirname(full), { recursive: true });
+      await writeFile(full, content);
+    }
+    const result = await scanPayload(root);
+    assert.deepEqual(
+      result.findings.map((finding) => `${finding.rule} ${finding.path}`).sort(),
+      stagings.map((name) => `build-output server/src-tauri/resources/${name}/leftover`).sort(),
+    );
+    assert.deepEqual(result.allowed.map((entry) => entry.path), ["pi-seed/npm/node_modules/jose/dist/webapi/key/import.js"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("runtime dependencies are installed without joining the Pi package manifest", () => {
   const groups = seedPackageGroups({

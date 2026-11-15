@@ -5,6 +5,6 @@
   },
   "pi-web": {
     "version": "0.15.0",
-    "reason": "Merged abcwyc v0.8.4 (7f2b14c5), which carries upstream pi-web 0.15.0; LW adaptations are documented in docs/merge-history.md."
+    "reason": "Merged abcwyc v0.8.5 (967df692), which still ships pi-web 0.15.0 (upstream pi-web 0.16.0 is not merged there yet); LW adaptations are documented in docs/merge-history.md."
   }
 }
