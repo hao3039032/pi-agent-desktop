@@ -379,12 +379,36 @@ The browser fixture delays handshake, admission and background history, triggers
 expires an HTTP reply after SSE reports a running agent without duplicating it.
 
 `ChatInput` also owns a composer generation, invalidated by switches/unmounts but
-not imperative draft promotion. Reference resolution and built-in command replies
-cannot submit or clear a different composer, including A→B→A. Text/attachment
-changes during reference resolution leave the edited draft untouched. Clear the
-submitted input before invoking the hook so synchronous recovery cannot be erased.
+not imperative draft promotion (`rekeyDraft` keeps the generation). Send, steer
+and follow-up share one single-flight gate (`submitResolvedMessage`, upstream's
+design): reference resolution snapshots the text, attachments and mention targets
+at submit time, and a second submit while one is in flight is dropped. A switch
+(including A→B→A) or unmount after the await never submits; the guard is the
+composer generation (`isCurrentComposer`), **not** `draftKeyRef` equality — a
+draft promotion rekeys the same composer and the pending send must survive it.
+Edits made while resolution waits follow upstream's snapshot semantics: the
+submission still sends its captured snapshot, and the newer draft survives
+uncleared (LW's earlier "edit aborts the send" behavior was replaced by the
+v0.8.7 merge; both test suites pin the snapshot rule). Queue actions clear the
+submitted input *before* invoking the hook so a synchronous rejection recovery
+is not erased; the send path clears after, skipped when the value was restored.
 Shell submissions obey the same post-readiness guard without clearing another
 session's busy state. Keep shell-only running controls distinct from agent steer.
+
+Attached-file submissions are literal model input on the CLI engine too. The
+stock RPC `prompt` command has no `expandPromptTemplates` field (the child always
+dispatches `/commands` and expands skills/templates), so the wrapper's
+file-bearing routes (`prompt`, parked replay, `steer`/`follow_up` re-routed to
+`prompt`, outbox delivery) pass `expandPromptTemplates: false`, which
+`RpcAgentSession.prompt` turns into the bridge op `prompt.literal`
+(`CliAgentSessionCore.sendLiteralPrompt`): the child runs
+`pi.sendUserMessage(content, { expandPromptTemplates: false, deliverAs })` and
+answers `started`/`queued` from its own `isIdle` at dispatch time. The settle
+contract is the stock one (epoch captured before send). A bare `RpcAgentSession`
+without the bridge refuses a literal prompt loudly. Pinned by
+`lib/rpc-manager-attached-prompts.test.mjs` (wrapper routes),
+`lib/pi-rpc/bridge.unit.test.mjs` (child op), `bridge-protocol.unit.test.mjs`
+(host corridor) and `session.unit.test.mjs` (the refusal).
 
 Behavioral coverage: `hooks/useAgentSession.submission-isolation.test.mjs` executes
 actual callbacks with controlled delayed replies; `node e2e/session-submission.mjs`

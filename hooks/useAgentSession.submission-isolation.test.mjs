@@ -3,6 +3,10 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { Script } from 'node:vm';
 import ts from 'typescript';
+import { createJiti } from 'jiti';
+
+const jiti = createJiti(import.meta.url);
+const { splitAttachedFiles } = await jiti.import('../lib/chat-attachments.ts');
 
 const hook = ts.createSourceFile('hook.ts', readFileSync(new URL('./useAgentSession.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
 const input = ts.createSourceFile('input.tsx', readFileSync(new URL('../components/ChatInput.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -34,6 +38,7 @@ function harness() {
     restoreSubmission: (...args) => restored.push(args), addNotice: n => notices.push(n),
     ensureEventsConnected: async () => {}, sendAgentCommand: async (sid, body) => { sent.push({ sid, body }); },
     isPromptRejectedError: e => e.code === 'prompt_rejected', reconcileAgentState() {}, closeEvents() {},
+    splitAttachedFiles,
   };
   env.isCurrentSubmission = callback(hook, 'isCurrentSubmission', env);
   env.abortSessionRuntime = callback(hook, 'abortSessionRuntime', env);
@@ -242,12 +247,14 @@ function composer() {
     resolveSessionReferences: () => gate.promise, sessionMentionTargetsRef: ref(new Map()), composeMessageWithAttachedFiles: t => t,
     onSend: (...args) => sent.push(args), onSteer: (...args) => sent.push(args), onFollowUp: (...args) => sent.push(args), onBuiltinCommand: undefined,
     composerMountedRef: ref(true), composerScopeRef: ref({ key:'A', generation:0 }), composerGeneration: 0,
+    submissionPendingRef: ref(false), submissionGenerationRef: ref(0), attachmentClearVersionRef: ref(0),
     draftKey: 'A', draftKeyRef: ref('A'), textareaRef: ref(null), setValue() {}, setAtQuery() {}, setHashQuery() {}, setHistoryMenuOpen() {}, clearImages() {}, clearAttachedFiles() {},
     clearDraft: key => drafts.delete(key),
   };
   env.attachedImagesRef.current = env.attachedImages;
   env.isCurrentComposer = callback(input, 'isCurrentComposer', env);
   env.clearInput = callback(input, 'clearInput', env);
+  env.submitResolvedMessage = callback(input, 'submitResolvedMessage', env);
   return { env, gate, sent, drafts };
 }
 for (const action of ['handleSend', 'sendQueued']) {
@@ -261,12 +268,19 @@ for (const action of ['handleSend', 'sendQueued']) {
         h.env.draftKeyRef.current = h.env.composerScopeRef.current.key;
       }
       h.gate.resolve('resolved'); await pending; await tick();
-      assert.equal(h.sent.length, 0); assert.equal(h.drafts.get('B'), 'new unsent draft'); assert.equal(h.drafts.get('A'), 'hello');
+      // Upstream snapshot semantics: an edit during resolution survives as the
+      // newer draft, and the submission still sends its captured snapshot
+      // (switch/A-B-A/unmount above never send). The draft is never cleared.
+      assert.equal(h.sent.length, change === 'edit' ? 1 : 0);
+      assert.equal(h.drafts.get('B'), 'new unsent draft'); assert.equal(h.drafts.get('A'), 'hello');
     });
   }
 }
-test('composer clears before synchronous rejection recovery, exactly once', async () => {
-  const h = composer(); h.env.onSend = () => h.drafts.set('A', 'restored');
+test('composer synchronous rejection recovery survives the send clear, exactly once', async () => {
+  const h = composer();
+  // The real restoreSubmission rewrites valueRef synchronously; the post-send
+  // unchanged() check then skips clearInput, so the restored draft survives.
+  h.env.onSend = () => { h.drafts.set('A', 'restored'); h.env.valueRef.current = 'restored'; };
   const pending = callback(input, 'handleSend', h.env)(); await tick(); h.gate.resolve('resolved'); await pending;
   assert.equal(h.drafts.get('A'), 'restored');
 });

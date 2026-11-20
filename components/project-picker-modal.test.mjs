@@ -44,6 +44,15 @@ function harness() {
     "@/lib/desktop-updater": { isTauriDesktop: () => true },
     "@/lib/desktop-window": { selectDirectoryNative: async () => null },
     "@/lib/ime": { isImeComposing: () => false },
+    // Upstream translated the picker's copy; mirror the en strings the
+    // assertions read (lib/i18n/messages/en.ts + locale-plugins.ts).
+    "@/hooks/useI18n": { useI18n: () => ({ t: (key) => ({
+      "sidebar.selectProject": "Select project…",
+      "sidebar.filterProjects": "Filter projects…",
+      "sidebar.noMatchingProjects": "No matching projects",
+      "sidebar.useDefaultDirectory": "Use default directory",
+      "sidebar.openFolder": "Open Folder…",
+    })[key] ?? key }) },
   };
   const source = readFileSync(new URL("./ProjectPicker.tsx", import.meta.url), "utf8");
   const compiled = ts.transpileModule(source, {
@@ -92,7 +101,7 @@ test("modal keeps the >7-project filter and the full matching list", () => {
   const view = harness();
   const rows = (nodes) => nodes.filter((n) => n.type === "button" && typeof n.props?.title === "string" && n.props.title.includes("projects"));
   let nodes = view({ recentProjects: PROJECTS, selectedCwd: null, selectedProject: null, variant: "modal" });
-  const filter = nodes.find((n) => n.type === "input" && n.props?.["aria-label"] === "Filter projects");
+  const filter = nodes.find((n) => n.type === "input" && n.props?.["aria-label"] === "Filter projects…");
   assert.ok(filter, "the filter box shows beyond the 7-entry cap");
   assert.equal(rows(nodes).length, 7, "unfiltered list keeps the cap");
   filter.props.onChange({ target: { value: "p" } });

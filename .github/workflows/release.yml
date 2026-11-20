@@ -21,6 +21,24 @@ jobs:
             target: aarch64-apple-darwin
             args: --target aarch64-apple-darwin
             apple_signing_identity: "-"
+            mac_arch: arm64
+            # GitHub lists release assets by name. A shared "macOS_" segment
+            # keeps the Apple Silicon and Intel downloads next to each other
+            # instead of split by the Linux amd64 and Windows x64 files.
+            asset_name_pattern: "[name]_[version]_macOS_[arch][ext]"
+          # Intel Macs: cross-compiled on the Apple Silicon runner (the only
+          # one with the macOS 26 SDK). The bundled server runs the Node that
+          # built it (prepare-desktop copies process.execPath), so this job
+          # installs an x64 Node and runs it under Rosetta; npm ci then also
+          # picks the x64 optional native packages. tauri-action reads the
+          # target from `args` and files the updater entry as darwin-x86_64.
+          - runner: macos-26
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+            apple_signing_identity: "-"
+            node_arch: x64
+            mac_arch: x86_64
+            asset_name_pattern: "[name]_[version]_macOS_[arch][ext]"
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             args: --target x86_64-unknown-linux-gnu --bundles deb
@@ -52,6 +70,7 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 22
+          architecture: ${{ matrix.node_arch }}
           cache: npm
 
       - name: Configure updater public key
@@ -104,6 +123,15 @@ jobs:
           PAYLOAD_CANARY: "1"
         run: npm run desktop:prepare
 
+      # An arm64 server binary inside an x86_64 app only fails on an Intel Mac,
+      # at launch. Check the staged runtime matches the target instead.
+      - name: Check the bundled Node architecture
+        if: runner.os == 'macOS'
+        run: |
+          archs="$(lipo -archs "src-tauri/resources/Pi Agent Server.app/Contents/MacOS/node")"
+          echo "Bundled Node: $archs"
+          test "$archs" = "${{ matrix.mac_arch }}"
+
       - name: Test desktop shell
         if: runner.os == 'Windows' || runner.os == 'Linux'
         run: cargo test --release --manifest-path src-tauri/Cargo.toml --lib --target ${{ matrix.target }}
@@ -120,48 +148,57 @@ jobs:
           tagName: v__VERSION__
           releaseName: pi-agent-desktop v__VERSION__
           releaseBody: |
-            ## Pi Agent Desktop 0.8.5
+            ## Pi Agent Desktop 0.8.7
 
             ### New
 
-            - **Settings sidebar.** On every desktop platform the Settings sections are now a list on the left, with the page beside it; narrower windows show an icon rail, and phones keep the drill-down. The list takes one Tab stop and moves with the arrow keys.
-            - **Folded subagents.** Subagent runs start folded under their session, behind an "Expand N subagents" toggle; your fold choices are remembered. Forks are now rows of their own beside their source, marked with a fork icon whose tooltip names the source, so they get pin, archive and Fork like any session.
+            - **Plugin marketplace.** Settings › Plugins can browse and search community packages on npm that declare `pi-package`, show their details, and install one for all projects or just the current one. A listing is the publisher's own claim, not a compatibility check.
+            - **Long pastes.** Pasting 2,000 or more characters into the composer adds them as a "Pasted text" attachment you can open or turn back into text. A message carrying attachments is never run as a `/command` or `!shell` command.
+            - **llama.cpp.** Settings › Models can add pi's built-in llama.cpp provider pointed at your router server (default `127.0.0.1:8080`), and custom providers get a Display name.
+            - **New icon.** The π. mark replaces the old icon; on macOS it now follows Apple's icon grid and sits the same size as other Dock icons.
 
             ### Improved
 
-            - Hovering a project in the sidebar shows its full path in a bar beside the row, instead of the system tooltip.
-            - With many projects, the project menu above the composer no longer runs off the top of the window; it scrolls.
+            - Recalling a past prompt from the composer's history brings back its images too, not only the text.
+            - Fetching a provider's models also reads its reasoning levels and image input; the provider key field is labelled Provider ID.
+            - macOS downloads are named `…_macOS_aarch64.dmg` (Apple Silicon) and `…_macOS_x64.dmg` (Intel), so both sit together in the release's file list.
 
             ### Fixed
 
-            - "Import models…" for a custom provider no longer returns a silently cut-off list: when the provider has more than 20 pages, or repeats a page, it now reports an error.
-            - The installer no longer risks carrying the build machine's `.pi/` project settings; packaging now stops if they, or anything that looks like a credential, end up in the payload.
+            - Testing a model sends a session id, which fixes `400 MissingSessionID` from opencode.ai; a `!command` API key runs once per test.
+            - The enabled-models list respects project trust, and `auth.json` / `settings.json` with a BOM or empty content no longer fail to load.
+            - A sign-in that the page has already closed no longer crashes the server when an extension answers late.
 
             Bundled components: pi 1.5.2, pi-web 0.15.0.
 
             ---
 
-            ## Pi Agent Desktop 0.8.5
+            ## Pi Agent Desktop 0.8.7
 
             ### 新增
 
-            - **设置左侧导航。** 各桌面平台的设置页统一改为左侧分区列表、右侧内容；窗口较窄时显示为图标栏，手机仍是逐级进入。分区列表只占一个 Tab 位置，可用方向键切换。
-            - **子智能体折叠。** 子智能体默认折叠在所属会话下，点“展开 N 个子智能体”即可展开，折叠状态会被记住。分叉对话不再嵌在源会话下面，而是作为独立的一行，带分叉图标，悬停可看到“分叉自「…」”，也能像普通会话一样置顶、存档和分叉。
+            - **插件市场。** 设置 › 插件可浏览、搜索 npm 上声明了 `pi-package` 的社区包，查看详情，并安装到全局或当前项目。收录仅代表发布者自己的声明，不代表已验证兼容性。
+            - **长文本作附件。** 在输入框粘贴 2,000 个字符以上的文本时，会添加为“粘贴文本”附件，可打开查看或“改为正文”。带附件的消息不会被当作 `/命令` 或 `!shell` 命令执行。
+            - **llama.cpp。** 设置 › 模型可添加 pi 内置的 llama.cpp Provider，指向你的路由服务器（默认 `127.0.0.1:8080`）；自定义 Provider 可设置显示名称。
+            - **新图标。** 应用图标换为新的 π. 标志；macOS 版按苹果图标网格留边，在 Dock 里与其他图标一样大。
 
             ### 改进
 
-            - 在侧栏中悬停项目时，会在该行旁边显示完整路径，取代系统自带的提示框。
-            - 项目很多时，输入框上方的项目菜单不再超出窗口顶部，改为可滚动。
+            - 从输入历史中调出以前的提示时，其中的图片也会一并恢复，而不只是文字。
+            - 拉取 Provider 的模型列表时会读取推理等级和图片输入；Provider 的键字段改名为 Provider ID。
+            - macOS 安装包改名为 `…_macOS_aarch64.dmg`（Apple 芯片）和 `…_macOS_x64.dmg`（Intel 芯片），在发布页的文件列表里排在一起。
 
             ### 修复
 
-            - 自定义 Provider 的“导入模型…”不会再悄悄返回不完整的列表：Provider 超过 20 页或重复返回同一页时，会直接报错。
-            - 安装包不会再意外带上构建机器的 `.pi/` 项目配置；打包时一旦发现这类文件或疑似凭据，会直接中止。
+            - 测试模型时会带上会话 ID，修复 opencode.ai 返回 `400 MissingSessionID` 的问题；`!command` 形式的 API 密钥每次测试只执行一次。
+            - 已启用模型列表遵循项目信任设置；`auth.json`、`settings.json` 带 BOM 或为空时不再读取失败。
+            - 页面已关闭的登录流程在扩展延迟回应时不再导致服务器崩溃。
 
             内置组件版本：pi 1.5.2、pi-web 0.15.0。
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true
+          releaseAssetNamePattern: ${{ matrix.asset_name_pattern }}
           args: ${{ matrix.args }}
 
   manifest:
@@ -261,19 +298,20 @@ jobs:
         with:
           ref: main
 
-      - name: Point the cask at the published DMG
+      - name: Point the cask at the published DMGs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="$(node -p "require('./src-tauri/pi-agent-desktop-package.json').version")"
-          digest="$(gh release view "v$version" --json assets \
-            --jq '.assets[] | select(.name | endswith("_aarch64.dmg")) | .digest')"
-          if [ -z "$digest" ]; then
-            echo "No aarch64 DMG digest on release v$version" >&2
+          assets="$(gh release view "v$version" --json assets --jq '.assets')"
+          arm_digest="$(jq -r '.[] | select(.name | endswith("_aarch64.dmg")) | .digest' <<<"$assets")"
+          intel_digest="$(jq -r '.[] | select(.name | endswith("_x64.dmg")) | .digest' <<<"$assets")"
+          if [ -z "$arm_digest" ] || [ -z "$intel_digest" ]; then
+            echo "Release v$version lacks the aarch64 or x64 DMG digest" >&2
             exit 1
           fi
-          node scripts/update-homebrew-cask.mjs "$version" "$digest"
+          node scripts/update-homebrew-cask.mjs "$version" "$arm_digest" "$intel_digest"
           if git diff --quiet -- Casks; then
             echo "Cask already at $version"
             exit 0

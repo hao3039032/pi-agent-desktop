@@ -7,9 +7,11 @@ import { PROJECT_SETTINGS_MAX_BYTES, readRegularFileText } from "./regular-file"
 // the child, and Settings resolves the `extensions` switches for exactly these
 // names, so `-builtin:<name>`, project overrides, and replacement by a
 // third-party extension that registers `/mcp`, `codemode`, or `tool_search`
-// read as in the CLI. `llama.cpp` is not among them: it serves a local model
-// server, not a feature of the session. The Code mode sandbox itself runs in
-// the bundled pi distribution; nothing in this server process executes it.
+// read as in the CLI. `llama.cpp` is not among the switches: it serves a local
+// model server, not a feature of the session; its provider loads in the child
+// (a CLI built-in) and in the runtimes used to list models
+// (lib/model-runtime.ts). The Code mode sandbox itself runs in the bundled pi
+// distribution; nothing in this server process executes it.
 
 export const MCP_DISABLE_VARIABLE = "PI_WEB_DISABLE_MCP";
 

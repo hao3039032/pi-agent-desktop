@@ -278,6 +278,9 @@ export class RpcAgentSession {
     images?: Array<{ type: "image"; data: string; mimeType: string }>;
     streamingBehavior?: "steer" | "followUp";
     source?: "interactive" | "rpc";
+    /** false = the submission is literal model input (attached files): no
+     *  extension-command dispatch, skill or template expansion in the child. */
+    expandPromptTemplates?: boolean;
     preflightResult?: (disposition: "handled" | "queued" | "started") => void;
   }): Promise<void> {
     // pi's prompt command acknowledges admission only; the run completes in
@@ -292,14 +295,22 @@ export class RpcAgentSession {
     // synchronously before this await resumes — a runEpoch read afterwards
     // would already include the run and wait one epoch too many (a hang).
     const epochAtSend = this.runEpoch;
-    const response = await this.client.command<{ disposition?: string }>(
-      "prompt",
-      data,
-      120_000,
-    );
-    const disposition = response?.disposition === "queued" || response?.disposition === "handled"
-      ? response.disposition
-      : "started";
+    // The SDK's RPC `prompt` command has no expandPromptTemplates field (it
+    // always expands), so a literal submission travels through the bridge's
+    // prompt.literal op instead — pi.sendUserMessage({expandPromptTemplates:
+    // false}) inside the child. Same admission/settle contract as below.
+    const disposition = options?.expandPromptTemplates === false
+      ? await this.sendLiteralPrompt(text, options)
+      : await (async () => {
+          const response = await this.client.command<{ disposition?: string }>(
+            "prompt",
+            data,
+            120_000,
+          );
+          return response?.disposition === "queued" || response?.disposition === "handled"
+            ? response.disposition
+            : "started";
+        })();
     options?.preflightResult?.(disposition);
     // The wrapper models the SDK contract, where the prompt promise resolves
     // only once the run is fully idle: a started submission waits for the
@@ -313,6 +324,18 @@ export class RpcAgentSession {
     } else if (disposition === "queued") {
       await this.waitForSettle(epochAtSend);
     }
+  }
+
+  /**
+   * A literal (non-expanding) submission. The base client speaks only the
+   * stock RPC protocol, which cannot express it; CliAgentSessionCore
+   * overrides this with the bridge's prompt.literal op.
+   */
+  protected async sendLiteralPrompt(_text: string, _options: {
+    images?: Array<{ type: "image"; data: string; mimeType: string }>;
+    streamingBehavior?: "steer" | "followUp";
+  }): Promise<"handled" | "queued" | "started"> {
+    throw new PiRpcUnsupportedError("prompt(expandPromptTemplates: false)", "the pi-web bridge's prompt.literal op");
   }
 
   /**

@@ -4,7 +4,7 @@
 
 - 当前仓库是 `hao3039032/pi-agent-desktop`，**直接上游是 https://github.com/abcwyc/pi-agent-desktop**（remote `abcwyc`）。`agegr/pi-web`（remote `piweb`）是上游的上游，不是本仓库默认 rebase 目标。
 - 用户说“rebase 上游 vX.Y.Z”时，默认指 **abcwyc 的 release tag**。禁止仅凭本地裸标签 `vX.Y.Z` 判断来源：两个仓库存在同名标签。必须先检查 `git remote -v` 和 `git ls-remote --tags abcwyc 'vX.Y.Z*'`，再用 `git fetch --no-tags abcwyc refs/tags/vX.Y.Z:refs/remotes/abcwyc/vX.Y.Z` 获取，使用 `abcwyc/vX.Y.Z^{commit}` 校验实际提交。
-- 本次直接上游基线：**abcwyc v0.8.5 = `967df692601bb566f3343b0ba0e510a4dbaf8c44`**（前一基线 v0.8.4 = `7f2b14c5b25d5334560b76f23cc9086fd7578f38`，v0.8.2 = `620aa1ae1afc947e342c3304c3d8a223d04f33e3`，v0.7.8 = `fc00e56d42fff380ede8628fb3a0915793258fa3`，v0.7.7 = `2ef9721a26391ede95255e7787158ab05ebd203b`，v0.7.6 = `67340ed4bf85a37ab20d2c0eccfe62af4cb1afbc`，v0.7.5 = `2909e09a7af13e74635ac5027d55afb4b180b4f1`）。同名标签在两个仓库都存在；本仓库实际 remote 是 `upstream`（url 指向 abcwyc），必须用 `upstream/vX.Y.Z^{commit}` 校验，不能用本地裸标签。v0.7.8、v0.8.2、v0.8.4 与 v0.8.5 均使用 merge 整合，保留 LW 与直接上游的提交历史。
+- 本次直接上游基线：**abcwyc v0.8.7 = `13d3efad9151092b5f8019ef06e8d15887ac6f3b`**（前一基线 v0.8.5 = `967df692601bb566f3343b0ba0e510a4dbaf8c44`，v0.8.4 = `7f2b14c5b25d5334560b76f23cc9086fd7578f38`，v0.8.2 = `620aa1ae1afc947e342c3304c3d8a223d04f33e3`，v0.7.8 = `fc00e56d42fff380ede8628fb3a0915793258fa3`，v0.7.7 = `2ef9721a26391ede95255e7787158ab05ebd203b`，v0.7.6 = `67340ed4bf85a37ab20d2c0eccfe62af4cb1afbc`，v0.7.5 = `2909e09a7af13e74635ac5027d55afb4b180b4f1`）。同名标签在两个仓库都存在；本仓库实际 remote 是 `upstream`（url 指向 abcwyc），必须用 `upstream/vX.Y.Z^{commit}` 校验，不能用本地裸标签。v0.7.8、v0.8.2、v0.8.4、v0.8.5 与 v0.8.7 均使用 merge 整合，保留 LW 与直接上游的提交历史。
 - 压缩提交只整理直接上游基线之后的 **LW 自有提交**；不得压缩、重写或重新归类 abcwyc 的桌面历史。先检查 merge-base、双方独有提交和变更范围；若范围突然变成数百个提交，停止并核对上游。
 - 重写前保留 backup 分支；压缩后比对完整 Git tree，确保代码不变；rebase 后核验目标祖先关系并做行为回归。不得把 abort/回滚称为完成，不得在未授权时 force-push。
 - 以下继承文档中的“fork/pi-web baseline”多指 **abcwyc 相对 pi-web 的维护边界**（例如 `scripts/fork-ownership.json`、CSS hash 基线）；不能据此决定 LW 的 rebase 范围。保留这些检查，但将直接上游整合与祖先项目的漂移统计分开。
@@ -97,6 +97,7 @@ app/api/
   agent/running/route.ts          GET currently-running session ids
   agent/running/events/route.ts   GET SSE stream of currently-running session ids
   agent/tasks/route.ts            GET live task snapshots (running step, waiting dialogs, last outcome) for the Tasks page
+  calendar/route.ts               GET ?from=&to= (ms) prompts per session, scheduled runs and planned slots for the Tasks calendar
   remote-access/route.ts          GET/PUT Tailscale remote-access setting (PUT only from loopback)
   network-proxy/route.ts          GET/PUT the app's HTTP proxy setting (PUT only from this computer); test/route.ts POST a connection test
   push/{config,subscribe,unsubscribe,test}/route.ts  Web Push key, device subscriptions, test send
@@ -161,6 +162,7 @@ lib/
   rpc-manager.ts      AgentSessionWrapper + registry + startRpcSession
   scheduled-tasks/    scheduler, runner, cron, store, run index for scheduled tasks (see docs/agents/scheduled-tasks.md)
   session-reader.ts   SessionManager wrappers + path cache + buildSessionContext adapter
+  session-prompts.ts  every user prompt with its time and reply, read on demand for the Tasks calendar (fingerprint cache)
   tool-presets.ts     PRESET_NONE/DEFAULT/FULL + getPresetFromTools()
   types.ts            shared TypeScript types
   normalize.ts        normalizeToolCalls() — field name mismatch between file format and our types
@@ -184,7 +186,7 @@ components/
   PluginsConfig.tsx   modal for installed package plugins
   SkillsConfig.tsx    modal for loaded/search/installable skills
   scheduled/          Scheduled page (list, detail, editor, run history) and its sidebar row
-  tasks/              Tasks page (waiting / running / recent across projects) and its sidebar row
+  tasks/              Tasks page (waiting / running / recent across projects), its Calendar mode (TaskCalendar, calendar-helpers) and its sidebar row
   RemoteAccessSection.tsx  Settings › General › Remote access (Tailscale) and "Notify this device"
   RelaySection.tsx    Settings › General › Remote relay: relay config, pairing QR, approvals, paired phones
   SettingsPanel.tsx   settings dialog; its General tab hosts the app intro, Version & Updates and the desktop-only switches
@@ -224,7 +226,8 @@ Read the doc for the area you touch before changing it. Upstream docs (no prefix
 - [subagents.md](docs/agents/subagents.md): removed with the CLI engine (M4) — the pi-subagents package runs its own children inside the pi child process; `lib/subagents.ts` keeps the legacy marker readers the session routes use.
 - [fork-tools-subagents.md](docs/agents/fork-tools-subagents.md) § restricted API: the pi-subagents fleet monitor — `app/api/agent/[id]/subagents`, `lib/pi-subagents-rpc.ts`, `lib/pi-subagents-view.ts`, the `subagentsEventBus` on the wrapper, `components/SubagentFleetPanel.tsx`.
 - [scheduled-tasks.md](docs/agents/scheduled-tasks.md): scheduled tasks (the Scheduled page): server-side scheduler and its lease, catch-up and overlap rules, read-only default, the run index that hides runs from the project tree, why shared state is on `globalThis`. Files: `lib/scheduled-tasks/**`, `app/api/scheduled-tasks/**`, `instrumentation-node.ts`, `hooks/useScheduledTasks.ts`, `components/scheduled/**`, the Scheduled row in `components/SessionSidebar.tsx`, the page overlay in `components/AppShell.tsx`.
-- [artifacts.md](docs/agents/artifacts.md): inline HTML/SVG/React previews and `:::artifact` blocks, output vs process files on the Artifacts page: what renders where, the sandbox rules and the desktop `about:srcdoc` allowance, the auto-run rule for scripted pages, the bundled React runtime (inlined, because sandboxed frames cannot reach localhost; `npm run preview-runtime` regenerates it), the fix flow and the prompt switch, the cross-session Artifacts page. Files: `lib/artifacts.ts`, `lib/artifact-store.ts`, `lib/artifact-index.ts`, `lib/file-output-role.ts`, `lib/artifact-file-roles.ts`, `lib/artifact-favorites.ts`, `components/artifacts/**`, `lib/html-preview.ts`, `lib/artifact-settings.ts`, `lib/pi-rpc/assets/pi-web-artifacts.mjs`, `hooks/useArtifactPublisher.ts`, `hooks/useHtmlPreviewFrame.ts`, `lib/preview-runtime.ts`, `scripts/build-preview-runtime.mjs`, `public/preview-runtime/`, `components/Artifact*.tsx`, `components/HtmlPreview*.tsx`, `components/artifact-tabs.ts`, `app/api/artifacts/**`, `is_inline_frame_document` in `src-tauri/src/lib.rs`.
+- [artifacts.md](docs/agents/artifacts.md): inline HTML/SVG/React previews and `:::artifact` blocks, output vs process files on the Artifacts page: what renders where, the sandbox rules and the desktop `about:srcdoc` allowance, the auto-run rule for scripted pages, the bundled React runtime (inlined, because sandboxed frames cannot reach localhost; `npm run preview-runtime` regenerates it), the fix flow and the prompt switch, the cross-session Artifacts page. Files: `lib/artifacts.ts`, `lib/artifact-store.ts`, `lib/artifact-index.ts`, `lib/file-output-role.ts`, `lib/artifact-file-roles.ts`, `lib/artifact-favorites.ts`, `components/artifacts/**`, `lib/html-preview.ts`, `lib/html-preview-stream.ts`, `lib/preview-theme-kit.ts`, `lib/artifact-settings.ts`, `lib/pi-rpc/assets/pi-web-artifacts.mjs`, `hooks/useArtifactPublisher.ts`, `hooks/useHtmlPreviewFrame.ts`, `lib/preview-runtime.ts`, `scripts/build-preview-runtime.mjs`, `public/preview-runtime/`, `components/Artifact*.tsx`, `components/HtmlPreview*.tsx`, `components/artifact-tabs.ts`, `app/api/artifacts/**`, `is_inline_frame_document` in `src-tauri/src/lib.rs`.
+- [remote-relay.md](docs/remote-relay.md): the end-to-end encrypted relay (Noise IK over a dumb relay, phone shell + tunnel service worker, pairing, request mark). Files: `lib/relay/**`, `relay/` (server, Docker), `relay-shell/` (`npm run relay:shell`), `app/api/relay/**`, `components/RelaySection.tsx`, `e2e/relay.mjs`; deploying: [remote-relay-deploy.md](docs/remote-relay-deploy.md). A request carrying the relay mark comes from a paired phone: it is never local (`isLocalRequest`), and local-only routes must ask `isLocalRequest()`, never a loopback Host.
 - [client-platform.md](docs/agents/client-platform.md): mobile software keyboard and viewport height, completion sound. Files: `hooks/useViewportHeight.ts`, `hooks/useAudio.ts`, the keyboard-open CSS.
 
 Fork notes:

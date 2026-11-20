@@ -56,6 +56,12 @@ export const APP_PREF_KEYS = {
    *  ("send after completion") instead of steering the current run. Absent or
    *  "false" is the steer default; existing users are never migrated. */
   queueWhileRunning: "pi-web:queue-while-running",
+  /** Tasks page layout: "calendar" or the list (anything else). */
+  tasksMode: "pi-web:tasks-mode",
+  /** Tasks calendar range: "week" or "month". */
+  tasksCalendarView: "pi-web:tasks-calendar-view",
+  /** Tasks calendar filter: project keys and `type:*` keys switched off. */
+  tasksCalendarHidden: "pi-web:tasks-calendar-hidden",
   /** Last open session / cwd / file tabs for desktop cold-start restore. */
   workspace: "pi-workspace-v1",
 } as const;

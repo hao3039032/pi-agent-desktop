@@ -26,6 +26,7 @@ const data = {
   '/api/models/enabled':{error:'No model calls in UI tests'},
   '/api/skills':{skills:['Review','Design','Test'].map(name=>({name,description:'Test skill',filePath:'D:/fixture/'+name+'/SKILL.md',
     baseDir:'D:/fixture/'+name,disableModelInvocation:false,sourceInfo:{source:'user',scope:'user'}})),diagnostics:[],projectResourcesLoaded:true},
+  '/api/plugins/search':{packages:[],nextOffset:null},
   '/api/plugins':{packages:[],standaloneExtensions:['First extension','Second extension','Third extension'].map(name=>({
     name,kind:'extension',scope:'global',path:'D:/fixture/'+name+'.ts',relativePath:name+'.ts',enabled:true})),
     totals:counts,diagnostics:[],projectResourcesLoaded:true},
