@@ -694,7 +694,7 @@ test("while a run streams, a bare /mcp opens Settings or is queued as before", a
       attachedImages: images,
       onAudioUnlock() {},
       clearInput() { calls.cleared += 1; },
-      async submitResolvedMessage(message, images, submit) { submit(message, images.length ? images : undefined); calls.cleared += 1; },
+      async submitResolvedMessage(message, images, files, submit) { submit(message, images.length ? images : undefined); calls.cleared += 1; },
       onBuiltinCommand: async () => ({ handled }),
       canRunBuiltinSlashCommandWhileStreaming,
       isBareMcpCommand,
@@ -737,7 +737,7 @@ test("handleSend lets a handled /mcp through while streaming and sends an unowne
       sessionMentionTargetsRef: { current: new Map() },
       runBuiltinCommand: async (message) => { calls.builtin.push(message); return handled; },
       clearInput() {},
-      async submitResolvedMessage(message, images, submit) { submit(message, images.length ? images : undefined); },
+      async submitResolvedMessage(message, images, files, submit) { submit(message, images.length ? images : undefined); },
       onSend: (message) => calls.sent.push(message),
     });
     await handleSend();
@@ -985,7 +985,7 @@ test("handleSend sends exactly once and routes builtin commands through the pend
       sessionMentionTargetsRef: { current: [] },
       onSend(message, images) { sends += 1; handler.sent = { message, images }; },
       clearInput() { cleared += 1; },
-      async submitResolvedMessage(message, images, submit) { submit(resolved ?? message, images.length ? images : undefined); cleared += 1; },
+      async submitResolvedMessage(message, images, files, submit) { submit(resolved ?? message, images.length ? images : undefined); cleared += 1; },
     });
     return handler().then(() => ({ sends, cleared, builtinCalls, sent: handler.sent }));
   }
@@ -1102,13 +1102,14 @@ test("selector rows expose a plain default star separate from the selected optio
 });
 
 
-test("reference submission is single-flight and preserves newer drafts", async () => {
+test("reference submission is single-flight, cancels stale edits and clears before submit", async () => {
   function fixture() {
     let release;
     const pending = new Promise(resolve => { release = resolve; });
     const images = [];
     const files = [{ id: "old", name: "old.txt", size: 3, text: "old" }];
     const state = {
+      value: "original",
       draftKey: "a", draftKeyRef: { current: "a" },
       // LW composer identity: a switch bumps the scope generation in render;
       // draft promotion rekeys without bumping it (rekeyDraft).
@@ -1125,7 +1126,7 @@ test("reference submission is single-flight and preserves newer drafts", async (
       && state.composerScopeRef.current.generation === state.composerGeneration;
     const submit = chatInputCallback("submitResolvedMessage", state);
     const sent = [];
-    return { state, images, release, sent, run: () => submit("original", images, text => sent.push(text)) };
+    return { state, images, files, release, sent, run: () => submit("original", images, files, text => sent.push(text)) };
   }
   const concurrent = fixture();
   const first = concurrent.run();
@@ -1135,6 +1136,8 @@ test("reference submission is single-flight and preserves newer drafts", async (
   assert.equal(concurrent.state.clears, 1);
   assert.equal(concurrent.state.submissionPendingRef.current, false);
 
+  // LW isolation: an edit or attachment replacement while references resolve
+  // cancels the stale submission; the newer draft is neither sent nor cleared.
   for (const change of [
     state => { state.valueRef.current = "new text"; },
     state => { state.attachedImagesRef.current = [{}]; },
@@ -1143,8 +1146,8 @@ test("reference submission is single-flight and preserves newer drafts", async (
     const f = fixture(); const work = f.run(); change(f.state);
     f.state.sessionMentionTargetsRef.current.set("target", "new-id");
     f.release(); await work;
-    assert.deepEqual(f.sent, ["original:original-id:old"], "submission keeps its attachment/reference snapshot");
-    assert.equal(f.state.clears, 0, "new input survives completion");
+    assert.equal(f.sent.length, 0, "a stale edit is never submitted");
+    assert.equal(f.state.clears, 0, "the newer draft survives untouched");
   }
   for (const invalidate of [
     state => { state.composerScopeRef.current = { key: "b", generation: 1 }; state.draftKeyRef.current = "b"; },
@@ -1181,21 +1184,23 @@ test("reference submission is single-flight and preserves newer drafts", async (
   assert.equal(old.state.submissionPendingRef.current, true, "old completion must not unlock a new submission");
   assert.equal(old.sent.length, 0);
 
+  // Both send and queue clear BEFORE the callback, so a synchronous rejection
+  // restores into an empty composer (no mergeRestoredSubmissionText doubling).
   const restored = fixture();
   let editor = "original";
   restored.state.clearInput = () => { editor = ""; };
   const restoreWork = chatInputCallback("submitResolvedMessage", restored.state)(
-    "original", restored.images, () => { editor = `rejected${editor ? `\n\n${editor}` : ""}`; }, true,
+    "original", restored.images, restored.files, () => { editor = `rejected${editor ? `\n\n${editor}` : ""}`; },
   );
   restored.release(); await restoreWork;
-  assert.equal(editor, "rejected", "queue clears before a synchronous rejection restores the submitted draft");
+  assert.equal(editor, "rejected", "clear-before-submit leaves a single restored copy");
 
   const failed = fixture();
   failed.state.resolveSessionReferences = async () => { throw new Error("network"); };
   const retry = chatInputCallback("submitResolvedMessage", failed.state);
-  await assert.rejects(retry("x", failed.images, () => {}), /network/);
+  await assert.rejects(retry("x", failed.images, failed.files, () => {}), /network/);
   assert.equal(failed.state.submissionPendingRef.current, false);
   failed.state.resolveSessionReferences = async () => "ok";
-  await chatInputCallback("submitResolvedMessage", failed.state)("x", failed.images, text => failed.sent.push(text));
+  await chatInputCallback("submitResolvedMessage", failed.state)("x", failed.images, failed.files, text => failed.sent.push(text));
   assert.equal(failed.sent.length, 1);
 });

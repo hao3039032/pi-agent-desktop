@@ -1503,8 +1503,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const submitResolvedMessage = useCallback(async (
     msg: string,
     images: AttachedImage[],
+    files: ChatTextAttachment[],
     submit: (message: string, images?: AttachedImage[]) => void,
-    clearBeforeSubmit = false,
   ) => {
     // Composer identity, not draftKey equality: draft promotion rekeys this
     // same composer (rekeyDraft keeps the generation), so a pending send must
@@ -1513,39 +1513,41 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     submissionPendingRef.current = true;
     const generation = submissionGenerationRef.current;
     const clearVersion = attachmentClearVersionRef.current;
-    const text = valueRef.current;
-    const files = attachedFilesRef.current;
     const targets = new Map(sessionMentionTargetsRef.current);
     try {
       const resolved = await resolveSessionReferences(msg, targets);
-      // Resolution can outlive a switch (including A -> B -> A) or an unmount;
-      // those never submit. Edits made while waiting survive as the newer
-      // draft: the submission keeps its text/attachment/reference snapshot.
+      // Resolution (and any built-in command tried first) can outlive a switch
+      // (including A -> B -> A) or an unmount; those never submit.
       if (generation !== submissionGenerationRef.current
         || !isCurrentComposer()
         || clearVersion !== attachmentClearVersionRef.current) return;
-      const unchanged = () => valueRef.current === text && attachedImagesRef.current === images
-        && attachedFilesRef.current === files;
-      // Queue handlers can synchronously restore a rejected submission.
-      if (clearBeforeSubmit && unchanged()) clearInput();
+      // An edit or attachment replacement while waiting cancels the stale
+      // submission: the newer draft is neither submitted nor cleared. The
+      // snapshot is the intent-time value/images/files, so a change during the
+      // built-in wait before this call is caught too.
+      if (valueRef.current !== value || attachedImagesRef.current !== images || attachedFilesRef.current !== files) return;
+      // Clear before the callback: a synchronous rejection restores the submitted
+      // draft into an empty composer, instead of mergeRestoredSubmissionText
+      // appending it to the still-present original (doubling text and images).
+      clearInput();
       submit(composeMessageWithAttachedFiles(resolved, files), images.length ? images : undefined);
-      if (!clearBeforeSubmit && unchanged()) clearInput();
     } finally {
       if (generation === submissionGenerationRef.current) submissionPendingRef.current = false;
     }
-  }, [clearInput, sessionMentionTargetsRef, isCurrentComposer]);
+  }, [value, clearInput, sessionMentionTargetsRef, isCurrentComposer]);
 
   const handleSend = useCallback(async () => {
     if (!isCurrentComposer()) return;
     const msg = value.trim();
     if (!msg && !attachedImages.length && !attachedFilesRef.current.length) return;
+    const files = attachedFilesRef.current;
     onAudioUnlock?.();
     const builtinAllowed = !isStreaming || offersBuiltinSlashCommandWhileStreaming(msg);
     if (builtinAllowed && await runBuiltinCommand(msg)) return;
     if (!isCurrentComposer() || isStreaming) return;
     // A run cannot start in a cwd that is gone; keep the draft until it is back or another project is picked.
     if (workspaceUnavailable) return;
-    await submitResolvedMessage(msg, attachedImages, onSend);
+    await submitResolvedMessage(msg, attachedImages, files, onSend);
   }, [value, attachedImages, workspaceUnavailable, isStreaming, runBuiltinCommand, onSend, onAudioUnlock, submitResolvedMessage, isCurrentComposer]);
 
   const slashQuery = !compact && value.startsWith("/") && !/\s/.test(value.slice(1))
@@ -1806,9 +1808,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     if (!isCurrentComposer() || promptPreparing) return;
     const msg = value.trim();
     if (!msg && !attachedImages.length && !attachedFilesRef.current.length) return;
+    const files = attachedFilesRef.current;
     onAudioUnlock?.();
-    const hasFiles = attachedFilesRef.current.length > 0;
-    const queue = () => submitResolvedMessage(msg, attachedImages, (resolvedMessage, images) => {
+    const hasFiles = files.length > 0;
+    const queue = () => submitResolvedMessage(msg, attachedImages, files, (resolvedMessage, images) => {
       const streamingBehavior = mode === "steer" ? "steer" : "followUp";
       if (mode === "steer" && msg.startsWith("/") && !hasFiles && onPromptWithStreamingBehavior) {
         onPromptWithStreamingBehavior(resolvedMessage, streamingBehavior, images);
@@ -1817,7 +1820,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
       } else if (mode === "followup" && onFollowUp) {
         onFollowUp(resolvedMessage, images);
       }
-    }, true);
+    });
     if (!attachedImages.length && !attachedFilesRef.current.length && onBuiltinCommand && canRunBuiltinSlashCommandWhileStreaming(msg)) {
       void runBuiltinCommand(msg);
       return;

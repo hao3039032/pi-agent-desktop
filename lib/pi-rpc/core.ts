@@ -39,7 +39,7 @@ import { appendChatUnlock } from "../chat-unlock";
 import { validateScheduledRunMarkerData, type ScheduledRunMarkerData } from "../scheduled-run-marker";
 import { PI_SUBAGENTS_PACKAGE_NAME } from "../subagent-settings";
 import { PiRpcClient, type PiRpcRecord } from "./client";
-import { PiRpcUnsupportedError, RpcAgentSession, type RpcAgentSessionOptions, type RpcAgentSessionState } from "./session";
+import { RpcAgentSession, type RpcAgentSessionOptions, type RpcAgentSessionState } from "./session";
 
 /** The subset of the SDK's SessionManager pi-web touches on a live wrapper. */
 export class FileSessionManagerView {
@@ -527,28 +527,6 @@ export class CliAgentSessionCore extends RpcAgentSession {
   }
 
   // --- bridge request/reply (host state through the child's extension) ------
-
-  /**
-   * A literal attached-file submission (upstream's expandPromptTemplates:
-   * false admission, ported to the CLI engine). The stock RPC prompt command
-   * always expands templates and dispatches /commands, so the bridge runs
-   * pi.sendUserMessage({expandPromptTemplates: false}) in the child instead.
-   * The child reports the disposition from its own isIdle at dispatch time
-   * (authoritative, no host-side race); an input hook that consumes the
-   * prompt would still read "started" — pi-web ships no input hooks, and the
-   * SDK's sendUserMessage is fire-and-forget so no finer signal exists.
-   */
-  protected override async sendLiteralPrompt(text: string, options: {
-    images?: Array<{ type: "image"; data: string; mimeType: string }>;
-    streamingBehavior?: "steer" | "followUp";
-  }): Promise<"handled" | "queued" | "started"> {
-    const result = await this.bridgeRequest<{ disposition?: string }>("prompt.literal", {
-      message: text,
-      ...(options.images?.length ? { images: options.images } : {}),
-      ...(options.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
-    }, 120_000);
-    return result?.disposition === "queued" ? "queued" : "started";
-  }
 
   /**
    * One host→child state request over the bridge command, answered by the

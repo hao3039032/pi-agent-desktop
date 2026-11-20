@@ -5,8 +5,11 @@ import { Script } from 'node:vm';
 import ts from 'typescript';
 import { createJiti } from 'jiti';
 
-const jiti = createJiti(import.meta.url);
+const jiti = createJiti(import.meta.url, { alias: { "@": process.cwd() } });
 const { splitAttachedFiles } = await jiti.import('../lib/chat-attachments.ts');
+// Shared-state module: import it as the components do (@/, no extension) so the
+// Windows jiti cache resolves the same instance (components/test-imports.test.mjs).
+const { mergeRestoredSubmissionText } = await jiti.import('@/lib/draft-store');
 
 const hook = ts.createSourceFile('hook.ts', readFileSync(new URL('./useAgentSession.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true);
 const input = ts.createSourceFile('input.tsx', readFileSync(new URL('../components/ChatInput.tsx', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -268,21 +271,49 @@ for (const action of ['handleSend', 'sendQueued']) {
         h.env.draftKeyRef.current = h.env.composerScopeRef.current.key;
       }
       h.gate.resolve('resolved'); await pending; await tick();
-      // Upstream snapshot semantics: an edit during resolution survives as the
-      // newer draft, and the submission still sends its captured snapshot
-      // (switch/A-B-A/unmount above never send). The draft is never cleared.
-      assert.equal(h.sent.length, change === 'edit' ? 1 : 0);
+      // LW isolation: a switch/A-B-A/unmount OR an edit during resolution never
+      // submits the stale text, and the newer draft is never cleared.
+      assert.equal(h.sent.length, 0);
       assert.equal(h.drafts.get('B'), 'new unsent draft'); assert.equal(h.drafts.get('A'), 'hello');
     });
   }
 }
-test('composer synchronous rejection recovery survives the send clear, exactly once', async () => {
+test('composer clears before submit so a synchronous rejection restores a single copy', async () => {
   const h = composer();
-  // The real restoreSubmission rewrites valueRef synchronously; the post-send
-  // unchanged() check then skips clearInput, so the restored draft survives.
-  h.env.onSend = () => { h.drafts.set('A', 'restored'); h.env.valueRef.current = 'restored'; };
+  // Model the real restoreSubmission: it merges the submitted text into whatever
+  // the composer still holds (mergeRestoredSubmissionText). Clearing BEFORE the
+  // callback leaves an empty composer, so the restore is a single copy — not the
+  // submitted text appended to the still-present original (text/images doubled).
+  h.env.onSend = (message) => {
+    h.sent.push([message]);
+    h.env.valueRef.current = mergeRestoredSubmissionText(message, h.env.valueRef.current);
+    h.drafts.set('A', h.env.valueRef.current);
+  };
   const pending = callback(input, 'handleSend', h.env)(); await tick(); h.gate.resolve('resolved'); await pending;
-  assert.equal(h.drafts.get('A'), 'restored');
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.drafts.get('A'), 'resolved', 'one restored copy, no merge doubling');
+});
+test('composer built-in fallback does not submit a draft edited while the command ran', async () => {
+  const h = composer(); const builtin = deferred();
+  let resolverCalls = 0;
+  const resolveReferences = h.env.resolveSessionReferences;
+  Object.assign(h.env, {
+    onBuiltinCommand: {}, isBareMcpCommand: () => true, canRunBuiltinSlashCommandWhileStreaming: () => false,
+    runBuiltinCommand: () => builtin.promise,
+    resolveSessionReferences: (...args) => { resolverCalls++; return resolveReferences(...args); },
+  });
+  const pending = callback(input, 'sendQueued', h.env)('steer'); await tick();
+  h.env.valueRef.current = 'new edit';   // the user keeps typing while /mcp is tried
+  builtin.resolve(false); await pending; await tick();
+  // The fallback must actually reach reference resolution and park on the gate.
+  // Leaving the gate unresolved would pass the assertions below even without the
+  // edit-abort check, because the submission never gets past the await.
+  assert.equal(resolverCalls, 1, 'the built-in fallback started reference resolution');
+  h.gate.resolve('resolved'); await tick();
+  assert.equal(h.sent.length, 0, 'the stale pre-edit submission is cancelled');
+  assert.equal(h.env.valueRef.current, 'new edit', 'the edited draft is preserved');
+  assert.equal(h.env.submissionPendingRef.current, false, 'the cancelled submission released the single-flight gate');
+  assert.equal(h.drafts.get('A'), 'hello', 'the stored draft is not cleared');
 });
 test('draft promotion does not invalidate a pending composer send', async () => {
   const h = composer(); const pending = callback(input, 'handleSend', h.env)(); await tick();

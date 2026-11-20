@@ -285,7 +285,23 @@ export class RpcAgentSession {
   }): Promise<void> {
     // pi's prompt command acknowledges admission only; the run completes in
     // the event stream (agent_settled), exactly like the wrapper expects.
-    const data: Record<string, unknown> = { message: text };
+    //
+    // The stock RPC `prompt` command has no expandPromptTemplates field (the
+    // child always expands), so a literal submission rides the SAME command
+    // with one transport guard: a leading newline when the text starts with
+    // "/". All three child-side triggers gate on a raw leading "/" — extension
+    // command dispatch (agent-session prompt()), _expandSkillCommand() and
+    // expandPromptTemplate() — so "\n/…" is never dispatched or expanded, while
+    // input hooks still run and admission stays the SDK's real preflight:
+    // handled/queued/started dispositions, no-model/no-auth/compaction errors
+    // rejecting the command, and the epoch settle contract below. The newline
+    // is whitespace: every display/restore path (splitAttachedFiles,
+    // getUserInputText, attachmentAwareTitle) trims it, and the wrapper keeps
+    // the original text for its optimistic bubble and rejection restore.
+    const literal = options?.expandPromptTemplates === false;
+    const data: Record<string, unknown> = {
+      message: literal && text.startsWith("/") ? `\n${text}` : text,
+    };
     if (options?.images?.length) data.images = options.images;
     if (options?.streamingBehavior) {
       data.streamingBehavior = options.streamingBehavior === "steer" ? "steer" : "followUp";
@@ -295,22 +311,14 @@ export class RpcAgentSession {
     // synchronously before this await resumes — a runEpoch read afterwards
     // would already include the run and wait one epoch too many (a hang).
     const epochAtSend = this.runEpoch;
-    // The SDK's RPC `prompt` command has no expandPromptTemplates field (it
-    // always expands), so a literal submission travels through the bridge's
-    // prompt.literal op instead — pi.sendUserMessage({expandPromptTemplates:
-    // false}) inside the child. Same admission/settle contract as below.
-    const disposition = options?.expandPromptTemplates === false
-      ? await this.sendLiteralPrompt(text, options)
-      : await (async () => {
-          const response = await this.client.command<{ disposition?: string }>(
-            "prompt",
-            data,
-            120_000,
-          );
-          return response?.disposition === "queued" || response?.disposition === "handled"
-            ? response.disposition
-            : "started";
-        })();
+    const response = await this.client.command<{ disposition?: string }>(
+      "prompt",
+      data,
+      120_000,
+    );
+    const disposition = response?.disposition === "queued" || response?.disposition === "handled"
+      ? response.disposition
+      : "started";
     options?.preflightResult?.(disposition);
     // The wrapper models the SDK contract, where the prompt promise resolves
     // only once the run is fully idle: a started submission waits for the
@@ -324,18 +332,6 @@ export class RpcAgentSession {
     } else if (disposition === "queued") {
       await this.waitForSettle(epochAtSend);
     }
-  }
-
-  /**
-   * A literal (non-expanding) submission. The base client speaks only the
-   * stock RPC protocol, which cannot express it; CliAgentSessionCore
-   * overrides this with the bridge's prompt.literal op.
-   */
-  protected async sendLiteralPrompt(_text: string, _options: {
-    images?: Array<{ type: "image"; data: string; mimeType: string }>;
-    streamingBehavior?: "steer" | "followUp";
-  }): Promise<"handled" | "queued" | "started"> {
-    throw new PiRpcUnsupportedError("prompt(expandPromptTemplates: false)", "the pi-web bridge's prompt.literal op");
   }
 
   /**

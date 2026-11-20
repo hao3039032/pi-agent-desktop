@@ -380,35 +380,56 @@ expires an HTTP reply after SSE reports a running agent without duplicating it.
 
 `ChatInput` also owns a composer generation, invalidated by switches/unmounts but
 not imperative draft promotion (`rekeyDraft` keeps the generation). Send, steer
-and follow-up share one single-flight gate (`submitResolvedMessage`, upstream's
-design): reference resolution snapshots the text, attachments and mention targets
-at submit time, and a second submit while one is in flight is dropped. A switch
-(including A→B→A) or unmount after the await never submits; the guard is the
-composer generation (`isCurrentComposer`), **not** `draftKeyRef` equality — a
-draft promotion rekeys the same composer and the pending send must survive it.
-Edits made while resolution waits follow upstream's snapshot semantics: the
-submission still sends its captured snapshot, and the newer draft survives
-uncleared (LW's earlier "edit aborts the send" behavior was replaced by the
-v0.8.7 merge; both test suites pin the snapshot rule). Queue actions clear the
-submitted input *before* invoking the hook so a synchronous rejection recovery
-is not erased; the send path clears after, skipped when the value was restored.
-Shell submissions obey the same post-readiness guard without clearing another
-session's busy state. Keep shell-only running controls distinct from agent steer.
+and follow-up share one single-flight gate (`submitResolvedMessage`): a second
+submit while one is in flight is dropped. A switch (including A→B→A) or unmount
+after the await never submits; the guard is the composer generation
+(`isCurrentComposer`), **not** `draftKeyRef` equality — a draft promotion rekeys
+the same composer and the pending send must survive it. An edit or attachment
+replacement while references resolve (or while a built-in command is tried first)
+**cancels the stale submission**: the newer draft is neither submitted nor
+cleared. The snapshot compared is the intent-time `value`/`images`/`files` the
+caller captured, so a change during the built-in wait before the gate is caught
+too. Every actual send clears the input *before* invoking the hook, so a
+synchronous rejection restores into an empty composer instead of
+`mergeRestoredSubmissionText` appending the submitted text/images to the
+still-present original (doubling them). Shell submissions obey the same
+post-readiness guard without clearing another session's busy state. Keep
+shell-only running controls distinct from agent steer.
 
 Attached-file submissions are literal model input on the CLI engine too. The
 stock RPC `prompt` command has no `expandPromptTemplates` field (the child always
 dispatches `/commands` and expands skills/templates), so the wrapper's
 file-bearing routes (`prompt`, parked replay, `steer`/`follow_up` re-routed to
-`prompt`, outbox delivery) pass `expandPromptTemplates: false`, which
-`RpcAgentSession.prompt` turns into the bridge op `prompt.literal`
-(`CliAgentSessionCore.sendLiteralPrompt`): the child runs
-`pi.sendUserMessage(content, { expandPromptTemplates: false, deliverAs })` and
-answers `started`/`queued` from its own `isIdle` at dispatch time. The settle
-contract is the stock one (epoch captured before send). A bare `RpcAgentSession`
-without the bridge refuses a literal prompt loudly. Pinned by
-`lib/rpc-manager-attached-prompts.test.mjs` (wrapper routes),
-`lib/pi-rpc/bridge.unit.test.mjs` (child op), `bridge-protocol.unit.test.mjs`
-(host corridor) and `session.unit.test.mjs` (the refusal).
+`prompt`, outbox delivery) pass `expandPromptTemplates: false`, and
+`RpcAgentSession.prompt` rides the **same stock prompt command** with one
+transport guard: a single leading newline when the text starts with `/`. All
+three child-side triggers gate on a raw leading `/` — extension-command dispatch
+(`prompt()`), `_expandSkillCommand()` and `expandPromptTemplate()` — so `\n/…` is
+never dispatched or expanded, while input hooks still run and admission stays the
+SDK's **real** preflight: `handled`/`queued`/`started` dispositions,
+no-model/no-auth/compaction errors rejecting the command (the wrapper's
+`rejectPreflight` → HTTP rejection → draft restore), and the epoch settle
+contract. The newline is whitespace: every display/restore path
+(`splitAttachedFiles`, `getUserInputText`, `attachmentAwareTitle`) trims it, and
+the wrapper keeps the original text for its optimistic bubble and rejection
+restore. There is **no** `prompt.literal` bridge op: a fire-and-forget
+`pi.sendUserMessage` that guesses the disposition from `isIdle` would
+false-accept a rejected prompt and hang waiting for a run that never starts
+(the v0.8.7 merge's first port did exactly that; the review loop replaced it).
+Pinned by `lib/rpc-manager-attached-prompts.test.mjs` (wrapper routes),
+`session.unit.test.mjs` + `bridge-protocol.unit.test.mjs` (wire encoding, real
+dispositions and rejection), `bridge.unit.test.mjs` (the op stays absent) and
+`lib/pi-rpc/literal-prompt.cli.smoke.test.mjs` (a real `pi` child: rejection
+propagates, plain commands dispatch, a literal `/command` does not, input hooks
+run, and the record round-trips losslessly — `PI_CLI_BIN`-gated, so it is skipped
+in the default `npm test`/CI and must be run explicitly with `PI_CLI_BIN` set).
+Two known, accepted limits of the transport newline: a recalled steering message
+(`handleRecallQueue` → `prependText`) returns the wire text verbatim, so a literal
+`/…` steer comes back into the composer with its leading newline (one extra blank
+line, cosmetic); and a third-party `input` hook that trims or rewrites the text to
+start with `/` would re-enable skill/template expansion (the child expands after
+input hooks) — extension-command dispatch stays guarded because it runs before the
+hooks, and pi-web ships no such hook.
 
 Behavioral coverage: `hooks/useAgentSession.submission-isolation.test.mjs` executes
 actual callbacks with controlled delayed replies; `node e2e/session-submission.mjs`
