@@ -1674,8 +1674,10 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
 
 // ── API Key detail ────────────────────────────────────────────────────────────
 
-// pi's default router address (`/login llama.cpp`, docs/llama-cpp.md).
-const DEFAULT_LLAMA_ROUTER_URL = "http://127.0.0.1:8080";
+// pi's default router address (`/login llama.cpp`, docs/llama-cpp.md); pi 1.6.0
+// moved it from 8080 to 9931 (`DEFAULT_LLAMA_SERVER_URL` in the SDK's llama
+// provider). A client component cannot import the SDK, so keep the two in step.
+const DEFAULT_LLAMA_ROUTER_URL = "http://127.0.0.1:9931";
 
 function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
   provider: ApiKeyProvider; onRefresh: () => void; enabledModels: EnabledModelsController; contextSettings: ModelContextSettings;

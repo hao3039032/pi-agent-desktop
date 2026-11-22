@@ -5,7 +5,7 @@
  * (OpenRouter-style session affinity, `compat.sendSessionAffinityHeaders` +
  * `compat.sessionAffinityFormat: "openrouter"` in models.json), which lets it
  * route a whole conversation consistently and reach the upstream prompt
- * cache. pi 1.5.2 sends it on the anthropic-messages, openai-completions and
+ * cache. pi 1.5.2 and 1.6.0 send it on the anthropic-messages, openai-completions and
  * openai-responses paths; the distro provider now defaults to
  * openai-completions with per-model protocol overrides, so one provider-level
  * pair covers them. The declarative source is `distro/distro.json` → `provider.compat`

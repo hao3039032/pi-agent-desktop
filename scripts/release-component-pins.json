@@ -1,7 +1,7 @@
 {
   "pi": {
-    "version": "1.5.2",
-    "reason": "Upgrade the bundled SDK to pi 1.5.2; checked against its changelog (missing-cwd Continue/Fork prompt is TUI-only, pi-web keeps its own switchSession; Anthropic OAuth reports a current Claude Code version)."
+    "version": "1.6.0",
+    "reason": "Upgrade the bundled SDK to pi 1.6.0 (the CLI release the distro build already downloads); checked against its changelog and a 1.5.2→1.6.0 package diff: RPC protocol, extension API, SDK exports and file formats unchanged; llama.cpp default router moved to 127.0.0.1:9931; the render() readonly break does not affect the seeded extensions."
   },
   "pi-web": {
     "version": "0.15.0",
