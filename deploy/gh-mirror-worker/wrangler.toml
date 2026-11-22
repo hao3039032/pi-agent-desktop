@@ -1,0 +1,22 @@
+name = "pi-gh-mirror"
+main = "src/index.mjs"
+compatibility_date = "2025-09-01"
+# workers.dev is unreachable from mainland China; serve on a custom domain only.
+workers_dev = false
+preview_urls = false
+
+# Replace with your own subdomain. Its zone must be on this Cloudflare account;
+# `wrangler deploy` creates the DNS record and certificate.
+routes = [
+  { pattern = "gh.hao3039032.work", custom_domain = true }
+]
+
+[vars]
+# Comma-separated owner/repo list. Anything else gets 403.
+ALLOWED_REPOS = "hao3039032/pi-agent-desktop"
+
+# Optional per-IP limit (requests per 60s). Remove if your plan rejects it.
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "3039032"
+simple = { limit = 120, period = 60 }

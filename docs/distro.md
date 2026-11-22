@@ -38,7 +38,7 @@
 
 ## PATH/npm 镜像与 GitHub 加速
 
-镜像**只有一个配置来源**：`distro/distro.json` 的 `updateMirrors`（当前 `gh-proxy.com`、`ghproxy.cn`）。同一条列表供给两条链路，所以清单和安装包不会各自漂移；`scripts/distro-build-config.mjs` 校验它（重复、超过 3 个、非法 host 都直接让发版失败），服务端与原生安装器各自用同一套规则再校验一次。
+镜像**只有一个配置来源**：`distro/distro.json` 的 `updateMirrors`（当前自建的 `gh.hao3039032.work` 居首，其后是公共的 `gh-proxy.com`、`ghproxy.cn`；自建镜像是 `deploy/gh-mirror-worker/` 的 Cloudflare Worker，只放行本仓库，部署与维护见该目录 README）。同一条列表供给两条链路，所以清单和安装包不会各自漂移；`scripts/distro-build-config.mjs` 校验它（重复、超过 3 个、非法 host 都直接让发版失败），服务端与原生安装器各自用同一套规则再校验一次。
 
 - **检查更新**（`lib/app-updates.ts` + `lib/update-mirrors-server.ts`）：先直连 `api.github.com`，再试 github.com 的 release 重定向探测，都失败才按序试镜像的 API 透传。服务端在**运行时**读 `distro/distro.json`（发行版把它拷到 server 根目录；源码树读 `distro/distro.json`），`PI_UPDATE_MIRRORS` 环境变量优先，**设为空字符串即禁用镜像**（与未设置不同）——这个变量**只影响服务端这一次检查**，安装器用的是构建期编译进去的列表。整次检查共享一个总时限，不是每个源各等一个超时。镜像返回 404、403 或 HTML 只说明该源不可用，换下一个；只有直连 `api.github.com` 的 404 才是"确实没有发布"。
 - **安装包下载**（`src-tauri/src/update_install.rs`）：原生命令 `install_available_update` 复用 tauri-plugin-updater 的 `Update::download`，**自动线路**下先直连清单里给的 github.com 资产 URL，**传输失败**才换成镜像前缀 URL 重试**同一个 Update**（同一个签名、同一个版本）。清单获取也是逐源独立尝试：某个镜像回了 HTML 或坏 JSON 只算这个源不可用，不会像插件的多 endpoint 循环那样直接中断。每次下载都会走插件自己的 minisign 校验；`distro-build-config.mjs` 把同一份 `updateMirrors` 写进构建环境（`PI_AGENT_DESKTOP_UPDATE_MIRRORS`），本地构建没有该变量，因此只用直连。
