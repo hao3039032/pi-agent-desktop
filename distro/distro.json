@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 2,
+  "revision": 3,
   "updateMirrors": [
     "gh.hao3039032.work",
     "gh-proxy.com",
@@ -22,7 +22,7 @@
       "sendSessionAffinityHeaders": true,
       "sessionAffinityFormat": "openrouter"
     },
-    "defaultModel": "glm-5.3",
+    "defaultModel": "glm-5.4",
     "models": [
       {
         "id": "glm-5.3",
@@ -30,6 +30,35 @@
         "reasoning": true,
         "input": [
           "text"
+        ],
+        "contextWindow": 1000000,
+        "maxTokens": 128000,
+        "thinkingLevelMap": {
+          "off": null,
+          "minimal": null,
+          "low": "low",
+          "medium": null,
+          "high": "high",
+          "xhigh": null,
+          "max": "max"
+        },
+        "compat": {
+          "supportsStore": false,
+          "supportsDeveloperRole": false,
+          "supportsReasoningEffort": true,
+          "maxTokensField": "max_tokens",
+          "thinkingFormat": "zai",
+          "supportsStrictMode": true,
+          "zaiToolStream": true
+        }
+      },
+      {
+        "id": "glm-5.4",
+        "name": "glm-5.4",
+        "reasoning": true,
+        "input": [
+          "text",
+          "image"
         ],
         "contextWindow": 1000000,
         "maxTokens": 128000,
@@ -156,8 +185,8 @@
         }
       },
       {
-        "id": "gemini-4-argon",
-        "name": "Gemini 4 Argon",
+        "id": "gemini-4-neon",
+        "name": "Gemini 4 Neon",
         "api": "google-generative-ai",
         "baseUrl": "https://ai-new-api.91prize.com/v1beta",
         "reasoning": true,
@@ -165,14 +194,8 @@
           "text",
           "image"
         ],
-        "cost": {
-          "input": 2,
-          "output": 10,
-          "cacheRead": 0.1,
-          "cacheWrite": 0
-        },
         "contextWindow": 1048576,
-        "maxTokens": 32768,
+        "maxTokens": 65536,
         "thinkingLevelMap": {
           "off": null,
           "minimal": null,
