@@ -1,7 +1,7 @@
 {
   "pi": {
-    "version": "1.6.0",
-    "reason": "Upgrade the bundled SDK to pi 1.6.0 (the CLI release the distro build already downloads); checked against its changelog and a 1.5.2→1.6.0 package diff: RPC protocol, extension API, SDK exports and file formats unchanged; llama.cpp default router moved to 127.0.0.1:9931; the render() readonly break does not affect the seeded extensions."
+    "version": "1.7.0",
+    "reason": "Upgrade the bundled SDK to pi 1.7.0 (the CLI release the distro build downloads); checked against the 1.6.0→1.7.0 changelogs and a package diff. Breaking changes carried: showCacheMissNotices became the four notices.* keys (pi migrates the old key on load and drops it on its next save; lib/transcript-notices-server.ts and /api/cache-miss-notices read and write the new keys, legacy value as fallback), install telemetry and the enableInstallTelemetry setting / PI_TELEMETRY are gone (unused here), and a stored credential now reports configured only for a provider the model registry can resolve it for (only the provider-listing tests assumed otherwise). RPC protocol, extension API and file formats are otherwise additive: blockedKind on ctx.ui dialogs, fullOutputError on truncated bash output, --agent-dir, program resume."
   },
   "pi-web": {
     "version": "0.15.0",

@@ -8,6 +8,13 @@ import { join, resolve } from "node:path";
  * (its model-backed authorizer chain link, named `pi-auto-review` in the
  * permission system's `authorizerChain`).
  *
+ * Since permission-system 45 the distro's chain starts with a second link,
+ * `yolo-session`, from the bundled `pi-permission-yolo-toggle` package
+ * (lib/distro/yolo-toggle-migration.ts). It is deliberately not among these
+ * packages: a chain link carries no tool or extractor, and the permission
+ * system judges a forwarded child ask on the serving node, whose own link
+ * decides (its docs, "Loading asymmetry"), so children need no copy of it.
+ *
  * Normal sessions load both through the settings package list like any other
  * package. Child sessions load no ambient extensions by default, which would
  * leave their bash ungated and the authorizer chain unresolvable, so every

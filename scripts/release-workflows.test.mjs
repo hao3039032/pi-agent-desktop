@@ -82,11 +82,11 @@ test("no test file is left out of npm test", async () => {
     .split("\n")
     .filter(Boolean);
 
-  const covered = tracked.filter((file) => /^(app|lib|scripts|components|hooks|relay|relay-shell|public)\//.test(file));
+  const covered = tracked.filter((file) => /^(app|lib|scripts|components|hooks|relay|relay-shell|public|deploy)\//.test(file));
   assert.deepEqual(
     tracked.filter((file) => !covered.includes(file)),
     [],
-    "a .test.mjs file lives outside app/, lib/, scripts/, components/, hooks/, relay/, relay-shell/ and public/ — extend npm test",
+    "a .test.mjs file lives outside app/, lib/, scripts/, components/, hooks/, relay/, relay-shell/, public/ and deploy/ — extend npm test",
   );
 });
 
@@ -254,9 +254,21 @@ test("distro session smoke tests run after the bundled packages are installed", 
   for (const name of ["distro-release.yml", "mac-build-test.yml"]) {
     const workflow = await readFile(join(root, ".github", "workflows", name), "utf8");
     const seed = workflow.indexOf("run: npm run distro:seed");
+    const permission = workflow.indexOf("lib/distro/permission-stack.integration.test.mjs");
     const verify = workflow.indexOf("run: npm run desktop:verify");
-    assert.ok(seed !== -1 && verify > seed, `${name}: verify must include the shipped package set`);
+    assert.ok(seed !== -1 && permission > seed, `${name}: permission integration must run against the real seed`);
+    assert.ok(permission !== -1 && verify > permission, `${name}: verify must include the shipped package set`);
+    assert.match(workflow, /lib\/distro\/permission-stack\.integration\.test\.mjs\s+lib\/distro\/permission-stack\.cli\.smoke\.test\.mjs/);
+    assert.match(workflow, /env -u PI_PACKAGE_DIR -u PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT -u JITI_ALIAS/);
   }
+});
+
+test("PR CI builds the real distro seed before the complete test suite", async () => {
+  const workflow = await readText(join(root, ".github", "workflows", "ci.yml"), "utf8");
+  const seed = workflow.indexOf("run: npm run distro:seed");
+  const tests = workflow.indexOf("npm test", seed);
+  assert.ok(seed !== -1 && tests > seed, "clean checkouts must not skip the permission-stack suites");
+  assert.match(workflow.slice(seed, tests + "npm test".length), /env -u PI_PACKAGE_DIR -u PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT -u JITI_ALIAS npm test/);
 });
 
 test("the distro release stages the pi CLI by target triple through the shared script", async () => {

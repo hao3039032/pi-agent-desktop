@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { DISTRO, distroProviderBaseUrl, distroServiceBaseUrl, imageGenBaseUrl, mergeDistroModels, mergeDistroProviderCompat, rebaseDistroModelUrls } from "./config";
 import { fileExists, isRecord, readJsonObject, writeJsonObject } from "./json-file";
-import { reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
+import { entrySource, findManagedEntry, reconcilePackages, type ManagedState, type PackageEntry } from "./packages";
 import { readModelsConfig, writeModelsConfig } from "../models-config-store";
 import { defaultToolEntries, getGlobalSettingsPath, updateGlobalSettings } from "../global-settings-file";
 import { runMcpAdapterMigration } from "./mcp-migration";
@@ -30,6 +30,51 @@ interface DistroState extends ManagedState {
   releaseMigrations?: Record<string, boolean>;
   /** The shellPath this app pinned to the bundled Git Bash (shell-path.ts). */
   managedShellPath?: string;
+  /**
+   * The toggle registration a run had to take out of `settings.json` for the
+   * 0.8.704 migration, with the user's whole entry. Written before that
+   * removal is flushed and cleared once the entry is registered again, so a
+   * crash or a later write failure cannot make the next start read the missing
+   * entry as a user removal.
+   */
+  pendingYoloToggle?: PendingYoloToggle;
+}
+
+/** distro.json source of the bundled YOLO toggle (PACKAGE_SOURCE_CONFLICTS). */
+const YOLO_TOGGLE_SOURCE = "git:github.com/hao3039032/pi-permission-yolo-toggle";
+
+interface PendingYoloToggle {
+  /** The user's entry as it was, filters and unknown fields included. */
+  entry: PackageEntry;
+  /** Its position in `settings.packages` when it was removed. */
+  index: number;
+  /** The bundled path the seeder had recorded for it, if any. */
+  managedPath?: string;
+}
+
+/** Put back a registration the previous run had to remove, unless the entry is
+ * already there (a flush that never happened, or a user re-add). */
+function withRestoredToggle(entries: PackageEntry[], pending: PendingYoloToggle): PackageEntry[] {
+  if (entries.some((entry) => entrySource(entry) === entrySource(pending.entry))) return entries;
+  const restored = [...entries];
+  restored.splice(Math.min(pending.index, restored.length), 0, pending.entry);
+  return restored;
+}
+
+/** Persist the recovery record before the toggle leaves settings.json. Every
+ * field the rest of this file manages is carried over, so a crash right after
+ * this write loses nothing else. */
+function writePendingToggle(agentDir: string, previous: DistroState | null, pending: PendingYoloToggle): void {
+  writeJsonObject(distroStatePath(agentDir), {
+    distro: DISTRO.id,
+    ...(previous?.seedVersion ? { seedVersion: previous.seedVersion } : {}),
+    ...(previous?.defaultsApplied ? { defaultsApplied: previous.defaultsApplied } : {}),
+    packages: { ...(previous?.packages ?? {}) },
+    ...(previous?.migrations ? { migrations: previous.migrations } : {}),
+    ...(previous?.releaseMigrations ? { releaseMigrations: previous.releaseMigrations } : {}),
+    ...(previous?.managedShellPath ? { managedShellPath: previous.managedShellPath } : {}),
+    pendingYoloToggle: pending,
+  });
 }
 
 export function distroStatePath(agentDir = getAgentDir()): string {
@@ -136,9 +181,65 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
   });
   const seed = manifest.packages.map(bundledPackage);
   const runtimePackages = (manifest.runtimePackages ?? []).map(bundledPackage);
-  const current = (settingsManager.getGlobalSettings().packages ?? []) as PackageEntry[];
-  const reconciled = reconcilePackages({ entries: current, seed, runtimePackages, previous });
-  if (reconciled.changed) settingsManager.setPackages(reconciled.entries as never);
+  const storedPackages = (settingsManager.getGlobalSettings().packages ?? []) as PackageEntry[];
+  // The 0.8.704 migration validates the toggle before it may load: an invalid
+  // config must not fall back to the fork's defaultEnabled:true. Until that
+  // release has a receipt the bundled toggle stays out of the settings flush
+  // (`runtimePackages` is pruned). Once it does, nothing is removed or
+  // re-added any more — the entry is only re-pointed at the current bundle
+  // path, filters intact.
+  const yoloToggle = seed.find((pkg) => pkg.source === YOLO_TOGGLE_SOURCE);
+  // A previous run recorded the user's entry before it took it out for that
+  // migration; put it back before any ownership decision is made.
+  const pendingToggle = yoloToggle ? previous?.pendingYoloToggle : undefined;
+  const current = pendingToggle
+    ? withRestoredToggle(storedPackages, pendingToggle)
+    : storedPackages;
+  const packagesPrevious: ManagedState = { packages: { ...(previous?.packages ?? {}) } };
+  if (pendingToggle?.managedPath) packagesPrevious.packages[YOLO_TOGGLE_SOURCE] = pendingToggle.managedPath;
+  const toggleAwaitingMigration = yoloToggle !== undefined
+    && previous?.releaseMigrations?.["0.8.704"] !== true;
+  const before = toggleAwaitingMigration
+    ? reconcilePackages({ entries: current, seed, runtimePackages, previous: packagesPrevious })
+    : null;
+  const yoloToggleWasRegistered = before?.entries.some((entry) => entrySource(entry) === yoloToggle?.path) === true;
+  // A genuine pre-existing user removal, but not the temporary removal below
+  // or conflict cleanup for a user's pikujs original: both are remembered by
+  // the state and must not be read as an uninstall.
+  const yoloToggleRemovalMemory = before && !yoloToggleWasRegistered
+    ? before.managed.packages[YOLO_TOGGLE_SOURCE]
+    : undefined;
+
+  // Record the user's whole entry (filters and unknown fields included) before
+  // the flush that takes it out of settings.json. A crash, a failed later
+  // write or a lost final state write then cannot turn it into a user removal.
+  // Nothing is written when this record cannot be saved: the write throws
+  // before the flush, so the entry stays registered for this run.
+  const toggleRemoval = yoloToggleWasRegistered && yoloToggle
+    ? findManagedEntry(current, yoloToggle, packagesPrevious.packages[YOLO_TOGGLE_SOURCE])
+    : undefined;
+  const pendingToggleAfter: PendingYoloToggle | undefined = toggleRemoval
+    ? {
+        entry: toggleRemoval.entry,
+        index: toggleRemoval.index,
+        ...(packagesPrevious.packages[YOLO_TOGGLE_SOURCE]
+          ? { managedPath: packagesPrevious.packages[YOLO_TOGGLE_SOURCE] }
+          : {}),
+      }
+    : undefined;
+  if (pendingToggleAfter) writePendingToggle(agentDir, previous, pendingToggleAfter);
+
+  let reconciled = reconcilePackages({
+    entries: current,
+    seed: toggleAwaitingMigration && yoloToggle ? seed.filter((pkg) => pkg !== yoloToggle) : seed,
+    runtimePackages: toggleAwaitingMigration && yoloToggle
+      ? [...runtimePackages, yoloToggle]
+      : runtimePackages,
+    previous: packagesPrevious,
+  });
+  // `current` may carry a restored entry that is not on disk yet, so the
+  // comparison has to be against what the settings manager loaded.
+  if (reconciled.changed || current !== storedPackages) settingsManager.setPackages(reconciled.entries as never);
   // A still-installed pi-plan-vanguard would shadow the bundled /plan prompt
   // template (pi dispatches extension commands before expanding templates),
   // so the template waits until the user removes it. Their own plan install
@@ -232,12 +333,16 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
     }
   }
 
+  const newlySeededFiles = new Set<string>();
   for (const [name, contents] of Object.entries(DISTRO.agentFiles)) {
     const path = join(agentDir, name);
     // A legacy file the owning extension reads (and migrates itself on next
     // save) must not be shadowed by a freshly seeded canonical file.
     if ((DISTRO.legacyAgentFiles?.[name] ?? []).some((legacy) => fileExists(join(agentDir, legacy)))) continue;
-    if (!fileExists(path) && isRecord(contents)) writeJsonObject(path, contents);
+    if (!fileExists(path) && isRecord(contents)) {
+      writeJsonObject(path, contents);
+      newlySeededFiles.add(name);
+    }
   }
 
   ensureImageGenConfig(agentDir);
@@ -251,7 +356,38 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
 
   if (versionChanged) refreshProviderModels();
 
-  const releaseMigrations = runReleaseMigrations(agentDir, previous?.releaseMigrations);
+  const releaseMigrations = runReleaseMigrations(
+    agentDir,
+    previous?.releaseMigrations,
+    undefined,
+    { newlySeededFiles },
+  );
+
+  if (toggleAwaitingMigration && yoloToggle && releaseMigrations["0.8.704"] === true) {
+    // Reload after the direct settings migrations, then register the toggle
+    // again — as the user's own entry (filters and unknown fields intact),
+    // which is why the removal recorded it whole.
+    const finalSettingsManager = SettingsManager.create(agentDir, agentDir);
+    const latest = (finalSettingsManager.getGlobalSettings().packages ?? []) as PackageEntry[];
+    const restored = pendingToggleAfter ? withRestoredToggle(latest, pendingToggleAfter) : latest;
+    reconciled = reconcilePackages({
+      entries: restored,
+      seed,
+      runtimePackages,
+      previous: packagesPrevious,
+    });
+    if (reconciled.changed || restored !== latest) finalSettingsManager.setPackages(reconciled.entries as never);
+    await finalSettingsManager.flush();
+  } else if (yoloToggleRemovalMemory) {
+    // The toggle stays out; the memory of the user's own removal must survive
+    // the reconcile that ran without it in the seed.
+    reconciled = {
+      ...reconciled,
+      managed: {
+        packages: { ...reconciled.managed.packages, [YOLO_TOGGLE_SOURCE]: yoloToggleRemovalMemory },
+      },
+    };
+  }
 
   writeJsonObject(distroStatePath(agentDir), {
     distro: DISTRO.id,
@@ -260,6 +396,11 @@ export async function seedAgentDir(resourcesDir: string, agentDir = getAgentDir(
     packages: reconciled.managed.packages,
     migrations,
     releaseMigrations,
+    // Carried until the toggle is registered again: the next start must
+    // restore the user's entry instead of remembering a removal nobody made.
+    ...(pendingToggleAfter && releaseMigrations["0.8.704"] !== true
+      ? { pendingYoloToggle: pendingToggleAfter }
+      : {}),
     // Preserved for ensureBundledBashShellPath, which merges into the same
     // file after this write; dropping it here would orphan the pin marker.
     ...(previous?.managedShellPath ? { managedShellPath: previous.managedShellPath } : {}),

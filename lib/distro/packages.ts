@@ -71,6 +71,17 @@ export const PROMPT_TEMPLATE_SHADOWS: Readonly<Record<string, string>> = {
   "npm:@codella/pi-prompt-plan": "git:github.com/hao3039032/pi-plan-vanguard",
 };
 
+/** Known different repositories that provide the same extension surface. An
+ * installed conflicting source satisfies the bundled seed, but is never
+ * rewritten or adopted. Keys and values are canonical `packageKey` identities;
+ * local paths deliberately cannot participate because their identity is unknown. */
+export const PACKAGE_SOURCE_CONFLICTS: Readonly<Record<string, readonly string[]>> = {
+  // The pikujs original and LW's fork both register yolo-session and /yolo.
+  "git:github.com/hao3039032/pi-permission-yolo-toggle": [
+    "git:github.com/pikujs/pi-permission-yolo-toggle",
+  ],
+};
+
 export function entrySource(entry: PackageEntry): string {
   return typeof entry === "string" ? entry : entry.source;
 }
@@ -120,6 +131,24 @@ function isBundleRegistration(
   return isSeedCopy(source, pkg.relativePath);
 }
 
+export interface ManagedEntryMatch {
+  entry: PackageEntry;
+  /** Position in the list the entry was found at. */
+  index: number;
+}
+
+/** The first registration in `entries` that this seeder owns for `pkg` — the
+ * same three identities `reconcilePackages` rewrites in place (current bundle
+ * path, a path our state recorded, any install's seed copy). */
+export function findManagedEntry(
+  entries: readonly PackageEntry[],
+  pkg: { path?: string; relativePath: string },
+  previousPath: string | undefined,
+): ManagedEntryMatch | undefined {
+  const index = entries.findIndex((entry) => isBundleRegistration(entry, pkg, previousPath));
+  return index === -1 ? undefined : { entry: entries[index], index };
+}
+
 export interface ReconcileInput {
   entries: PackageEntry[];
   seed: Array<SeedPackage & { relativePath: string }>;
@@ -144,9 +173,10 @@ export interface ReconcileResult {
  *   place to the current bundle path, keeping the user's per-package
  *   filters; duplicates are dropped;
  * - a package the user removed after we added it stays removed;
- * - a package the user installed themselves in any other form (npm:/git:
- *   source, versioned spec, or their own local path) is left untouched —
- *   their install wins and no duplicate is appended;
+ * - a package the user installed themselves in any canonical npm:/git: form
+ *   (including a versioned spec or a declared conflict) is left untouched and
+ *   no duplicate is appended. Independent local paths are also left untouched,
+ *   but cannot suppress seeding because they have no reliable package identity;
  * - otherwise the bundled path is appended (fresh machine, no entry at all).
  *
  * Entries we manage for packages that left the seed (dropped from the bundle)
@@ -168,6 +198,7 @@ export function reconcilePackages({ entries, seed, runtimePackages = [], previou
   ));
   const managed: ManagedState = { packages: {} };
   const shadowed: Array<{ source: string; shadow: string }> = [];
+  const conflicted = new Set<string>();
 
   for (const pkg of seed) {
     const key = packageKey(pkg.source);
@@ -182,13 +213,28 @@ export function reconcilePackages({ entries, seed, runtimePackages = [], previou
       if (previousPath && normalizePath(source) === normalizePath(previousPath)) return true;
       return isSeedCopy(source, pkg.relativePath);
     };
-    // Presence in any form (versioned npm spec, git URL variant, or an
-    // unrelated local checkout) means the user already has this package, so
-    // seeding must not append a second copy next to theirs.
+    // Canonical npm/git identities (including the explicit conflict table)
+    // mean the user already has this extension. packageKey deliberately
+    // returns null for local paths, so those never suppress seeding.
     const present = (entry: PackageEntry) => {
       const entryKey = key !== null ? packageKey(entrySource(entry)) : null;
-      return entryKey !== null && entryKey === key;
+      return entryKey !== null && key !== null
+        && (entryKey === key || PACKAGE_SOURCE_CONFLICTS[key]?.includes(entryKey) === true);
     };
+
+    // A user's original wins even when our fork was registered first. Remove
+    // only registrations owned by this seeder, and do not remember that
+    // temporary removal as a user uninstall: removing the original later must
+    // allow the bundled fork to be seeded again.
+    const hasConflict = key !== null && result.some((entry) => {
+      const entryKey = packageKey(entrySource(entry));
+      return entryKey !== null && PACKAGE_SOURCE_CONFLICTS[key]?.includes(entryKey) === true;
+    });
+    if (hasConflict) {
+      result = result.filter((entry) => !owned(entry));
+      conflicted.add(pkg.source);
+      continue;
+    }
 
     const firstIndex = result.findIndex(owned);
     if (firstIndex === -1) {
@@ -215,7 +261,7 @@ export function reconcilePackages({ entries, seed, runtimePackages = [], previou
 
   // Keep "removed by the user" memory for packages we skipped above.
   for (const [source, path] of Object.entries(previous?.packages ?? {})) {
-    if (!(source in managed.packages) && seed.some((pkg) => pkg.source === source)) {
+    if (!(source in managed.packages) && !conflicted.has(source) && seed.some((pkg) => pkg.source === source)) {
       managed.packages[source] = path;
     }
   }

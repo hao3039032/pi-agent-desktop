@@ -4,11 +4,17 @@ import { applyExaFallbackMigration } from "./exa-fallback";
 import { applySessionAffinityMigration } from "./session-affinity-migration";
 import { applyOpenAICompletionsMigration } from "./openai-completions-migration";
 import { applyExaDefaultMigration } from "./exa-default-migration";
+import { applyYoloToggleMigration } from "./yolo-toggle-migration";
+
+export interface ReleaseMigrationContext {
+  /** Paths actually created by this seed run's write-when-missing agentFiles pass. */
+  newlySeededFiles?: ReadonlySet<string>;
+}
 
 export interface ReleaseMigration {
   /** Immutable release version: append a new entry, never repurpose a shipped one. */
   version: string;
-  run: (agentDir: string) => void;
+  run: (agentDir: string, context: ReleaseMigrationContext) => void;
 }
 
 /** Only migrations included in this release are listed here. Keep old entries:
@@ -58,6 +64,14 @@ export const RELEASE_MIGRATIONS: readonly ReleaseMigration[] = [
       if (report.kept.length) console.log(`[distro] Exa default search: ${report.kept.join("; ")}`);
     },
   },
+  {
+    version: "0.8.704",
+    run(agentDir, context) {
+      const report = applyYoloToggleMigration(agentDir, context);
+      if (report.written.length) console.log(`[distro] YOLO toggle: wrote ${report.written.join(", ")}`);
+      if (report.kept.length) console.log(`[distro] YOLO toggle: ${report.kept.join("; ")}`);
+    },
+  },
 ];
 
 /** Each release has an independent completion receipt, not a highest-version
@@ -68,6 +82,7 @@ export function runReleaseMigrations(
   agentDir: string,
   completed: Record<string, boolean> = {},
   entries: readonly ReleaseMigration[] = RELEASE_MIGRATIONS,
+  context: ReleaseMigrationContext = {},
 ): Record<string, boolean> {
   const next = { ...completed };
   const versions = new Set<string>();
@@ -78,7 +93,7 @@ export function runReleaseMigrations(
   for (const entry of [...entries].sort((a, b) => compare(a.version, b.version))) {
     if (next[entry.version] === true) continue;
     try {
-      entry.run(agentDir);
+      entry.run(agentDir, context);
       next[entry.version] = true;
     } catch (error) {
       console.warn(`[distro] release migration ${entry.version} failed; will retry at next startup:`, error);

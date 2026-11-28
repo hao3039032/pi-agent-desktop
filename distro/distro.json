@@ -1,7 +1,7 @@
 {
   "$comment": "Distribution overlay for this fork. See docs/distro.md. Bump `revision` to publish a rebuild without an upstream change; it counts per upstream version and resets to 1 when a sync changes the version (scripts/distro-reset-revision.mjs).",
   "id": "lw",
-  "revision": 3,
+  "revision": 4,
   "updateMirrors": [
     "gh.hao3039032.work",
     "gh-proxy.com",
@@ -290,7 +290,8 @@
     "npm:pi-omp-advisor",
     "npm:@codella/pi-prompt-plan@0.2.2",
     "npm:@gotgenes/pi-permission-system",
-    "npm:@erichll/pi-auto-review"
+    "npm:@erichll/pi-auto-review",
+    "git:github.com/hao3039032/pi-permission-yolo-toggle"
   ],
   "settingsDefaults": {
     "defaultThinkingLevel": "high",
@@ -355,7 +356,6 @@
       "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
       "debugLog": false,
       "permissionReviewLog": true,
-      "yoloMode": true,
       "permissionDialogKeys": {
         "approve": "1",
         "approveSession": "2",
@@ -368,6 +368,7 @@
       ],
       "promptTimeoutMs": 120000,
       "authorizerChain": [
+        "yolo-session",
         "pi-auto-review"
       ],
       "shellTools": {

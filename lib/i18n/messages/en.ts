@@ -762,7 +762,7 @@ export const enLocale: LocalePlugin = {
     "transcriptNotice.foldCacheMiss": "cache miss {tokens} tokens{cost}",
     "transcriptNotice.foldCacheMisses": "{count} cache misses {tokens} tokens{cost}",
     "settings.cacheMissNotices": "Show cache and cost notices",
-    "settings.cacheMissNoticesDescription": "pi's showCacheMissNotices: cache misses, cache warming, compaction cost and Anthropic dropping thinking blocks, in the chat. Saved to the global settings.json; a project's .pi/settings.json can override it.",
+    "settings.cacheMissNoticesDescription": "pi's transcript notices (notices.cacheMisses, cacheWarming, compactionCosts, reasoningDrops): cache misses, cache warming, compaction cost and Anthropic dropping thinking blocks, in the chat. Saved to the global settings.json; a project's .pi/settings.json can override it.",
     "chat.filesWritten": "Files changed",
     "chat.openWrittenFile": "Open {name}",
     "chat.writtenFileMissing": "No longer exists",

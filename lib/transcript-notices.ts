@@ -1,5 +1,5 @@
-// Client-safe: the transcript notices pi's TUI shows under `showCacheMissNotices`
-// (#1265). The server derives them from the session entries
+// Client-safe: the transcript notices pi's TUI shows for the transcript notices it
+// has on (#1265). The server derives them from the session entries
 // (lib/transcript-notices-server.ts) and hangs them on the chat message they
 // follow; the chat renders them as one line each.
 
@@ -15,6 +15,30 @@ export type TranscriptNotice =
 
 /** The property a chat message carries its notices in; never part of pi's message. */
 export const TRANSCRIPT_NOTICES_KEY = "transcriptNotices";
+
+/** The pi settings key that shows a notice kind: `notices.<key>` since pi 1.6.1. */
+export type TranscriptNoticeSettingKey = "cacheMisses" | "cacheWarming" | "compactionCosts" | "reasoningDrops";
+
+export const TRANSCRIPT_NOTICE_SETTING_KEYS: readonly TranscriptNoticeSettingKey[] = [
+  "cacheMisses",
+  "cacheWarming",
+  "compactionCosts",
+  "reasoningDrops",
+];
+
+/** The settings key pi gates each notice kind with (interactive-mode.js). */
+export function transcriptNoticeSettingKey(kind: TranscriptNotice["kind"]): TranscriptNoticeSettingKey {
+  switch (kind) {
+    case "cache_miss":
+      return "cacheMisses";
+    case "cache_warm":
+      return "cacheWarming";
+    case "summary_cost":
+      return "compactionCosts";
+    case "thinking_dropped":
+      return "reasoningDrops";
+  }
+}
 
 export type WithTranscriptNotices<T> = T & { [TRANSCRIPT_NOTICES_KEY]?: TranscriptNotice[] };
 

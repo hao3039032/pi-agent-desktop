@@ -122,6 +122,13 @@ jobs:
       - name: Pre-install distro pi packages
         run: npm run distro:seed
 
+      - name: Test the seeded permission stack
+        run: >-
+          env -u PI_PACKAGE_DIR -u PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT -u JITI_ALIAS
+          node --experimental-strip-types --test
+          lib/distro/permission-stack.integration.test.mjs
+          lib/distro/permission-stack.cli.smoke.test.mjs
+
       - name: Verify packaged server
         # Include the shipped packages in the session-start smoke test.
         run: npm run desktop:verify

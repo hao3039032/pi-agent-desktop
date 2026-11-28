@@ -762,7 +762,7 @@ export const zhCNLocale: LocalePlugin = {
     "transcriptNotice.foldCacheMiss": "缓存未命中 {tokens} Token{cost}",
     "transcriptNotice.foldCacheMisses": "缓存未命中 {count} 次 {tokens} Token{cost}",
     "settings.cacheMissNotices": "显示缓存与费用提示",
-    "settings.cacheMissNoticesDescription": "即 pi 的 showCacheMissNotices：在对话中显示缓存未命中、缓存预热、压缩费用，以及 Anthropic 丢弃思考块。保存到全局 settings.json，项目的 .pi/settings.json 可以覆盖它。",
+    "settings.cacheMissNoticesDescription": "即 pi 的 notices（cacheMisses、cacheWarming、compactionCosts、reasoningDrops）：在对话中显示缓存未命中、缓存预热、压缩费用，以及 Anthropic 丢弃思考块。保存到全局 settings.json，项目的 .pi/settings.json 可以覆盖它。",
     "chat.filesWritten": "改动的文件",
     "chat.openWrittenFile": "打开 {name}",
     "chat.writtenFileMissing": "已不存在",

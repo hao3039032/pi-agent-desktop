@@ -74,7 +74,7 @@ import type { McpHost } from "./mcp-host";
 import type { DebugMcpHost, DebugSessionLifecycle, DebugWrapperSnapshot } from "./debug-types";
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
 import { isNestedToolExecutionEvent } from "./agent-event-wire";
-import { collectLiveAssistantNotices, readShowCacheMissNotices, withSessionPrices } from "./transcript-notices-server";
+import { anyTranscriptNoticeEnabled, collectLiveAssistantNotices, filterTranscriptNotices, readTranscriptNoticeSettings, withSessionPrices } from "./transcript-notices-server";
 import {
   appendClearedSessionToolSelection,
   appendSessionToolSelection,
@@ -941,23 +941,25 @@ export class AgentSessionWrapper {
   }
 
   /**
-   * An assistant `message_end` with the notices pi's TUI shows under
-   * `showCacheMissNotices` (#1265), as `transcriptNotices` beside the message.
-   * The message itself is left alone: pi writes that object to the file.
+   * An assistant `message_end` with the notices pi's TUI shows for the
+   * transcript notices it has on (#1265; one `notices.*` key per kind since
+   * pi 1.6.1), as `transcriptNotices` beside the message. The message itself
+   * is left alone: pi writes that object to the file.
    */
   private withTranscriptNotices(event: AgentEvent): AgentEvent {
     const message = event.message as { role?: unknown } | undefined;
     if (this.listeners.size === 0 || message?.role !== "assistant") return event;
     try {
       const manager = this.inner.sessionManager;
-      if (!readShowCacheMissNotices(manager.getCwd())) return event;
+      const settings = readTranscriptNoticeSettings(manager.getCwd());
+      if (!anyTranscriptNoticeEnabled(settings)) return event;
       const entries = manager.getEntries() as unknown as SessionEntry[];
-      const notices = collectLiveAssistantNotices(
+      const notices = filterTranscriptNotices(collectLiveAssistantNotices(
         entries,
         manager.getBranch() as unknown as SessionEntry[],
         message,
         withSessionPrices(entries, this.inner.modelRuntime),
-      );
+      ), settings);
       return notices.length > 0 ? { ...event, transcriptNotices: notices } : event;
     } catch (error) {
       console.warn("[pi-web] transcript notices failed:", error instanceof Error ? error.message : error);

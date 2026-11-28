@@ -25,7 +25,10 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npx tsc --noEmit
-      - run: npm test
+      # The permission-stack suites exercise the real gitignored bundle; do
+      # not let a clean PR checkout reduce them to skipped tests.
+      - run: npm run distro:seed
+      - run: env -u PI_PACKAGE_DIR -u PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT -u JITI_ALIAS npm test
 
   # demo/ keeps copies of components/, hooks/ and lib/ and is only built by the
   # manual Demo workflow, so report when those copies fall behind. Never fails:

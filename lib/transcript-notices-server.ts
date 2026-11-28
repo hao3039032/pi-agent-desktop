@@ -2,13 +2,23 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentUsage, SessionEntry } from "./types";
-import { withTranscriptNotices, type TranscriptNotice } from "./transcript-notices";
+import { transcriptNoticeSettingKey, TRANSCRIPT_NOTICE_SETTING_KEYS, withTranscriptNotices, type TranscriptNotice, type TranscriptNoticeSettingKey } from "./transcript-notices";
 
-// The notices pi's TUI shows when `showCacheMissNotices` is on (#1265), derived
-// from session entries so a reload, a reconnect or an older page shows the same
-// ones: cache misses are never persisted, the TUI re-derives them too.
+// The notices pi's TUI shows for the transcript notices it has on (#1265),
+// derived from session entries so a reload, a reconnect or an older page shows
+// the same ones: cache misses are never persisted, the TUI re-derives them too.
 // `scanCacheMisses()` ports the SDK's core/cache-stats.js, which the package
 // does not export; lib/transcript-notices.test.mjs compares the two.
+//
+// Which notices are on is pi's own setting, read from the settings files
+// without pi's lock: one key per notice under `notices` since pi 1.6.1
+// (`notices.cacheMisses`, `cacheWarming`, `compactionCosts`, `reasoningDrops`),
+// project over global. Until pi 1.6.0 it was the single `showCacheMissNotices`;
+// pi migrates that value into the four keys on load and drops the key on its
+// next save, so a file it has not rewritten yet still carries it. Both are
+// read here the way pi resolves them (SettingsManager.migrateSettings, then a
+// per-key merge): a key wins over the legacy value, which fills the keys a
+// file does not set.
 
 /** Idle gaps past this are named as the likely cause of a miss (Anthropic's default cache TTL). */
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -313,39 +323,76 @@ export function collectLiveAssistantNotices(
   return notices;
 }
 
+/** On/off per notice kind, as pi's TUI decides it (`notices.<key>` in the settings). */
+export interface TranscriptNoticeSettings {
+  cacheMisses: boolean;
+  cacheWarming: boolean;
+  compactionCosts: boolean;
+  reasoningDrops: boolean;
+}
+
+export { TRANSCRIPT_NOTICE_SETTING_KEYS, transcriptNoticeSettingKey, type TranscriptNoticeSettingKey };
+
+/** Whether any notice kind is on; none means the chat shows no notices at all. */
+export function anyTranscriptNoticeEnabled(settings: TranscriptNoticeSettings): boolean {
+  return TRANSCRIPT_NOTICE_SETTING_KEYS.some((key) => settings[key]);
+}
+
+/** Only the notices whose kind pi's settings show. */
+export function filterTranscriptNotices<T extends TranscriptNotice>(
+  notices: readonly T[],
+  settings: TranscriptNoticeSettings,
+): T[] {
+  return notices.filter((notice) => settings[transcriptNoticeSettingKey(notice.kind)]);
+}
+
+interface NoticeFileValues {
+  /** The file's `notices` object, keys pi does not know included; absent when unset. */
+  notices: Record<string, unknown> | undefined;
+  /** The file's legacy `showCacheMissNotices`, when it is a boolean. */
+  legacy: boolean | undefined;
+}
+
+const NO_NOTICE_VALUES: NoticeFileValues = { notices: undefined, legacy: undefined };
+
 interface CachedSetting {
   stamp: string;
-  value: boolean | undefined;
+  value: NoticeFileValues;
 }
 
 const SETTING_CACHE_LIMIT = 200;
 const settingCache = new Map<string, CachedSetting>();
 
 /**
- * One settings file's `showCacheMissNotices`, read without pi's file lock:
+ * One settings file's notice values, read without pi's file lock:
  * `SettingsManager.create()` locks each file (a `settings.json.lock` directory
  * in the project) and busy-waits when another writer holds it, which every
  * history read and every reply would pay. Cached until the file changes.
  */
-function readSettingFile(path: string): boolean | undefined {
+function readSettingFile(path: string): NoticeFileValues {
   let stamp: string;
   try {
     const stats = statSync(path);
     stamp = `${stats.ino}:${stats.size}:${stats.mtimeMs}`;
   } catch {
     settingCache.delete(path);
-    return undefined;
+    return NO_NOTICE_VALUES;
   }
   const cached = settingCache.get(path);
   if (cached?.stamp === stamp) return cached.value;
-  let value: boolean | undefined;
+  let value = NO_NOTICE_VALUES;
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
-    const raw = isRecord(parsed) ? parsed.showCacheMissNotices : undefined;
-    value = typeof raw === "boolean" ? raw : undefined;
+    if (isRecord(parsed)) {
+      const legacy = parsed.showCacheMissNotices;
+      value = {
+        notices: isRecord(parsed.notices) ? parsed.notices : undefined,
+        legacy: typeof legacy === "boolean" ? legacy : undefined,
+      };
+    }
   } catch {
     // pi skips a file it cannot parse, keeping the other one.
-    value = undefined;
+    value = NO_NOTICE_VALUES;
   }
   settingCache.delete(path);
   settingCache.set(path, { stamp, value });
@@ -353,11 +400,30 @@ function readSettingFile(path: string): boolean | undefined {
   return value;
 }
 
-/** pi's `showCacheMissNotices` for a folder: project settings over global, off by default. */
-export function readShowCacheMissNotices(cwd: string, agentDir: string = getAgentDir()): boolean {
-  return readSettingFile(join(cwd, ".pi", "settings.json"))
-    ?? readSettingFile(join(agentDir, "settings.json"))
-    ?? false;
+/**
+ * pi's transcript notice settings for a folder: project settings over global
+ * per key, the legacy single switch filling what a file does not set, off by
+ * default (pi's `SETTINGS_DEFAULTS.notices`).
+ */
+export function readTranscriptNoticeSettings(cwd: string, agentDir: string = getAgentDir()): TranscriptNoticeSettings {
+  const files = cwd
+    ? [readSettingFile(join(cwd, ".pi", "settings.json")), readSettingFile(join(agentDir, "settings.json"))]
+    : [readSettingFile(join(agentDir, "settings.json"))];
+  const settings = { cacheMisses: false, cacheWarming: false, compactionCosts: false, reasoningDrops: false };
+  for (const key of TRANSCRIPT_NOTICE_SETTING_KEYS) {
+    for (const file of files) {
+      const own = file.notices?.[key];
+      if (typeof own === "boolean") {
+        settings[key] = own;
+        break;
+      }
+      if (file.legacy !== undefined) {
+        settings[key] = file.legacy;
+        break;
+      }
+    }
+  }
+  return settings;
 }
 
 /**
@@ -393,10 +459,11 @@ export function withSessionPrices(entries: readonly SessionEntry[], models?: Not
 }
 
 /**
- * A session's notices for the history routes, or undefined while the setting
- * is off. A total miss is priced from the session's own cache reads, then
- * `models` (an open session's runtime); the extension-loaded runtime is never
- * built here, as that runs every extension with no deadline.
+ * A session's notices for the history routes, or undefined while every notice
+ * is off. Only the kinds pi's settings show are kept. A total miss is priced
+ * from the session's own cache reads, then `models` (an open session's
+ * runtime); the extension-loaded runtime is never built here, as that runs
+ * every extension with no deadline.
  */
 export function readSessionTranscriptNotices(options: {
   entries: readonly SessionEntry[];
@@ -404,8 +471,16 @@ export function readSessionTranscriptNotices(options: {
   leafId?: string | null;
   models?: NoticeModelLookup;
 }): Map<string, TranscriptNotice[]> | undefined {
-  if (!options.cwd || !readShowCacheMissNotices(options.cwd)) return undefined;
-  return collectTranscriptNotices(options.entries, withSessionPrices(options.entries, options.models), { leafId: options.leafId });
+  if (!options.cwd) return undefined;
+  const settings = readTranscriptNoticeSettings(options.cwd);
+  if (!anyTranscriptNoticeEnabled(settings)) return undefined;
+  const collected = collectTranscriptNotices(options.entries, withSessionPrices(options.entries, options.models), { leafId: options.leafId });
+  const shown = new Map<string, TranscriptNotice[]>();
+  for (const [entryId, notices] of collected) {
+    const kept = filterTranscriptNotices(notices, settings);
+    if (kept.length > 0) shown.set(entryId, kept);
+  }
+  return shown;
 }
 
 /** `context` with each message carrying the notices of its entry. */

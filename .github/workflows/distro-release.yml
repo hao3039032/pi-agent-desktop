@@ -220,6 +220,14 @@ jobs:
       - name: Pre-install distro pi packages
         run: npm run distro:seed
 
+      - name: Test the seeded permission stack
+        shell: bash
+        run: >-
+          env -u PI_PACKAGE_DIR -u PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT -u JITI_ALIAS
+          node --experimental-strip-types --test
+          lib/distro/permission-stack.integration.test.mjs
+          lib/distro/permission-stack.cli.smoke.test.mjs
+
       - name: Scan the seeded pi packages
         # desktop:prepare ran its payload scan before the seed existed, so the
         # seed is scanned here. PortableGit (staged below, Windows only) is
